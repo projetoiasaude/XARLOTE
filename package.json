@@ -1,0 +1,23 @@
+{
+  "name": "ia-da-saude",
+  "private": true,
+  "scripts": {
+    "dev:api": "pnpm --filter @iasaude/api dev",
+    "dev:worker": "pnpm --filter @iasaude/worker dev",
+    "dev:web": "pnpm --filter @iasaude/web dev",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "typecheck": "pnpm -r typecheck",
+    "dev": "concurrently \"pnpm dev:api\" \"pnpm dev:worker\" \"pnpm dev:web\""
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.14.0",
+    "prettier": "^3.3.0",
+    "concurrently": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  }
+}
