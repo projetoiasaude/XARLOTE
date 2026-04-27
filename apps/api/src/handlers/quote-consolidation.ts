@@ -1,6 +1,194 @@
 import { db, writeLog } from '@iasaude/db';
 import { sendOutbound } from './outbound.js';
 
+const CHECK_3MIN_MS = 3 * 60 * 1000;
+const CHECK_5MIN_MS = 5 * 60 * 1000;
+const scheduledTimeouts = new Set<string>();
+
+/**
+ * Timers por pedido:
+ *
+ *  3 min → se ≥3 cotações: consolida agora. Senão: fica em silêncio.
+ *  5 min → se ≥1 cotação:  consolida agora com o que tiver.
+ *         se 0 cotações:   entra em modo "eager" (status_5min_done=true).
+ *
+ * Modo eager: a próxima cotação que chegar via notifyUserQuoteArrived
+ * dispara consolidação imediata, sem esperar mais.
+ */
+export function scheduleQuoteTimeout(
+  orderId: string,
+  userConversationId: string,
+  userPhoneE164: string,
+  traceId: string,
+): void {
+  if (scheduledTimeouts.has(orderId)) return;
+  scheduledTimeouts.add(orderId);
+
+  setTimeout(() => {
+    check3min(orderId, userConversationId, userPhoneE164, traceId).catch((err) =>
+      writeLog('error', 'order', `3min check failed: ${String(err)}`, { traceId, orderId }),
+    );
+  }, CHECK_3MIN_MS);
+
+  setTimeout(() => {
+    check5min(orderId, userConversationId, userPhoneE164, traceId)
+      .catch((err) => writeLog('error', 'order', `5min check failed: ${String(err)}`, { traceId, orderId }))
+      .finally(() => scheduledTimeouts.delete(orderId));
+  }, CHECK_5MIN_MS);
+}
+
+async function check3min(
+  orderId: string,
+  userConversationId: string,
+  userPhoneE164: string,
+  traceId: string,
+): Promise<void> {
+  const { data: order } = await db.from('orders').select('status').eq('id', orderId).single();
+  if (!order || order.status !== 'quoting') return;
+
+  const { data: quotes } = await db.from('quotes').select('status').eq('order_id', orderId);
+  const quotedCount = (quotes ?? []).filter((q) => q.status === 'quoted').length;
+
+  await db.from('orders').update({ status_3min_sent: true }).eq('id', orderId);
+
+  if (quotedCount >= 3) {
+    await writeLog('info', 'order', `3min: ${quotedCount} cotações — consolidando agora`, { traceId, orderId });
+    await consolidateQuotesEarly(orderId, userConversationId, userPhoneE164, traceId);
+  } else {
+    await writeLog('info', 'order', `3min: ${quotedCount} cotação(ões) — aguardando silenciosamente`, { traceId, orderId });
+  }
+}
+
+async function check5min(
+  orderId: string,
+  userConversationId: string,
+  userPhoneE164: string,
+  traceId: string,
+): Promise<void> {
+  const { data: order } = await db.from('orders').select('status').eq('id', orderId).single();
+  if (!order || order.status !== 'quoting') return;
+
+  const { data: quotes } = await db.from('quotes').select('status').eq('order_id', orderId);
+  const quotedCount = (quotes ?? []).filter((q) => q.status === 'quoted').length;
+
+  if (quotedCount >= 1) {
+    await writeLog('info', 'order', `5min: ${quotedCount} cotação(ões) — consolidando agora`, { traceId, orderId });
+    await consolidateQuotesEarly(orderId, userConversationId, userPhoneE164, traceId);
+  } else {
+    // Sem cotações ainda → modo eager: próxima que chegar consolida imediatamente
+    await db.from('orders').update({ status_5min_done: true }).eq('id', orderId);
+    await writeLog('info', 'order', '5min: 0 cotações — modo eager ativado', { traceId, orderId });
+  }
+}
+
+/** Snapshot do estado atual — usado pelo get_order_status da Sara e idempotência do start. */
+export async function sendCurrentOrderStatus(
+  orderId: string,
+  userConversationId: string,
+  userPhoneE164: string,
+  traceId: string,
+): Promise<void> {
+  const { data: order } = await db.from('orders').select('status').eq('id', orderId).single();
+  if (!order) return;
+
+  if (['quoted', 'confirming', 'handed_off'].includes(order.status)) {
+    await sendOutbound(
+      userConversationId,
+      userPhoneE164,
+      order.status === 'quoted'
+        ? 'Suas cotações já estão prontas! 💙 Olha as opções na nossa última mensagem aí em cima — me diz qual prefere.'
+        : 'Seu pedido já foi confirmado com a farmácia escolhida 💙 Se precisar de qualquer coisa é só falar.',
+      traceId,
+    );
+    return;
+  }
+
+  const { data: quotes } = await db.from('quotes').select('status').eq('order_id', orderId);
+  const total = (quotes ?? []).length;
+  const quoted = (quotes ?? []).filter((q) => q.status === 'quoted').length;
+  const closed = (quotes ?? []).filter((q) => ['unavailable', 'timeout'].includes(q.status)).length;
+  const pending = total - quoted - closed;
+
+  // Tem pelo menos 1 cotação? Consolida agora.
+  if (quoted >= 1) {
+    await consolidateQuotesEarly(orderId, userConversationId, userPhoneE164, traceId);
+    return;
+  }
+
+  let msg: string;
+  if (total === 0) {
+    msg = 'Ainda estou organizando as farmácias daqui 💙 me dá só mais um instantinho.';
+  } else if (pending > 0) {
+    msg = `Ainda nenhuma resposta com preço, mas ${pending} farmácia${pending > 1 ? 's' : ''} ${pending > 1 ? 'estão' : 'está'} olhando ✨ assim que alguma responder eu te aviso na hora.`;
+  } else {
+    msg = 'As farmácias que contatei não conseguiram responder dessa vez 😕 Posso tentar de novo em outra região, se você quiser.';
+  }
+  await sendOutbound(userConversationId, userPhoneE164, msg, traceId);
+}
+
+/**
+ * Chamado de inbound-supplier após record_quote_price.
+ * - Se modo eager (5min sem cotação): consolida imediatamente.
+ * - Senão: avisa o usuário que chegou mais uma cotação.
+ */
+export async function notifyUserQuoteArrived(
+  orderId: string,
+  supplierName: string,
+  traceId: string,
+): Promise<void> {
+  const { data: order } = await db
+    .from('orders')
+    .select('status, status_5min_done, conversation_id')
+    .eq('id', orderId)
+    .single();
+  if (!order || order.status !== 'quoting') return;
+
+  const { data: userConv } = await db
+    .from('conversations')
+    .select('whatsapp_jid')
+    .eq('id', order.conversation_id)
+    .single();
+  const userPhone = userConv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
+  if (!userPhone) return;
+
+  const userConversationId = order.conversation_id;
+  const userPhoneE164 = `+${userPhone}`;
+
+  // Modo eager: 5 min já passaram sem cotação — consolida imediatamente com o que chegou
+  if (order.status_5min_done) {
+    await writeLog('info', 'order', `Modo eager: cotação de ${supplierName} disparou consolidação imediata`, { traceId, orderId });
+    await consolidateQuotesEarly(orderId, userConversationId, userPhoneE164, traceId);
+    return;
+  }
+
+  // Modo normal: notifica chegada incremental
+  const { data: quotes } = await db.from('quotes').select('status').eq('order_id', orderId);
+  const quotedCount = (quotes ?? []).filter((q) => q.status === 'quoted').length;
+  const total = (quotes ?? []).length;
+
+  const msg =
+    quotedCount === 1
+      ? `Boa, recebi a primeira cotação aqui (${supplierName}) 💙 vou aguardar mais umas pra te trazer as melhores opções.`
+      : `Mais uma cotação chegando (${supplierName}) — ${quotedCount} de ${total} ✨`;
+
+  await sendOutbound(userConversationId, userPhoneE164, msg, traceId);
+}
+
+/** Consolida prematuramente fechando as quotes ainda pendentes. */
+async function consolidateQuotesEarly(
+  orderId: string,
+  userConversationId: string,
+  userPhoneE164: string,
+  traceId: string,
+): Promise<void> {
+  await db
+    .from('quotes')
+    .update({ status: 'timeout', completed_at: new Date().toISOString() })
+    .eq('order_id', orderId)
+    .in('status', ['pending', 'contacting', 'negotiating']);
+  await consolidateQuotes(orderId, userConversationId, userPhoneE164, traceId);
+}
+
 interface QuoteRow {
   id: string;
   status: string;
@@ -58,7 +246,7 @@ export async function consolidateQuotes(
   const { data: suppliers } = await db.from('suppliers').select('id, name').in('id', supplierIds);
   const supplierMap = new Map<string, string>((suppliers ?? []).map((s: SupplierRow) => [s.id, s.name]));
 
-  // Sort by total price (ascending)
+  // Sort by total price (ascending), show up to 3
   const sorted = [...successful]
     .filter((q) => q.total != null)
     .sort((a, b) => (a.total ?? 999) - (b.total ?? 999))

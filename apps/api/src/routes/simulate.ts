@@ -109,6 +109,83 @@ export async function simulateRoute(app: FastifyInstance) {
     return reply.send({ messages: messages ?? [] });
   });
 
+  // ─── Reset: apaga toda a simulação de um número ──────────────────────────────
+  // Remove user, conversations (sara + suppliers desse user), messages, orders, quotes,
+  // assistant_tasks, prescriptions, addresses, conditions, allergies, medications, consents.
+  // Deixa as tabelas suppliers/system_logs intactas (são compartilhadas).
+  app.post('/simulate/reset', async (req, reply) => {
+    const Body = z.object({ phone: z.string().min(8) });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+    const phoneE164 = parsed.data.phone.startsWith('+') ? parsed.data.phone : `+${parsed.data.phone}`;
+    const { db } = await import('@iasaude/db');
+
+    const { data: user } = await db.from('users').select('id').eq('phone_e164', phoneE164).maybeSingle();
+    if (!user) return reply.send({ ok: true, message: 'Nenhum dado para esse número.' });
+
+    const userId = user.id;
+
+    // Conversations do usuário (com sara) e conversations de fornecedor ligadas a orders dele
+    const { data: orders } = await db.from('orders').select('id').eq('user_id', userId);
+    const orderIds = (orders ?? []).map((o) => o.id);
+
+    const { data: quotes } = orderIds.length
+      ? await db.from('quotes').select('id, conversation_id').in('order_id', orderIds)
+      : { data: [] as Array<{ id: string; conversation_id: string | null }> };
+    const quoteConvIds = (quotes ?? []).map((q) => q.conversation_id).filter(Boolean) as string[];
+
+    const { data: userConvs } = await db.from('conversations').select('id').eq('user_id', userId);
+    const userConvIds = (userConvs ?? []).map((c) => c.id);
+
+    const allConvIds = Array.from(new Set([...userConvIds, ...quoteConvIds]));
+
+    // Apaga em ordem segura (filhos antes dos pais)
+    if (allConvIds.length) await db.from('messages').delete().in('conversation_id', allConvIds);
+    if (orderIds.length) await db.from('quotes').delete().in('order_id', orderIds);
+    if (orderIds.length) await db.from('orders').delete().in('id', orderIds);
+    await db.from('assistant_tasks').delete().eq('user_id', userId);
+    await db.from('prescriptions').delete().eq('user_id', userId);
+    await db.from('user_addresses').delete().eq('user_id', userId);
+    await db.from('user_health_conditions').delete().eq('user_id', userId);
+    await db.from('user_allergies').delete().eq('user_id', userId);
+    await db.from('user_medications').delete().eq('user_id', userId);
+    await db.from('consent_events').delete().eq('user_id', userId);
+    await db.from('reminders').delete().eq('user_id', userId);
+    if (allConvIds.length) await db.from('conversations').delete().in('id', allConvIds);
+    await db.from('users').delete().eq('id', userId);
+
+    return reply.send({
+      ok: true,
+      removed: {
+        userId,
+        conversations: allConvIds.length,
+        orders: orderIds.length,
+        quotes: quotes?.length ?? 0,
+      },
+    });
+  });
+
+  // ─── Reset ALL: apaga TODOS os dados de teste ────────────────────────────────
+  app.post('/simulate/reset-all', async (_req, reply) => {
+    const { db } = await import('@iasaude/db');
+    // Delete in dependency order (children first)
+    await db.from('messages').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('quotes').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('orders').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('assistant_tasks').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('reminders').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('consent_events').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('user_health_conditions').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('user_allergies').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('user_medications').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('user_addresses').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('conversations').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('users').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    await db.from('system_logs').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    return reply.send({ ok: true });
+  });
+
   // ─── User replies as pharmacy ─────────────────────────────────────────────────
   app.post('/simulate/pharmacy-reply', async (req, reply) => {
     const parsed = PharmacyReplySchema.safeParse(req.body);

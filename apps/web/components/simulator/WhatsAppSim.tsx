@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Send, MapPin, Image as ImageIcon, Phone, RefreshCw,
-  Store, ChevronRight, Clock, CheckCircle, XCircle, Loader2,
+  Store, ChevronRight, Clock, CheckCircle, XCircle, Loader2, Trash2,
 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import { apiUrl, formatTime } from '@/lib/utils';
@@ -326,6 +326,57 @@ export function WhatsAppSimulator() {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
   }
 
+  // ─── Reset simulation for current phone ───────────────────────────────────
+  async function resetSimulation() {
+    if (!confirm(`Apagar TODA a simulação do ${phone}? Conversas, pedidos, cotações, perfil — tudo. Não dá pra desfazer.`)) return;
+    setLoading(true);
+    try {
+      const res = await fetch(apiUrl('/api/simulate/reset'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(`Erro ao resetar: ${JSON.stringify(err)}`);
+        return;
+      }
+      setMessages([]);
+      setConversationId(null);
+      setActiveOrder(null);
+      setPharmacyQuotes([]);
+      setSelectedPharmacyConvId(null);
+      await loadConversation(phone);
+    } catch (err) {
+      alert(`Erro ao resetar: ${err}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ─── Reset ALL simulation data ───────────────────────────────────────────
+  async function resetAll() {
+    if (!confirm('Apagar TODOS os dados de teste? Usuários, conversas, pedidos, cotações, logs — tudo. Não dá pra desfazer.')) return;
+    setLoading(true);
+    try {
+      const res = await fetch(apiUrl('/api/simulate/reset-all'), { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert(`Erro: ${JSON.stringify(err)}`);
+        return;
+      }
+      setMessages([]);
+      setConversationId(null);
+      setActiveOrder(null);
+      setPharmacyQuotes([]);
+      setSelectedPharmacyConvId(null);
+    } catch (err) {
+      alert(`Erro: ${err}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   // ─── Send pharmacy reply ─────────────────────────────────────────────────
 
   async function sendPharmacyReply() {
@@ -436,9 +487,25 @@ export function WhatsAppSimulator() {
           </div>
         )}
 
-        <div className="p-3 border-t border-wa-border">
+        <div className="p-3 border-t border-wa-border space-y-2">
           <button onClick={() => loadConversation(phone)} className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-white">
             <RefreshCw size={11} /> Recarregar
+          </button>
+          <button
+            onClick={resetSimulation}
+            disabled={loading}
+            className="flex items-center gap-1.5 text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
+            title="Apaga conversas, pedidos, cotações e perfil deste número"
+          >
+            <Trash2 size={11} /> Resetar simulação
+          </button>
+          <button
+            onClick={resetAll}
+            disabled={loading}
+            className="flex items-center gap-1.5 text-xs text-red-600 hover:text-red-400 disabled:opacity-50 font-semibold"
+            title="Apaga TODOS os dados de teste — todos os números"
+          >
+            <Trash2 size={11} /> Zerar tudo
           </button>
         </div>
       </div>

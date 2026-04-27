@@ -28,6 +28,35 @@ export interface PlaceResult {
   isOpen?: boolean;
 }
 
+// Names/types that Google Places Legacy returns as "pharmacy" but aren't real human pharmacies.
+// Keep as lowercased substrings; matched against name + types[].
+const PHARMACY_NAME_BLOCKLIST = [
+  'pet ',
+  'pets ',
+  'petshop',
+  'pet shop',
+  'pet-shop',
+  'veterinár',
+  'veterinari',
+  'agropecuár',
+  'agropecuari',
+  'animal',
+  'ração',
+  'racao',
+  'aquári',
+];
+
+const PHARMACY_TYPE_BLOCKLIST = ['pet_store', 'veterinary_care'];
+
+function isLikelyHumanPharmacy(name: string, types: string[]): boolean {
+  const n = name.toLowerCase();
+  if (PHARMACY_NAME_BLOCKLIST.some((kw) => n.includes(kw))) return false;
+  if (types.some((t) => PHARMACY_TYPE_BLOCKLIST.includes(t))) return false;
+  // Must include at least one of these types (Google ranks loosely with type=pharmacy)
+  const ok = types.some((t) => ['pharmacy', 'drugstore', 'health', 'store'].includes(t));
+  return ok || types.length === 0;
+}
+
 export async function findNearbyPharmacies(
   lat: number,
   lng: number,
@@ -38,6 +67,7 @@ export async function findNearbyPharmacies(
       location: `${lat},${lng}`,
       radius: radiusMeters,
       type: 'pharmacy',
+      keyword: 'farmácia',
       key: getKey(),
       language: 'pt-BR',
     },
@@ -49,7 +79,13 @@ export async function findNearbyPharmacies(
   }
 
   const places: unknown[] = res.data?.results ?? [];
-  return places.map((p: any) => {
+  const filtered = places.filter((p: any) => {
+    const name = (p.name ?? '') as string;
+    const types = (p.types ?? []) as string[];
+    return isLikelyHumanPharmacy(name, types);
+  });
+
+  return filtered.map((p: any) => {
     const vicinity: string = p.vicinity ?? '';
     // vicinity is like "Av Paulista, 1000 - Jardins, São Paulo"
     // Try to parse city from the last segment after the last dash
@@ -77,54 +113,8 @@ export async function findNearbyPharmacies(
 }
 
 /**
- * Geocodifica endereço texto → lat/lng.
- * Usa Nominatim (OpenStreetMap) como primário — gratuito, sem API key.
- * Faz fallback para Google Geocoding API se GOOGLE_MAPS_API_KEY estiver configurada e Nominatim falhar.
+ * geocodeAddress foi movida para ./geocoding.ts (Nominatim com normalização BR + fallbacks).
  */
-export async function geocodeAddress(address: string): Promise<{ lat: number; lng: number; formattedAddress: string } | null> {
-  // 1. Tenta Nominatim (OpenStreetMap)
-  try {
-    const nominatimRes = await axios.get('https://nominatim.openstreetmap.org/search', {
-      params: { q: address, format: 'json', limit: 1, countrycodes: 'br', addressdetails: 0 },
-      headers: {
-        'User-Agent': 'IA-da-Saude/1.0 (contact@iadasaude.com)',
-        'Accept-Language': 'pt-BR,pt;q=0.9',
-      },
-      timeout: 8_000,
-    });
-    const results = nominatimRes.data as Array<{ lat: string; lon: string; display_name: string }>;
-    if (results?.length > 0 && results[0]) {
-      return {
-        lat: parseFloat(results[0].lat),
-        lng: parseFloat(results[0].lon),
-        formattedAddress: results[0].display_name,
-      };
-    }
-  } catch {
-    // Nominatim falhou — tenta Google abaixo
-  }
-
-  // 2. Fallback: Google Geocoding API
-  const apiKey = process.env['GOOGLE_MAPS_API_KEY'];
-  if (!apiKey) return null;
-
-  try {
-    const res = await axios.get(GEOCODING_BASE, {
-      params: { address, key: apiKey, language: 'pt-BR', region: 'BR' },
-      timeout: 8_000,
-    });
-    if (res.data?.status !== 'OK') return null;
-    const result = res.data?.results?.[0];
-    if (!result) return null;
-    return {
-      lat: result.geometry.location.lat as number,
-      lng: result.geometry.location.lng as number,
-      formattedAddress: result.formatted_address as string,
-    };
-  } catch {
-    return null;
-  }
-}
 
 export async function reverseGeocode(lat: number, lng: number): Promise<string | null> {
   const res = await axios.get(GEOCODING_BASE, {

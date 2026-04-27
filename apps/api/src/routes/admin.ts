@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { db } from '@iasaude/db';
 import { loadPrompts, savePrompts } from '../config/prompts.js';
+import { buildSaraSystemPrompt, buildAgentPharmacySystemPrompt } from '@iasaude/llm';
 
 export async function adminRoute(app: FastifyInstance) {
   // List conversations with pagination
@@ -91,6 +92,30 @@ export async function adminRoute(app: FastifyInstance) {
     return reply.send(loadPrompts());
   });
 
+  // Get the BASE prompts (read-only preview) — used by the dashboard so admins can
+  // see what they're customizing on top of. Renders with placeholder context.
+  app.get('/prompts/base', async (_req, reply) => {
+    const sara = buildSaraSystemPrompt({
+      preferredName: '{{nome do usuário}}',
+      conditions: ['{{condição}}'],
+      allergies: ['{{alergia}}'],
+      medications: ['{{medicamento}}'],
+      addresses: [],
+      memoryCards: [],
+      activeOrderSummary: null,
+    });
+    const agentQuoting = buildAgentPharmacySystemPrompt({
+      items: [{ name: '{{medicamento}}', dosage: '{{dosagem}}', quantity: '{{quantidade}}', substitutes_ok: true }],
+      neighborhoodCity: '{{bairro, cidade}}',
+    });
+    const agentConfirmation = buildAgentPharmacySystemPrompt({
+      items: [{ name: '{{medicamento}}', dosage: '{{dosagem}}', quantity: '{{quantidade}}', substitutes_ok: true }],
+      neighborhoodCity: '{{bairro, cidade}}',
+      isOrderConfirmation: true,
+    });
+    return reply.send({ sara, agent_quoting: agentQuoting, agent_confirmation: agentConfirmation });
+  });
+
   // Update prompts config
   app.put('/prompts', async (req, reply) => {
     const body = req.body as Record<string, string>;
@@ -101,6 +126,21 @@ export async function adminRoute(app: FastifyInstance) {
       llm_model: typeof body['llm_model'] === 'string' ? body['llm_model'] : undefined,
     });
     return reply.send(updated);
+  });
+
+  // Reset all dev/test data — messages, conversations, orders, quotes, users, logs
+  app.post('/reset-dev', async (_req, reply) => {
+    const uuidTables = ['assistant_tasks', 'consent_events', 'reminders', 'prescriptions', 'quotes', 'messages', 'orders', 'conversations', 'users'];
+    const bigintTables = ['system_logs'];
+    for (const table of bigintTables) {
+      const { error } = await db.from(table as any).delete().gt('id', 0);
+      if (error) return reply.code(500).send({ error: `Failed on ${table}: ${error.message}` });
+    }
+    for (const table of uuidTables) {
+      const { error } = await db.from(table as any).delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      if (error) return reply.code(500).send({ error: `Failed on ${table}: ${error.message}` });
+    }
+    return reply.send({ ok: true, cleared: [...bigintTables, ...uuidTables] });
   });
 
   // System logs

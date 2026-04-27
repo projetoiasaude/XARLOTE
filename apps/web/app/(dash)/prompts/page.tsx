@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { Bot, Pill, Save, RotateCcw, CheckCircle, AlertCircle, Key, Cpu } from 'lucide-react';
+import { Bot, Pill, Save, RotateCcw, CheckCircle, AlertCircle, Key, Cpu, Eye, EyeOff, Copy } from 'lucide-react';
 
 const API = process.env['NEXT_PUBLIC_API_URL'] ?? 'http://localhost:3001';
 
@@ -23,6 +23,12 @@ interface PromptsConfig {
   llm_model: string;
 }
 
+interface BasePrompts {
+  sara: string;
+  agent_quoting: string;
+  agent_confirmation: string;
+}
+
 type Status = 'idle' | 'saving' | 'saved' | 'error';
 
 export default function PromptsPage() {
@@ -36,6 +42,10 @@ export default function PromptsPage() {
   const [errorMsg, setErrorMsg] = useState('');
   const [customModel, setCustomModel] = useState('');
   const [showKey, setShowKey] = useState(false);
+  const [base, setBase] = useState<BasePrompts | null>(null);
+  const [showSaraBase, setShowSaraBase] = useState(false);
+  const [showAgentBase, setShowAgentBase] = useState(false);
+  const [agentBaseTab, setAgentBaseTab] = useState<'quoting' | 'confirmation'>('quoting');
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -50,7 +60,16 @@ export default function PromptsPage() {
         }
       })
       .catch(() => {});
+
+    fetch(`${API}/admin/prompts/base`)
+      .then((r) => r.json())
+      .then((data: BasePrompts) => setBase(data))
+      .catch(() => {});
   }, []);
+
+  function copyBase(text: string) {
+    navigator.clipboard?.writeText(text).catch(() => {});
+  }
 
   const effectiveModel = customModel || config.llm_model;
 
@@ -182,16 +201,47 @@ export default function PromptsPage() {
           </div>
         </div>
 
-        {/* Sara prompt */}
+        {/* Xarlote prompt */}
         <div className="bg-wa-panel border border-wa-border rounded-xl p-5">
           <div className="flex items-center gap-2 mb-1">
             <Bot size={18} className="text-brand-400" />
-            <h2 className="text-base font-medium text-white">Sara — Instruções adicionais</h2>
+            <h2 className="text-base font-medium text-white">Xarlote — IA do usuário</h2>
           </div>
           <p className="text-xs text-gray-400 mb-3">
-            <strong className="text-gray-300">Anexadas</strong> ao prompt base da Sara.
-            Use para ajustar tom, adicionar regras de negócio ou testar comportamentos específicos.
+            Veja abaixo o <strong className="text-gray-300">prompt base</strong> que orienta a Xarlote no WhatsApp,
+            e adicione <strong className="text-gray-300">instruções extras</strong> que serão anexadas ao final.
           </p>
+
+          {/* Base prompt — read-only */}
+          <div className="mb-4 border border-wa-border rounded-lg overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-2 bg-wa-bg border-b border-wa-border">
+              <span className="text-xs font-medium text-gray-300">Prompt base (somente leitura)</span>
+              <div className="flex items-center gap-1">
+                {base?.sara && (
+                  <button
+                    onClick={() => copyBase(base.sara)}
+                    className="p-1.5 rounded text-gray-400 hover:text-white hover:bg-wa-panel transition-colors"
+                    title="Copiar prompt base"
+                  >
+                    <Copy size={13} />
+                  </button>
+                )}
+                <button
+                  onClick={() => setShowSaraBase((v) => !v)}
+                  className="flex items-center gap-1.5 px-2 py-1 rounded text-xs text-gray-400 hover:text-white hover:bg-wa-panel transition-colors"
+                >
+                  {showSaraBase ? <><EyeOff size={12} /> Ocultar</> : <><Eye size={12} /> Mostrar</>}
+                </button>
+              </div>
+            </div>
+            {showSaraBase && (
+              <pre className="text-xs text-gray-400 p-3 max-h-80 overflow-auto whitespace-pre-wrap font-mono">
+                {base?.sara ?? 'Carregando…'}
+              </pre>
+            )}
+          </div>
+
+          <label className="block text-xs font-medium text-gray-300 mb-1.5">Instruções adicionais (anexadas ao final do prompt base)</label>
           <textarea
             className="w-full h-44 bg-wa-bg border border-wa-border rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-brand-500 resize-y font-mono"
             placeholder={"Exemplos:\n- Responda sempre em inglês.\n- Seja mais formal e evite emojis.\n- Se o usuário mencionar pressão alta, sempre pergunte se está tomando medicação."}
@@ -200,7 +250,7 @@ export default function PromptsPage() {
           />
           <p className="text-xs text-gray-500 mt-1">
             {config.sara_suffix.length} caracteres
-            {config.sara_suffix.trim() === '' && ' — usando somente o prompt base'}
+            {config.sara_suffix.trim() === '' && ' — usando somente o prompt base da Xarlote'}
           </p>
         </div>
 
@@ -208,15 +258,60 @@ export default function PromptsPage() {
         <div className="bg-wa-panel border border-wa-border rounded-xl p-5">
           <div className="flex items-center gap-2 mb-1">
             <Pill size={18} className="text-green-400" />
-            <h2 className="text-base font-medium text-white">Agente Farmácia — Prompt completo</h2>
+            <h2 className="text-base font-medium text-white">Agente Farmácia — IA das farmácias</h2>
           </div>
           <p className="text-xs text-gray-400 mb-3">
-            Se preenchido, <strong className="text-gray-300">substitui completamente</strong> o prompt padrão do agente farmácia.
-            Deixe vazio para usar o padrão do sistema.
+            Veja o <strong className="text-gray-300">prompt base</strong> que orienta o agente ao negociar com farmácias.
+            Se preencher o campo abaixo, ele <strong className="text-gray-300">substitui</strong> o prompt base.
           </p>
+
+          {/* Base prompt — read-only with tabs */}
+          <div className="mb-4 border border-wa-border rounded-lg overflow-hidden">
+            <div className="flex items-center justify-between px-3 py-2 bg-wa-bg border-b border-wa-border">
+              <div className="flex items-center gap-1">
+                <span className="text-xs font-medium text-gray-300 mr-2">Prompt base:</span>
+                <button
+                  onClick={() => setAgentBaseTab('quoting')}
+                  className={`px-2 py-0.5 rounded text-xs transition-colors ${agentBaseTab === 'quoting' ? 'bg-green-500/20 text-green-300' : 'text-gray-500 hover:text-gray-300'}`}
+                >
+                  Cotação
+                </button>
+                <button
+                  onClick={() => setAgentBaseTab('confirmation')}
+                  className={`px-2 py-0.5 rounded text-xs transition-colors ${agentBaseTab === 'confirmation' ? 'bg-green-500/20 text-green-300' : 'text-gray-500 hover:text-gray-300'}`}
+                >
+                  Confirmação
+                </button>
+              </div>
+              <div className="flex items-center gap-1">
+                {base && (
+                  <button
+                    onClick={() => copyBase(agentBaseTab === 'quoting' ? base.agent_quoting : base.agent_confirmation)}
+                    className="p-1.5 rounded text-gray-400 hover:text-white hover:bg-wa-panel transition-colors"
+                    title="Copiar prompt base"
+                  >
+                    <Copy size={13} />
+                  </button>
+                )}
+                <button
+                  onClick={() => setShowAgentBase((v) => !v)}
+                  className="flex items-center gap-1.5 px-2 py-1 rounded text-xs text-gray-400 hover:text-white hover:bg-wa-panel transition-colors"
+                >
+                  {showAgentBase ? <><EyeOff size={12} /> Ocultar</> : <><Eye size={12} /> Mostrar</>}
+                </button>
+              </div>
+            </div>
+            {showAgentBase && (
+              <pre className="text-xs text-gray-400 p-3 max-h-80 overflow-auto whitespace-pre-wrap font-mono">
+                {base ? (agentBaseTab === 'quoting' ? base.agent_quoting : base.agent_confirmation) : 'Carregando…'}
+              </pre>
+            )}
+          </div>
+
+          <label className="block text-xs font-medium text-gray-300 mb-1.5">Override do prompt (substitui o base se preenchido)</label>
           <textarea
             className="w-full h-56 bg-wa-bg border border-wa-border rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-brand-500 resize-y font-mono"
-            placeholder={"Deixe vazio para usar o prompt padrão.\n\nExemplo:\nVocê é um agente da IA da Saúde responsável por cotar medicamentos em farmácias..."}
+            placeholder={"Deixe vazio para usar o prompt padrão.\n\nDica: clique em 'Mostrar' acima e copie o base para usar como ponto de partida."}
             value={config.agent_override}
             onChange={(e) => setConfig((c) => ({ ...c, agent_override: e.target.value }))}
           />
@@ -268,7 +363,7 @@ export default function PromptsPage() {
           <p>• A API key e o modelo são salvos em <code className="text-gray-200">apps/api/data/prompts.json</code>.</p>
           <p>• A cada mensagem recebida, o handler lê o arquivo — sem precisar reiniciar o servidor.</p>
           <p>• O modelo padrão é <code className="text-gray-200">openai/gpt-4.1-mini</code> via OpenRouter.</p>
-          <p>• Para ver o prompt base da Sara, veja <code className="text-gray-200">packages/llm/src/prompts/sara.system.ts</code>.</p>
+          <p>• Para ver o prompt base da Xarlote, veja <code className="text-gray-200">packages/llm/src/prompts/sara.system.ts</code>.</p>
         </div>
       </div>
     </div>

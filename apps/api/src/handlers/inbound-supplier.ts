@@ -11,7 +11,24 @@ import { AGENT_INSTANCE } from '@iasaude/shared';
 import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
-import { consolidateQuotes } from './quote-consolidation.js';
+import { consolidateQuotes, notifyUserQuoteArrived } from './quote-consolidation.js';
+
+/** Extrai "Setor X, Cidade, UF" do endereço completo (Nominatim/ViaCEP). */
+function extractDeliverySectorLocal(fullAddress: string | null): string | null {
+  if (!fullAddress) return null;
+  const parts = fullAddress.split(',').map((s) => s.trim()).filter(Boolean);
+  const ignoreLow = /^(região|brasil|brazil|região centro-oeste|mesorregião|microrregião)/i;
+  const isStreet = /^(rua|r\.?|avenida|av\.?|alameda|al\.?|travessa|tv\.?|rodovia|rod\.?|praça|estrada)\b/i;
+  const cleanParts: string[] = [];
+  for (const p of parts) {
+    if (ignoreLow.test(p)) continue;
+    if (isStreet.test(p)) continue;
+    if (/^\d{5}-?\d{3}$/.test(p)) continue;
+    cleanParts.push(p);
+    if (cleanParts.length >= 3) break;
+  }
+  return cleanParts.length ? cleanParts.join(', ') : null;
+}
 
 export interface SupplierInboundCtx {
   conversationId: string;
@@ -112,17 +129,32 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
 
   // 6. Build context
   const history = await getConversationMessages(conversationId, 24);
-  const order = quote.orders as { items: OrderItem[]; delivery_lat?: number; delivery_lng?: number } | null;
-  const supplier = quote.suppliers as { city?: string; state?: string } | null;
+  const order = quote.orders as {
+    items: OrderItem[];
+    delivery_address?: string | null;
+    delivery_lat?: number;
+    delivery_lng?: number;
+    payment_method?: string | null;
+  } | null;
 
-  const systemPrompt = buildAgentPharmacySystemPrompt({
-    items: order?.items ?? [],
-    neighborhoodCity: [supplier?.city, supplier?.state].filter(Boolean).join(', ') || 'região',
-    isOrderConfirmation,
-  });
+  // Setor/bairro do usuário (vindo de delivery_address). Cai pra cidade da farmácia se não tiver.
+  const supplier = quote.suppliers as { city?: string; state?: string } | null;
+  const userNeighborhood =
+    extractDeliverySectorLocal(order?.delivery_address ?? null) ||
+    [supplier?.city, supplier?.state].filter(Boolean).join(', ') ||
+    'região';
+
+  const cfg = loadPrompts();
+  const systemPrompt = cfg.agent_override.trim()
+    ? cfg.agent_override.trim()
+    : buildAgentPharmacySystemPrompt({
+        items: order?.items ?? [],
+        neighborhoodCity: userNeighborhood,
+        paymentMethod: order?.payment_method ?? null,
+        isOrderConfirmation,
+      });
 
   // 7. Call LLM (Agent persona)
-  const cfg = loadPrompts();
   let llmResponse;
   try {
     llmResponse = await chat(text, {
@@ -173,6 +205,11 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
           await writeLog('error', 'quote', `Erro ao atualizar cotação: ${qErr.message}`, { traceId, quoteId: quote.id });
         } else {
           await writeLog('info', 'quote', `✅ Cotação registrada: R$${a.total}`, { traceId, quoteId: quote.id, total: a.total, delivery_fee: a.delivery_fee });
+          // Avisa o usuário que mais uma cotação chegou (só enquanto order ainda em quoting)
+          const supplierName = (quote.suppliers as { name?: string } | null)?.name ?? 'farmácia';
+          await notifyUserQuoteArrived(quote.order_id, supplierName, traceId).catch((e) =>
+            writeLog('warn', 'order', `Falha ao notificar cliente da cotação: ${String(e)}`, { traceId }),
+          );
         }
         shouldFinalize = true;
         outcome = 'quoted';
@@ -254,7 +291,8 @@ export async function initiatePharmacyNegotiation(
   quoteId: string,
   orderId: string,
   items: OrderItem[],
-  locationText: string,
+  userNeighborhood: string,
+  paymentMethod: string | null,
   userConversationId: string,
   userPhoneE164: string,
   traceId: string,
@@ -291,12 +329,19 @@ export async function initiatePharmacyNegotiation(
     .update({ memory_cards: [{ user_conversation_id: userConversationId, user_phone: userPhoneE164, order_id: orderId }] })
     .eq('id', conv.id);
 
-  // Build opening message via Agent LLM
+  // Build opening message via Agent LLM. Repassamos o setor REAL do usuário (não a cidade da farmácia).
   const cfg = loadPrompts();
-  const systemPrompt = buildAgentPharmacySystemPrompt({
-    items,
-    neighborhoodCity: [supplier.city, supplier.state].filter(Boolean).join(', ') || locationText,
-  });
+  const systemPrompt = cfg.agent_override.trim()
+    ? cfg.agent_override.trim()
+    : buildAgentPharmacySystemPrompt({
+        items,
+        neighborhoodCity: userNeighborhood,
+        paymentMethod: paymentMethod ?? null,
+      });
+
+  const itemsText = items.map((i) => `${i.name}${i.dosage ? ` ${i.dosage}` : ''}${i.quantity ? ` (${i.quantity})` : ''}`).join(', ');
+  const paymentClause = paymentMethod ? ` O pagamento vai ser via ${paymentMethod}.` : '';
+  const fallbackOpening = `Oi, tudo bem? Aqui é a Xarlote, você teria ${itemsText}? Para entregar no ${userNeighborhood}, queria saber o preço e prazo de entrega, por favor.${paymentClause}`;
 
   let opening: string;
   try {
@@ -305,16 +350,16 @@ export async function initiatePharmacyNegotiation(
       apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'],
       systemInstruction:
         systemPrompt +
-        '\n\nEsta é a primeira mensagem. Escreva apenas a mensagem de abertura para a farmácia — apresentando-se e perguntando sobre os itens. Não use tools ainda.',
+        '\n\nEsta é a primeira mensagem. Escreva apenas a mensagem de abertura para a farmácia — apresentando-se como Xarlote e perguntando sobre os itens. Sem emojis. Sem mencionar IA/agente/sistema. Não use tools ainda.',
       history: [],
       tools: [],
       temperature: 0.4,
       maxOutputTokens: 200,
       timeoutMs: 20_000,
     });
-    opening = res.text.trim() || `Olá! Aqui é o agente da IA da Saúde. Posso cotar alguns medicamentos com vocês? Precisamos de: ${items.map((i) => `${i.name}${i.dosage ? ` ${i.dosage}` : ''}`).join(', ')}.`;
+    opening = res.text.trim() || fallbackOpening;
   } catch {
-    opening = `Olá! Aqui é o agente da IA da Saúde. Posso cotar alguns medicamentos com vocês? Precisamos de: ${items.map((i) => `${i.name}${i.dosage ? ` ${i.dosage}` : ''}`).join(', ')}.`;
+    opening = fallbackOpening;
   }
 
   await writeLog('info', 'pharmacy', `Initiating negotiation with ${supplier.name}`, {

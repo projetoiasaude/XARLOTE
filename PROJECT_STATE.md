@@ -19,20 +19,20 @@
 |---|---|
 | Fluxo completo farmácia | ✅ **FUNCIONANDO no simulador** |
 | Google Places (Legacy Nearby Search) | ✅ **Funcionando** — retorna farmácias reais |
-| Google Geocoding API | ❌ **DESABILITADA no GCP** — endereço por texto não funciona |
+| Google Geocoding API | ✅ **Substituída por Nominatim (OpenStreetMap)** — endereço por texto funciona |
 | Simulador WhatsApp (duas abas) | ✅ Aba "Usuário" + aba "Farmácias" em tempo real |
 | Agent LLM — record_quote_price | ✅ **Corrigido** — chama tool imediatamente ao receber preço |
 | Consolidação de cotações | ✅ Dispara automaticamente com 3+ quotes ou todos terminais |
 | Onboarding + LGPD | ✅ Funcionando |
 | Localização via botão (coordenadas) | ✅ Funcionando |
-| Localização via texto (endereço digitado) | ❌ **QUEBRADO** — Geocoding API disabled |
+| Localização via texto (endereço digitado) | ✅ **Funcionando** — Nominatim (OSM), sem API key |
 | API local | ✅ porta **3001** |
 | Dashboard local | ✅ porta **3002** |
 | uazapi | ⏳ Não configurado — modo simulator |
 | Redis/BullMQ | ⏳ Opcional em dev — processa inline |
 | Deploy Railway/Vercel | ⏳ Pendente |
 
-**Próximo passo imediato**: corrigir geocoding via texto usando Nominatim (OpenStreetMap, gratuito, sem API key).
+**Geocoding por texto**: funcionando via Nominatim (OpenStreetMap). O bug era que `geocodeAddress` não estava exportada no `packages/integrations/src/index.ts`, virando `undefined` em runtime.
 
 ---
 
@@ -56,7 +56,7 @@ pnpm --filter web dev    # Dashboard → :3002
 | Filas | Redis 7 + BullMQ |
 | Frontend | Next.js 14 App Router + Tailwind + shadcn/ui |
 | WhatsApp | uazapi — instâncias `sara` (usuários) e `agent` (farmácias) |
-| Geolocalização | Google Places Legacy Nearby Search ✅ · Geocoding → migrar para Nominatim |
+| Geolocalização | Google Places Legacy Nearby Search ✅ · Nominatim (OSM) para geocoding por texto ✅ |
 | Hospedagem | Railway (api + worker + Redis) · Vercel (web) |
 
 ---
@@ -130,4 +130,11 @@ RLS ativa em tudo. Backend usa service role. Dashboard usa anon + `is_staff()`.
 |---|---|
 | 2026-04-19 | Plano completo criado em `docs/PLAN.md` |
 | 2026-04-20 | Código MVP completo: todos os packages + apps/api + apps/web. Schema Supabase aplicado. LLM migrado Gemini → OpenRouter. |
-| 2026-04-21 | **Fluxo farmácias funcionando end-to-end**: Google Places real (Legacy API), simulador duas abas, Agent prompt reescrito (árvore de decisão → record_quote_price funciona), consolidação automática, Sara retorna top-3 com preço/Pix. Geocoding por texto ainda quebrado (API GCP desabilitada). |
+| 2026-04-21 | **Fluxo farmácias funcionando end-to-end**: Google Places real (Legacy API), simulador duas abas, Agent prompt reescrito (árvore de decisão → record_quote_price funciona), consolidação automática, Xarlote retorna top-3 com preço/Pix. Geocoding por texto ainda quebrado (API GCP desabilitada). |
+| 2026-04-26 | **Geocoding por texto corrigido (sessão 1)**: faltava export no index. **Bug real (sessão 2, validado E2E)**: havia DUAS `geocodeAddress` — uma em `geocoding.ts` (nova, Nominatim) e outra duplicada em `google-places.ts` (antiga, axios). O `export *` de `google-places.js` (que vinha primeiro no index) sobrescrevia a nova. Removida a duplicata. **Adicionado** normalização BR de endereços (R.→Rua, St.→Setor, remove Qd/Lt/Bl/Apto, preserva CEP) com fallbacks (raw → normalizado → CEP isolado → cidade/UF). **Prompt da Xarlote** reforçado com árvore de decisão explícita: ao receber endereço durante cotação, DEVE chamar `start_pharmacy_order` imediatamente (LLM antes chamava `save_user_profile_fact` com payload vazio). **Verificado E2E** com endereço "R. 14, 201 - Qd. B8, Lt. 20 - St. Oeste, Goiânia - GO, 74120-070" → geocodificado → 5 cotações reais criadas. |
+| 2026-04-27 (sessão 7) | **UX completa da cotação**: (1) Idempotência: `start_pharmacy_order` re-chamado quando há order ativa não reinicia — só atualiza status. (2) Status incrementais ao usuário: pós-discovery "Achei N farmácias e já contatei", cada quote chegando "Boa, recebi a Nº cotação (X)", 3min nudge, 5min consolidação forçada (substitui cap 10min). (3) `get_order_status` ativo: força consolidação com 1+ cotações, ou avisa "ainda aguardando". (4) Mensagem à farmácia sem emojis, com setor/bairro real do usuário, tom natural pós-preço ("vou confirmar com o cliente e já volto"), pergunta frete se silente (1 ciclo). (5) Política do agent prompt: endereço só setor+rua; produto responde se sabe, senão volta ao usuário. (6) `payment_method` incorporado: Sara pede junto com endereço (3 perguntas em bullets), persistido em `orders.payment_method`, passado à farmácia na abertura e confirmação. Migration aplicada via MCP. |
+| 2026-04-27 (sessão 8) | **3 correções**: (1) **Bug confirmação à farmácia**: suppliers criados pelo Google Places não têm `whatsapp_e164`/`phone_e164`, causando skip silencioso do `sendOutboundToSupplier`. Corrigido em `tool-executor.ts` com mesmo fallback de phone fake já usado em `initiatePharmacyNegotiation`. (2) **Botão "Zerar tudo"** no simulador: endpoint `POST /api/simulate/reset-all` deleta todos os dados de teste (todas as tabelas, todos os números); botão vermelho escuro na sidebar do WhatsAppSim. (3) **Nova lógica de timeout/consolidação** em `quote-consolidation.ts`: 3min → se ≥3 cotações consolida, senão silêncio; 5min → se ≥1 cotação consolida, se 0 ativa "modo eager" (`status_5min_done=true`); modo eager → qualquer cotação que chegar dispara consolidação imediata. Remove nudge de "ainda aguardando". |
+| 2026-04-26 (sessão 6) | **ViaCEP + extração de logradouro**: descoberto que Nominatim NÃO indexa CEPs BR (testado, retorna `[]`). Adicionado fallback via ViaCEP que resolve CEP → logradouro/bairro/cidade/UF, daí monta queries estruturadas no Nominatim. `extractMainStreet` extrai "Avenida X" / "Rua Y" do texto cru parando em stopwords (esquina/com/qd/lt) — resolve "Avenida Interligação esquina com a rua 5". Cadeia: raw → normalized → ViaCEP×3 → mainStreet+cityState → cityState. Prompt Sara: pedir CEP, e em caso de falha pedir CEP/📍 em vez de variações. |
+| 2026-04-26 (sessão 5) | **Geocoding com confiança + persona humana**: (1) `geocoding.ts` agora retorna `confidence: 'precise' \| 'low'`; matches que caem só em cidade/UF (último fallback) viram `low` e o tool-executor pede refinamento ao usuário em vez de buscar farmácias no centro errado. Caso real: "Setor Recanto das Emas, Goiânia" (bairro de outra UF) gerava match em Goiânia-centro. (2) Prompt do agente farmácia (cotação + confirmação) reescrito: Xarlote fala como humana no WhatsApp, proibido mencionar IA/bot/agente/sistema. Mensagens hardcoded em `inbound-supplier.ts` e `tool-executor.ts` reescritas no mesmo tom. |
+| 2026-04-26 (sessão 4) | **Localização por pedido + reset**: (1) safety net em `tool-executor.ts` — se `location.address` veio nos args, geocodifica sempre (ignora lat/lng do LLM, que vinha reaproveitando coords do histórico). Lat/lng direto só de `ctx.inbound.location` (botão 📍 atual). (2) Prompt Sara com regra "NÃO REUTILIZE LOCALIZAÇÕES DO HISTÓRICO". (3) Endpoint `POST /simulate/reset { phone }` + botão "Resetar simulação" no WhatsAppSim apaga tudo do número (user/conversas/orders/quotes/perfil). **Migration `orders.delivery_address text` aplicada em prod via MCP Supabase.** |
+| 2026-04-26 (sessão 3) | **3 ajustes de qualidade no fluxo de cotação**: (1) **Filtro de farmácias** em `google-places.ts` — blocklist por nome (`pet`, `veterinár`, `agropecuári`, `animal`, `ração`, `aquári`) + tipos (`pet_store`, `veterinary_care`), `keyword=farmácia` adicionado ao Nearby Search. Resolve o caso "Pet Ville Premium Pet Shop" aparecendo nos resultados. (2) **Timeout 10min**: novo `scheduleQuoteTimeout` em `quote-consolidation.ts`; ao criar pedido em `tool-executor.ts`, agenda `setTimeout(10min)` que marca quotes não-terminais como `timeout` e força consolidação. (3) **Prompts base visíveis no /prompts** (Opção B, sem breaking change): novo endpoint `GET /admin/prompts/base`; UI mostra prompt base read-only (Sara + agente cotação + agente confirmação) acima do editor de customização. **Bug latente corrigido**: `agent_override` estava no schema desde sempre mas não era aplicado em `inbound-supplier.ts` — ligado nos 2 spots (handler de msgs + opening). |

@@ -7,6 +7,26 @@ import { findNearbyPharmacies, geocodeAddress } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
+import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
+
+/** Extrai apenas "Setor/Bairro X, Cidade, UF" do endereço completo do Nominatim/ViaCEP. */
+function extractDeliverySector(fullAddress: string | null): string | null {
+  if (!fullAddress) return null;
+  // Nominatim typical: "Avenida Interligação, Setor Santa Rita VII, Goiânia, Região..., Goiás, ..."
+  const parts = fullAddress.split(',').map((s) => s.trim()).filter(Boolean);
+  // Procura tokens que parecem bairro/setor (não administrativos, não rua, não numéricos puros)
+  const ignoreLow = /^(região|brasil|brazil|região centro-oeste|mesorregião|microrregião)/i;
+  const isStreet = /^(rua|r\.?|avenida|av\.?|alameda|al\.?|travessa|tv\.?|rodovia|rod\.?|praça|estrada)\b/i;
+  const cleanParts: string[] = [];
+  for (const p of parts) {
+    if (ignoreLow.test(p)) continue;
+    if (isStreet.test(p)) continue;
+    if (/^\d{5}-?\d{3}$/.test(p)) continue;
+    cleanParts.push(p);
+    if (cleanParts.length >= 3) break;
+  }
+  return cleanParts.length ? cleanParts.join(', ') : null;
+}
 
 interface ToolContext {
   userId: string;
@@ -32,7 +52,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         await handleParsePrescription(tc.args as { message_id: string }, ctx);
         break;
       case 'start_pharmacy_order':
-        await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; location?: { lat?: number; lng?: number; address?: string } }, ctx);
+        await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string }, ctx);
         break;
       case 'create_reminder':
         await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown> }, ctx);
@@ -41,7 +61,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         await sendOutbound(ctx.conversationId, ctx.phoneE164, '⚠️ Se for uma emergência, liga agora pro SAMU: *192*. Não espere! Estou aqui se precisar de mais ajuda. 💙', ctx.traceId);
         break;
       case 'get_order_status':
-        // Read-only, Gemini will get the response in text
+        await handleGetOrderStatus(ctx);
         break;
       case 'confirm_order_selection':
         await handleConfirmOrder(tc.args as { order_id: string; quote_id: string }, ctx);
@@ -136,25 +156,59 @@ async function handleParsePrescription(args: { message_id: string }, ctx: ToolCo
 }
 
 async function handleStartPharmacyOrder(
-  args: { items: OrderItem[]; location?: { lat?: number; lng?: number; address?: string } },
+  args: { items: OrderItem[]; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string },
   ctx: ToolContext
 ) {
+  // ─── IDEMPOTÊNCIA ──────────────────────────────────────────────────────────
+  // Se já existe uma order ativa (quoting/quoted/confirming) pra esse usuário,
+  // NÃO cria outra e NÃO reinicia contato com farmácias. Apenas atualiza status.
+  // (Sara costuma re-chamar essa tool quando usuário pressiona — proteção essencial.)
+  const { data: existingActive } = await db
+    .from('orders')
+    .select('id, status')
+    .eq('user_id', ctx.userId)
+    .in('status', ['quoting', 'quoted', 'confirming'])
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (existingActive) {
+    await writeLog('warn', 'order', `start_pharmacy_order ignorado — já há pedido ativo (${existingActive.status})`, {
+      traceId: ctx.traceId, existingOrderId: existingActive.id,
+    });
+    await sendCurrentOrderStatus(existingActive.id, ctx.conversationId, ctx.phoneE164, ctx.traceId);
+    return;
+  }
+
   let lat: number | null = null;
   let lng: number | null = null;
+  let deliveryAddress: string | null = null;
   let locationSource = 'unknown';
 
-  if (args.location?.lat && args.location?.lng) {
-    lat = args.location.lat;
-    lng = args.location.lng;
-    locationSource = 'llm_args';
-  } else if (args.location?.address) {
+  // Prioridade: endereço de texto > localização do WhatsApp > lat/lng dos args do LLM.
+  // (LLM costuma reaproveitar coords antigas do histórico — texto fresco é mais confiável.)
+  if (args.location?.address) {
     await writeLog('info', 'geocoding', `Geocodificando endereço: ${args.location.address}`, { traceId: ctx.traceId });
     const geo = await geocodeAddress(args.location.address);
-    if (geo) {
+    if (geo && geo.confidence === 'precise') {
       lat = geo.lat;
       lng = geo.lng;
+      deliveryAddress = geo.formattedAddress || args.location.address;
       locationSource = `geocoded:${geo.formattedAddress}`;
-      await writeLog('info', 'geocoding', `Endereço localizado: ${geo.formattedAddress} → ${lat.toFixed(5)},${lng.toFixed(5)}`, { traceId: ctx.traceId, lat, lng });
+      await writeLog('info', 'geocoding', `Endereço localizado (preciso): ${geo.formattedAddress} → ${lat.toFixed(5)},${lng.toFixed(5)}`, { traceId: ctx.traceId, lat, lng });
+    } else if (geo && geo.confidence === 'low') {
+      // Geocoder caiu no fallback de cidade/estado — provavelmente bairro/rua não existe.
+      // Não usa pra busca local (centro da cidade pode estar a km do usuário); pede refinamento.
+      await writeLog('warn', 'geocoding', `Match impreciso (só cidade/UF): ${geo.formattedAddress} — pedindo refinamento`, {
+        traceId: ctx.traceId, queriedAddress: args.location.address, matched: geo.formattedAddress,
+      });
+      await sendOutbound(
+        ctx.conversationId,
+        ctx.phoneE164,
+        `Hmm, não consegui achar esse endereço exato no mapa 😕 Confere pra mim o nome do bairro/setor e o CEP? Ou se preferir, compartilha sua localização pelo botão 📍 que fica mais rápido 💙`,
+        ctx.traceId,
+      );
+      return;
     } else {
       await writeLog('warn', 'geocoding', `Endereço não encontrado: ${args.location.address}`, { traceId: ctx.traceId });
       await sendOutbound(
@@ -168,7 +222,17 @@ async function handleStartPharmacyOrder(
   } else if (ctx.inbound.location) {
     lat = ctx.inbound.location.lat;
     lng = ctx.inbound.location.lng;
+    deliveryAddress = `Localização compartilhada via WhatsApp (lat ${lat.toFixed(5)}, lng ${lng.toFixed(5)})`;
     locationSource = 'whatsapp_location';
+  } else if (args.location?.lat && args.location?.lng) {
+    // Fallback: LLM mandou só lat/lng (sem endereço de texto e sem localização do usuário na msg atual).
+    // Aceita, mas registra para debug — costuma ser sintoma de coord reaproveitada do histórico.
+    lat = args.location.lat;
+    lng = args.location.lng;
+    locationSource = 'llm_args_coords_only';
+    await writeLog('warn', 'geocoding', `LLM passou lat/lng sem endereço de texto — possível reuso de histórico`, {
+      traceId: ctx.traceId, lat, lng,
+    });
   }
 
   if (!lat || !lng) {
@@ -201,11 +265,13 @@ async function handleStartPharmacyOrder(
     items: args.items,
     delivery_lat: lat,
     delivery_lng: lng,
+    delivery_address: deliveryAddress,
+    payment_method: args.payment_method ?? null,
   }).select('id').single();
 
   if (!order?.id) return;
 
-  await startPharmacyDiscovery(order.id, lat, lng, args.items, ctx);
+  await startPharmacyDiscovery(order.id, lat, lng, args.items, deliveryAddress, args.payment_method ?? null, ctx);
 }
 
 async function startPharmacyDiscovery(
@@ -213,6 +279,8 @@ async function startPharmacyDiscovery(
   lat: number,
   lng: number,
   items: OrderItem[],
+  deliveryAddress: string | null,
+  paymentMethod: string | null,
   ctx: ToolContext
 ) {
   await writeLog('info', 'places', `Buscando farmácias via Google Places — centro: ${lat.toFixed(5)},${lng.toFixed(5)}, raio: 3km`, {
@@ -289,8 +357,20 @@ async function startPharmacyDiscovery(
     farmácias: top.map((p, i) => `${i + 1}. ${p.name} (${p.distanceKm?.toFixed(2)}km)`),
   });
 
+  // Notifica o usuário que farmácias foram encontradas e contatos iniciaram
+  await sendOutbound(
+    ctx.conversationId,
+    ctx.phoneE164,
+    `Achei ${quoteIds.length} farmácia${quoteIds.length > 1 ? 's' : ''} aqui na sua região e já entrei em contato com ${quoteIds.length > 1 ? 'elas' : 'ela'} ✨ assim que chegarem as respostas eu te aviso na hora.`,
+    ctx.traceId,
+  );
+
+  // Setor/bairro real do usuário pra passar pra farmácia (não a cidade da farmácia em si).
+  const userNeighborhood =
+    extractDeliverySector(deliveryAddress) ||
+    (top[0]?.city ? `${top[0].city}` : `lat ${lat.toFixed(4)}, lng ${lng.toFixed(4)}`);
+
   // Initiate negotiations staggered by 2s each to avoid hammering the LLM
-  const locationText = top[0]?.city ? `${top[0].city}` : `lat ${lat.toFixed(4)}, lng ${lng.toFixed(4)}`;
   for (let i = 0; i < quoteIds.length; i++) {
     const quoteId = quoteIds[i] as string;
     const delay = i * 2000;
@@ -299,13 +379,42 @@ async function startPharmacyDiscovery(
         quoteId,
         orderId,
         items,
-        locationText,
+        userNeighborhood,
+        paymentMethod,
         ctx.conversationId,
         ctx.phoneE164,
         ctx.traceId,
       ).catch(console.error);
     }, delay);
   }
+
+  // Schedule a 10-minute hard timeout — pharmacies that don't respond by then
+  // get marked as `timeout` and we consolidate with whatever quotes we have.
+  scheduleQuoteTimeout(orderId, ctx.conversationId, ctx.phoneE164, ctx.traceId);
+}
+
+async function handleGetOrderStatus(ctx: ToolContext) {
+  // Pega o pedido ativo mais recente do usuário (qualquer status não-terminal).
+  const { data: order } = await db
+    .from('orders')
+    .select('id, status')
+    .eq('user_id', ctx.userId)
+    .in('status', ['quoting', 'quoted', 'confirming', 'handed_off'])
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!order) {
+    await sendOutbound(
+      ctx.conversationId,
+      ctx.phoneE164,
+      'No momento não tem nenhum pedido em andamento aqui 💙 É só me falar o medicamento e o endereço que eu cuido pra você.',
+      ctx.traceId,
+    );
+    return;
+  }
+
+  await sendCurrentOrderStatus(order.id, ctx.conversationId, ctx.phoneE164, ctx.traceId);
 }
 
 async function handleCreateReminder(
@@ -340,21 +449,46 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     return;
   }
 
-  // 3. Load order items
-  const { data: order } = await db.from('orders').select('items').eq('id', args.order_id).single();
+  // 3. Load order items + delivery address + payment method
+  const { data: order } = await db
+    .from('orders')
+    .select('items, delivery_address, delivery_lat, delivery_lng, payment_method')
+    .eq('id', args.order_id)
+    .single();
   const items = (order?.items ?? []) as OrderItem[];
+  const deliveryAddress =
+    (order?.delivery_address as string | null) ??
+    (order?.delivery_lat && order?.delivery_lng
+      ? `lat ${Number(order.delivery_lat).toFixed(5)}, lng ${Number(order.delivery_lng).toFixed(5)}`
+      : null);
+  const userPaymentMethod = (order?.payment_method as string | null) ?? null;
 
-  // 4. Send confirmation message to pharmacy via agent
+  // 4. Send confirmation message to pharmacy via agent (tom humano, sem emojis)
   const supplier = quote.suppliers as { id: string; name: string; whatsapp_e164?: string; phone_e164?: string } | null;
   if (supplier && quote.conversation_id) {
-    const supplierPhone = supplier.whatsapp_e164 || supplier.phone_e164;
-    if (supplierPhone) {
-      const itemsList = items.map((i: OrderItem) => `• ${i.name}${i.dosage ? ` ${i.dosage}` : ''}${i.quantity ? ` (${i.quantity})` : ''}`).join('\n');
-      const paymentMethod = ((quote.payment_methods ?? ['pix']) as string[])[0] ?? 'pix';
-      const confirmToPharmacy = `Olá! 🙏 O cliente confirmou o pedido. Por favor, prepare para entrega:\n${itemsList}\n\nPagamento: ${paymentMethod.toUpperCase()}\nSe possível, confirme quando estiver pronto!`;
-      await sendOutboundToSupplier(quote.conversation_id as string, supplierPhone, confirmToPharmacy, ctx.traceId);
-      await writeLog('info', 'order', `Confirmação enviada para ${supplier.name}`, { traceId: ctx.traceId, quoteId: args.quote_id });
-    }
+    // Fallback to fake simulator phone (same scheme used in initiatePharmacyNegotiation)
+    const supplierPhone =
+      supplier.whatsapp_e164 || supplier.phone_e164 || `+555500000${supplier.id.slice(0, 4)}`;
+    const itemsList = items
+      .map((i: OrderItem) => `- ${i.name}${i.dosage ? ` ${i.dosage}` : ''}${i.quantity ? ` (${i.quantity})` : ''}`)
+      .join('\n');
+    const paymentLabel = (userPaymentMethod || ((quote.payment_methods ?? ['pix']) as string[])[0] || 'pix').toString();
+    const addressLine = deliveryAddress ? `\nEndereço de entrega: ${deliveryAddress}` : '';
+    const confirmToPharmacy = `Oi, voltando aqui — o cliente fechou com vocês. Pode preparar pra entrega, por favor:\n${itemsList}${addressLine}\nForma de pagamento: ${paymentLabel}.\nMe avisa quando o pedido estiver pronto ou saindo, por favor. Obrigada!`;
+    await sendOutboundToSupplier(quote.conversation_id as string, supplierPhone, confirmToPharmacy, ctx.traceId);
+    await writeLog('info', 'order', `Confirmação enviada para ${supplier.name}`, {
+      traceId: ctx.traceId,
+      quoteId: args.quote_id,
+      deliveryAddress,
+      paymentMethod: paymentLabel,
+    });
+  } else {
+    await writeLog('warn', 'order', `Confirmação NÃO enviada — supplier ou conversation_id ausente`, {
+      traceId: ctx.traceId,
+      quoteId: args.quote_id,
+      hasSupplier: !!supplier,
+      hasConversation: !!quote.conversation_id,
+    });
   }
 
   // 5. Update order to handed_off

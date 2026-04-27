@@ -164,12 +164,17 @@ export async function processInboundUser(
     userMsgContent = `[Áudio recebido — duração: ${Math.round((inbound.mediaDurationMs ?? 0) / 1000)}s]`;
   }
 
-  // 10. Call Gemini
+  // 10. Call LLM (Sara)
+  const model = promptsConfig.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini';
+  await writeLog('info', 'llm', `Xarlote → LLM [${model}] — msg: "${userMsgContent.slice(0, 80)}${userMsgContent.length > 80 ? '…' : ''}"`, {
+    traceId, model, historyLen: geminiHistory.length,
+  });
+
   const llmStart = Date.now();
   let llmResponse;
   try {
     llmResponse = await chat(userMsgContent, {
-      model: promptsConfig.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
+      model,
       apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
       systemInstruction: systemPrompt,
       history: geminiHistory,
@@ -180,8 +185,8 @@ export async function processInboundUser(
     });
   } catch (err) {
     const errMsg = String(err);
-    console.error('[GEMINI ERROR]', err);
-    await writeLog('error', 'llm', 'Gemini error', { traceId, error: errMsg });
+    console.error('[LLM ERROR]', err);
+    await writeLog('error', 'llm', `Sara LLM error: ${errMsg.slice(0, 200)}`, { traceId, error: errMsg });
 
     const isQuota = errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('RESOURCE_EXHAUSTED');
     const userMsg = isQuota
@@ -192,9 +197,15 @@ export async function processInboundUser(
     return { traceId, conversationId: conversation.id };
   }
 
+  await writeLog('info', 'llm', `Xarlote ← LLM [${llmResponse.model}] — ${llmResponse.tokensIn}in/${llmResponse.tokensOut}out tok, ${llmResponse.latencyMs}ms${llmResponse.toolCalls.length ? ` — tools: ${llmResponse.toolCalls.map((t) => t.name).join(', ')}` : ''}${llmResponse.text ? ` — "${llmResponse.text.slice(0, 60)}…"` : ''}`, {
+    traceId, model: llmResponse.model, tokensIn: llmResponse.tokensIn, tokensOut: llmResponse.tokensOut, latencyMs: llmResponse.latencyMs,
+    tools: llmResponse.toolCalls.map((t) => t.name),
+  });
+
   // 11. Execute tool calls
   if (llmResponse.toolCalls.length > 0) {
     for (const tc of llmResponse.toolCalls) {
+      await writeLog('info', 'tool', `Tool call: ${tc.name}`, { traceId, args: tc.args });
       await handleToolCall(tc, {
         userId: user.id,
         conversationId: conversation.id,
@@ -208,6 +219,7 @@ export async function processInboundUser(
 
   // 12. Send text response
   if (llmResponse.text.trim()) {
+    await writeLog('info', 'outbound', `Xarlote → usuário: "${llmResponse.text.trim().slice(0, 100)}${llmResponse.text.length > 100 ? '…' : ''}"`, { traceId });
     await sendOutbound(conversation.id, phoneE164, llmResponse.text.trim(), traceId, {
       model: llmResponse.model,
       tokensIn: llmResponse.tokensIn,

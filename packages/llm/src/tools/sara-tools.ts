@@ -87,6 +87,10 @@ export const saraTools: ToolDefinition[] = [
               address: { type: 'string' },
             },
           },
+          payment_method: {
+            type: 'string',
+            description: 'Forma de pagamento que o usuário disse preferir (ex.: "pix", "cartão de crédito", "cartão de débito", "dinheiro"). Omitir se o usuário ainda não falou.',
+          },
         },
         required: ['items'],
       },
