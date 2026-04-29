@@ -11,46 +11,52 @@ export async function webhookRoute(app: FastifyInstance) {
     const body = req.body as UazapiWebhookPayload;
     const secret = req.headers['x-uazapi-secret'];
 
-    // Log raw payload during integration debugging
-    req.log.info({ raw: body }, 'uazapi webhook received (full body)');
-
     // Verify secret when configured
     const expectedSecret = process.env['UAZAPI_WEBHOOK_SECRET'];
     if (expectedSecret && secret !== expectedSecret) {
       return reply.code(401).send({ error: 'Unauthorized' });
     }
 
-    // Aceita variações do evento de mensagem que a uazapi pode enviar
-    const evt = body?.event;
-    const isMessageEvent = evt === 'messages.upsert' || evt === 'message' || evt === 'messages' || evt === 'messages.update';
-    if (!isMessageEvent) {
-      req.log.info({ event: evt }, 'uazapi webhook: not a message event, skipping');
-      return reply.send({ ok: true });
+    const eventType = body?.EventType;
+    const instanceName = body?.instanceName ?? req.params.instance;
+
+    req.log.info(
+      { eventType, instanceName, fromMe: body?.message?.fromMe, msgType: body?.message?.type },
+      'uazapi webhook received'
+    );
+
+    // Só processa eventos de mensagem novos. uazapi também envia "messages_update" (status delivered/read)
+    // e "wasSentByApi" (echo das próprias mensagens) — esses devem ser ignorados.
+    if (eventType !== 'messages') {
+      return reply.send({ ok: true, skipped: eventType });
     }
 
-    // Idempotency check
-    const eventId = body.data?.key?.id;
+    // Idempotência por messageid
+    const eventId = body?.message?.messageid || body?.message?.id;
     if (eventId) {
       const { error: dupError } = await db.from('webhook_events').insert({
         provider: 'uazapi',
-        instance: body.instance,
+        instance: instanceName,
         external_event_id: eventId,
-        event_type: body.event,
+        event_type: eventType,
         raw: body,
       });
       if (dupError?.code === '23505') {
-        return reply.send({ ok: true, skipped: true });
+        return reply.send({ ok: true, skipped: 'duplicate' });
       }
     }
 
     const normalized = normalizeWebhookPayload(body);
-    if (!normalized) return reply.send({ ok: true });
+    if (!normalized) {
+      req.log.info({ eventType, fromMe: body?.message?.fromMe }, 'uazapi webhook: ignored (fromMe/group/empty)');
+      return reply.send({ ok: true, skipped: 'no-normalized' });
+    }
 
-    // Route based on instance: agent instance handles supplier inbound
-    if (body.instance === AGENT_INSTANCE) {
-      setImmediate(() => processInboundSupplierFromWebhook(normalized).catch(console.error));
+    // Roteia: instance do agente (farmácias) vs sara (usuários)
+    if (instanceName === AGENT_INSTANCE || instanceName === process.env['UAZAPI_AGENT_INSTANCE']) {
+      setImmediate(() => processInboundSupplierFromWebhook(normalized).catch((err) => req.log.error(err)));
     } else {
-      setImmediate(() => processInboundUser(normalized).catch(console.error));
+      setImmediate(() => processInboundUser(normalized).catch((err) => req.log.error(err)));
     }
 
     return reply.send({ ok: true });
