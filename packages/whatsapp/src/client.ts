@@ -10,7 +10,9 @@ function buildConfig(instance: 'sara' | 'agent' | string): ClientConfig {
   const serverUrl = process.env['UAZAPI_SERVER_URL'] ?? '';
   const upper = instance.toUpperCase();
   const token = process.env[`UAZAPI_${upper}_TOKEN`] ?? '';
-  return { serverUrl, token, instance };
+  // UAZAPI_SARA_INSTANCE / UAZAPI_AGENT_INSTANCE permite usar um nome diferente de 'sara'/'agent'
+  const instanceName = process.env[`UAZAPI_${upper}_INSTANCE`] ?? instance;
+  return { serverUrl, token, instance: instanceName };
 }
 
 async function apiCall(cfg: ClientConfig, method: string, path: string, body?: unknown) {

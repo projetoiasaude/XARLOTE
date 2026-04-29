@@ -63,6 +63,13 @@ export async function processInboundUser(
   // 4. Update conversation last_message_at
   await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversation.id);
 
+  // 5a. Comando especial @teste — zera tudo e reinicia Xarlote
+  if (inbound.text?.trim() === '@teste') {
+    await resetAllData(db);
+    await sendOutbound(conversation.id, phoneE164, '🔄 Reset completo! Pode começar do zero.', traceId);
+    return { traceId, conversationId: conversation.id };
+  }
+
   // 5. Handle consent flow
   if (user.onboarding_status === 'not_started' || user.onboarding_status === 'consent_pending') {
     if (user.onboarding_status === 'not_started') {
@@ -229,6 +236,23 @@ export async function processInboundUser(
   }
 
   return { traceId, conversationId: conversation.id };
+}
+
+// Mesma lógica do endpoint POST /simulate/reset-all — apaga todos os dados de teste
+async function resetAllData(dbClient: typeof db): Promise<void> {
+  await dbClient.from('messages').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('quotes').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('orders').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('assistant_tasks').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('reminders').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('consent_events').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('user_health_conditions').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('user_allergies').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('user_medications').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('user_addresses').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('conversations').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('users').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('system_logs').delete().neq('id', '00000000-0000-0000-0000-000000000000');
 }
 
 async function handleForgetMe(userId: string, conversationId: string, phoneE164: string, traceId: string) {
