@@ -20,7 +20,7 @@ export async function webhookRoute(app: FastifyInstance) {
     const eventType = body?.EventType;
     const instanceName = body?.instanceName ?? req.params.instance;
 
-    req.log.info(
+    req.log.debug(
       { eventType, instanceName, fromMe: body?.message?.fromMe, msgType: body?.message?.type },
       'uazapi webhook received'
     );
