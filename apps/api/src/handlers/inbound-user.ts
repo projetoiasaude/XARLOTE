@@ -4,6 +4,7 @@ import { isForgetMeRequest, buildConsentEvent } from '@iasaude/core';
 import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE } from '@iasaude/shared';
 import type { NormalizedInbound } from '@iasaude/shared';
 import { chat, buildSaraSystemPrompt, saraTools, messagesToHistory, trimHistory } from '@iasaude/llm';
+import { sendMenu, isSimulatorMode } from '@iasaude/whatsapp';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutbound } from './outbound.js';
 import { handleToolCall } from './tool-executor.js';
@@ -73,16 +74,48 @@ export async function processInboundUser(
   // 5. Handle consent flow
   if (user.onboarding_status === 'not_started' || user.onboarding_status === 'consent_pending') {
     if (user.onboarding_status === 'not_started') {
-      // Send LGPD consent link and wait for user to respond
+      // Send LGPD consent message com botões interativos (Aceitar/Recusar) via uazapi /send/menu.
+      // Persistimos o texto da mensagem normalmente em `messages` (pra aparecer no dashboard),
+      // mas o envio real ao usuário usa sendMenu pra renderizar os botões clicáveis.
       await db.from('users').update({ onboarding_status: 'consent_pending' }).eq('id', user.id);
-      await sendOutbound(conversation.id, phoneE164, ONBOARDING_CONSENT_MESSAGE, traceId);
+
+      await db.from('messages').insert({
+        conversation_id: conversation.id,
+        direction: 'out',
+        sender_role: 'assistant',
+        content_type: 'text',
+        content: ONBOARDING_CONSENT_MESSAGE,
+        trace_id: traceId,
+      });
+      await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversation.id);
+
+      if (!isSimulatorMode()) {
+        try {
+          await sendMenu(SARA_INSTANCE, phoneE164, ONBOARDING_CONSENT_MESSAGE, ['Aceitar', 'Recusar'], {
+            type: 'button',
+          });
+        } catch (err) {
+          await writeLog('error', 'outbound', `Failed to send consent menu: ${String(err)}`, { traceId });
+          // Fallback: envia texto puro caso o menu falhe
+          await sendOutbound(conversation.id, phoneE164, ONBOARDING_CONSENT_MESSAGE, traceId);
+        }
+      }
       return { traceId, conversationId: conversation.id };
     }
 
-    // Link-based consent: any message after seeing the link = user accepted
-    const text = inbound.text ?? '';
-    if (text.trim().length > 0 || inbound.contentType !== 'text') {
-      // Record consent
+    // Resposta ao botão/texto. Detecta intenção: aceitar vs recusar.
+    const text = (inbound.text ?? '').trim();
+    const lower = text.toLowerCase();
+    const isRefuse = /^recusar?$/.test(lower) || /^n[aã]o\s*aceito$/.test(lower) || lower === 'recuso';
+    const isAccept = !isRefuse && (text.length > 0 || inbound.contentType !== 'text');
+
+    if (isRefuse) {
+      const refuseMsg = `Tudo bem, sem pressão 💙 Sem o aceite da LGPD eu não posso seguir com o atendimento. Quando quiser, é só me responder *"Aceitar"* aqui que a gente continua de onde parou.`;
+      await sendOutbound(conversation.id, phoneE164, refuseMsg, traceId);
+      return { traceId, conversationId: conversation.id };
+    }
+
+    if (isAccept) {
       const consentPayload = buildConsentEvent(user.id, inboundMsg.id, text || `[${inbound.contentType}]`);
       await db.from('consent_events').insert(consentPayload);
       await db.from('users').update({
@@ -97,11 +130,11 @@ export async function processInboundUser(
       const welcomeMsg = `Boa! 💙 Agora me conta — como você gosta de ser chamado(a)?`;
       await sendOutbound(conversation.id, phoneE164, welcomeMsg, traceId);
       return { traceId, conversationId: conversation.id };
-    } else {
-      // Empty message or timeout — resend link
-      await sendOutbound(conversation.id, phoneE164, ONBOARDING_CONSENT_REPEAT_MESSAGE, traceId);
-      return { traceId, conversationId: conversation.id };
     }
+
+    // Mensagem vazia / mídia sem contexto — reenvia o link
+    await sendOutbound(conversation.id, phoneE164, ONBOARDING_CONSENT_REPEAT_MESSAGE, traceId);
+    return { traceId, conversationId: conversation.id };
   }
 
   // 6. Check forget-me

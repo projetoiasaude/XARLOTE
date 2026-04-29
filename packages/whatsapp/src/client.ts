@@ -33,6 +33,32 @@ export async function sendText(instance: string, phoneE164: string, text: string
   return { messageId: result?.messageid ?? result?.id ?? '' };
 }
 
+/**
+ * Envia menu interativo (botões clicáveis) via uazapi.
+ * Doc: https://docs.uazapi.com/endpoint/post/send~menu
+ *
+ * @param type - 'button' (até 3 opções), 'list', 'poll', etc.
+ * @param choices - Array de opções (ex: ['Aceitar', 'Recusar']).
+ */
+export async function sendMenu(
+  instance: string,
+  phoneE164: string,
+  text: string,
+  choices: string[],
+  opts: { type?: 'button' | 'list' | 'poll'; footerText?: string } = {}
+): Promise<{ messageId: string }> {
+  const cfg = buildConfig(instance);
+  const number = phoneE164.replace('+', '');
+  const result = await apiCall(cfg, 'POST', '/send/menu', {
+    number,
+    type: opts.type ?? 'button',
+    text,
+    choices,
+    ...(opts.footerText ? { footerText: opts.footerText } : {}),
+  });
+  return { messageId: result?.messageid ?? result?.id ?? '' };
+}
+
 export async function sendImage(instance: string, phoneE164: string, imageUrl: string, caption?: string): Promise<{ messageId: string }> {
   const cfg = buildConfig(instance);
   const number = phoneE164.replace('+', '');
