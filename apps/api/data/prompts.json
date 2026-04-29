@@ -1,6 +1,6 @@
 {
   "sara_suffix": "",
   "agent_override": "",
-  "llm_api_key": "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",
-  "llm_model": "openai/gpt-4.1-mini"
+  "llm_api_key": "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",
+  "llm_model": "deepseek/deepseek-v4-flash"
 }
