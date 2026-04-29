@@ -13,26 +13,25 @@
 
 ---
 
-## 2. Estado atual — 2026-04-28
+## 2. Estado atual — 2026-04-29
 
 | Item | Status |
 |---|---|
-| Fluxo completo farmácia | ✅ **FUNCIONANDO** (farmácias ainda simuladas no WhatsApp real) |
-| Google Places (Legacy Nearby Search) | ✅ **Funcionando** — retorna farmácias reais |
-| Google Geocoding API | ✅ **Substituída por Nominatim (OpenStreetMap)** — endereço por texto funciona |
-| Simulador WhatsApp (duas abas) | ✅ Aba "Usuário" + aba "Farmácias" em tempo real |
-| Agent LLM — record_quote_price | ✅ **Corrigido** — chama tool imediatamente ao receber preço |
-| Consolidação de cotações | ✅ Dispara automaticamente com 3+ quotes ou todos terminais |
-| Onboarding + LGPD | ✅ Funcionando |
-| Localização via botão (coordenadas) | ✅ Funcionando |
-| Localização via texto (endereço digitado) | ✅ **Funcionando** — Nominatim (OSM), sem API key |
-| API local | ✅ porta **3001** |
-| Dashboard local | ✅ porta **3002** |
-| uazapi (instância Sara) | ✅ **Configurado** — número `+55 62 9834-5024`, token configurado no `.env` |
-| Webhook uazapi | ✅ Rota `/webhook/uazapi/sara` pronta — aguarda URL pública |
-| Comando `@teste` (reset via WA) | ✅ Implementado — zera todos os dados e reinicia Xarlote |
-| Redis/BullMQ | ⏳ Opcional em dev — processa inline |
-| Deploy Railway (API) | ✅ **Rodando** — `https://ia-da-saude-api-production.up.railway.app` |
+| **Fluxo end-to-end (WhatsApp real → Xarlote → cotação 5 farmácias)** | ✅ **FUNCIONANDO em produção** |
+| LLM (OpenRouter) | ✅ Modelo `deepseek/deepseek-v4-flash` + fallback chain (`gpt-4.1-mini`, `gpt-4o-mini`) — sem trava em 429 upstream |
+| uazapi (instância Sara — usuários) | ✅ Conectada · `VEDACIL-HIAGO` · número `+55 62 9834-5024` |
+| uazapi (instância Agente — farmácias) | ⏳ **Não conectada** · respostas simuladas via dashboard |
+| Webhook uazapi | ✅ `POST /webhook/uazapi/VEDACIL-HIAGO` configurado no painel |
+| Mensagem inicial LGPD (botões Aceitar/Recusar) | ✅ uazapi `/send/menu` |
+| Comando `@teste` (reset total via WA) | ✅ Funciona |
+| Localização (botão 📍 WhatsApp) | ✅ **Corrigido** — extrai de `message.content.degreesLatitude/Longitude` (formato real Baileys), não de `message.latitude/longitude` |
+| Localização por endereço texto | ✅ Nominatim + ViaCEP fallback |
+| Google Places (busca farmácias) | ✅ Legacy Nearby Search — 5 farmácias reais por raio (3/5/8 km) |
+| Consolidação de cotações | ✅ 3min/5min com modo eager |
+| **Chat manual de farmácia no dashboard** | ✅ **NOVO** — botão "Responder como farmácia" em cada quote do `/orders/[id]` (drawer com realtime + composer) |
+| Dashboard local | ✅ porta **3002** · aponta `NEXT_PUBLIC_API_URL` pra produção (Railway) |
+| Dashboard — anon key Supabase | ✅ Corrigida (estava com `iat:1755…` em vez de `1775…`) + RLS policies `anon_read_*` aplicadas |
+| API Railway | ✅ `https://ia-da-saude-api-production.up.railway.app` · health 200 |
 
 **uazapi instância Sara**: `WHATSAPP_MODE=uazapi`, `UAZAPI_SERVER_URL=https://criate.uazapi.com`, `UAZAPI_SARA_TOKEN` configurado. Nome da instância lido via `UAZAPI_SARA_INSTANCE` (padrão `sara`).
 
@@ -143,6 +142,9 @@ RLS ativa em tudo. Backend usa service role. Dashboard usa anon + `is_staff()`.
 | 2026-04-26 (sessão 5) | **Geocoding com confiança + persona humana**: (1) `geocoding.ts` agora retorna `confidence: 'precise' \| 'low'`; matches que caem só em cidade/UF (último fallback) viram `low` e o tool-executor pede refinamento ao usuário em vez de buscar farmácias no centro errado. Caso real: "Setor Recanto das Emas, Goiânia" (bairro de outra UF) gerava match em Goiânia-centro. (2) Prompt do agente farmácia (cotação + confirmação) reescrito: Xarlote fala como humana no WhatsApp, proibido mencionar IA/bot/agente/sistema. Mensagens hardcoded em `inbound-supplier.ts` e `tool-executor.ts` reescritas no mesmo tom. |
 | 2026-04-26 (sessão 4) | **Localização por pedido + reset**: (1) safety net em `tool-executor.ts` — se `location.address` veio nos args, geocodifica sempre (ignora lat/lng do LLM, que vinha reaproveitando coords do histórico). Lat/lng direto só de `ctx.inbound.location` (botão 📍 atual). (2) Prompt Sara com regra "NÃO REUTILIZE LOCALIZAÇÕES DO HISTÓRICO". (3) Endpoint `POST /simulate/reset { phone }` + botão "Resetar simulação" no WhatsAppSim apaga tudo do número (user/conversas/orders/quotes/perfil). **Migration `orders.delivery_address text` aplicada em prod via MCP Supabase.** |
 | 2026-04-29 (sessão 10) | **Deploy Railway**: projeto `ia-da-saude-api` criado, todas as env vars configuradas, nixpacks.toml controla install (pnpm --no-frozen-lockfile) e start (tsx). API em `https://ia-da-saude-api-production.up.railway.app`. Webhook URL para uazapi: `/webhook/uazapi/VEDACIL-HIAGO`. |
+| 2026-04-29 (sessão 14) | **Chat manual de farmácia no dashboard** (provisório, enquanto a 2ª instância uazapi não conecta): novo `PharmacyChatDrawer` em `apps/web/components/chat/`. Botão "Responder como farmácia" em cada quote do `/orders/[id]` abre drawer com mensagens realtime (filter por `quotes.conversation_id`) e composer que posta em `POST /api/simulate/pharmacy-reply` → `processInboundSupplier` → LLM responde. `outbound-agent.ts` agora também trata "AGENT_TOKEN ausente" como simulado (só persiste a mensagem). `apps/web/.env.local`: `NEXT_PUBLIC_API_URL` aponta pra Railway. **PROJECT_STATE atualizado**. |
+| 2026-04-29 (sessão 13) | **Bug fix CRÍTICO — localização vinha 0,0**: payload real da uazapi tem lat/lng em `message.content.degreesLatitude/Longitude` (formato Baileys), mas `normalize.ts` lia de `message.latitude/longitude` (campos inexistentes) → `?? 0` virava 0,0 → backend respondia "coordenadas inválidas". Corrigido: lê de `content.*` primeiro, fallback pra campos planos; também detecta location via `mediaType === 'location'`. Coords inválidas viram texto sinalizado em vez de buscar farmácia em (0,0). Validado com payload real do banco: `-16.6867, -49.2617` (Goiânia). **Fluxo end-to-end agora 100% operacional** — confirmado E2E via dashboard mostrando 5 quotes geradas a partir da localização real do usuário. |
+| 2026-04-29 (sessão 12) | **2 fixes de infra LLM/dashboard**: (1) **Chave OpenRouter renovada** (a antiga retornava 401 "User not found" → toda mensagem caía no fallback "Tive um probleminha"). Modelo trocado pra `deepseek/deepseek-v4-flash` + fallback chain (`models: [primário, gpt-4.1-mini, gpt-4o-mini]`) pra OpenRouter rotear automaticamente em 429 upstream (DeepInfra free tier saturava). Backoff em 429 subiu pra 8s/tentativa. (2) **Dashboard mostrando "Nenhuma conversa"**: anon key do Supabase em `apps/web/.env.local` estava errada (`iat:1755…` vs correta `iat:1775…` — uma troca de dígito). Além disso, RLS policies só permitiam `is_staff()` — adicionadas policies `anon_read_*` em `conversations`/`messages`/`users`/`orders`/`quotes`/`suppliers`/`system_logs` (dashboard é localhost-only). |
 | 2026-04-29 (sessão 11) | **uazapi format fix (CRÍTICO)**: a integração uazapi NÃO usa formato Baileys como o código original presumia. Capturado payload real e descoberto: (1) Webhook envia `EventType` (não `event`), `instanceName` (não `instance`), e `message.{text,messageid,sender,fromMe,wasSentByApi,type}` (não `data.key.{remoteJid,id}`/`data.message.conversation`). (2) Endpoint outbound é `/send/text` (não `/message/sendText/{instance}`). (3) Filtra `fromMe`/`wasSentByApi` para não processar echo. **Validado E2E**: webhook simulado → Xarlote respondeu → mensagem persistida + enviada via uazapi (echo recebido). Agora basta o usuário mandar mensagem real. |
 | 2026-04-28 (sessão 9) | **Integração real uazapi (instância Sara)**: (1) `.env` atualizado com `UAZAPI_SERVER_URL`, `UAZAPI_SARA_TOKEN`, `WHATSAPP_MODE=uazapi` — mensagens enviadas pelo usuário real chegam via webhook e respostas da Xarlote vão de volta pelo WhatsApp. (2) `client.ts` atualizado: `buildConfig` lê `UAZAPI_${INSTANCE}_INSTANCE` env var para usar o nome real da instância no uazapi (evita hardcoded `'sara'`). (3) `inbound-user.ts`: comando `@teste` detectado antes do LLM — executa reset completo (todos os dados) e confirma ao usuário, equivalente ao botão "Zerar tudo" do simulador. Farmácias continuam simuladas (segunda instância pendente). Webhook URL: `POST /webhook/uazapi/sara`. |
 | 2026-04-26 (sessão 3) | **3 ajustes de qualidade no fluxo de cotação**: (1) **Filtro de farmácias** em `google-places.ts` — blocklist por nome (`pet`, `veterinár`, `agropecuári`, `animal`, `ração`, `aquári`) + tipos (`pet_store`, `veterinary_care`), `keyword=farmácia` adicionado ao Nearby Search. Resolve o caso "Pet Ville Premium Pet Shop" aparecendo nos resultados. (2) **Timeout 10min**: novo `scheduleQuoteTimeout` em `quote-consolidation.ts`; ao criar pedido em `tool-executor.ts`, agenda `setTimeout(10min)` que marca quotes não-terminais como `timeout` e força consolidação. (3) **Prompts base visíveis no /prompts** (Opção B, sem breaking change): novo endpoint `GET /admin/prompts/base`; UI mostra prompt base read-only (Sara + agente cotação + agente confirmação) acima do editor de customização. **Bug latente corrigido**: `agent_override` estava no schema desde sempre mas não era aplicado em `inbound-supplier.ts` — ligado nos 2 spots (handler de msgs + opening). |
