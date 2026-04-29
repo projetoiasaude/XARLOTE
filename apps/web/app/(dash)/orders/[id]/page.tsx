@@ -1,7 +1,9 @@
 'use client';
 import { useEffect, useState } from 'react';
+import { MessageCircle } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import { timeAgo } from '@/lib/utils';
+import { PharmacyChatDrawer } from '@/components/chat/PharmacyChatDrawer';
 
 interface Quote {
   id: string;
@@ -13,6 +15,7 @@ interface Quote {
   pix_key: string | null;
   notes: string | null;
   distance_km: number | null;
+  conversation_id: string | null;
   suppliers?: { name: string; whatsapp_e164?: string } | null;
 }
 
@@ -38,10 +41,14 @@ export default function OrderDetailPage({ params }: { params: { id: string } }) 
   const { id } = params;
   const [order, setOrder] = useState<Order | null>(null);
   const [quotes, setQuotes] = useState<Quote[]>([]);
+  const [chatQuote, setChatQuote] = useState<Quote | null>(null);
 
   async function load() {
     const { data: ord } = await supabase.from('orders').select('*').eq('id', id).single();
-    const { data: qs } = await supabase.from('quotes').select('*, suppliers(name, whatsapp_e164)').eq('order_id', id);
+    const { data: qs } = await supabase
+      .from('quotes')
+      .select('*, suppliers(name, whatsapp_e164)')
+      .eq('order_id', id);
     setOrder(ord as Order);
     setQuotes((qs as Quote[]) ?? []);
   }
@@ -79,7 +86,7 @@ export default function OrderDetailPage({ params }: { params: { id: string } }) 
         {quotes.map((q) => {
           const st = QUOTE_STATUS[q.status] ?? { label: q.status, color: 'text-gray-400' };
           return (
-            <div key={q.id} className="bg-wa-panel border border-wa-border rounded-xl p-4">
+            <div key={q.id} className="bg-wa-panel border border-wa-border rounded-xl p-4 flex flex-col">
               <div className="flex items-center justify-between mb-2">
                 <p className="text-white font-medium text-sm">{(q.suppliers as any)?.name ?? '—'}</p>
                 <span className={`text-xs font-medium ${st.color}`}>{st.label}</span>
@@ -95,10 +102,30 @@ export default function OrderDetailPage({ params }: { params: { id: string } }) 
                 </div>
               )}
               {q.notes && <p className="text-xs text-gray-500 mt-2 italic">"{q.notes}"</p>}
+
+              {/* Botão de chat manual — provisório enquanto a 2ª instância da uazapi
+                  (lado farmácia) não está conectada. Permite responder como se fosse
+                  a farmácia, pra testar o fluxo da Xarlote-agente. */}
+              <button
+                onClick={() => setChatQuote(q)}
+                disabled={!q.conversation_id}
+                className="mt-3 flex items-center justify-center gap-2 bg-brand-500/20 hover:bg-brand-500/30 disabled:opacity-30 disabled:cursor-not-allowed text-brand-400 text-xs font-medium py-2 px-3 rounded-lg border border-brand-500/30 transition-colors"
+                title={q.conversation_id ? 'Abrir chat de simulação' : 'Conversa ainda não criada'}
+              >
+                <MessageCircle size={14} />
+                Responder como farmácia
+              </button>
             </div>
           );
         })}
       </div>
+
+      <PharmacyChatDrawer
+        open={!!chatQuote}
+        conversationId={chatQuote?.conversation_id ?? null}
+        pharmacyName={(chatQuote?.suppliers as any)?.name ?? 'Farmácia'}
+        onClose={() => setChatQuote(null)}
+      />
     </div>
   );
 }

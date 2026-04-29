@@ -30,9 +30,12 @@ export async function sendOutboundToSupplier(
     .update({ last_message_at: new Date().toISOString() })
     .eq('id', conversationId);
 
-  if (isSimulatorMode()) {
-    // Simulator: no auto-reply. User manually responds as each pharmacy.
-    await writeLog('info', 'agent', 'Mensagem do agente salva — aguardando resposta manual no painel de farmácias', {
+  // Modo simulador OU instância do agente não configurada (sem WhatsApp conectado
+  // pro lado das farmácias) → apenas persistimos a mensagem e o operador
+  // responde manualmente no dashboard como se fosse a farmácia.
+  const agentTokenConfigured = !!process.env['UAZAPI_AGENT_TOKEN'];
+  if (isSimulatorMode() || !agentTokenConfigured) {
+    await writeLog('info', 'agent', 'Mensagem do agente salva — aguardando resposta manual no dashboard (chat por farmácia)', {
       traceId, conversationId,
     });
     return;
