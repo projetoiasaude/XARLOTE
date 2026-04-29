@@ -44,6 +44,11 @@ export interface ChatOptions {
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 const DEFAULT_MODEL = 'openai/gpt-4.1-mini';
 
+// Modelos de fallback usados pelo OpenRouter quando o primário fica indisponível
+// (rate-limit upstream, provider down, etc). OpenRouter tenta na ordem.
+// Doc: https://openrouter.ai/docs/features/model-routing
+const FALLBACK_MODELS = ['openai/gpt-4.1-mini', 'openai/gpt-4o-mini'];
+
 function getApiKey(override?: string): string {
   const key = override ?? process.env['OPENROUTER_API_KEY'] ?? process.env['GOOGLE_GENAI_API_KEY'] ?? '';
   if (!key) throw new Error('No LLM API key configured. Set OPENROUTER_API_KEY or configure in the Prompts dashboard.');
@@ -61,8 +66,14 @@ async function callOpenRouter(
 ): Promise<ChatResponse> {
   const start = Date.now();
 
+  // Fallback chain: se o modelo primário ficar indisponível (429 upstream, etc),
+  // OpenRouter automaticamente tenta os modelos listados em `models` na ordem.
+  // Filtramos pra não duplicar o primário caso ele já seja um dos fallbacks.
+  const fallbacks = FALLBACK_MODELS.filter((m) => m !== modelName);
+
   const body: Record<string, unknown> = {
     model: modelName,
+    models: [modelName, ...fallbacks],
     messages,
     temperature,
     max_tokens: maxTokens,
@@ -155,7 +166,9 @@ export async function chat(userMessage: string, opts: ChatOptions = {}): Promise
       const isRateLimit = errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('RESOURCE_EXHAUSTED');
       attempt++;
       if (attempt >= maxAttempts) throw err;
-      const delay = isRateLimit || isTransient ? 5000 * attempt : 1000 * 2 ** (attempt - 1);
+      // Backoff agressivo em 429/transient (rate-limit upstream demora pra liberar);
+      // Como já temos fallback de modelos, normalmente o OpenRouter resolve antes do retry.
+      const delay = isRateLimit ? 8000 * attempt : isTransient ? 5000 * attempt : 1000 * 2 ** (attempt - 1);
       await sleep(delay);
     }
   }
