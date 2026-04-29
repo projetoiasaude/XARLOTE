@@ -16,7 +16,16 @@ export interface UazapiSendImagePayload {
 export interface UazapiWebhookMessage {
   chatid: string;
   chatlid?: string;
-  content?: { text?: string; contextInfo?: unknown };
+  content?: {
+    text?: string;
+    contextInfo?: unknown;
+    // Campos específicos de localização (uazapi coloca lat/lng dentro de `content`)
+    degreesLatitude?: number;
+    degreesLongitude?: number;
+    name?: string;
+    address?: string;
+    JPEGThumbnail?: string;
+  };
   edited?: string;
   fromMe: boolean;
   groupName?: string;

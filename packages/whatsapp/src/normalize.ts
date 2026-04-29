@@ -67,16 +67,36 @@ export function normalizeWebhookPayload(payload: UazapiWebhookPayload): Normaliz
     };
   }
 
-  // Localização
-  if (type === 'location' || messageType.includes('location')) {
+  // Localização — uazapi pode entregar lat/lng em vários lugares dependendo da versão:
+  // 1) msg.content.degreesLatitude / degreesLongitude (formato Baileys, atual)
+  // 2) msg.latitude / msg.longitude (formato antigo/simplificado)
+  // mediaType também identifica ('location') quando type vem como 'media'.
+  if (
+    type === 'location' ||
+    messageType.includes('location') ||
+    msg.mediaType === 'location'
+  ) {
+    const lat = msg.content?.degreesLatitude ?? msg.latitude;
+    const lng = msg.content?.degreesLongitude ?? msg.longitude;
+
+    // Se as coords vieram inválidas (formato desconhecido ou bug do cliente WhatsApp),
+    // converte pra texto sinalizando o problema, pra Xarlote pedir reenvio ou CEP.
+    if (lat == null || lng == null || (lat === 0 && lng === 0)) {
+      return {
+        ...base,
+        contentType: 'text',
+        text: '[Localização compartilhada chegou sem coordenadas válidas — pedir pro usuário enviar de novo ou digitar CEP/endereço com número e bairro]',
+      };
+    }
+
     return {
       ...base,
       contentType: 'location',
       location: {
-        lat: msg.latitude ?? 0,
-        lng: msg.longitude ?? 0,
-        name: msg.locationName,
-        address: msg.locationAddress,
+        lat,
+        lng,
+        name: msg.content?.name ?? msg.locationName,
+        address: msg.content?.address ?? msg.locationAddress,
       },
     };
   }
