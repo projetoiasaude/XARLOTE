@@ -1,9 +1,7 @@
 [build]
 builder = "nixpacks"
-buildCommand = "pnpm install --no-frozen-lockfile"
 
 [deploy]
-startCommand = "pnpm --filter @iasaude/api start"
 healthcheckPath = "/health"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3

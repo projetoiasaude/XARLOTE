@@ -1,0 +1,5 @@
+[phases.install]
+cmds = ["pnpm install --no-frozen-lockfile"]
+
+[start]
+cmd = "pnpm --filter @iasaude/api start"
