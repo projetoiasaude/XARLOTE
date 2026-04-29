@@ -11,13 +11,20 @@ export async function webhookRoute(app: FastifyInstance) {
     const body = req.body as UazapiWebhookPayload;
     const secret = req.headers['x-uazapi-secret'];
 
+    // Log raw payload during integration debugging
+    req.log.info({ raw: body }, 'uazapi webhook received (full body)');
+
     // Verify secret when configured
     const expectedSecret = process.env['UAZAPI_WEBHOOK_SECRET'];
     if (expectedSecret && secret !== expectedSecret) {
       return reply.code(401).send({ error: 'Unauthorized' });
     }
 
-    if (body.event !== 'messages.upsert') {
+    // Aceita variações do evento de mensagem que a uazapi pode enviar
+    const evt = body?.event;
+    const isMessageEvent = evt === 'messages.upsert' || evt === 'message' || evt === 'messages' || evt === 'messages.update';
+    if (!isMessageEvent) {
+      req.log.info({ event: evt }, 'uazapi webhook: not a message event, skipping');
       return reply.send({ ok: true });
     }
 
