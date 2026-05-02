@@ -1,22 +1,22 @@
 export const LGPD_POLICY_VERSION = process.env['PRIVACY_POLICY_VERSION'] ?? '1.0';
 export const LGPD_POLICY_URL = process.env['PRIVACY_POLICY_URL'] ?? 'https://iadasaude.com/privacidade';
 
-export const ONBOARDING_CONSENT_MESSAGE = `Oi! Eu sou a *Xarlote*, sua assistente de saúde.
+export const ONBOARDING_CONSENT_MESSAGE = `Oi! Eu sou a *Xarlote*, sua assistente de saúde 💙
 
-Estou aqui pra te ajudar no dia a dia com medicamentos, lembretes, dúvidas simples, pedir remédios em farmácias, marcar consultas e muito mais — tudo pelo WhatsApp.
+Estou aqui pra te ajudar no dia a dia com medicamentos, lembretes, dúvidas simples, pedir remédios em farmácias, marcar consultas e muito mais. Tudo pelo WhatsApp.
 
 Antes da gente começar, preciso que você aceite nossa política de privacidade. É ela que explica como cuidamos dos seus dados com segurança, seguindo a LGPD.
 
-👉 Dá uma olhadinha aqui:
+Dá uma olhadinha aqui:
 ${LGPD_POLICY_URL}
 
-Depois de acessar o link e clicar em *"Aceitar"*, você autoriza o uso dos seus dados de saúde para que eu possa te atender melhor. E claro: você pode mudar de ideia e revogar esse consentimento quando quiser. 💙`;
+Depois é só clicar em *Aceitar* aqui embaixo pra autorizar o uso dos seus dados de saúde. Se mudar de ideia, você pode revogar esse consentimento quando quiser.`;
 
-export const ONBOARDING_CONSENT_REPEAT_MESSAGE = `Para continuar, preciso que você aceite os termos de uso pelo link:
+export const ONBOARDING_CONSENT_REPEAT_MESSAGE = `Pra gente continuar, preciso que você aceite nossa política de privacidade pelo link:
 
-👉 ${LGPD_POLICY_URL}
+${LGPD_POLICY_URL}
 
-Após aceitar, é só me enviar qualquer mensagem que eu continuo! 😊`;
+Quando aceitar, é só me responder por aqui que eu sigo de onde a gente parou.`;
 
 export const CONSENT_ACCEPTED_PATTERNS = [
   /^sim\s*aceito$/i,

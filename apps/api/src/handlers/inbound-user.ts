@@ -110,7 +110,7 @@ export async function processInboundUser(
     const isAccept = !isRefuse && (text.length > 0 || inbound.contentType !== 'text');
 
     if (isRefuse) {
-      const refuseMsg = `Tudo bem, sem pressão 💙 Sem o aceite da LGPD eu não posso seguir com o atendimento. Quando quiser, é só me responder *"Aceitar"* aqui que a gente continua de onde parou.`;
+      const refuseMsg = `Tudo bem, sem pressão. Sem o aceite da LGPD eu não posso seguir com o atendimento. Quando quiser, é só me responder *Aceitar* aqui que a gente continua de onde parou.`;
       await sendOutbound(conversation.id, phoneE164, refuseMsg, traceId);
       return { traceId, conversationId: conversation.id };
     }
@@ -127,7 +127,7 @@ export async function processInboundUser(
       }).eq('id', user.id);
       user = { ...user, onboarding_status: 'profiling', lgpd_consent_at: new Date().toISOString() };
 
-      const welcomeMsg = `Boa! 💙 Agora me conta — como você gosta de ser chamado(a)?`;
+      const welcomeMsg = `Boa! Pra gente começar, como você gosta de ser chamado(a)?`;
       await sendOutbound(conversation.id, phoneE164, welcomeMsg, traceId);
       return { traceId, conversationId: conversation.id };
     }
@@ -139,7 +139,7 @@ export async function processInboundUser(
 
   // 6. Check forget-me
   if (inbound.text && isForgetMeRequest(inbound.text)) {
-    const confirmMsg = `Entendido 💙 Para confirmar que você quer apagar todos os seus dados, responde com *CONFIRMO APAGAR*. Isso é irreversível.`;
+    const confirmMsg = `Entendido. Pra confirmar que você quer apagar todos os seus dados, responde com *CONFIRMO APAGAR*. Isso é irreversível.`;
     await sendOutbound(conversation.id, phoneE164, confirmMsg, traceId);
     return { traceId, conversationId: conversation.id };
   }
@@ -300,7 +300,7 @@ async function handleForgetMe(userId: string, conversationId: string, phoneE164:
   await db.from('user_addresses').delete().eq('user_id', userId);
   await db.from('users').update({ phone_e164: `deleted-${userId}`, full_name: null, preferred_name: null, deleted_at: new Date().toISOString() }).eq('id', userId);
 
-  const goodbye = 'Pronto, apaguei tudo 💙 Se mudar de ideia, é só me chamar de novo.';
+  const goodbye = 'Pronto, apaguei tudo. Se mudar de ideia, é só me chamar de novo.';
   await sendOutbound(conversationId, phoneE164, goodbye, traceId);
 
   await writeLog('info', 'lgpd', 'User forget-me completed', { traceId, userId });
