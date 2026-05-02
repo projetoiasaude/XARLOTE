@@ -1,6 +1,6 @@
 {
   "sara_suffix": "",
   "agent_override": "",
-  "llm_api_key": "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",
+  "llm_api_key": "",
   "llm_model": "deepseek/deepseek-v4-flash"
 }
