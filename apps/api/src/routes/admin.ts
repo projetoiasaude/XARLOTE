@@ -161,4 +161,18 @@ export async function adminRoute(app: FastifyInstance) {
     if (error) return reply.code(500).send({ error: error.message });
     return reply.send(data);
   });
+
+  // Debug: lista os últimos webhook_events crus, pra inspecionar payloads
+  // (especialmente útil quando algo chega da uazapi e não é reconhecido pelo normalize).
+  app.get('/webhook-events', async (req, reply) => {
+    const q = req.query as Record<string, string>;
+    const limit = parseInt(q['limit'] ?? '20');
+    const { data, error } = await db
+      .from('webhook_events')
+      .select('id, provider, instance, event_type, external_event_id, raw, received_at')
+      .order('received_at', { ascending: false })
+      .limit(limit);
+    if (error) return reply.code(500).send({ error: error.message });
+    return reply.send(data);
+  });
 }

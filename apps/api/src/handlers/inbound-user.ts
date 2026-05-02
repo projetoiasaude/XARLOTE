@@ -106,8 +106,18 @@ export async function processInboundUser(
     // Resposta ao botão/texto. Detecta intenção: aceitar vs recusar.
     const text = (inbound.text ?? '').trim();
     const lower = text.toLowerCase();
+    // Aceita formas: 'aceitar', 'aceito', 'sim aceito', 'concordo', etc.
     const isRefuse = /^recusar?$/.test(lower) || /^n[aã]o\s*aceito$/.test(lower) || lower === 'recuso';
     const isAccept = !isRefuse && (text.length > 0 || inbound.contentType !== 'text');
+
+    await writeLog('info', 'consent', `Consent flow recebeu mensagem do usuário (status=${user.onboarding_status})`, {
+      traceId,
+      contentType: inbound.contentType,
+      textLen: text.length,
+      textPreview: text.slice(0, 60),
+      isRefuse,
+      isAccept,
+    });
 
     if (isRefuse) {
       const refuseMsg = `Tudo bem, sem pressão. Sem o aceite da LGPD eu não posso seguir com o atendimento. Quando quiser, é só me responder *Aceitar* aqui que a gente continua de onde parou.`;
