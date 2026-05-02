@@ -236,12 +236,27 @@ export async function processInboundUser(
   } catch (err) {
     const errMsg = String(err);
     console.error('[LLM ERROR]', err);
-    await writeLog('error', 'llm', `Sara LLM error: ${errMsg.slice(0, 200)}`, { traceId, error: errMsg });
 
-    const isQuota = errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('RESOURCE_EXHAUSTED');
-    const userMsg = isQuota
-      ? 'Estou com a agenda cheia agora 🙈 tenta de novo em alguns minutinhos?'
-      : 'Tive um probleminha aqui, mas já já resolvo. Pode repetir sua mensagem? 😊';
+    // Classifica o tipo de erro pra deixar log e mensagem ao usuário mais úteis.
+    const isAuth = errMsg.includes('401') || errMsg.includes('User not found') || errMsg.includes('Unauthorized') || errMsg.includes('No auth credentials');
+    const isQuota = errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('insufficient_quota');
+    const isPayment = errMsg.includes('402') || errMsg.includes('Payment Required') || errMsg.includes('credits');
+
+    const errorTag = isAuth ? '[AUTH/KEY INVÁLIDA]' : isPayment ? '[SEM CRÉDITO]' : isQuota ? '[RATE LIMIT]' : '[ERRO LLM]';
+    await writeLog('error', 'llm', `${errorTag} Sara LLM error: ${errMsg.slice(0, 200)}`, {
+      traceId, error: errMsg, isAuth, isQuota, isPayment,
+    });
+
+    // Mensagem ao usuário (sem expor detalhes técnicos).
+    let userMsg: string;
+    if (isAuth || isPayment) {
+      // Bug de configuração nosso, repetir não vai resolver. Pede pra aguardar.
+      userMsg = 'Opa, tive um problema técnico aqui no atendimento. Já estou avisando o time pra resolver. Daqui a pouco a gente continua.';
+    } else if (isQuota) {
+      userMsg = 'Estou com a agenda cheia agora 🙈 tenta de novo em alguns minutinhos?';
+    } else {
+      userMsg = 'Tive um probleminha aqui, mas já já resolvo. Pode repetir sua mensagem?';
+    }
 
     await sendOutbound(conversation.id, phoneE164, userMsg, traceId);
     return { traceId, conversationId: conversation.id };
