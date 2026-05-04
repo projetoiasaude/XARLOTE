@@ -13,21 +13,39 @@ import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { consolidateQuotes, notifyUserQuoteArrived } from './quote-consolidation.js';
 
-/** Extrai "Setor X, Cidade, UF" do endereço completo (Nominatim/ViaCEP). */
+/**
+ * Extrai "Rua/Avenida X, Setor Y" do endereço completo (Nominatim/ViaCEP / Google reverse).
+ * Mantém a rua + setor (sem número, sem CEP, sem cidade/UF) pra usar na cotação.
+ * Retorna null se for string sintética só com lat/lng — caller usa fallback.
+ */
 function extractDeliverySectorLocal(fullAddress: string | null): string | null {
   if (!fullAddress) return null;
+  if (/Localização compartilhada|^lat\s|coordenadas?\b/i.test(fullAddress)) return null;
+
   const parts = fullAddress.split(',').map((s) => s.trim()).filter(Boolean);
   const ignoreLow = /^(região|brasil|brazil|região centro-oeste|mesorregião|microrregião)/i;
-  const isStreet = /^(rua|r\.?|avenida|av\.?|alameda|al\.?|travessa|tv\.?|rodovia|rod\.?|praça|estrada)\b/i;
-  const cleanParts: string[] = [];
+  const isStreet = /^(rua|r\.?|avenida|av\.?|alameda|al\.?|travessa|tv\.?|rodovia|rod\.?|praça|pç\.?|estrada|via|quadra|qd\.?)\b/i;
+  const isOnlyNumber = /^\d+[a-zA-Z]?$/;
+  const isCep = /^\d{5}-?\d{3}$/;
+  const isUf = /^([A-Z]{2}|Goiás|Goias|São Paulo|Rio de Janeiro|Minas Gerais|Bahia|Paraná|Pernambuco|Ceará|Pará|Distrito Federal|Mato Grosso|Mato Grosso do Sul|Espírito Santo|Santa Catarina|Rio Grande do Sul|Rio Grande do Norte|Alagoas|Sergipe|Paraíba|Piauí|Maranhão|Tocantins|Acre|Amapá|Amazonas|Rondônia|Roraima)$/i;
+
+  let street: string | null = null;
+  let sector: string | null = null;
+
   for (const p of parts) {
-    if (ignoreLow.test(p)) continue;
-    if (isStreet.test(p)) continue;
-    if (/^\d{5}-?\d{3}$/.test(p)) continue;
-    cleanParts.push(p);
-    if (cleanParts.length >= 3) break;
+    if (ignoreLow.test(p) || isCep.test(p) || isOnlyNumber.test(p) || isUf.test(p)) continue;
+    if (isStreet.test(p)) {
+      if (!street) street = p;
+      continue;
+    }
+    if (!sector) {
+      sector = p;
+      if (street) break;
+    }
   }
-  return cleanParts.length ? cleanParts.join(', ') : null;
+
+  const result = [street, sector].filter(Boolean).join(', ');
+  return result || null;
 }
 
 export interface SupplierInboundCtx {

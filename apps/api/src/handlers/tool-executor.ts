@@ -3,29 +3,49 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { findNearbyPharmacies, geocodeAddress } from '@iasaude/integrations';
+import { findNearbyPharmacies, geocodeAddress, reverseGeocode } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
 
-/** Extrai apenas "Setor/Bairro X, Cidade, UF" do endereço completo do Nominatim/ViaCEP. */
+/**
+ * Extrai um identificador curto do endereço pra usar na cotação com a farmácia:
+ * formato "Rua/Avenida X, Setor/Bairro Y" (sem número, sem CEP, sem cidade/UF).
+ * Endereço completo + lat/lng só são repassados na confirmação do pedido.
+ *
+ * Nominatim típico: "Avenida Interligação, Setor Santa Rita VII, Goiânia, Região..., Goiás, 74999-999, Brasil"
+ * ViaCEP típico:    "R. 14, 201, St. Oeste, Goiânia, Goiás"
+ */
 function extractDeliverySector(fullAddress: string | null): string | null {
   if (!fullAddress) return null;
-  // Nominatim typical: "Avenida Interligação, Setor Santa Rita VII, Goiânia, Região..., Goiás, ..."
+  // Strings sintéticas (sem reverse geocoding) não rendem extração — caller usa fallback.
+  if (/Localização compartilhada|^lat\s|coordenadas?\b/i.test(fullAddress)) return null;
+
   const parts = fullAddress.split(',').map((s) => s.trim()).filter(Boolean);
-  // Procura tokens que parecem bairro/setor (não administrativos, não rua, não numéricos puros)
   const ignoreLow = /^(região|brasil|brazil|região centro-oeste|mesorregião|microrregião)/i;
-  const isStreet = /^(rua|r\.?|avenida|av\.?|alameda|al\.?|travessa|tv\.?|rodovia|rod\.?|praça|estrada)\b/i;
-  const cleanParts: string[] = [];
+  const isStreet = /^(rua|r\.?|avenida|av\.?|alameda|al\.?|travessa|tv\.?|rodovia|rod\.?|praça|pç\.?|estrada|via|quadra|qd\.?)\b/i;
+  const isOnlyNumber = /^\d+[a-zA-Z]?$/;
+  const isCep = /^\d{5}-?\d{3}$/;
+  const isUf = /^([A-Z]{2}|Goiás|Goias|São Paulo|Rio de Janeiro|Minas Gerais|Bahia|Paraná|Pernambuco|Ceará|Pará|Distrito Federal|Mato Grosso|Mato Grosso do Sul|Espírito Santo|Santa Catarina|Rio Grande do Sul|Rio Grande do Norte|Alagoas|Sergipe|Paraíba|Piauí|Maranhão|Tocantins|Acre|Amapá|Amazonas|Rondônia|Roraima)$/i;
+
+  let street: string | null = null;
+  let sector: string | null = null;
+
   for (const p of parts) {
-    if (ignoreLow.test(p)) continue;
-    if (isStreet.test(p)) continue;
-    if (/^\d{5}-?\d{3}$/.test(p)) continue;
-    cleanParts.push(p);
-    if (cleanParts.length >= 3) break;
+    if (ignoreLow.test(p) || isCep.test(p) || isOnlyNumber.test(p) || isUf.test(p)) continue;
+    if (isStreet.test(p)) {
+      if (!street) street = p;
+      continue;
+    }
+    if (!sector) {
+      sector = p;
+      if (street) break;
+    }
   }
-  return cleanParts.length ? cleanParts.join(', ') : null;
+
+  const result = [street, sector].filter(Boolean).join(', ');
+  return result || null;
 }
 
 interface ToolContext {
@@ -222,8 +242,28 @@ async function handleStartPharmacyOrder(
   } else if (ctx.inbound.location) {
     lat = ctx.inbound.location.lat;
     lng = ctx.inbound.location.lng;
-    deliveryAddress = `Localização compartilhada via WhatsApp (lat ${lat.toFixed(5)}, lng ${lng.toFixed(5)})`;
     locationSource = 'whatsapp_location';
+    // Reverse geocode pra ter "Avenida X, Setor Y, Cidade, UF" no delivery_address.
+    // Sem isso, a cotação vira "Para entregar no Localização compartilhada via WhatsApp (lat ...)" — vergonhoso.
+    try {
+      const formatted = await reverseGeocode(lat, lng);
+      if (formatted) {
+        deliveryAddress = formatted;
+        await writeLog('info', 'geocoding', `Reverse geocode da localização WhatsApp: ${formatted}`, {
+          traceId: ctx.traceId, lat, lng,
+        });
+      } else {
+        deliveryAddress = `Localização compartilhada via WhatsApp (lat ${lat.toFixed(5)}, lng ${lng.toFixed(5)})`;
+        await writeLog('warn', 'geocoding', `Reverse geocode retornou vazio — usando coordenadas como fallback`, {
+          traceId: ctx.traceId, lat, lng,
+        });
+      }
+    } catch (err) {
+      deliveryAddress = `Localização compartilhada via WhatsApp (lat ${lat.toFixed(5)}, lng ${lng.toFixed(5)})`;
+      await writeLog('warn', 'geocoding', `Reverse geocode falhou: ${String(err).slice(0, 120)}`, {
+        traceId: ctx.traceId, lat, lng,
+      });
+    }
   } else if (args.location?.lat && args.location?.lng) {
     // Fallback: LLM mandou só lat/lng (sem endereço de texto e sem localização do usuário na msg atual).
     // Aceita, mas registra para debug — costuma ser sintoma de coord reaproveitada do histórico.
@@ -473,8 +513,19 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
       .map((i: OrderItem) => `- ${i.name}${i.dosage ? ` ${i.dosage}` : ''}${i.quantity ? ` (${i.quantity})` : ''}`)
       .join('\n');
     const paymentLabel = (userPaymentMethod || ((quote.payment_methods ?? ['pix']) as string[])[0] || 'pix').toString();
-    const addressLine = deliveryAddress ? `\nEndereço de entrega: ${deliveryAddress}` : '';
-    const confirmToPharmacy = `Oi, voltando aqui — o cliente fechou com vocês. Pode preparar pra entrega, por favor:\n${itemsList}${addressLine}\nForma de pagamento: ${paymentLabel}.\nMe avisa quando o pedido estiver pronto ou saindo, por favor. Obrigada!`;
+    // Aqui já vai TUDO: endereço completo + link do Google Maps com a localização exata
+    // (no momento da cotação a gente passa só rua/setor pra não vazar info do cliente sem fechar pedido).
+    const mapsLink =
+      order?.delivery_lat != null && order?.delivery_lng != null
+        ? `https://www.google.com/maps?q=${Number(order.delivery_lat).toFixed(6)},${Number(order.delivery_lng).toFixed(6)}`
+        : null;
+    const addressParts: string[] = [];
+    if (deliveryAddress && !/Localização compartilhada|^lat\s/i.test(deliveryAddress)) {
+      addressParts.push(`Endereço de entrega: ${deliveryAddress}`);
+    }
+    if (mapsLink) addressParts.push(`Localização no mapa: ${mapsLink}`);
+    const addressLine = addressParts.length ? `\n${addressParts.join('\n')}` : '';
+    const confirmToPharmacy = `Oi, voltando aqui, o cliente fechou com vocês. Pode preparar pra entrega, por favor:\n${itemsList}${addressLine}\nForma de pagamento: ${paymentLabel}.\nMe avisa quando o pedido estiver pronto ou saindo, por favor. Obrigada!`;
     await sendOutboundToSupplier(quote.conversation_id as string, supplierPhone, confirmToPharmacy, ctx.traceId);
     await writeLog('info', 'order', `Confirmação enviada para ${supplier.name}`, {
       traceId: ctx.traceId,
