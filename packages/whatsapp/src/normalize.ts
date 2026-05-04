@@ -38,6 +38,31 @@ export function normalizeWebhookPayload(payload: UazapiWebhookPayload): Normaliz
   // Mas também pode vir só messageType ('ExtendedTextMessage', 'Conversation', etc.)
   const type = (msg.type || '').toLowerCase();
   const messageType = (msg.messageType || '').toLowerCase();
+  const mediaType = (msg.mediaType || '').toLowerCase();
+
+  // Resposta de botão/lista (clique em quick_reply ou item de lista).
+  // uazapi entrega como type='media', messageType='ButtonsResponseMessage' (ou ListResponseMessage),
+  // mediaType='buttons_response', com o texto selecionado em msg.buttonOrListid / vote /
+  // content.Response.SelectedDisplayText / content.selectedButtonID. msg.text vem vazio nesse caso,
+  // então o fluxo de texto não pega — precisa desse branch antes.
+  const isButtonReply =
+    messageType === 'buttonsresponsemessage' ||
+    messageType === 'listresponsemessage' ||
+    messageType === 'templatebuttonreplymessage' ||
+    messageType === 'interactiveresponsemessage' ||
+    mediaType === 'buttons_response' ||
+    mediaType === 'list_response';
+
+  if (isButtonReply) {
+    const text =
+      msg.buttonOrListid ||
+      msg.vote ||
+      msg.content?.Response?.SelectedDisplayText ||
+      msg.content?.selectedButtonID ||
+      msg.text ||
+      '';
+    return { ...base, contentType: 'text', text };
+  }
 
   // Texto
   if (type === 'text' || messageType.includes('text') || messageType === 'conversation') {

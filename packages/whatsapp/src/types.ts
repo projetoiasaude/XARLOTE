@@ -25,7 +25,17 @@ export interface UazapiWebhookMessage {
     name?: string;
     address?: string;
     JPEGThumbnail?: string;
+    // Campos de resposta de botão/lista (ButtonsResponseMessage)
+    selectedButtonID?: string;
+    Response?: {
+      SelectedDisplayText?: string;
+      [k: string]: unknown;
+    };
+    [k: string]: unknown;
   };
+  // Resposta de botão/lista — uazapi expõe o texto selecionado nesses campos
+  buttonOrListid?: string;
+  vote?: string;
   edited?: string;
   fromMe: boolean;
   groupName?: string;
