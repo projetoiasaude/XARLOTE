@@ -3,7 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { findNearbyPharmacies, geocodeAddress, reverseGeocode } from '@iasaude/integrations';
+import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
@@ -243,24 +243,35 @@ async function handleStartPharmacyOrder(
     lat = ctx.inbound.location.lat;
     lng = ctx.inbound.location.lng;
     locationSource = 'whatsapp_location';
-    // Reverse geocode pra ter "Avenida X, Setor Y, Cidade, UF" no delivery_address.
-    // Sem isso, a cotação vira "Para entregar no Localização compartilhada via WhatsApp (lat ...)" — vergonhoso.
+    // Reverse geocode pra ter um endereço REAL ("Rua X, 123, Setor Y, Cidade - UF, CEP") em vez
+    // de "Localização compartilhada via WhatsApp (lat ...)" — a farmácia precisa disso pra calcular frete.
+    // Tenta Nominatim primeiro (gratuito, retorna structured address com rua/número/setor/CEP).
+    // Cai pro Google Geocoding como fallback se o Nominatim falhar (ele pode estar lento ou off).
     try {
-      const formatted = await reverseGeocode(lat, lng);
-      if (formatted) {
-        deliveryAddress = formatted;
-        await writeLog('info', 'geocoding', `Reverse geocode da localização WhatsApp: ${formatted}`, {
+      const nomi = await reverseGeocodeNominatim(lat, lng);
+      if (nomi) {
+        deliveryAddress = nomi.formattedAddress;
+        await writeLog('info', 'geocoding', `Reverse geocode (Nominatim): ${nomi.shortAddress}`, {
           traceId: ctx.traceId, lat, lng,
+          road: nomi.road, neighborhood: nomi.neighborhood, city: nomi.city, postcode: nomi.postcode,
         });
       } else {
-        deliveryAddress = `Localização compartilhada via WhatsApp (lat ${lat.toFixed(5)}, lng ${lng.toFixed(5)})`;
-        await writeLog('warn', 'geocoding', `Reverse geocode retornou vazio — usando coordenadas como fallback`, {
-          traceId: ctx.traceId, lat, lng,
-        });
+        const goog = await reverseGeocode(lat, lng).catch(() => null);
+        if (goog) {
+          deliveryAddress = goog;
+          await writeLog('info', 'geocoding', `Reverse geocode (Google fallback): ${goog}`, {
+            traceId: ctx.traceId, lat, lng,
+          });
+        } else {
+          deliveryAddress = `Localização compartilhada via WhatsApp (lat ${lat.toFixed(5)}, lng ${lng.toFixed(5)})`;
+          await writeLog('warn', 'geocoding', `Reverse geocode falhou em Nominatim e Google — usando coords`, {
+            traceId: ctx.traceId, lat, lng,
+          });
+        }
       }
     } catch (err) {
       deliveryAddress = `Localização compartilhada via WhatsApp (lat ${lat.toFixed(5)}, lng ${lng.toFixed(5)})`;
-      await writeLog('warn', 'geocoding', `Reverse geocode falhou: ${String(err).slice(0, 120)}`, {
+      await writeLog('warn', 'geocoding', `Reverse geocode lançou exception: ${String(err).slice(0, 120)}`, {
         traceId: ctx.traceId, lat, lng,
       });
     }

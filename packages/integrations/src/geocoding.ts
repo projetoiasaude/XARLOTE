@@ -155,6 +155,85 @@ function isPreciseHit(hit: NominatimHit): boolean {
   return true;
 }
 
+interface NominatimReverseHit {
+  lat: string;
+  lon: string;
+  display_name: string;
+  address?: {
+    road?: string;
+    house_number?: string;
+    neighbourhood?: string;
+    suburb?: string;
+    quarter?: string;
+    city?: string;
+    town?: string;
+    municipality?: string;
+    state?: string;
+    postcode?: string;
+    country?: string;
+    [k: string]: string | undefined;
+  };
+}
+
+export interface ReverseGeocodeResult {
+  /** display_name completo do Nominatim (ex.: "Rua T-25, 100, Setor Bueno, Goiânia, ..., Goiás, 74230-100, Brasil") */
+  formattedAddress: string;
+  /** Versão compacta sem país/região metropolitana, ideal pra mostrar à farmácia na confirmação. */
+  shortAddress: string;
+  road?: string;
+  houseNumber?: string;
+  neighborhood?: string;
+  city?: string;
+  state?: string;
+  postcode?: string;
+}
+
+/**
+ * Reverse geocode via Nominatim (OpenStreetMap). Retorna o display_name completo
+ * + uma versão "shortAddress" compacta + os componentes estruturados.
+ *
+ * Não usa Google Geocoding porque a API key do projeto tem restrição (só Places liberado).
+ */
+export async function reverseGeocodeNominatim(lat: number, lng: number, timeoutMs = 8_000): Promise<ReverseGeocodeResult | null> {
+  const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=jsonv2&zoom=18&addressdetails=1&accept-language=pt-BR`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { headers: HEADERS, signal: controller.signal });
+    if (!res.ok) return null;
+    const hit = (await res.json()) as NominatimReverseHit;
+    if (!hit?.display_name) return null;
+
+    const a = hit.address ?? {};
+    const neighborhood = a.neighbourhood || a.suburb || a.quarter;
+    const city = a.city || a.town || a.municipality;
+
+    // Versão curta: rua + número + bairro + cidade/UF + CEP. Sem "Brasil", sem "Microrregião de…"
+    const parts: string[] = [];
+    if (a.road) parts.push(a.house_number ? `${a.road}, ${a.house_number}` : a.road);
+    if (neighborhood) parts.push(neighborhood);
+    if (city && a.state) parts.push(`${city} - ${a.state}`);
+    else if (city) parts.push(city);
+    if (a.postcode) parts.push(`CEP ${a.postcode}`);
+    const shortAddress = parts.join(', ') || hit.display_name;
+
+    return {
+      formattedAddress: hit.display_name,
+      shortAddress,
+      road: a.road,
+      houseNumber: a.house_number,
+      neighborhood,
+      city,
+      state: a.state,
+      postcode: a.postcode,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function geocodeAddress(address: string): Promise<GeocodeResult | null> {
   type Attempt = { q: string; tier: 'precise' | 'low' };
   const attempts: Attempt[] = [];

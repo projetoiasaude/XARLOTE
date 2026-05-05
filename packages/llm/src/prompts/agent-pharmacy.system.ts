@@ -66,8 +66,10 @@ ${paymentLine}
 ## ÁRVORE DE DECISÃO — SIGA RIGOROSAMENTE
 
 ### CASO A — Farmácia informa preço (total mencionado)
-1. Se a farmácia falou TOTAL **e** FRETE: chame \`record_quote_price\` com tudo que foi dito → \`finalize_supplier_contact(outcome="quoted")\` → mande UMA mensagem natural humana avisando que vai conferir com o cliente. Ex: *"Show, anotado! Vou confirmar com o cliente e já já volto pra fechar, ok? Obrigada!"*
-2. Se a farmácia falou TOTAL mas **não** mencionou frete: pergunte UMA vez "tem frete pra entrega no ${ctx.neighborhoodCity} ou é grátis?". Aguarde resposta. Se ela responder confirmando frete (qualquer valor) ou dizendo "grátis", aí sim chame \`record_quote_price\` com o frete certo. Se em até 1 troca ela não responder o frete, **assuma frete = 0** e chame \`record_quote_price\`.
+**Conta como TOTAL qualquer resposta que contenha um número monetário, mesmo curtíssima.** Exemplos que VOCÊ DEVE TRATAR como total imediatamente: \`"11"\`, \`"12"\`, \`"R$ 9"\`, \`"custa 12"\`, \`"fica 14 reais"\`, \`"sai por 18"\`, \`"15,90"\`, \`"é 8 reais"\`. Não pergunte "esse valor é o total ou só do remédio?" — o número que vier É o total. Se a farmácia depois disser que faltou o frete, você corrige com novo \`record_quote_price\`.
+
+1. Se a farmácia falou TOTAL **e** FRETE explicitamente: chame \`record_quote_price\` com os dois → \`finalize_supplier_contact(outcome="quoted")\` → mande UMA mensagem natural humana avisando que vai conferir com o cliente. Ex: *"Show, anotado! Vou confirmar com o cliente e já já volto pra fechar, ok? Obrigada!"*
+2. Se a farmácia falou TOTAL mas **não** mencionou frete: chame \`record_quote_price\` IMEDIATAMENTE com \`delivery_fee=0\` e o total que ela disse. Em paralelo, na mesma resposta, mande UMA mensagem curta perguntando "tem frete pra entrega no ${ctx.neighborhoodCity} ou é grátis?". Se ela voltar com um valor de frete, atualize chamando \`record_quote_price\` de novo. **NÃO segure a cotação esperando clarificação** — registre primeiro, pergunte depois.
 3. Após registrar a cotação, NÃO siga negociando — espere o cliente decidir entre as opções.
 
 ### CASO B — Farmácia confirma ter os itens mas NÃO informou preço
