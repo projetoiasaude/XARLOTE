@@ -1,10 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { normalizeWebhookPayload } from '@iasaude/whatsapp';
-import { db } from '@iasaude/db';
+import { db, writeLog } from '@iasaude/db';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { processInboundSupplierFromWebhook } from '../handlers/inbound-supplier.js';
 import type { UazapiWebhookPayload } from '@iasaude/whatsapp';
 import { AGENT_INSTANCE } from '@iasaude/shared';
+import { loadPrompts } from '../config/prompts.js';
 
 export async function webhookRoute(app: FastifyInstance) {
   app.post<{ Params: { instance: string } }>('/uazapi/:instance', async (req, reply) => {
@@ -53,9 +54,27 @@ export async function webhookRoute(app: FastifyInstance) {
     }
 
     // Roteia: instance do agente (farmácias) vs sara (usuários)
-    if (instanceName === AGENT_INSTANCE || instanceName === process.env['UAZAPI_AGENT_INSTANCE']) {
+    const isAgentInstance =
+      instanceName === AGENT_INSTANCE || instanceName === process.env['UAZAPI_AGENT_INSTANCE'];
+    if (isAgentInstance) {
       setImmediate(() => processInboundSupplierFromWebhook(normalized).catch((err) => req.log.error(err)));
     } else {
+      // Interruptor mestre: se a Xarlote estiver desligada no painel, ignora a mensagem do usuário.
+      // Devolve 200 OK pro uazapi não retentar; loga pra ficar rastreável no dashboard.
+      const cfg = loadPrompts();
+      if (!cfg.xarlote_enabled) {
+        await writeLog(
+          'info',
+          'webhook',
+          `Xarlote DESLIGADA — mensagem de ${normalized.from.phoneE164} ignorada`,
+          {
+            instance: instanceName,
+            phone: normalized.from.phoneE164,
+            contentType: normalized.contentType,
+          },
+        );
+        return reply.send({ ok: true, skipped: 'xarlote_disabled' });
+      }
       setImmediate(() => processInboundUser(normalized).catch((err) => req.log.error(err)));
     }
 

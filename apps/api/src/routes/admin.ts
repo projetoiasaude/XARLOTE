@@ -118,12 +118,13 @@ export async function adminRoute(app: FastifyInstance) {
 
   // Update prompts config
   app.put('/prompts', async (req, reply) => {
-    const body = req.body as Record<string, string>;
+    const body = req.body as Record<string, unknown>;
     const updated = savePrompts({
-      sara_suffix: typeof body['sara_suffix'] === 'string' ? body['sara_suffix'] : undefined,
-      agent_override: typeof body['agent_override'] === 'string' ? body['agent_override'] : undefined,
-      llm_api_key: typeof body['llm_api_key'] === 'string' ? body['llm_api_key'] : undefined,
-      llm_model: typeof body['llm_model'] === 'string' ? body['llm_model'] : undefined,
+      sara_suffix: typeof body['sara_suffix'] === 'string' ? (body['sara_suffix'] as string) : undefined,
+      agent_override: typeof body['agent_override'] === 'string' ? (body['agent_override'] as string) : undefined,
+      llm_api_key: typeof body['llm_api_key'] === 'string' ? (body['llm_api_key'] as string) : undefined,
+      llm_model: typeof body['llm_model'] === 'string' ? (body['llm_model'] as string) : undefined,
+      xarlote_enabled: typeof body['xarlote_enabled'] === 'boolean' ? (body['xarlote_enabled'] as boolean) : undefined,
     });
     return reply.send(updated);
   });

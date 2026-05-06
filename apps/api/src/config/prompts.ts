@@ -8,6 +8,12 @@ export interface PromptsConfig {
   agent_override: string;
   llm_api_key: string;       // OpenRouter API key (sobrescreve OPENROUTER_API_KEY)
   llm_model: string;         // Ex: "openai/gpt-4.1-mini"
+  /**
+   * Interruptor mestre da Xarlote. Quando false, o webhook do uazapi descarta
+   * mensagens recebidas do usuário sem chamar a IA (a Xarlote fica "desligada"
+   * pro WhatsApp). O fluxo agente/farmácia segue funcionando.
+   */
+  xarlote_enabled: boolean;
 }
 
 const defaults: PromptsConfig = {
@@ -15,6 +21,7 @@ const defaults: PromptsConfig = {
   agent_override: '',
   llm_api_key: '',
   llm_model: 'openai/gpt-4.1-mini',
+  xarlote_enabled: true,
 };
 
 export function loadPrompts(): PromptsConfig {

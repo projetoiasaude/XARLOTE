@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { buildSimulatedInbound } from '@iasaude/whatsapp';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { processInboundSupplier } from '../handlers/inbound-supplier.js';
+import { loadPrompts } from '../config/prompts.js';
 
 const SimulateSchema = z.object({
   phone: z.string().min(8),
@@ -28,6 +29,15 @@ export async function simulateRoute(app: FastifyInstance) {
     const parsed = SimulateSchema.safeParse(req.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.flatten() });
+    }
+
+    // Mesmo gate do webhook real: simulador respeita o interruptor mestre.
+    if (!loadPrompts().xarlote_enabled) {
+      return reply.code(503).send({
+        ok: false,
+        skipped: 'xarlote_disabled',
+        message: 'Xarlote está desligada no painel — ative o interruptor em /prompts pra voltar a responder.',
+      });
     }
 
     const normalized = buildSimulatedInbound(parsed.data);

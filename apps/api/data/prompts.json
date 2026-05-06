@@ -2,5 +2,6 @@
   "sara_suffix": "",
   "agent_override": "",
   "llm_api_key": "",
-  "llm_model": "openai/gpt-4.1-mini"
+  "llm_model": "openai/gpt-4.1-mini",
+  "xarlote_enabled": true
 }

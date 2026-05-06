@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { Bot, Pill, Save, RotateCcw, CheckCircle, AlertCircle, Key, Cpu, Eye, EyeOff, Copy } from 'lucide-react';
+import { Bot, Pill, Save, RotateCcw, CheckCircle, AlertCircle, Key, Cpu, Eye, EyeOff, Copy, Power } from 'lucide-react';
 
 const API = process.env['NEXT_PUBLIC_API_URL'] ?? 'http://localhost:3001';
 
@@ -21,6 +21,7 @@ interface PromptsConfig {
   agent_override: string;
   llm_api_key: string;
   llm_model: string;
+  xarlote_enabled: boolean;
 }
 
 interface BasePrompts {
@@ -33,10 +34,10 @@ type Status = 'idle' | 'saving' | 'saved' | 'error';
 
 export default function PromptsPage() {
   const [config, setConfig] = useState<PromptsConfig>({
-    sara_suffix: '', agent_override: '', llm_api_key: '', llm_model: 'openai/gpt-4.1-mini',
+    sara_suffix: '', agent_override: '', llm_api_key: '', llm_model: 'openai/gpt-4.1-mini', xarlote_enabled: true,
   });
   const [original, setOriginal] = useState<PromptsConfig>({
-    sara_suffix: '', agent_override: '', llm_api_key: '', llm_model: 'openai/gpt-4.1-mini',
+    sara_suffix: '', agent_override: '', llm_api_key: '', llm_model: 'openai/gpt-4.1-mini', xarlote_enabled: true,
   });
   const [status, setStatus] = useState<Status>('idle');
   const [errorMsg, setErrorMsg] = useState('');
@@ -77,7 +78,37 @@ export default function PromptsPage() {
     config.sara_suffix !== original.sara_suffix ||
     config.agent_override !== original.agent_override ||
     config.llm_api_key !== original.llm_api_key ||
-    effectiveModel !== original.llm_model;
+    effectiveModel !== original.llm_model ||
+    config.xarlote_enabled !== original.xarlote_enabled;
+
+  // Toggle do interruptor mestre — salva imediato, sem precisar do botão "Salvar".
+  // Otimista: troca o estado local na hora; em caso de erro, reverte.
+  const [toggleBusy, setToggleBusy] = useState(false);
+  async function handleToggleEnabled() {
+    if (toggleBusy) return;
+    const next = !config.xarlote_enabled;
+    setToggleBusy(true);
+    setConfig((c) => ({ ...c, xarlote_enabled: next }));
+    try {
+      const res = await fetch(`${API}/admin/prompts`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ xarlote_enabled: next }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const saved: PromptsConfig = await res.json();
+      // Atualiza o estado original também pra não marcar como dirty.
+      setOriginal((o) => ({ ...o, xarlote_enabled: saved.xarlote_enabled }));
+      setConfig((c) => ({ ...c, xarlote_enabled: saved.xarlote_enabled }));
+    } catch (err) {
+      // Reverte em caso de erro
+      setConfig((c) => ({ ...c, xarlote_enabled: !next }));
+      setErrorMsg(`Falha ao alternar interruptor: ${String(err)}`);
+      setStatus('error');
+    } finally {
+      setToggleBusy(false);
+    }
+  }
 
   async function handleSave() {
     setStatus('saving');
@@ -120,6 +151,66 @@ export default function PromptsPage() {
       </div>
 
       <div className="space-y-6">
+
+        {/* Master switch — interruptor que liga/desliga a Xarlote */}
+        <div
+          className={`rounded-xl p-5 border transition-colors ${
+            config.xarlote_enabled
+              ? 'bg-wa-panel border-green-500/30'
+              : 'bg-red-950/30 border-red-500/40'
+          }`}
+        >
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex items-center gap-3 min-w-0">
+              <div
+                className={`flex items-center justify-center w-10 h-10 rounded-full shrink-0 ${
+                  config.xarlote_enabled ? 'bg-green-500/15 text-green-400' : 'bg-red-500/15 text-red-400'
+                }`}
+              >
+                <Power size={18} />
+              </div>
+              <div className="min-w-0">
+                <h2 className="text-base font-medium text-white flex items-center gap-2">
+                  Xarlote
+                  <span
+                    className={`text-xs font-medium px-2 py-0.5 rounded-full ${
+                      config.xarlote_enabled
+                        ? 'bg-green-500/20 text-green-300'
+                        : 'bg-red-500/20 text-red-300'
+                    }`}
+                  >
+                    {config.xarlote_enabled ? 'Conectada' : 'Desconectada'}
+                  </span>
+                </h2>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  {config.xarlote_enabled
+                    ? 'Recebendo mensagens do WhatsApp e respondendo normalmente.'
+                    : 'Mensagens do WhatsApp são descartadas — a Xarlote não responde nada até o interruptor voltar.'}
+                </p>
+              </div>
+            </div>
+
+            {/* Toggle switch */}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={config.xarlote_enabled}
+              disabled={toggleBusy}
+              onClick={handleToggleEnabled}
+              className={`relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-wa-panel disabled:opacity-50 disabled:cursor-not-allowed ${
+                config.xarlote_enabled ? 'bg-green-500 focus:ring-green-400' : 'bg-gray-600 focus:ring-gray-400'
+              }`}
+              title={config.xarlote_enabled ? 'Clique pra desligar a Xarlote' : 'Clique pra ligar a Xarlote'}
+            >
+              <span
+                aria-hidden="true"
+                className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-white shadow-lg ring-0 transition-transform ${
+                  config.xarlote_enabled ? 'translate-x-5' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </div>
+        </div>
 
         {/* LLM Config */}
         <div className="bg-wa-panel border border-wa-border rounded-xl p-5">
