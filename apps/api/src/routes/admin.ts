@@ -124,6 +124,8 @@ export async function adminRoute(app: FastifyInstance) {
       agent_override: typeof body['agent_override'] === 'string' ? (body['agent_override'] as string) : undefined,
       llm_api_key: typeof body['llm_api_key'] === 'string' ? (body['llm_api_key'] as string) : undefined,
       llm_model: typeof body['llm_model'] === 'string' ? (body['llm_model'] as string) : undefined,
+      vision_model: typeof body['vision_model'] === 'string' ? (body['vision_model'] as string) : undefined,
+      audio_model: typeof body['audio_model'] === 'string' ? (body['audio_model'] as string) : undefined,
       xarlote_enabled: typeof body['xarlote_enabled'] === 'boolean' ? (body['xarlote_enabled'] as boolean) : undefined,
     });
     return reply.send(updated);

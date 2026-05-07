@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { Bot, Pill, Save, RotateCcw, CheckCircle, AlertCircle, Key, Cpu, Eye, EyeOff, Copy, Power } from 'lucide-react';
+import { Bot, Pill, Save, RotateCcw, CheckCircle, AlertCircle, Key, Cpu, Eye, EyeOff, Copy, Power, Image as ImageIcon, Mic } from 'lucide-react';
 
 const API = process.env['NEXT_PUBLIC_API_URL'] ?? 'http://localhost:3001';
 
@@ -16,11 +16,35 @@ const MODELS = [
   { value: 'meta-llama/llama-3.3-70b-instruct', label: 'Llama 3.3 70B (OpenRouter)' },
 ];
 
+// Modelos vision-capable. Tenha cuidado em mudar aqui — se o usuário escolher um non-vision,
+// imagens caem como "não consigo ver".
+const VISION_MODELS = [
+  { value: 'openai/gpt-4.1-mini', label: 'GPT-4.1 Mini — rápido e barato (recomendado)' },
+  { value: 'openai/gpt-4.1', label: 'GPT-4.1 — melhor qualidade' },
+  { value: 'openai/gpt-4o', label: 'GPT-4o — multimodal robusto' },
+  { value: 'openai/gpt-4o-mini', label: 'GPT-4o Mini' },
+  { value: 'anthropic/claude-3-5-sonnet', label: 'Claude 3.5 Sonnet — análise rica de imagem' },
+  { value: 'anthropic/claude-3-5-haiku', label: 'Claude 3.5 Haiku' },
+  { value: 'google/gemini-2.0-flash-001', label: 'Gemini 2.0 Flash' },
+  { value: 'google/gemini-2.5-flash-preview', label: 'Gemini 2.5 Flash Preview' },
+];
+
+// Modelos de transcrição de áudio. `openai/*` via OpenRouter (multipart);
+// `gemini/*` via API direta do Google (inlineData).
+const AUDIO_MODELS = [
+  { value: 'openai/whisper-1', label: 'Whisper-1 (OpenRouter) — padrão, robusto' },
+  { value: 'openai/whisper-large-v3', label: 'Whisper Large v3 (OpenRouter)' },
+  { value: 'gemini/gemini-2.0-flash', label: 'Gemini 2.0 Flash (Google direto) — barato, PT-BR' },
+  { value: 'gemini/gemini-2.5-flash', label: 'Gemini 2.5 Flash (Google direto)' },
+];
+
 interface PromptsConfig {
   sara_suffix: string;
   agent_override: string;
   llm_api_key: string;
   llm_model: string;
+  vision_model: string;
+  audio_model: string;
   xarlote_enabled: boolean;
 }
 
@@ -34,10 +58,14 @@ type Status = 'idle' | 'saving' | 'saved' | 'error';
 
 export default function PromptsPage() {
   const [config, setConfig] = useState<PromptsConfig>({
-    sara_suffix: '', agent_override: '', llm_api_key: '', llm_model: 'openai/gpt-4.1-mini', xarlote_enabled: true,
+    sara_suffix: '', agent_override: '', llm_api_key: '',
+    llm_model: 'openai/gpt-4.1-mini', vision_model: 'openai/gpt-4.1-mini', audio_model: 'openai/whisper-1',
+    xarlote_enabled: true,
   });
   const [original, setOriginal] = useState<PromptsConfig>({
-    sara_suffix: '', agent_override: '', llm_api_key: '', llm_model: 'openai/gpt-4.1-mini', xarlote_enabled: true,
+    sara_suffix: '', agent_override: '', llm_api_key: '',
+    llm_model: 'openai/gpt-4.1-mini', vision_model: 'openai/gpt-4.1-mini', audio_model: 'openai/whisper-1',
+    xarlote_enabled: true,
   });
   const [status, setStatus] = useState<Status>('idle');
   const [errorMsg, setErrorMsg] = useState('');
@@ -79,6 +107,8 @@ export default function PromptsPage() {
     config.agent_override !== original.agent_override ||
     config.llm_api_key !== original.llm_api_key ||
     effectiveModel !== original.llm_model ||
+    config.vision_model !== original.vision_model ||
+    config.audio_model !== original.audio_model ||
     config.xarlote_enabled !== original.xarlote_enabled;
 
   // Toggle do interruptor mestre — salva imediato, sem precisar do botão "Salvar".
@@ -114,7 +144,12 @@ export default function PromptsPage() {
     setStatus('saving');
     setErrorMsg('');
     try {
-      const payload = { ...config, llm_model: effectiveModel };
+      const payload = {
+        ...config,
+        llm_model: effectiveModel,
+        vision_model: config.vision_model,
+        audio_model: config.audio_model,
+      };
       const res = await fetch(`${API}/admin/prompts`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -287,6 +322,90 @@ export default function PromptsPage() {
                 <a href="https://openrouter.ai/models" target="_blank" rel="noreferrer" className="text-brand-400 hover:underline">
                   openrouter.ai/models
                 </a>
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Multimodal — vision + audio */}
+        <div className="bg-wa-panel border border-wa-border rounded-xl p-5">
+          <div className="flex items-center gap-2 mb-1">
+            <ImageIcon size={18} className="text-cyan-400" />
+            <h2 className="text-base font-medium text-white">Multimodal — visão e áudio</h2>
+          </div>
+          <p className="text-xs text-gray-400 mb-4">
+            A Xarlote enxerga fotos (receita, embalagem, exame) e ouve áudios (transcreve antes de processar).
+            Aqui você troca o modelo usado em cada caso. Imagem entra na conversa; áudio é transcrito separadamente.
+          </p>
+
+          <div className="grid gap-4 md:grid-cols-2">
+            {/* Vision model */}
+            <div>
+              <label className="flex items-center gap-1.5 text-xs font-medium text-gray-300 mb-1.5">
+                <ImageIcon size={12} />
+                Modelo de visão (imagem)
+              </label>
+              <select
+                className="w-full bg-wa-bg border border-wa-border rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-brand-500"
+                value={
+                  VISION_MODELS.find((m) => m.value === config.vision_model)
+                    ? config.vision_model
+                    : '__custom_vision__'
+                }
+                onChange={(e) => {
+                  if (e.target.value === '__custom_vision__') return;
+                  setConfig((c) => ({ ...c, vision_model: e.target.value }));
+                }}
+              >
+                {VISION_MODELS.map((m) => (
+                  <option key={m.value} value={m.value}>{m.label}</option>
+                ))}
+                <option value="__custom_vision__">Outro (digitar manualmente)…</option>
+              </select>
+              <input
+                type="text"
+                className="mt-2 w-full bg-wa-bg border border-wa-border rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-brand-500 font-mono"
+                placeholder="ex: openai/gpt-4o, anthropic/claude-3-5-sonnet…"
+                value={config.vision_model}
+                onChange={(e) => setConfig((c) => ({ ...c, vision_model: e.target.value }))}
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Precisa ser <strong className="text-gray-300">vision-capable</strong>. Se a Xarlote responder &quot;não consigo ver imagem&quot;, troque pra outro.
+              </p>
+            </div>
+
+            {/* Audio model */}
+            <div>
+              <label className="flex items-center gap-1.5 text-xs font-medium text-gray-300 mb-1.5">
+                <Mic size={12} />
+                Modelo de áudio (transcrição)
+              </label>
+              <select
+                className="w-full bg-wa-bg border border-wa-border rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-brand-500"
+                value={
+                  AUDIO_MODELS.find((m) => m.value === config.audio_model)
+                    ? config.audio_model
+                    : '__custom_audio__'
+                }
+                onChange={(e) => {
+                  if (e.target.value === '__custom_audio__') return;
+                  setConfig((c) => ({ ...c, audio_model: e.target.value }));
+                }}
+              >
+                {AUDIO_MODELS.map((m) => (
+                  <option key={m.value} value={m.value}>{m.label}</option>
+                ))}
+                <option value="__custom_audio__">Outro (digitar manualmente)…</option>
+              </select>
+              <input
+                type="text"
+                className="mt-2 w-full bg-wa-bg border border-wa-border rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:border-brand-500 font-mono"
+                placeholder="ex: openai/whisper-1, gemini/gemini-2.0-flash…"
+                value={config.audio_model}
+                onChange={(e) => setConfig((c) => ({ ...c, audio_model: e.target.value }))}
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Prefixo <code className="text-gray-300">openai/</code> = OpenRouter. <code className="text-gray-300">gemini/</code> = Google direto (precisa <code>GOOGLE_GENAI_API_KEY</code>).
               </p>
             </div>
           </div>

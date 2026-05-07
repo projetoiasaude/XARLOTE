@@ -7,7 +7,18 @@ export interface PromptsConfig {
   sara_suffix: string;
   agent_override: string;
   llm_api_key: string;       // OpenRouter API key (sobrescreve OPENROUTER_API_KEY)
-  llm_model: string;         // Ex: "openai/gpt-4.1-mini"
+  llm_model: string;         // Ex: "openai/gpt-4.1-mini" — modelo conversacional principal
+  /**
+   * Modelo usado pra entender IMAGEM (multimodal vision). Precisa ser vision-capable.
+   * Default: openai/gpt-4.1-mini.
+   */
+  vision_model: string;
+  /**
+   * Modelo usado pra TRANSCREVER ÁUDIO. Aceita tanto modelos OpenRouter
+   * (`openai/whisper-1`) quanto Gemini direto (`gemini/gemini-2.0-flash`).
+   * Default: openai/whisper-1.
+   */
+  audio_model: string;
   /**
    * Interruptor mestre da Xarlote. Quando false, o webhook do uazapi descarta
    * mensagens recebidas do usuário sem chamar a IA (a Xarlote fica "desligada"
@@ -21,6 +32,8 @@ const defaults: PromptsConfig = {
   agent_override: '',
   llm_api_key: '',
   llm_model: 'openai/gpt-4.1-mini',
+  vision_model: 'openai/gpt-4.1-mini',
+  audio_model: 'openai/whisper-1',
   xarlote_enabled: true,
 };
 

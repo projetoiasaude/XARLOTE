@@ -2,9 +2,37 @@
 // Base URL: https://openrouter.ai/api/v1
 // Models: https://openrouter.ai/models
 
+/**
+ * Conteúdo multimodal — protocolo OpenAI Chat Completions.
+ * `text` é texto puro; `image_url` é uma imagem (data URL ou http URL).
+ * Modelos vision-capable (gpt-4.1-mini, gpt-4o, etc) entendem nativamente.
+ */
+export type ChatContent =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } };
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: string | ChatContent[];
+}
+
+/**
+ * Helper pra montar `content` de uma mensagem do usuário com texto + imagem(ns).
+ * Use base64 (`data:${mime};base64,${b64}`) ou URL pública.
+ */
+export function userContentWithImage(text: string, imageDataUrls: string[]): ChatContent[] {
+  const parts: ChatContent[] = [];
+  if (text) parts.push({ type: 'text', text });
+  for (const url of imageDataUrls) {
+    parts.push({ type: 'image_url', image_url: { url } });
+  }
+  return parts;
+}
+
+export function dataUrl(base64: string, mime = 'image/jpeg'): string {
+  // Aceita base64 cru ou já com prefix
+  if (base64.startsWith('data:')) return base64;
+  return `data:${mime};base64,${base64}`;
 }
 
 export interface ToolDefinition {
@@ -138,7 +166,10 @@ async function callOpenRouter(
   };
 }
 
-export async function chat(userMessage: string, opts: ChatOptions = {}): Promise<ChatResponse> {
+export async function chat(
+  userMessage: string | ChatContent[],
+  opts: ChatOptions = {}
+): Promise<ChatResponse> {
   const modelName = opts.model ?? process.env['OPENROUTER_MODEL'] ?? DEFAULT_MODEL;
   const apiKey = getApiKey(opts.apiKey);
   const temperature = opts.temperature ?? 0.4;
@@ -212,9 +243,12 @@ export async function extractStructured<T>(
   const messages: ChatMessage[] = [];
 
   if (imageBase64) {
-    // Vision: include image as base64
-    const visionMsg = `${prompt}\n\n[Imagem em base64: data:${imageMime};base64,${imageBase64}]`;
-    messages.push({ role: 'user', content: visionMsg });
+    // Multimodal vision: passa a imagem pelo canal `image_url` do protocolo OpenAI
+    // (em vez de embutir base64 em string como antes — workaround ineficiente).
+    messages.push({
+      role: 'user',
+      content: userContentWithImage(prompt, [dataUrl(imageBase64, imageMime)]),
+    });
   } else {
     messages.push({ role: 'user', content: prompt });
   }

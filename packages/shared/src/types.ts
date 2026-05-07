@@ -167,10 +167,36 @@ export interface Reminder {
   created_at: string;
 }
 
+export type MemoryKind = 'fact' | 'episode' | 'preference' | 'affect';
+
 export interface MemoryCard {
-  created_at: string;
+  /** uuid (cliente gera, indexada também em memory_cards_index pra retrieval) */
+  id?: string;
+  kind?: MemoryKind;
   text: string;
   tags: string[];
+  confidence?: number;
+  source?: 'self_reported' | 'inferred';
+  /** ISO timestamp — base do decay temporal */
+  last_seen_at?: string;
+  created_at: string;
+}
+
+/** Linha da tabela memory_cards_index (espelho com embedding pra kNN) */
+export interface MemoryCardIndexed {
+  id: string;
+  user_id: string;
+  conversation_id: string | null;
+  kind: MemoryKind;
+  text: string;
+  tags: string[];
+  confidence: number;
+  source: 'self_reported' | 'inferred';
+  last_seen_at: string;
+  created_at: string;
+  /** retornado por match_user_memory; ausente em selects normais */
+  similarity?: number;
+  decayed_score?: number;
 }
 
 export interface SystemLog {

@@ -1,13 +1,20 @@
 import { randomUUID } from 'crypto';
-import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog } from '@iasaude/db';
+import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory } from '@iasaude/db';
 import { isForgetMeRequest, buildConsentEvent } from '@iasaude/core';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE } from '@iasaude/shared';
-import type { NormalizedInbound } from '@iasaude/shared';
-import { chat, buildSaraSystemPrompt, saraTools, messagesToHistory, trimHistory } from '@iasaude/llm';
-import { sendMenu, isSimulatorMode } from '@iasaude/whatsapp';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES } from '@iasaude/shared';
+import type { NormalizedInbound, ProfileEnricherJob, MemoryCard } from '@iasaude/shared';
+import { chat, buildSaraSystemPrompt, saraTools, messagesToHistory, trimHistory, embed, userContentWithImage, dataUrl, type ChatContent } from '@iasaude/llm';
+import { sendMenu, isSimulatorMode, downloadMedia } from '@iasaude/whatsapp';
+import { transcribeAudio } from '@iasaude/integrations';
+import { Queue } from 'bullmq';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutbound } from './outbound.js';
 import { handleToolCall } from './tool-executor.js';
+
+// Queue pra disparar enricher async — instância única por processo
+const enricherQueue = new Queue(QUEUE_NAMES.PROFILE_ENRICHER, {
+  connection: { url: process.env['REDIS_URL'] ?? 'redis://localhost:6379' },
+});
 
 export async function processInboundUser(
   inbound: NormalizedInbound
@@ -185,9 +192,30 @@ export async function processInboundUser(
 
   const activeOrderSummary = activeOrder?.summary ?? null;
 
-  const memoryCards = Array.isArray(conversation.memory_cards) ? conversation.memory_cards : [];
-
   const promptsConfig = loadPrompts();
+
+  // Memória semântica: top-K cards relevantes ao input atual (decay temporal aplicado).
+  // Embedda só se houver texto pra consultar; senão usa fallback last_seen_at.
+  let queryEmbedding: number[] | null = null;
+  if (inbound.text && inbound.text.length > 0 && (promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'])) {
+    try {
+      queryEmbedding = await embed(inbound.text.slice(0, 1000), {
+        apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
+        timeoutMs: 6_000,
+      });
+    } catch (err) {
+      // embedding não-bloqueante; fallback de retrieval cobre
+      await writeLog('warn', 'memory', `embed query falhou: ${String(err).slice(0, 120)}`, { traceId });
+    }
+  }
+  const relevantCards = await retrieveRelevantCards(user.id, conversation.id, queryEmbedding, 8);
+  const memoryCards: MemoryCard[] = relevantCards.length
+    ? relevantCards.map((c) => ({
+        id: c.id, kind: c.kind, text: c.text, tags: c.tags,
+        confidence: c.confidence, source: c.source,
+        last_seen_at: c.last_seen_at, created_at: c.created_at,
+      }))
+    : (Array.isArray(conversation.memory_cards) ? conversation.memory_cards : []);
 
   let systemPrompt = buildSaraSystemPrompt({
     user,
@@ -204,20 +232,82 @@ export async function processInboundUser(
     systemPrompt += `\n\n## INSTRUÇÕES ADICIONAIS (configuradas no dashboard)\n${promptsConfig.sara_suffix.trim()}`;
   }
 
-  // 9. Build user message string for Gemini
-  let userMsgContent = inbound.text ?? '';
+  // 9. Build user message — texto, áudio (transcrito), imagem (multimodal vision), localização.
+  // userMsgContent vira `string | ChatContent[]`. Default texto puro; vira array quando há imagem.
+  let userMsgContent: string | ChatContent[] = inbound.text ?? '';
+  let userMsgPreview = '';
+
   if (inbound.contentType === 'location' && inbound.location) {
     userMsgContent = `[Localização compartilhada: lat ${inbound.location.lat}, lng ${inbound.location.lng}${inbound.location.name ? `, ${inbound.location.name}` : ''}]`;
-  } else if (inbound.contentType === 'image') {
-    userMsgContent = `[Imagem recebida${inbound.text ? `: ${inbound.text}` : ''}] (message_id: ${inboundMsg.id})`;
+    userMsgPreview = userMsgContent;
   } else if (inbound.contentType === 'audio') {
-    userMsgContent = `[Áudio recebido — duração: ${Math.round((inbound.mediaDurationMs ?? 0) / 1000)}s]`;
+    // Baixa o áudio do uazapi e transcreve antes da Sara ver.
+    let transcript = '';
+    try {
+      const buffer = await downloadMedia(inbound.instance, inbound.externalId);
+      if (buffer) {
+        const audioModel = promptsConfig.audio_model || 'openai/whisper-1';
+        const result = await transcribeAudio(buffer, inbound.mediaMime ?? 'audio/ogg', {
+          model: audioModel,
+          openRouterKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
+          geminiKey: process.env['GOOGLE_GENAI_API_KEY'],
+          timeoutMs: 30_000,
+        });
+        transcript = result.text;
+        await writeLog('info', 'transcription', `Áudio transcrito (${result.provider}/${result.model}, ${transcript.length} chars)`, {
+          traceId, provider: result.provider, model: result.model, audioMime: inbound.mediaMime,
+        });
+        // Persiste a transcrição na mensagem original pra auditoria + enricher
+        if (transcript) {
+          await db.from('messages').update({ transcript }).eq('id', inboundMsg.id);
+        }
+      }
+    } catch (err) {
+      await writeLog('warn', 'transcription', `Falha ao transcrever áudio: ${String(err).slice(0, 200)}`, { traceId });
+    }
+    userMsgContent = transcript
+      ? `[Áudio transcrito] ${transcript}`
+      : `[Áudio recebido mas não consegui transcrever — duração: ${Math.round((inbound.mediaDurationMs ?? 0) / 1000)}s. Peça pra digitar.]`;
+    userMsgPreview = userMsgContent;
+  } else if (inbound.contentType === 'image') {
+    // Baixa a imagem e passa pelo canal multimodal da OpenAI (image_url data URL).
+    const caption = inbound.text ?? '';
+    let dataUrlValue: string | null = null;
+    try {
+      // Se o webhook já tinha base64 (caso simulador), reutiliza
+      if (inbound.mediaBase64) {
+        dataUrlValue = dataUrl(inbound.mediaBase64, inbound.mediaMime ?? 'image/jpeg');
+      } else {
+        const buffer = await downloadMedia(inbound.instance, inbound.externalId);
+        if (buffer) {
+          dataUrlValue = dataUrl(buffer.toString('base64'), inbound.mediaMime ?? 'image/jpeg');
+        }
+      }
+    } catch (err) {
+      await writeLog('warn', 'vision', `Falha ao baixar imagem: ${String(err).slice(0, 200)}`, { traceId });
+    }
+
+    if (dataUrlValue) {
+      const promptText = caption
+        ? `[O usuário enviou uma imagem com a legenda: "${caption}". Olhe a imagem e responda naturalmente.]`
+        : `[O usuário enviou uma imagem. Olhe e responda naturalmente — descreva brevemente o que vê e siga a conversa.]`;
+      userMsgContent = userContentWithImage(promptText, [dataUrlValue]);
+      userMsgPreview = `[imagem${caption ? ` + "${caption.slice(0, 40)}"` : ''}]`;
+    } else {
+      userMsgContent = `[Recebi uma imagem mas não consegui carregar. Peça pra mandar de novo.]${caption ? ` Legenda: ${caption}` : ''}`;
+      userMsgPreview = userMsgContent;
+    }
+  } else {
+    userMsgPreview = typeof userMsgContent === 'string' ? userMsgContent : '[multimodal]';
   }
 
-  // 10. Call LLM (Sara)
-  const model = promptsConfig.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini';
-  await writeLog('info', 'llm', `Xarlote → LLM [${model}] — msg: "${userMsgContent.slice(0, 80)}${userMsgContent.length > 80 ? '…' : ''}"`, {
-    traceId, model, historyLen: geminiHistory.length,
+  // 10. Call LLM (Sara) — usa vision_model quando a mensagem é multimodal (imagem)
+  const isMultimodal = Array.isArray(userMsgContent);
+  const model = isMultimodal
+    ? (promptsConfig.vision_model || promptsConfig.llm_model || 'openai/gpt-4.1-mini')
+    : (promptsConfig.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini');
+  await writeLog('info', 'llm', `Xarlote → LLM [${model}${isMultimodal ? ' vision' : ''}] — msg: "${userMsgPreview.slice(0, 80)}${userMsgPreview.length > 80 ? '…' : ''}"`, {
+    traceId, model, historyLen: geminiHistory.length, multimodal: isMultimodal,
   });
 
   const llmStart = Date.now();
@@ -293,6 +383,28 @@ export async function processInboundUser(
     });
   }
 
+  // 13. Dispara enricher async (não bloqueia resposta — extrai fatos das últimas 6 msgs)
+  try {
+    const recent = await db
+      .from('messages')
+      .select('id')
+      .eq('conversation_id', conversation.id)
+      .order('created_at', { ascending: false })
+      .limit(6);
+    const messageIds = (recent.data ?? []).map((m) => m.id).reverse();
+    if (messageIds.length >= 2) {
+      const job: ProfileEnricherJob = { conversationId: conversation.id, messageIds, traceId };
+      await enricherQueue.add('enrich', job, {
+        removeOnComplete: { age: 3600, count: 100 },
+        removeOnFail: { age: 86400, count: 50 },
+        attempts: 2,
+        backoff: { type: 'fixed', delay: 10_000 },
+      });
+    }
+  } catch (err) {
+    await writeLog('warn', 'enrichment', `Falha ao enfileirar enricher: ${String(err).slice(0, 120)}`, { traceId });
+  }
+
   return { traceId, conversationId: conversation.id };
 }
 
@@ -323,6 +435,7 @@ async function handleForgetMe(userId: string, conversationId: string, phoneE164:
   await db.from('user_allergies').delete().eq('user_id', userId);
   await db.from('user_medications').delete().eq('user_id', userId);
   await db.from('user_addresses').delete().eq('user_id', userId);
+  await deleteUserMemory(userId);
   await db.from('users').update({ phone_e164: `deleted-${userId}`, full_name: null, preferred_name: null, deleted_at: new Date().toISOString() }).eq('id', userId);
 
   const goodbye = 'Pronto, apaguei tudo. Se mudar de ideia, é só me chamar de novo.';

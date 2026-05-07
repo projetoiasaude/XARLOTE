@@ -20,7 +20,8 @@
     "fastify": "^4.28.0",
     "zod": "^3.23.8",
     "dotenv": "^16.4.5",
-    "pino": "^9.4.0"
+    "pino": "^9.4.0",
+    "bullmq": "^5.13.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
