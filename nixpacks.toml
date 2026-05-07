@@ -2,7 +2,9 @@
 cmds = ["pnpm install --no-frozen-lockfile"]
 
 [phases.build]
-cmds = []
+cmds = ["pnpm -r build"]
 
 [start]
-cmd = "pnpm --filter @iasaude/api start"
+# API + Worker rodam no mesmo container Railway via concurrently.
+# Worker tem profile-enricher (extrai memória), reminder-dispatcher e conversation-compactor.
+cmd = "pnpm start:prod"

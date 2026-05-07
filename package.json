@@ -8,7 +8,8 @@
     "build": "pnpm -r build",
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
-    "dev": "concurrently \"pnpm dev:api\" \"pnpm dev:worker\" \"pnpm dev:web\""
+    "dev": "concurrently \"pnpm dev:api\" \"pnpm dev:worker\" \"pnpm dev:web\"",
+    "start:prod": "concurrently --kill-others-on-fail --names api,worker --prefix-colors blue,green \"pnpm --filter @iasaude/api start\" \"pnpm --filter @iasaude/worker start\""
   },
   "devDependencies": {
     "typescript": "^5.4.0",
