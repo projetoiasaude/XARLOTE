@@ -242,28 +242,35 @@ export async function processInboundUser(
     userMsgPreview = userMsgContent;
   } else if (inbound.contentType === 'audio') {
     // Baixa o áudio do uazapi e transcreve antes da Sara ver.
+    // uazapi exige o `id` LONGO (com prefixo de número), não o messageid curto.
+    const longId =
+      (inbound.raw as { message?: { id?: string } } | null)?.message?.id ?? inbound.externalId;
     let transcript = '';
+    let downloadedMime = inbound.mediaMime ?? 'audio/ogg';
     try {
-      const buffer = await downloadMedia(inbound.instance, inbound.externalId);
-      if (buffer) {
+      const media = await downloadMedia(inbound.instance, longId);
+      if (media) {
+        downloadedMime = media.mime || downloadedMime;
+        await writeLog('info', 'transcription', `Áudio baixado (${media.buffer.length} bytes, ${downloadedMime})`, { traceId });
         const audioModel = promptsConfig.audio_model || 'openai/whisper-1';
-        const result = await transcribeAudio(buffer, inbound.mediaMime ?? 'audio/ogg', {
+        const result = await transcribeAudio(media.buffer, downloadedMime, {
           model: audioModel,
           openRouterKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
           geminiKey: process.env['GOOGLE_GENAI_API_KEY'],
           timeoutMs: 30_000,
         });
         transcript = result.text;
-        await writeLog('info', 'transcription', `Áudio transcrito (${result.provider}/${result.model}, ${transcript.length} chars)`, {
-          traceId, provider: result.provider, model: result.model, audioMime: inbound.mediaMime,
+        await writeLog('info', 'transcription', `Áudio transcrito (${result.provider}/${result.model}, ${transcript.length} chars): "${transcript.slice(0, 80)}"`, {
+          traceId, provider: result.provider, model: result.model, audioMime: downloadedMime,
         });
-        // Persiste a transcrição na mensagem original pra auditoria + enricher
         if (transcript) {
           await db.from('messages').update({ transcript }).eq('id', inboundMsg.id);
         }
+      } else {
+        await writeLog('warn', 'transcription', `downloadMedia retornou null pro áudio (id=${longId})`, { traceId, longId });
       }
     } catch (err) {
-      await writeLog('warn', 'transcription', `Falha ao transcrever áudio: ${String(err).slice(0, 200)}`, { traceId });
+      await writeLog('error', 'transcription', `Erro transcrever áudio: ${String(err).slice(0, 240)}`, { traceId, longId });
     }
     userMsgContent = transcript
       ? `[Áudio transcrito] ${transcript}`
@@ -272,19 +279,23 @@ export async function processInboundUser(
   } else if (inbound.contentType === 'image') {
     // Baixa a imagem e passa pelo canal multimodal da OpenAI (image_url data URL).
     const caption = inbound.text ?? '';
+    const longId =
+      (inbound.raw as { message?: { id?: string } } | null)?.message?.id ?? inbound.externalId;
     let dataUrlValue: string | null = null;
     try {
-      // Se o webhook já tinha base64 (caso simulador), reutiliza
       if (inbound.mediaBase64) {
         dataUrlValue = dataUrl(inbound.mediaBase64, inbound.mediaMime ?? 'image/jpeg');
       } else {
-        const buffer = await downloadMedia(inbound.instance, inbound.externalId);
-        if (buffer) {
-          dataUrlValue = dataUrl(buffer.toString('base64'), inbound.mediaMime ?? 'image/jpeg');
+        const media = await downloadMedia(inbound.instance, longId);
+        if (media) {
+          await writeLog('info', 'vision', `Imagem baixada (${media.buffer.length} bytes, ${media.mime})`, { traceId });
+          dataUrlValue = dataUrl(media.buffer.toString('base64'), media.mime || 'image/jpeg');
+        } else {
+          await writeLog('warn', 'vision', `downloadMedia retornou null pra imagem (id=${longId})`, { traceId, longId });
         }
       }
     } catch (err) {
-      await writeLog('warn', 'vision', `Falha ao baixar imagem: ${String(err).slice(0, 200)}`, { traceId });
+      await writeLog('error', 'vision', `Erro baixar imagem: ${String(err).slice(0, 240)}`, { traceId, longId });
     }
 
     if (dataUrlValue) {

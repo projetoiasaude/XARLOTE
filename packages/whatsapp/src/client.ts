@@ -98,12 +98,43 @@ export async function getInstanceStatus(instance: string): Promise<{ connected: 
   }
 }
 
-export async function downloadMedia(instance: string, messageId: string): Promise<Buffer | null> {
+/**
+ * Baixa o conteúdo binário de uma mídia (áudio/imagem/doc) via uazapi.
+ *
+ * IMPORTANTE: o `messageId` aqui precisa ser o **id longo** do payload
+ * (ex.: `556298345024:3A6A22A40561634EC12A`), NÃO o `messageid` curto.
+ * Internamente uazapi devolve `{fileURL, mimetype}` apontando pro CDN dela
+ * (ex.: `https://criate.uazapi.com/files/<sha>.jpg`) — fazemos um segundo
+ * GET pra puxar o buffer.
+ *
+ * Retorna `null` em qualquer falha (caller decide o fallback de UX).
+ */
+export async function downloadMedia(
+  instance: string,
+  messageId: string
+): Promise<{ buffer: Buffer; mime: string } | null> {
   const cfg = buildConfig(instance);
   try {
-    const result = await apiCall(cfg, 'POST', '/message/download', { messageid: messageId });
-    if (!result?.base64) return null;
-    return Buffer.from(result.base64, 'base64');
+    const result = await apiCall(cfg, 'POST', '/message/download', { id: messageId });
+    // Caminho atual da uazapi: { fileURL, mimetype }
+    if (result?.fileURL) {
+      const fileRes = await axios.get<ArrayBuffer>(result.fileURL, {
+        responseType: 'arraybuffer',
+        timeout: 30_000,
+      });
+      return {
+        buffer: Buffer.from(fileRes.data),
+        mime: result.mimetype || 'application/octet-stream',
+      };
+    }
+    // Fallback legado: caso a API volte a entregar base64
+    if (result?.base64) {
+      return {
+        buffer: Buffer.from(result.base64, 'base64'),
+        mime: result.mimetype || 'application/octet-stream',
+      };
+    }
+    return null;
   } catch {
     return null;
   }
