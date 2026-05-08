@@ -33,7 +33,7 @@ const defaults: PromptsConfig = {
   llm_api_key: '',
   llm_model: 'openai/gpt-4.1-mini',
   vision_model: 'openai/gpt-4.1-mini',
-  audio_model: 'openai/whisper-1',
+  audio_model: 'openai/gpt-4o-audio-preview',
   xarlote_enabled: true,
 };
 

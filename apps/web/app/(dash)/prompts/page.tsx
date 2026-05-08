@@ -29,12 +29,14 @@ const VISION_MODELS = [
   { value: 'google/gemini-2.5-flash-preview', label: 'Gemini 2.5 Flash Preview' },
 ];
 
-// Modelos de transcrição de áudio. `openai/*` via OpenRouter (multipart);
-// `gemini/*` via API direta do Google (inlineData).
+// Modelos de transcrição de áudio.
+//   `openai/gpt-4o-audio-preview` → OpenRouter chat-with-audio (recomendado, usa key OpenRouter)
+//   `whisper/whisper-1`           → OpenAI direta (precisa OPENAI_API_KEY separada)
+//   `gemini/...`                  → Google direta (precisa GOOGLE_GENAI_API_KEY)
 const AUDIO_MODELS = [
-  { value: 'openai/whisper-1', label: 'Whisper-1 (OpenRouter) — padrão, robusto' },
-  { value: 'openai/whisper-large-v3', label: 'Whisper Large v3 (OpenRouter)' },
-  { value: 'gemini/gemini-2.0-flash', label: 'Gemini 2.0 Flash (Google direto) — barato, PT-BR' },
+  { value: 'openai/gpt-4o-audio-preview', label: 'GPT-4o Audio (OpenRouter) — recomendado, usa key OpenRouter' },
+  { value: 'whisper/whisper-1', label: 'Whisper-1 (OpenAI direta) — precisa OPENAI_API_KEY' },
+  { value: 'gemini/gemini-2.0-flash', label: 'Gemini 2.0 Flash (Google direto) — precisa GOOGLE_GENAI_API_KEY' },
   { value: 'gemini/gemini-2.5-flash', label: 'Gemini 2.5 Flash (Google direto)' },
 ];
 
@@ -59,12 +61,12 @@ type Status = 'idle' | 'saving' | 'saved' | 'error';
 export default function PromptsPage() {
   const [config, setConfig] = useState<PromptsConfig>({
     sara_suffix: '', agent_override: '', llm_api_key: '',
-    llm_model: 'openai/gpt-4.1-mini', vision_model: 'openai/gpt-4.1-mini', audio_model: 'openai/whisper-1',
+    llm_model: 'openai/gpt-4.1-mini', vision_model: 'openai/gpt-4.1-mini', audio_model: 'openai/gpt-4o-audio-preview',
     xarlote_enabled: true,
   });
   const [original, setOriginal] = useState<PromptsConfig>({
     sara_suffix: '', agent_override: '', llm_api_key: '',
-    llm_model: 'openai/gpt-4.1-mini', vision_model: 'openai/gpt-4.1-mini', audio_model: 'openai/whisper-1',
+    llm_model: 'openai/gpt-4.1-mini', vision_model: 'openai/gpt-4.1-mini', audio_model: 'openai/gpt-4o-audio-preview',
     xarlote_enabled: true,
   });
   const [status, setStatus] = useState<Status>('idle');
