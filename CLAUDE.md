@@ -24,15 +24,30 @@ Node 20 · TS 5 · Fastify 4 · BullMQ 5 · Redis 7 · **OpenRouter** (modelo pa
 
 ## LLM — notas importantes
 - **Provider**: OpenRouter (`https://openrouter.ai/api/v1`) — API OpenAI-compatible.
-- **API key e modelo** são lidos de `apps/api/data/prompts.json` (runtime, sem reiniciar) ou do `.env` como fallback.
-- **`packages/llm/src/client.ts`**: usa `fetch` nativo (sem SDK). Formato de messages: `{role, content}`. Tools: `{type:'function', function:{name, description, parameters}}`.
+- **API key e modelos** (chat, vision, audio) são lidos de `apps/api/data/prompts.json` (runtime, sem reiniciar) ou do `.env` como fallback.
+- **`packages/llm/src/client.ts`**: usa `fetch` nativo (sem SDK). Formato de messages: `{role, content}`. `content` aceita `string | ChatContent[]` (multimodal). Tools: `{type:'function', function:{name, description, parameters}}`.
+- **Imagem**: passe via `userContentWithImage(text, [dataUrl])` — protocolo `image_url` do OpenAI. NÃO embuta base64 em string.
+- **Áudio**: NÃO existe `/audio/transcriptions` no OpenRouter. Use `gpt-4o-audio-preview` via `/chat/completions` com `input_audio` na content array (`packages/integrations/src/transcription.ts → transcribeWithChatAudio`). Whisper só funciona via OpenAI direta (`OPENAI_API_KEY` separada).
+- **Embeddings**: `openai/text-embedding-3-small` (1536-d) via `packages/llm/src/embeddings.ts` — usado pelo enricher e pelo retrieval.
 - **Histórico** (`trim-history.ts`): role `'user'` para msgs in, role `'assistant'` para msgs out (era `'model'` no Gemini).
-- Google Gemini API key ainda existe em `.env` como fallback/OCR — mas **não** é mais o LLM principal.
+- Google Gemini API key ainda existe em `.env` como fallback opcional pra áudio/visão (`gemini/...` em audio_model).
+
+## Memória persistente — princípios
+- **Fonte canônica** dos memory cards: `conversations.memory_cards` JSONB (LGPD/portabilidade).
+- **Espelho indexado**: `memory_cards_index` com embedding `vector(1536)`, função SQL `match_user_memory(user_id, query_emb, k, min_sim)`. Decay temporal: `fact`/`affect` nunca decai; `episode` 90d half-life; `preference` 180d.
+- **Profile enricher** (`apps/api/src/workers/profile-enricher.worker.ts`) é a ÚNICA via que escreve memória. Roda async post-turn via queue `PROFILE_ENRICHER`. Confidence ≥ 0.7. Marca `source='inferred'` (vs `'self_reported'` quando o user dita explicitamente).
+- **Sara**: usa cards recuperados (top-K) no system prompt, agrupados por kind. Quando memória influencia ação, fala em voz alta (*"Lembrei que você é alérgico a dipirona…"*). Se confidence baixa, pergunta antes de assumir.
+- **Forget-me**: cascata via FK `on delete cascade` no `memory_cards_index` + `deleteUserMemory()` chamada no fluxo CONFIRMO APAGAR.
+
+## Mídia (uazapi)
+- **Download**: use o `id` LONGO da mensagem (`556298345024:3A...`), não o `messageid` curto. Endpoint POST `/message/download` com `{id}` retorna `{fileURL, mimetype}` — fazer GET na fileURL pra puxar buffer.
+- **buildConfig** em `packages/whatsapp/src/client.ts` resolve token via constante (`SARA_INSTANCE` = "sara"), NÃO via nome real da instância webhook (`VEDACIL-HIAGO`). Sempre passar `SARA_INSTANCE` em `downloadMedia()`.
 
 ## Dashboard — rotas
 - `http://localhost:3002/simulator` — simulador WhatsApp
 - `http://localhost:3002/conversations` — conversas em tempo real
-- `http://localhost:3002/prompts` — configurar API key, modelo, prompts dos agentes
+- `http://localhost:3002/prompts` — interruptor on/off + API key + modelo chat + modelo visão + modelo áudio + prompts dos agentes
+- `http://localhost:3002/users` + `/users/[id]` — perfil 360 com memória agrupada por kind, lembretes, badges de origem
 - `http://localhost:3002/logs` — logs do sistema
 
 ## Persona Sara (resumo do tom)

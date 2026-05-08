@@ -13,7 +13,7 @@
 
 ---
 
-## 2. Estado atual — 2026-04-29
+## 2. Estado atual — 2026-05-08
 
 | Item | Status |
 |---|---|
@@ -28,10 +28,20 @@
 | Localização por endereço texto | ✅ Nominatim + ViaCEP fallback |
 | Google Places (busca farmácias) | ✅ Legacy Nearby Search — 5 farmácias reais por raio (3/5/8 km) |
 | Consolidação de cotações | ✅ 3min/5min com modo eager |
-| **Chat manual de farmácia no dashboard** | ✅ **NOVO** — botão "Responder como farmácia" em cada quote do `/orders/[id]` (drawer com realtime + composer) |
+| **Chat manual de farmácia no dashboard** | ✅ botão "Responder como farmácia" em cada quote do `/orders/[id]` (drawer com realtime + composer) |
 | Dashboard local | ✅ porta **3002** · aponta `NEXT_PUBLIC_API_URL` pra produção (Railway) |
 | Dashboard — anon key Supabase | ✅ Corrigida (estava com `iat:1755…` em vez de `1775…`) + RLS policies `anon_read_*` aplicadas |
 | API Railway | ✅ `https://ia-da-saude-api-production.up.railway.app` · health 200 |
+| **Memória persistente evolutiva** (estilo Hermes) | ✅ pgvector + `memory_cards_index` + 4 kinds (fact/episode/preference/affect) + decay temporal por tipo + retrieval semântico top-K=8 antes de cada turn |
+| **Profile Enricher worker** | ✅ async post-turn, extrai fatos confidence ≥ 0.7, popula `user_*` + `memory_cards_index` (com embedding `text-embedding-3-small`) |
+| **Conversation Compactor** | ✅ cron 1h condensa conversas >50 msgs em memory cards `episode` |
+| **Áudio nativo (transcrição)** | ✅ `gpt-4o-audio-preview` via OpenRouter chat-with-audio (input_audio na content array) — OpenRouter NÃO expõe Whisper, gpt-4o-audio é o caminho |
+| **Imagem nativa (multimodal vision)** | ✅ canal real `image_url` do protocolo OpenAI (não mais base64-em-string) — Sara enxerga foto de receita / embalagem / exame / qualquer coisa direto |
+| **Interruptor mestre Xarlote (on/off)** | ✅ toggle no `/prompts` — quando off, webhook descarta msgs sem chamar LLM |
+| **Controles de modelo no dashboard** | ✅ `/prompts` com dropdowns: LLM principal, modelo de visão, modelo de áudio, persistidos em `apps/api/data/prompts.json` |
+| **Página Perfil 360** | ✅ `/users/[id]` com memória agrupada por kind, badges de origem (`auto`/`usuário`), confidence bars, lembretes ativos |
+| **Reverse geocode (botão 📍)** | ✅ Nominatim primário (rua + setor + CEP) + Google fallback (a key do Google Maps tem só Places liberado, Geocoding nega) |
+| **API + Worker no mesmo processo** | ✅ healthcheck Railway exigia 1 processo único — workers (reminder-dispatcher, profile-enricher, compactor) movidos pra `apps/api/src/workers/` |
 
 **uazapi instância Sara**: `WHATSAPP_MODE=uazapi`, `UAZAPI_SERVER_URL=https://criate.uazapi.com`, `UAZAPI_SARA_TOKEN` configurado. Nome da instância lido via `UAZAPI_SARA_INSTANCE` (padrão `sara`).
 
@@ -132,6 +142,7 @@ RLS ativa em tudo. Backend usa service role. Dashboard usa anon + `is_staff()`.
 
 | Data | Mudança |
 |---|---|
+| 2026-05-08 | **Memória evolutiva + áudio + imagem multimodais** (sessão 18). (1) Migration `0001_memory_pgvector.sql`: extension `vector`, tabela `memory_cards_index` (kind/confidence/source/embedding 1536-d), função SQL `match_user_memory` com decay temporal por kind (fact/affect nunca; episode 90d half-life; preference 180d), coluna `messages.transcript`. (2) **Profile enricher worker** (`apps/api/src/workers/profile-enricher.worker.ts`): consome queue `PROFILE_ENRICHER` post-turn, LLM extratora com confidence ≥ 0.7, popula `user_*` (source='inferred') e `memory_cards_index` com embeddings via OpenRouter `text-embedding-3-small`. (3) **Conversation compactor** cron 1h. (4) **Áudio**: webhook baixa via uazapi `/message/download` com `id` longo (não `messageid` curto) → segue `fileURL` → buffer; transcrição via `gpt-4o-audio-preview` no `/chat/completions` (formato `input_audio`) — OpenRouter NÃO expõe `/audio/transcriptions`, esse foi o caminho que funcionou. (5) **Imagem**: `client.ts` ChatMessage.content vira `string \| ChatContent[]`, helpers `userContentWithImage` + `dataUrl`. Sara enxerga foto direto via canal `image_url`. (6) **Sara prompt** ganha seções "ÁUDIO E IMAGEM — você ENXERGA e OUVE" + "Como usar a memória" (transparência + esquecimento elegante). (7) **Dashboard /prompts** com dropdowns vision_model + audio_model. (8) **Página /users/[id]** com memória agrupada por kind, badges `auto`/`usuário`, confidence bars, lembretes ativos. (9) **Deploy**: workers movidos pra `apps/api/src/workers/` (mesmo processo Node) — concurrently quebrava o healthcheck do Railway, mascarando deploys. (10) Bugs descobertos no caminho: (a) `downloadMedia` usava `messageid` curto e formato `{base64}` — uazapi exige `id` longo e devolve `{fileURL,mimetype}`; (b) `buildConfig` resolvia token via nome real da instância webhook (`VEDACIL-HIAGO`) em vez de `SARA_INSTANCE` ('sara'); (c) `pnpm -r build` no nixpacks tentava buildar o `apps/web` que falha sem env de Supabase em build-time — agora `pnpm --filter '!@iasaude/web' -r build`. |
 | 2026-04-19 | Plano completo criado em `docs/PLAN.md` |
 | 2026-04-20 | Código MVP completo: todos os packages + apps/api + apps/web. Schema Supabase aplicado. LLM migrado Gemini → OpenRouter. |
 | 2026-04-21 | **Fluxo farmácias funcionando end-to-end**: Google Places real (Legacy API), simulador duas abas, Agent prompt reescrito (árvore de decisão → record_quote_price funciona), consolidação automática, Xarlote retorna top-3 com preço/Pix. Geocoding por texto ainda quebrado (API GCP desabilitada). |
