@@ -243,12 +243,15 @@ export async function processInboundUser(
   } else if (inbound.contentType === 'audio') {
     // Baixa o áudio do uazapi e transcreve antes da Sara ver.
     // uazapi exige o `id` LONGO (com prefixo de número), não o messageid curto.
+    // IMPORTANTE: usa `SARA_INSTANCE` ("sara") como chave do buildConfig — o
+    // `inbound.instance` é o nome real da uazapi (ex: "VEDACIL-HIAGO") e
+    // não bate com a env var UAZAPI_SARA_TOKEN.
     const longId =
       (inbound.raw as { message?: { id?: string } } | null)?.message?.id ?? inbound.externalId;
     let transcript = '';
     let downloadedMime = inbound.mediaMime ?? 'audio/ogg';
     try {
-      const media = await downloadMedia(inbound.instance, longId);
+      const media = await downloadMedia(SARA_INSTANCE, longId);
       if (media) {
         downloadedMime = media.mime || downloadedMime;
         await writeLog('info', 'transcription', `Áudio baixado (${media.buffer.length} bytes, ${downloadedMime})`, { traceId });
@@ -286,7 +289,7 @@ export async function processInboundUser(
       if (inbound.mediaBase64) {
         dataUrlValue = dataUrl(inbound.mediaBase64, inbound.mediaMime ?? 'image/jpeg');
       } else {
-        const media = await downloadMedia(inbound.instance, longId);
+        const media = await downloadMedia(SARA_INSTANCE, longId);
         if (media) {
           await writeLog('info', 'vision', `Imagem baixada (${media.buffer.length} bytes, ${media.mime})`, { traceId });
           dataUrlValue = dataUrl(media.buffer.toString('base64'), media.mime || 'image/jpeg');
