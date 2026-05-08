@@ -2,7 +2,10 @@
 cmds = ["pnpm install --no-frozen-lockfile"]
 
 [phases.build]
-cmds = ["pnpm -r build"]
+# Builda apenas API + worker + libs compartilhadas (NÃO o apps/web — Next.js
+# precisa de envs de build-time que não estão no Railway dessa service, e
+# o web roda em outro lugar).
+cmds = ["pnpm --filter '!@iasaude/web' -r build"]
 
 [start]
 # API + Worker rodam no mesmo container Railway via concurrently.
