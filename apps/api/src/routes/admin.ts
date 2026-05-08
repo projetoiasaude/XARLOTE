@@ -61,19 +61,31 @@ export async function adminRoute(app: FastifyInstance) {
     return reply.send(data);
   });
 
-  // Get user profile 360
+  // Get user profile 360 (now: + memória semântica + lembretes ativos + adesão)
   app.get<{ Params: { id: string } }>('/users/:id', async (req, reply) => {
     const { id } = req.params;
-    const [u, cond, allg, meds, addr, ords] = await Promise.all([
+    const [u, cond, allg, meds, addr, ords, mem, rem] = await Promise.all([
       db.from('users').select('*').eq('id', id).single(),
-      db.from('user_health_conditions').select('*').eq('user_id', id).eq('active', true),
-      db.from('user_allergies').select('*').eq('user_id', id),
-      db.from('user_medications').select('*').eq('user_id', id).eq('active', true),
-      db.from('user_addresses').select('*').eq('user_id', id),
+      db.from('user_health_conditions').select('*').eq('user_id', id).eq('active', true).order('created_at', { ascending: false }),
+      db.from('user_allergies').select('*').eq('user_id', id).order('created_at', { ascending: false }),
+      db.from('user_medications').select('*').eq('user_id', id).eq('active', true).order('created_at', { ascending: false }),
+      db.from('user_addresses').select('*').eq('user_id', id).order('created_at', { ascending: false }),
       db.from('orders').select('id, status, items, created_at').eq('user_id', id).order('created_at', { ascending: false }).limit(10),
+      // memory_cards_index pode não existir se a migration não rodou — try/catch tolerante
+      db.from('memory_cards_index').select('id, kind, text, tags, confidence, source, last_seen_at, created_at').eq('user_id', id).order('last_seen_at', { ascending: false }).limit(80).then((r) => r, () => ({ data: [] as unknown[], error: null })),
+      db.from('reminders').select('id, type, title, body, scheduled_at, rrule, next_run_at, status, medication_id, created_at').eq('user_id', id).in('status', ['pending', 'sent', 'snoozed']).order('next_run_at', { ascending: true, nullsFirst: false }).limit(50),
     ]);
     if (!u.data) return reply.code(404).send({ error: 'Not found' });
-    return reply.send({ user: u.data, conditions: cond.data ?? [], allergies: allg.data ?? [], medications: meds.data ?? [], addresses: addr.data ?? [], recentOrders: ords.data ?? [] });
+    return reply.send({
+      user: u.data,
+      conditions: cond.data ?? [],
+      allergies: allg.data ?? [],
+      medications: meds.data ?? [],
+      addresses: addr.data ?? [],
+      recentOrders: ords.data ?? [],
+      memoryCards: mem.data ?? [],
+      reminders: rem.data ?? [],
+    });
   });
 
   // List suppliers
