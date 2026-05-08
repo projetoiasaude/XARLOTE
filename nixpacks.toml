@@ -8,6 +8,8 @@ cmds = ["pnpm install --no-frozen-lockfile"]
 cmds = ["pnpm --filter '!@iasaude/web' -r build"]
 
 [start]
-# API + Worker rodam no mesmo container Railway via concurrently.
-# Worker tem profile-enricher (extrai memória), reminder-dispatcher e conversation-compactor.
-cmd = "pnpm start:prod"
+# API agora roda os workers (reminder-dispatcher, profile-enricher,
+# conversation-compactor) no mesmo processo Node — concurrently quebrava
+# o healthcheck do Railway. Tudo num único processo é mais simples e
+# confiável pro container do Railway.
+cmd = "pnpm --filter @iasaude/api start"

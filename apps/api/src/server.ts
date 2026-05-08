@@ -6,6 +6,9 @@ import { healthRoute } from './routes/health.js';
 import { simulateRoute } from './routes/simulate.js';
 import { webhookRoute } from './routes/webhook.uazapi.js';
 import { adminRoute } from './routes/admin.js';
+import { dispatchReminders } from './workers/reminder-dispatcher.worker.js';
+import { startProfileEnricherWorker } from './workers/profile-enricher.worker.js';
+import { compactStaleConversations } from './workers/conversation-compactor.worker.js';
 
 async function main() {
   const app = Fastify({
@@ -32,6 +35,15 @@ async function main() {
     await app.listen({ port, host: '0.0.0.0' });
     console.log(`\n🚀 API running on http://localhost:${port}`);
     console.log(`   Mode: ${process.env['WHATSAPP_MODE'] ?? 'uazapi'}`);
+
+    // Bootstrap workers no MESMO processo da API (Railway tem 1 container só).
+    // Antes ficavam no apps/worker via concurrently, mas isso quebrava o
+    // healthcheck do Railway (que olhava `/health` e não recebia resposta).
+    setInterval(() => dispatchReminders().catch((e) => app.log.error(e, 'reminder dispatch failed')), 30_000);
+    dispatchReminders().catch((e) => app.log.error(e, 'reminder dispatch initial failed'));
+    startProfileEnricherWorker();
+    setInterval(() => compactStaleConversations().catch((e) => app.log.error(e, 'compactor failed')), 60 * 60 * 1000);
+    console.log(`   Workers: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h)`);
   } catch (err) {
     app.log.error(err);
     process.exit(1);
