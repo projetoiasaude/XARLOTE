@@ -1,8 +1,13 @@
 'use client';
 import { useEffect, useState } from 'react';
+import { motion } from 'framer-motion';
+import { MapPin, Phone, Star, Ban, Store, Search } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import { timeAgo } from '@/lib/utils';
-import { MapPin, Phone, Star, Ban } from 'lucide-react';
+import {
+  GlassCard, GlassBadge, GlassInput, Avatar, SectionHeader, EmptyState,
+  Tabs, type BadgeTone,
+} from '@/components/ui';
 
 interface Supplier {
   id: string;
@@ -23,10 +28,10 @@ interface Supplier {
   created_at: string;
 }
 
-const STATUS_STYLES: Record<string, string> = {
-  active: 'bg-green-900/40 text-green-400',
-  blacklisted: 'bg-red-900/40 text-red-400',
-  inactive: 'bg-gray-800 text-gray-500',
+const STATUS_TONE: Record<string, BadgeTone> = {
+  active: 'success',
+  blacklisted: 'danger',
+  inactive: 'neutral',
 };
 
 export default function SuppliersPage() {
@@ -48,101 +53,142 @@ export default function SuppliersPage() {
     .filter((s) =>
       !search ||
       s.name.toLowerCase().includes(search.toLowerCase()) ||
-      (s.city ?? '').toLowerCase().includes(search.toLowerCase())
+      (s.city ?? '').toLowerCase().includes(search.toLowerCase()),
     );
 
-  return (
-    <div className="p-6">
-      <div className="flex items-center gap-3 mb-5">
-        <h1 className="text-xl font-bold text-white">Farmácias / Fornecedores</h1>
-        <div className="flex gap-1 ml-auto">
-          {(['all', 'active', 'blacklisted'] as const).map((f) => (
-            <button
-              key={f}
-              onClick={() => setFilter(f)}
-              className={`px-3 py-1 rounded text-xs ${filter === f ? 'bg-wa-bubble_in text-white' : 'text-gray-500 hover:text-white'}`}
-            >
-              {f === 'all' ? 'Todos' : f === 'active' ? 'Ativos' : 'Bloqueados'}
-            </button>
-          ))}
-        </div>
-      </div>
+  const countAll = suppliers.length;
+  const countActive = suppliers.filter((s) => s.status === 'active').length;
+  const countBlacklisted = suppliers.filter((s) => s.status === 'blacklisted').length;
 
-      <input
-        type="text"
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-        placeholder="Buscar por nome ou cidade…"
-        className="w-full mb-4 px-3 py-2 bg-wa-panel border border-wa-border rounded-lg text-sm text-white placeholder-gray-500 outline-none focus:border-brand-500"
+  return (
+    <div className="space-y-6">
+      <SectionHeader
+        icon={Store}
+        title="Farmácias"
+        subtitle={`${countAll} cadastradas`}
+        size="lg"
+        action={
+          <Tabs
+            id="suppliers-filter"
+            value={filter}
+            onChange={(v) => setFilter(v as typeof filter)}
+            size="sm"
+            options={[
+              { value: 'all', label: 'Todas', count: countAll },
+              { value: 'active', label: 'Ativas', count: countActive },
+              { value: 'blacklisted', label: 'Bloqueadas', count: countBlacklisted },
+            ]}
+          />
+        }
       />
 
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-        {visible.map((s) => (
-          <div key={s.id} className="bg-wa-panel border border-wa-border rounded-xl p-4 space-y-2">
-            <div className="flex items-start justify-between gap-2">
-              <p className="text-white font-semibold text-sm leading-tight">{s.name}</p>
-              <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium shrink-0 ${STATUS_STYLES[s.status] ?? 'text-gray-400'}`}>
-                {s.status}
-              </span>
-            </div>
-
-            {s.address && (
-              <div className="flex items-start gap-1.5 text-xs text-gray-400">
-                <MapPin size={12} className="mt-0.5 shrink-0 text-gray-500" />
-                <span>{s.address}{s.city ? `, ${s.city}` : ''}{s.state ? `/${s.state}` : ''}</span>
-              </div>
-            )}
-
-            <div className="flex items-center gap-3 text-xs">
-              {s.phone_e164 && (
-                <span className="flex items-center gap-1 text-gray-400">
-                  <Phone size={11} /> {s.phone_e164}
-                </span>
-              )}
-              {s.whatsapp_verified_at ? (
-                <span className="text-green-400 font-medium">WhatsApp ✓</span>
-              ) : (
-                <span className="text-gray-600">WhatsApp —</span>
-              )}
-            </div>
-
-            {s.rating !== null && (
-              <div className="flex items-center gap-1 text-xs text-yellow-400">
-                <Star size={11} fill="currentColor" />
-                <span>{s.rating.toFixed(1)}</span>
-                {s.reviews && <span className="text-gray-500">({s.reviews} avaliações)</span>}
-              </div>
-            )}
-
-            {s.tags && s.tags.length > 0 && (
-              <div className="flex flex-wrap gap-1">
-                {s.tags.map((tag) => (
-                  <span key={tag} className="text-[10px] bg-wa-bg text-gray-400 px-1.5 py-0.5 rounded">{tag}</span>
-                ))}
-              </div>
-            )}
-
-            {s.blacklist_reason && (
-              <div className="flex items-start gap-1.5 text-xs text-red-400">
-                <Ban size={11} className="mt-0.5 shrink-0" />
-                <span>{s.blacklist_reason}</span>
-              </div>
-            )}
-
-            <div className="flex items-center justify-between text-[10px] text-gray-600 pt-1 border-t border-wa-border">
-              <span>{s.source}</span>
-              {s.last_contacted_at
-                ? <span>Último contato: {timeAgo(s.last_contacted_at)}</span>
-                : <span>Nunca contatado</span>}
-            </div>
-          </div>
-        ))}
-        {visible.length === 0 && (
-          <p className="text-gray-500 text-sm col-span-full">
-            {search ? 'Nenhum resultado.' : 'Nenhuma farmácia cadastrada ainda.'}
-          </p>
-        )}
+      <div className="relative max-w-md">
+        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-white/40 pointer-events-none" />
+        <GlassInput
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Buscar por nome ou cidade…"
+          className="pl-9"
+        />
       </div>
+
+      {visible.length === 0 ? (
+        <GlassCard className="p-2">
+          <EmptyState
+            icon={Store}
+            title={search ? 'Nenhum resultado' : 'Nenhuma farmácia ainda'}
+            hint={search ? 'Tente outro termo.' : 'Suppliers aparecem aqui após a primeira busca via Google Places.'}
+          />
+        </GlassCard>
+      ) : (
+        <motion.div
+          initial="hidden"
+          animate="show"
+          variants={{
+            hidden: { opacity: 0 },
+            show: { opacity: 1, transition: { staggerChildren: 0.04 } },
+          }}
+          className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4"
+        >
+          {visible.map((s) => (
+            <motion.div
+              key={s.id}
+              variants={{
+                hidden: { opacity: 0, y: 8 },
+                show: { opacity: 1, y: 0, transition: { type: 'spring' as const, stiffness: 320, damping: 26 } },
+              }}
+            >
+              <GlassCard className="p-4 h-full flex flex-col">
+                <div className="flex items-start gap-3 mb-2">
+                  <Avatar name={s.name} size="sm" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-white font-semibold text-sm leading-tight">{s.name}</p>
+                    {s.rating !== null && (
+                      <div className="flex items-center gap-1 text-xs text-amber-300 mt-0.5">
+                        <Star size={11} fill="currentColor" />
+                        <span>{s.rating.toFixed(1)}</span>
+                        {s.reviews && <span className="text-white/40">({s.reviews})</span>}
+                      </div>
+                    )}
+                  </div>
+                  <GlassBadge tone={STATUS_TONE[s.status] ?? 'neutral'} size="xs">
+                    {s.status}
+                  </GlassBadge>
+                </div>
+
+                <div className="space-y-1.5 flex-1 mb-2">
+                  {s.address && (
+                    <div className="flex items-start gap-1.5 text-xs text-white/55">
+                      <MapPin size={11} className="mt-0.5 shrink-0 text-emerald-300/70" />
+                      <span>{s.address}{s.city ? `, ${s.city}` : ''}{s.state ? `/${s.state}` : ''}</span>
+                    </div>
+                  )}
+                  <div className="flex items-center gap-3 text-xs">
+                    {s.phone_e164 && (
+                      <span className="flex items-center gap-1 text-white/55">
+                        <Phone size={11} /> {s.phone_e164}
+                      </span>
+                    )}
+                    {s.whatsapp_verified_at ? (
+                      <GlassBadge tone="success" size="xs">WhatsApp ✓</GlassBadge>
+                    ) : (
+                      <span className="text-white/30 text-[11px]">sem WA</span>
+                    )}
+                  </div>
+
+                  {s.tags && s.tags.length > 0 && (
+                    <div className="flex flex-wrap gap-1 pt-1">
+                      {s.tags.slice(0, 4).map((tag) => (
+                        <span
+                          key={tag}
+                          className="text-[10px] bg-white/[0.04] text-white/55 px-1.5 py-0.5 rounded border border-white/8"
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {s.blacklist_reason && (
+                    <div className="flex items-start gap-1.5 text-xs text-rose-300 mt-1">
+                      <Ban size={11} className="mt-0.5 shrink-0" />
+                      <span>{s.blacklist_reason}</span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-between text-[10px] text-white/35 pt-2 border-t border-white/5">
+                  <span className="uppercase tracking-wider">{s.source}</span>
+                  {s.last_contacted_at
+                    ? <span>{timeAgo(s.last_contacted_at)}</span>
+                    : <span>nunca contatado</span>}
+                </div>
+              </GlassCard>
+            </motion.div>
+          ))}
+        </motion.div>
+      )}
     </div>
   );
 }

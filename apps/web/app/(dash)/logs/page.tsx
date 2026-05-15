@@ -1,5 +1,12 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Activity, ChevronDown } from 'lucide-react';
+import {
+  GlassPanel, GlassButton, GlassBadge, StatusPing, Tabs, SectionHeader,
+  type BadgeTone,
+} from '@/components/ui';
+import { cn } from '@/lib/utils';
 
 const API = process.env['NEXT_PUBLIC_API_URL'] ?? 'http://localhost:3001';
 
@@ -13,35 +20,32 @@ interface Log {
   created_at: string;
 }
 
-const LEVEL_COLORS: Record<string, string> = {
-  error: 'text-red-400 bg-red-950/30',
-  warn:  'text-yellow-400 bg-yellow-950/20',
-  info:  'text-blue-400',
-  debug: 'text-gray-500',
+const LEVEL_TONE: Record<string, BadgeTone> = {
+  error: 'danger',
+  warn: 'warn',
+  info: 'info',
+  debug: 'neutral',
 };
 
-const LEVEL_BADGE: Record<string, string> = {
-  error: 'bg-red-500/20 text-red-400 border border-red-500/30',
-  warn:  'bg-yellow-500/20 text-yellow-400 border border-yellow-500/30',
-  info:  'bg-blue-500/20 text-blue-400 border border-blue-500/30',
-  debug: 'bg-gray-500/20 text-gray-400 border border-gray-500/30',
-};
-
-const CATEGORY_COLORS: Record<string, string> = {
-  webhook:  'text-purple-400',
-  llm:      'text-cyan-400',
-  tool:     'text-orange-400',
-  outbound: 'text-green-400',
-  order:    'text-yellow-400',
-  places:   'text-pink-400',
-  geocoding:'text-teal-400',
-  lgpd:     'text-gray-400',
-  error:    'text-red-400',
+const CATEGORY_COLOR: Record<string, string> = {
+  webhook: 'text-fuchsia-300',
+  llm: 'text-cyan-300',
+  tool: 'text-amber-300',
+  outbound: 'text-emerald-300',
+  order: 'text-yellow-300',
+  places: 'text-rose-300',
+  geocoding: 'text-teal-300',
+  lgpd: 'text-white/60',
+  enrichment: 'text-purple-300',
+  transcription: 'text-blue-300',
+  vision: 'text-violet-300',
+  consent: 'text-emerald-300',
+  memory: 'text-pink-300',
+  error: 'text-rose-300',
 };
 
 function formatTime(iso: string) {
-  const d = new Date(iso);
-  return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 export default function LogsPage() {
@@ -52,7 +56,6 @@ export default function LogsPage() {
   const latestId = useRef(0);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Initial load
   useEffect(() => {
     fetch(`${API}/admin/logs?limit=200`)
       .then((r) => r.json())
@@ -63,7 +66,6 @@ export default function LogsPage() {
       .catch(() => {});
   }, []);
 
-  // Polling every 2s for new logs
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
@@ -79,7 +81,6 @@ export default function LogsPage() {
     return () => clearInterval(interval);
   }, []);
 
-  // Auto-scroll to bottom when new logs arrive
   useEffect(() => {
     if (autoScroll && bottomRef.current) {
       bottomRef.current.scrollIntoView({ behavior: 'smooth' });
@@ -87,6 +88,7 @@ export default function LogsPage() {
   }, [logs, autoScroll]);
 
   const visible = filter === 'all' ? logs : logs.filter((l) => l.level === filter);
+  const countByLevel = (level: string) => logs.filter((l) => l.level === level).length;
 
   function toggleExpand(id: number) {
     setExpanded((prev) => {
@@ -100,72 +102,97 @@ export default function LogsPage() {
   const hasMetadata = (log: Log) => log.metadata && Object.keys(log.metadata).length > 0;
 
   return (
-    <div className="flex flex-col h-full p-4">
-      {/* Header */}
-      <div className="flex items-center gap-3 mb-3 shrink-0">
-        <h1 className="text-lg font-semibold text-white">Logs em tempo real</h1>
-        <span className="flex items-center gap-1 text-xs text-green-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse inline-block" />
-          live
-        </span>
-        <div className="flex gap-1 ml-auto items-center">
-          <button
-            onClick={() => setAutoScroll((v) => !v)}
-            className={`px-2 py-1 rounded text-xs mr-2 ${autoScroll ? 'bg-green-500/20 text-green-400' : 'text-gray-500 hover:text-white'}`}
-          >
-            {autoScroll ? '↓ auto' : '↓ manual'}
-          </button>
-          {(['all', 'info', 'warn', 'error'] as const).map((l) => (
-            <button
-              key={l}
-              onClick={() => setFilter(l)}
-              className={`px-3 py-1 rounded text-xs font-sans ${filter === l ? 'bg-wa-bubble_in text-white' : 'text-gray-500 hover:text-white'}`}
+    <div className="flex flex-col h-[calc(100vh-3rem)] space-y-4">
+      <SectionHeader
+        icon={Activity}
+        title="Logs em tempo real"
+        subtitle="Auto-refresh a cada 2 segundos"
+        size="lg"
+        action={
+          <div className="flex items-center gap-2">
+            <GlassBadge tone="live" dot>live</GlassBadge>
+            <Tabs
+              id="log-level"
+              value={filter}
+              onChange={setFilter}
+              size="sm"
+              options={[
+                { value: 'all', label: 'Todos', count: logs.length },
+                { value: 'info', label: 'Info', count: countByLevel('info') },
+                { value: 'warn', label: 'Warn', count: countByLevel('warn') },
+                { value: 'error', label: 'Error', count: countByLevel('error') },
+              ]}
+            />
+            <GlassButton
+              variant={autoScroll ? 'primary' : 'secondary'}
+              size="sm"
+              onClick={() => setAutoScroll((v) => !v)}
             >
-              {l}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Log list — newest on top */}
-      <div className="flex-1 overflow-y-auto space-y-0.5 font-mono text-xs">
-        {visible.length === 0 && (
-          <p className="text-gray-500 font-sans text-sm p-2">
-            Nenhum log ainda. Execute o simulador para gerar logs.
-          </p>
-        )}
-        {visible.map((log) => (
-          <div
-            key={log.id}
-            className={`rounded px-2 py-1 cursor-pointer ${LEVEL_COLORS[log.level] ?? ''} hover:brightness-125 transition-all`}
-            onClick={() => hasMetadata(log) && toggleExpand(log.id)}
-          >
-            <div className="flex items-start gap-2">
-              <span className="text-gray-600 shrink-0 w-20">{formatTime(log.created_at)}</span>
-              <span className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${LEVEL_BADGE[log.level] ?? ''}`}>
-                {log.level}
-              </span>
-              <span className={`shrink-0 w-20 truncate font-medium ${CATEGORY_COLORS[log.category] ?? 'text-gray-400'}`}>
-                {log.category}
-              </span>
-              <span className="text-gray-200 flex-1 leading-relaxed break-words whitespace-pre-wrap">
-                {log.message}
-              </span>
-              {hasMetadata(log) && (
-                <span className="text-gray-600 shrink-0 text-[10px] select-none">
-                  {expanded.has(log.id) ? '▲' : '▼'}
-                </span>
-              )}
-            </div>
-            {expanded.has(log.id) && hasMetadata(log) && (
-              <pre className="mt-1 ml-[10.5rem] text-[11px] text-gray-400 bg-black/30 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
-                {JSON.stringify(log.metadata, null, 2)}
-              </pre>
-            )}
+              {autoScroll ? '↓ auto' : '↓ manual'}
+            </GlassButton>
           </div>
-        ))}
-        <div ref={bottomRef} />
-      </div>
+        }
+      />
+
+      <GlassPanel className="flex-1 overflow-hidden flex flex-col">
+        <div className="flex-1 overflow-y-auto px-1 py-1">
+          {visible.length === 0 ? (
+            <p className="text-white/40 font-sans text-sm p-6 text-center">
+              Nenhum log ainda. Execute o simulador para gerar logs.
+            </p>
+          ) : (
+            <div className="space-y-px font-mono text-xs">
+              {visible.map((log) => {
+                const isExpanded = expanded.has(log.id);
+                return (
+                  <div
+                    key={log.id}
+                    onClick={() => hasMetadata(log) && toggleExpand(log.id)}
+                    className={cn(
+                      'rounded-lg px-2.5 py-1.5 hover:bg-white/[0.04] transition-colors',
+                      hasMetadata(log) && 'cursor-pointer',
+                    )}
+                  >
+                    <div className="flex items-start gap-2">
+                      <StatusPing tone={LEVEL_TONE[log.level] === 'danger' ? 'danger' : LEVEL_TONE[log.level] === 'warn' ? 'warn' : LEVEL_TONE[log.level] === 'info' ? 'accent' : 'neutral'} pulse={false} className="mt-1.5" />
+                      <span className="text-white/35 shrink-0 w-16 tabular-nums">{formatTime(log.created_at)}</span>
+                      <span className={cn('shrink-0 w-20 truncate font-medium', CATEGORY_COLOR[log.category] ?? 'text-white/60')}>
+                        {log.category}
+                      </span>
+                      <span className="text-white/85 flex-1 leading-relaxed break-words whitespace-pre-wrap">
+                        {log.message}
+                      </span>
+                      {hasMetadata(log) && (
+                        <ChevronDown
+                          size={12}
+                          className={cn(
+                            'text-white/35 shrink-0 mt-0.5 transition-transform',
+                            isExpanded && 'rotate-180',
+                          )}
+                        />
+                      )}
+                    </div>
+                    <AnimatePresence>
+                      {isExpanded && hasMetadata(log) && (
+                        <motion.pre
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: 'auto', opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={{ duration: 0.18 }}
+                          className="mt-1 ml-[7.25rem] text-[11px] text-white/55 bg-black/30 rounded-lg p-2 overflow-x-auto whitespace-pre-wrap break-all border border-white/5"
+                        >
+                          {JSON.stringify(log.metadata, null, 2)}
+                        </motion.pre>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                );
+              })}
+              <div ref={bottomRef} />
+            </div>
+          )}
+        </div>
+      </GlassPanel>
     </div>
   );
 }
