@@ -50,6 +50,15 @@ Node 20 · TS 5 · Fastify 4 · BullMQ 5 · Redis 7 · **OpenRouter** (modelo pa
 - `http://localhost:3002/users` + `/users/[id]` — perfil 360 com memória agrupada por kind, lembretes, badges de origem
 - `http://localhost:3002/logs` — logs do sistema
 
+## Dashboard — design (Liquid Glass)
+- Dark mode only. Background com 3 orbs animados azul+roxo+pink (`components/layout/AmbientBackground.tsx`).
+- Tokens: `ink-base`, `accent`, `aurora-blue/purple/pink` em `tailwind.config.ts`.
+- Utilities: `.glass`, `.glass-spec` (specular highlight), `.glass-hi`, `.glass-lo` em `globals.css`.
+- 12 primitivos drop-in em `components/ui/` (GlassCard, GlassButton, GlassBadge, Tabs com layoutId, Drawer, Avatar, etc) — **use sempre** em vez de `bg-wa-panel border ...`.
+- Animações com `framer-motion@11` — spring physics em hover/tap, stagger 0.04s em listas, page transition fade-up no `template.tsx`.
+- Respeita `prefers-reduced-transparency` (cai pra opaco) e `prefers-reduced-motion` (para animações).
+- Paleta `wa-*` legacy mantida só pra `WhatsAppSim.tsx` (944 linhas, não refatorado nessa sprint).
+
 ## Persona Sara (resumo do tom)
 Empática, intimista, concisa (ritmo WhatsApp, 1-3 linhas), PT-BR natural, nunca diagnostica, nunca ajusta dose, confirma antes de agir, orienta SAMU 192 em sinais de emergência.
 
