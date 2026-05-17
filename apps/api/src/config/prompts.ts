@@ -50,8 +50,11 @@ const defaults: PromptsConfig = {
   xarlote_enabled: true,
   tts_enabled: false,
   tts_api_key: '',
-  tts_voice_id: 'EXAVITQu4vr4xnSDxMaL',
-  tts_model: 'eleven_flash_v2_5',
+  // Carla — Inviting, Warm and Helpful (BR-nativa, shared library).
+  // Identidade definida da Xarlote. Configurável mas com default forte.
+  tts_voice_id: 'm151rjrbWXbBqyq56tly',
+  // Multilingual v2 — melhor pronúncia PT-BR, suporta <break/> SSML.
+  tts_model: 'eleven_multilingual_v2',
 };
 
 /**

@@ -416,11 +416,19 @@ export async function processInboundUser(
     await writeLog('info', 'outbound', `Xarlote → usuário ${shouldVoiceIntro ? '[ÁUDIO intro]' : ''}: "${replyText.slice(0, 100)}${replyText.length > 100 ? '…' : ''}"`, { traceId, voiceIntro: shouldVoiceIntro });
 
     if (shouldVoiceIntro) {
+      // Captura o nome a partir do texto da Sara se o enricher ainda não populou
+      // user.preferred_name (a Sara acabou de ouvir o nome nesse turno; o enricher
+      // roda async DEPOIS). Heurística: pega a 1ª palavra capitalizada depois de
+      // "Oi", "Olá", "Prazer" — combina com como a Sara saúda.
+      const nameMatch = replyText.match(/(?:oi|olá|ola|prazer|opa|ei)[,\s]+([A-ZÁÉÍÓÚÂÊÔÃÕ][a-záéíóúâêôãõ]{1,30})/i);
+      const inferredName = nameMatch?.[1] ?? null;
       const sentAudio = await sendOutboundAudio(conversation.id, phoneE164, replyText, traceId, {
         model: llmResponse.model,
         tokensIn: llmResponse.tokensIn,
         tokensOut: llmResponse.tokensOut,
         latencyMs: Date.now() - llmStart,
+      }, {
+        preferredName: user.preferred_name ?? inferredName,
       });
       if (sentAudio) {
         // Marca o flag pra nunca mais repetir o intro pra esse usuário.

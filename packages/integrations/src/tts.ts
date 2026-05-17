@@ -46,8 +46,23 @@ export interface TtsResult {
   charsBilled: number;
 }
 
-const DEFAULT_VOICE = 'EXAVITQu4vr4xnSDxMaL'; // Sarah — premade feminina
-const DEFAULT_MODEL = 'eleven_flash_v2_5';
+/**
+ * Voz default da Xarlote — identidade própria, BR-nativa.
+ *
+ * Carla — "Inviting, Warm and Helpful" (ElevenLabs shared library).
+ * - Acento: brazilian
+ * - Idade: young female
+ * - Descritivo: professional, accolhedora
+ * - Use case: informative_educational (combina com concierge de saúde)
+ * - ~37k clones na library (validação de qualidade pela comunidade)
+ *
+ * Comparada com vozes premade inglesas (Sarah/Jessica/etc) tocadas via
+ * `multilingual_v2` → muito menos sotaque, prosódia PT-BR natural,
+ * pronúncia correta de nomes ("Hiago" → "Iago" com H mudo), entonação
+ * caloriosa nas perguntas.
+ */
+const DEFAULT_VOICE = 'm151rjrbWXbBqyq56tly'; // Carla — Inviting, Warm and Helpful (BR)
+const DEFAULT_MODEL = 'eleven_multilingual_v2'; // Melhor PT-BR; suporta SSML <break>
 const DEFAULT_FORMAT = 'mp3_44100_128';
 
 export async function synthesizeSpeech(
@@ -68,9 +83,13 @@ export async function synthesizeSpeech(
     text: trimmed,
     model_id: modelId,
     voice_settings: {
-      stability: opts.stability ?? 0.45,
-      similarity_boost: opts.similarityBoost ?? 0.8,
-      style: opts.style ?? 0.35,
+      // Stability baixa (0.30-0.40) → mais variação emocional, soa menos
+      // robótico. Pra conversational/warm, ElevenLabs recomenda <0.5.
+      stability: opts.stability ?? 0.35,
+      // Similarity alto → consistência do timbre próprio da voz Carla.
+      similarity_boost: opts.similarityBoost ?? 0.85,
+      // Style alto → mais dramatismo/entonação no momento de saudação.
+      style: opts.style ?? 0.55,
       use_speaker_boost:
         typeof opts.useSpeakerBoost === 'boolean'
           ? opts.useSpeakerBoost
@@ -134,6 +153,116 @@ export interface VoiceSummary {
   category?: string;
   labels?: Record<string, string>;
   preview_url?: string;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Humanizer — transforma o texto que a Sara escreveu em "voice script"
+// otimizado pro ElevenLabs entregar áudio NATURAL em PT-BR.
+//
+// Princípios:
+//   1. Não muda o texto exibido no dashboard/messages — opera SÓ na hora de
+//      sintetizar. O usuário vê "Oi Hiago" no log; ouve "Oi Iago" no áudio.
+//   2. Corrige pronúncia de nomes que o TTS erra:
+//      - H mudo: "Hiago" → "Iago", "Hugo" → "Ugo", "Heitor" → "Eitor"
+//      - Iniciais soletradas: "JP" → "jota pê", "AC" → "a cê", "TC" → "tê cê"
+//   3. Insere pausa SSML (<break time="0.3s"/>) após primeira vírgula da
+//      saudação — cria aquele micro-respiro de sorriso ("Oi Iago, [pausa] prazer!").
+//   4. Substitui reticências "…" e "..." por <break time="0.4s"/> pra
+//      pausas mais limpas que o "...uhh..." que o TTS faz sozinho.
+//   5. Mantém pontuação restante intacta — vírgulas e exclamações já dão
+//      entonação suficiente quando combinadas com voice_settings calibrados.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Fonema brasileiro de cada letra do alfabeto (pra soletrar iniciais). */
+const PT_LETTER: Record<string, string> = {
+  A: 'a', B: 'bê', C: 'cê', D: 'dê', E: 'é', F: 'éfe',
+  G: 'gê', H: 'agá', I: 'i', J: 'jota', K: 'cá', L: 'éle',
+  M: 'ême', N: 'êne', O: 'ó', P: 'pê', Q: 'quê', R: 'erre',
+  S: 'ésse', T: 'tê', U: 'u', V: 'vê', W: 'dáblio', X: 'chis',
+  Y: 'ípsilon', Z: 'zê',
+};
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Detecta se a string é iniciais (2-5 letras maiúsculas seguidas) e devolve
+ * versão soletrada em PT-BR. "JP" → "jota pê", "AC" → "a cê", "BC" → "bê cê".
+ * Retorna null se não for iniciais.
+ */
+function spellInitialsIfApplicable(name: string): string | null {
+  // 2-3 letras maiúsculas = quase sempre iniciais (JP, AC, RG, USP).
+  // 4+ letras = quase sempre nome em caixa alta (HIAGO, MARIA) — não soletra.
+  if (!/^[A-Z]{2,3}$/.test(name)) return null;
+  return name.split('').map((c) => PT_LETTER[c] ?? c).join(' ');
+}
+
+/**
+ * Normaliza nome em caixa alta pra capitalização normal antes de aplicar
+ * outras regras: "HIAGO" → "Hiago", "MARIA" → "Maria".
+ * Mantém nomes compostos com hífen/espaço.
+ */
+function normalizeCaps(name: string): string {
+  if (!/^[A-ZÁÉÍÓÚÂÊÔÃÕ]+(?:[\s-][A-ZÁÉÍÓÚÂÊÔÃÕ]+)*$/.test(name)) return name;
+  return name
+    .toLowerCase()
+    .replace(/(^|[\s-])(\p{L})/gu, (_, sep, ch) => sep + ch.toUpperCase());
+}
+
+/**
+ * Aplica fonética PT-BR num nome único:
+ *   - Inicial H + vogal → remove o H (H mudo): "Hiago" → "Iago"
+ *   - Iniciais all-caps → soletra: "JP" → "Jota Pê"
+ * Não toca nomes "normais" tipo "Maria", "Lucas".
+ */
+export function nameForVoice(name: string): string {
+  if (!name) return name;
+  const trimmed = name.trim();
+  // 1. Iniciais (JP, AC, RG) → soletra
+  const initials = spellInitialsIfApplicable(trimmed);
+  if (initials) return initials;
+  // 2. Normaliza caixa alta pra title case (HIAGO → Hiago) antes do H mudo
+  const normalized = normalizeCaps(trimmed);
+  // 3. H mudo em início de nome BR (Hiago, Hugo, Helena, Heitor)
+  return normalized.replace(/^H([aeiouáéíóúâêîôûãõAEIOUÁÉÍÓÚÂÊÎÔÛÃÕ])/, '$1');
+}
+
+export interface HumanizeOptions {
+  /** Nome preferido do usuário (vai ter pronúncia corrigida no texto inteiro). */
+  preferredName?: string | null;
+  /** Insere <break/> SSML após a primeira vírgula da saudação. Default true. */
+  addBreaks?: boolean;
+}
+
+export function humanizeForVoice(text: string, opts: HumanizeOptions = {}): string {
+  let out = text;
+
+  // 1. Corrige pronúncia do nome do usuário em todo o texto
+  if (opts.preferredName) {
+    const orig = opts.preferredName.trim();
+    const fixed = nameForVoice(orig);
+    if (fixed && fixed.toLowerCase() !== orig.toLowerCase()) {
+      // Match whole-word, case-insensitive — pega "HIAGO", "Hiago", "hiago"
+      const re = new RegExp(`\\b${escapeRegex(orig)}\\b`, 'gi');
+      out = out.replace(re, fixed);
+    }
+  }
+
+  // 2. Reticências → break SSML mais limpo
+  //    "…" (U+2026), "...", "...."
+  out = out.replace(/…|\.{3,}/g, ' <break time="0.35s"/> ');
+
+  // 3. Pausa de sorriso após primeira vírgula da saudação
+  //    Identifica padrão típico: "Oi X," / "Olá X," / "Prazer X," nos primeiros 35 chars
+  if (opts.addBreaks !== false) {
+    out = out.replace(
+      /^((?:oi|olá|ola|prazer|opa|ei|e aí|eai)[^,.!?]{0,30}[,!])/i,
+      '$1 <break time="0.3s"/>',
+    );
+  }
+
+  return out.trim();
 }
 
 export async function listVoices(apiKey: string, timeoutMs = 8_000): Promise<VoiceSummary[]> {

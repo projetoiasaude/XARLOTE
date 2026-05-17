@@ -1,6 +1,6 @@
 import { db, writeLog } from '@iasaude/db';
 import { isSimulatorMode, sendText, sendAudio } from '@iasaude/whatsapp';
-import { synthesizeSpeech } from '@iasaude/integrations';
+import { synthesizeSpeech, humanizeForVoice } from '@iasaude/integrations';
 import { SARA_INSTANCE } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 
@@ -64,12 +64,18 @@ export async function sendOutbound(
  *
  * Retorna `true` se mandou áudio, `false` se caiu pro fallback de texto.
  */
+export interface SendAudioContext {
+  /** Nome preferido do usuário — usado pra corrigir pronúncia (H mudo, iniciais). */
+  preferredName?: string | null;
+}
+
 export async function sendOutboundAudio(
   conversationId: string,
   phoneE164: string,
   text: string,
   traceId: string,
-  llmMeta: LlmMeta = {}
+  llmMeta: LlmMeta = {},
+  ctx: SendAudioContext = {}
 ): Promise<boolean> {
   const cfg = loadPrompts();
   const apiKey = cfg.tts_api_key || process.env['ELEVENLABS_API_KEY'] || '';
@@ -80,10 +86,17 @@ export async function sendOutboundAudio(
     return false;
   }
 
+  // Humaniza o texto SÓ pra síntese (pausas, correção de nomes).
+  // `text` original continua sendo o que vai pro DB/dashboard.
+  const voiceScript = humanizeForVoice(text, { preferredName: ctx.preferredName });
+  if (voiceScript !== text) {
+    await writeLog('info', 'tts', `Voice script humanizado: "${voiceScript.slice(0, 120)}…"`, { traceId, original: text.slice(0, 120) });
+  }
+
   let synth: Awaited<ReturnType<typeof synthesizeSpeech>> | null = null;
   const ttsStart = Date.now();
   try {
-    synth = await synthesizeSpeech(text, {
+    synth = await synthesizeSpeech(voiceScript, {
       apiKey,
       voiceId: cfg.tts_voice_id,
       modelId: cfg.tts_model,

@@ -45,10 +45,13 @@ const AUDIO_MODELS = [
 ];
 
 const TTS_MODELS = [
-  { value: 'eleven_flash_v2_5', label: 'Flash v2.5 — rápido e barato (recomendado)' },
-  { value: 'eleven_multilingual_v2', label: 'Multilingual v2 — qualidade máxima' },
+  { value: 'eleven_multilingual_v2', label: 'Multilingual v2 — melhor PT-BR (padrão Xarlote)' },
+  { value: 'eleven_flash_v2_5', label: 'Flash v2.5 — rápido e barato' },
   { value: 'eleven_turbo_v2_5', label: 'Turbo v2.5 — meio termo' },
 ];
+
+// voice_id da identidade Xarlote — destaque no UI
+const XARLOTE_VOICE_ID = 'm151rjrbWXbBqyq56tly';
 
 interface PromptsConfig {
   sara_suffix: string;
@@ -85,7 +88,7 @@ const DEFAULT_CFG: PromptsConfig = {
   llm_model: 'openai/gpt-4.1-mini', vision_model: 'openai/gpt-4.1-mini',
   audio_model: 'openai/gpt-4o-audio-preview', xarlote_enabled: true,
   tts_enabled: false, tts_api_key: '',
-  tts_voice_id: 'EXAVITQu4vr4xnSDxMaL', tts_model: 'eleven_flash_v2_5',
+  tts_voice_id: XARLOTE_VOICE_ID, tts_model: 'eleven_multilingual_v2',
 };
 
 export default function PromptsPage() {
@@ -673,6 +676,13 @@ export default function PromptsPage() {
             <p className="text-xs text-amber-200/80 leading-relaxed">
               <strong>Critério de uso:</strong> hoje só dispara áudio na <em>primeira saudação chamando o nome</em> do usuário
               (logo após ele aceitar a LGPD e responder o nome). Marca <code>users.metadata.audio_intro_sent=true</code> e nunca repete.
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-accent/25 bg-accent/[0.05] px-3 py-2.5">
+            <p className="text-xs text-white/75 leading-relaxed">
+              <strong className="text-accent-hi">Identidade Xarlote:</strong> voz <em>Carla — Inviting, Warm and Helpful</em> (BR nativa, ElevenLabs library) + modelo <em>Multilingual v2</em>.
+              Texto vai por um <strong>humanizador</strong> antes do TTS: corrige pronúncia de nomes ("HIAGO" → <code>iago</code> com H mudo, "JP" → <code>jota pê</code>) e insere micro-pausas SSML pra dar respiração natural. Voz só, texto preservado.
             </p>
           </div>
         </div>

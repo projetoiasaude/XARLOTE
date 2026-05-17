@@ -159,16 +159,35 @@ export async function adminRoute(app: FastifyInstance) {
 
   // Reseta a flag `audio_intro_sent` de um user pra ele receber o áudio na próxima msg.
   // Útil quando o gatilho falhou (deploy sem TTS, erro LLM no turno crítico, etc).
+  // Body opcional: { fullFlow: true } também deleta msgs da conversa e
+  // volta status pra 'not_started' (passa pelo consent + nome de novo).
   app.post('/users/:id/reset-audio-intro', async (req, reply) => {
     const { id } = req.params as { id: string };
+    const body = (req.body ?? {}) as { fullFlow?: boolean };
+
     const { data: user } = await db.from('users').select('id, metadata').eq('id', id).single();
     if (!user) return reply.code(404).send({ error: 'user not found' });
     const meta = (user.metadata as Record<string, unknown> | null) ?? {};
     delete meta['audio_intro_sent'];
     delete meta['audio_intro_at'];
-    const { error } = await db.from('users').update({ metadata: meta }).eq('id', id);
+
+    const updates: Record<string, unknown> = { metadata: meta };
+    let deletedMessages = 0;
+    if (body.fullFlow) {
+      // Apaga msgs e enriquecimento ligado a esse user — força fluxo zerado
+      updates['onboarding_status'] = 'not_started';
+      updates['preferred_name'] = null;
+      const { data: convs } = await db.from('conversations').select('id').eq('user_id', id);
+      const convIds = (convs ?? []).map((c) => c.id);
+      for (const cid of convIds) {
+        const { count } = await db.from('messages').delete({ count: 'exact' }).eq('conversation_id', cid);
+        deletedMessages += count ?? 0;
+      }
+      await db.from('memory_cards_index').delete().eq('user_id', id);
+    }
+    const { error } = await db.from('users').update(updates).eq('id', id);
     if (error) return reply.code(500).send({ error: error.message });
-    return reply.send({ ok: true, userId: id });
+    return reply.send({ ok: true, userId: id, deletedMessages, fullFlow: !!body.fullFlow });
   });
 
   // Preview rápido — sintetiza um texto curto e devolve o MP3 (audio/mpeg).
