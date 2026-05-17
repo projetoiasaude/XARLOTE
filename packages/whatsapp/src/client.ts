@@ -71,6 +71,32 @@ export async function sendImage(instance: string, phoneE164: string, imageUrl: s
   return { messageId: result?.messageid ?? result?.id ?? '' };
 }
 
+/**
+ * Envia mensagem de áudio (voice note) via uazapi /send/media com type=audio.
+ *
+ * @param audio  Buffer (encodado em base64 no payload) OU URL pública pra o arquivo.
+ * @param mime   mime real do áudio — meramente informativo; uazapi aceita mp3/ogg/m4a.
+ * @param ptv    Se true (default), envia como Push-To-Talk (a bolinha de microfone
+ *               típica do WhatsApp). Se false, envia como anexo de áudio comum.
+ */
+export async function sendAudio(
+  instance: string,
+  phoneE164: string,
+  audio: Buffer | string,
+  opts: { mime?: string; ptv?: boolean } = {}
+): Promise<{ messageId: string }> {
+  const cfg = buildConfig(instance);
+  const number = phoneE164.replace('+', '');
+  const file = Buffer.isBuffer(audio) ? audio.toString('base64') : audio;
+  const result = await apiCall(cfg, 'POST', '/send/media', {
+    number,
+    type: opts.ptv === false ? 'audio' : 'ptt',
+    file,
+    ...(opts.mime ? { mimetype: opts.mime } : {}),
+  });
+  return { messageId: result?.messageid ?? result?.id ?? '' };
+}
+
 // uazapi não tem endpoint de presence isolado documentado de forma estável — desativado.
 export async function setPresence(_instance: string, _phoneE164: string, _state: 'composing' | 'paused'): Promise<void> {
   return;

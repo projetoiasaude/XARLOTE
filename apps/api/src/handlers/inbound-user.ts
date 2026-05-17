@@ -8,7 +8,7 @@ import { sendMenu, isSimulatorMode, downloadMedia } from '@iasaude/whatsapp';
 import { transcribeAudio } from '@iasaude/integrations';
 import { Queue } from 'bullmq';
 import { loadPrompts } from '../config/prompts.js';
-import { sendOutbound } from './outbound.js';
+import { sendOutbound, sendOutboundAudio } from './outbound.js';
 import { handleToolCall } from './tool-executor.js';
 
 // Queue pra disparar enricher async — instância única por processo
@@ -165,8 +165,12 @@ export async function processInboundUser(
     return { traceId, conversationId: conversation.id };
   }
 
-  // 7. Mark active if still profiling
-  if (user.onboarding_status === 'profiling') {
+  // 7. Mark active if still profiling.
+  // Captura wasProfiling pra disparar voice intro: a 1ª msg após `Aceitar` é
+  // sempre o usuário dizendo o nome dele. A resposta da Sara nesse turno é a
+  // saudação "Prazer, X!" que merece sair como áudio.
+  const wasProfiling = user.onboarding_status === 'profiling';
+  if (wasProfiling) {
     await db.from('users').update({ onboarding_status: 'active' }).eq('id', user.id);
     user = { ...user, onboarding_status: 'active' };
   }
@@ -386,15 +390,52 @@ export async function processInboundUser(
     }
   }
 
-  // 12. Send text response
+  // 12. Send response — texto OU áudio (voice intro na primeira saudação)
   if (llmResponse.text.trim()) {
-    await writeLog('info', 'outbound', `Xarlote → usuário: "${llmResponse.text.trim().slice(0, 100)}${llmResponse.text.length > 100 ? '…' : ''}"`, { traceId });
-    await sendOutbound(conversation.id, phoneE164, llmResponse.text.trim(), traceId, {
-      model: llmResponse.model,
-      tokensIn: llmResponse.tokensIn,
-      tokensOut: llmResponse.tokensOut,
-      latencyMs: Date.now() - llmStart,
-    });
+    const meta = (user.metadata as { audio_intro_sent?: boolean } | null | undefined) ?? {};
+    const alreadyIntroed = meta.audio_intro_sent === true;
+    // Conta quantas msgs outbound a Sara já mandou pra esse user fora do consent flow.
+    // Se for a 1ª (= a próxima) E o user já consentiu E ainda não rolou intro,
+    // dispara áudio. Robusto contra falhas anteriores (ex: deploy sem TTS).
+    const { count: outCount } = await db
+      .from('messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('conversation_id', conversation.id)
+      .eq('direction', 'out')
+      .eq('sender_role', 'assistant');
+    // outCount inclui a msg de consent + o "como gosta de ser chamado" do consent flow.
+    // Sara só começa a falar de fato APÓS o user passar de consent → profiling → active.
+    // Então a 1ª resposta "real" dela = quando outCount <= 2 (consent + "como gosta de").
+    const isFirstRealReply = (outCount ?? 99) <= 2;
+    const shouldVoiceIntro =
+      promptsConfig.tts_enabled &&
+      !alreadyIntroed &&
+      user.lgpd_consent_at != null &&
+      (wasProfiling || isFirstRealReply);
+    const replyText = llmResponse.text.trim();
+    await writeLog('info', 'outbound', `Xarlote → usuário ${shouldVoiceIntro ? '[ÁUDIO intro]' : ''}: "${replyText.slice(0, 100)}${replyText.length > 100 ? '…' : ''}"`, { traceId, voiceIntro: shouldVoiceIntro });
+
+    if (shouldVoiceIntro) {
+      const sentAudio = await sendOutboundAudio(conversation.id, phoneE164, replyText, traceId, {
+        model: llmResponse.model,
+        tokensIn: llmResponse.tokensIn,
+        tokensOut: llmResponse.tokensOut,
+        latencyMs: Date.now() - llmStart,
+      });
+      if (sentAudio) {
+        // Marca o flag pra nunca mais repetir o intro pra esse usuário.
+        await db.from('users').update({
+          metadata: { ...meta, audio_intro_sent: true, audio_intro_at: new Date().toISOString() },
+        }).eq('id', user.id);
+      }
+    } else {
+      await sendOutbound(conversation.id, phoneE164, replyText, traceId, {
+        model: llmResponse.model,
+        tokensIn: llmResponse.tokensIn,
+        tokensOut: llmResponse.tokensOut,
+        latencyMs: Date.now() - llmStart,
+      });
+    }
   }
 
   // 13. Dispara enricher async (não bloqueia resposta — extrai fatos das últimas 6 msgs)

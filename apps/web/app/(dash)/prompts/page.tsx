@@ -5,6 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   Bot, Pill, Save, RotateCcw, CheckCircle, AlertCircle, Key,
   Cpu, Eye, EyeOff, Copy, Power, Image as ImageIcon, Mic, SlidersHorizontal,
+  Volume2, RefreshCw, Play,
 } from 'lucide-react';
 import {
   GlassCard, GlassButton, GlassInput, GlassTextarea, GlassBadge,
@@ -43,6 +44,12 @@ const AUDIO_MODELS = [
   { value: 'gemini/gemini-2.5-flash', label: 'Gemini 2.5 Flash (Google direto)' },
 ];
 
+const TTS_MODELS = [
+  { value: 'eleven_flash_v2_5', label: 'Flash v2.5 — rápido e barato (recomendado)' },
+  { value: 'eleven_multilingual_v2', label: 'Multilingual v2 — qualidade máxima' },
+  { value: 'eleven_turbo_v2_5', label: 'Turbo v2.5 — meio termo' },
+];
+
 interface PromptsConfig {
   sara_suffix: string;
   agent_override: string;
@@ -51,6 +58,18 @@ interface PromptsConfig {
   vision_model: string;
   audio_model: string;
   xarlote_enabled: boolean;
+  tts_enabled: boolean;
+  tts_api_key: string;
+  tts_voice_id: string;
+  tts_model: string;
+}
+
+interface ElVoice {
+  voice_id: string;
+  name: string;
+  category?: string;
+  labels?: Record<string, string>;
+  preview_url?: string;
 }
 
 interface BasePrompts {
@@ -65,6 +84,8 @@ const DEFAULT_CFG: PromptsConfig = {
   sara_suffix: '', agent_override: '', llm_api_key: '',
   llm_model: 'openai/gpt-4.1-mini', vision_model: 'openai/gpt-4.1-mini',
   audio_model: 'openai/gpt-4o-audio-preview', xarlote_enabled: true,
+  tts_enabled: false, tts_api_key: '',
+  tts_voice_id: 'EXAVITQu4vr4xnSDxMaL', tts_model: 'eleven_flash_v2_5',
 };
 
 export default function PromptsPage() {
@@ -78,6 +99,10 @@ export default function PromptsPage() {
   const [showSaraBase, setShowSaraBase] = useState(false);
   const [showAgentBase, setShowAgentBase] = useState(false);
   const [agentBaseTab, setAgentBaseTab] = useState<'quoting' | 'confirmation'>('quoting');
+  const [showTtsKey, setShowTtsKey] = useState(false);
+  const [voices, setVoices] = useState<ElVoice[]>([]);
+  const [loadingVoices, setLoadingVoices] = useState(false);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -109,7 +134,74 @@ export default function PromptsPage() {
     effectiveModel !== original.llm_model ||
     config.vision_model !== original.vision_model ||
     config.audio_model !== original.audio_model ||
-    config.xarlote_enabled !== original.xarlote_enabled;
+    config.xarlote_enabled !== original.xarlote_enabled ||
+    config.tts_enabled !== original.tts_enabled ||
+    config.tts_api_key !== original.tts_api_key ||
+    config.tts_voice_id !== original.tts_voice_id ||
+    config.tts_model !== original.tts_model;
+
+  async function loadVoices() {
+    setLoadingVoices(true);
+    try {
+      const res = await fetch(`${API}/admin/tts/voices`);
+      const data = await res.json();
+      setVoices(Array.isArray(data?.voices) ? data.voices : []);
+    } catch {
+      setVoices([]);
+    } finally {
+      setLoadingVoices(false);
+    }
+  }
+
+  useEffect(() => {
+    if (config.tts_api_key && voices.length === 0 && !loadingVoices) {
+      void loadVoices();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.tts_api_key]);
+
+  function previewVoice(url: string) {
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause();
+    }
+    const audio = new Audio(url);
+    previewAudioRef.current = audio;
+    void audio.play().catch(() => {});
+  }
+
+  const [testingTts, setTestingTts] = useState(false);
+  const [ttsTestError, setTtsTestError] = useState<string | null>(null);
+  async function testTts() {
+    setTtsTestError(null);
+    setTestingTts(true);
+    try {
+      // Salva config primeiro pra garantir que o backend usa o estado atual
+      if (isDirty) await handleSave();
+      const res = await fetch(`${API}/admin/tts/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          voiceId: config.tts_voice_id,
+          modelId: config.tts_model,
+          name: 'Hiago',
+        }),
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody?.error || `HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      if (previewAudioRef.current) previewAudioRef.current.pause();
+      const audio = new Audio(url);
+      previewAudioRef.current = audio;
+      await audio.play();
+    } catch (err) {
+      setTtsTestError(String(err).slice(0, 200));
+    } finally {
+      setTestingTts(false);
+    }
+  }
 
   const [toggleBusy, setToggleBusy] = useState(false);
   async function handleToggleEnabled() {
@@ -145,6 +237,10 @@ export default function PromptsPage() {
         llm_model: effectiveModel,
         vision_model: config.vision_model,
         audio_model: config.audio_model,
+        tts_enabled: config.tts_enabled,
+        tts_api_key: config.tts_api_key,
+        tts_voice_id: config.tts_voice_id,
+        tts_model: config.tts_model,
       };
       const res = await fetch(`${API}/admin/prompts`, {
         method: 'PUT',
@@ -404,6 +500,179 @@ export default function PromptsPage() {
             />
             <p className="text-xs text-white/40 mt-1.5">
               <code>openai/</code> = OpenRouter · <code>gemini/</code> = Google direto
+            </p>
+          </div>
+        </div>
+      </GlassCard>
+
+      {/* Voz da Xarlote (TTS via ElevenLabs) */}
+      <GlassCard className="p-5">
+        <div className="flex items-start justify-between gap-3">
+          <SectionHeader
+            icon={Volume2}
+            title="Voz da Xarlote (ElevenLabs)"
+            subtitle="Áudio humanizado em momentos raros — hoje: primeira saudação chamando o nome"
+          />
+          <button
+            type="button"
+            role="switch"
+            aria-checked={config.tts_enabled}
+            onClick={() => setConfig((c) => ({ ...c, tts_enabled: !c.tts_enabled }))}
+            className={cn(
+              'relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full transition-colors mt-1',
+              'focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+              config.tts_enabled
+                ? 'bg-accent shadow-glow-accent'
+                : 'bg-white/10 border border-white/15',
+            )}
+          >
+            <motion.span
+              aria-hidden
+              animate={{ x: config.tts_enabled ? 22 : 4 }}
+              transition={{ type: 'spring', stiffness: 500, damping: 30 }}
+              className="absolute top-1 inline-block h-5 w-5 rounded-full bg-white shadow-lg"
+            />
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-4">
+          <div>
+            <label className="flex items-center gap-1.5 text-xs font-medium text-white/70 mb-1.5">
+              <Key size={12} />
+              API Key (ElevenLabs)
+            </label>
+            <div className="flex gap-2">
+              <GlassInput
+                type={showTtsKey ? 'text' : 'password'}
+                placeholder="sk_…"
+                value={config.tts_api_key}
+                onChange={(e) => setConfig((c) => ({ ...c, tts_api_key: e.target.value }))}
+                className="flex-1 font-mono"
+              />
+              <GlassButton variant="secondary" size="md" onClick={() => setShowTtsKey((v) => !v)}>
+                {showTtsKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                {showTtsKey ? 'Ocultar' : 'Mostrar'}
+              </GlassButton>
+            </div>
+            <p className="text-xs text-white/40 mt-1.5">
+              Pegue em{' '}
+              <a
+                href="https://elevenlabs.io/app/settings/api-keys"
+                target="_blank"
+                rel="noreferrer"
+                className="text-accent-hi hover:underline"
+              >
+                elevenlabs.io/settings/api-keys
+              </a>
+            </p>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-xs font-medium text-white/70">Voz</label>
+              <button
+                type="button"
+                onClick={loadVoices}
+                disabled={loadingVoices || !config.tts_api_key}
+                className="flex items-center gap-1 text-xs text-white/55 hover:text-white disabled:opacity-50"
+              >
+                <RefreshCw size={11} className={loadingVoices ? 'animate-spin' : ''} />
+                {loadingVoices ? 'Carregando…' : voices.length > 0 ? `${voices.length} vozes` : 'Listar'}
+              </button>
+            </div>
+            {voices.length > 0 ? (
+              <div className="grid gap-2 max-h-72 overflow-y-auto pr-1">
+                {voices.map((v) => {
+                  const isSelected = v.voice_id === config.tts_voice_id;
+                  return (
+                    <button
+                      key={v.voice_id}
+                      type="button"
+                      onClick={() => setConfig((c) => ({ ...c, tts_voice_id: v.voice_id }))}
+                      className={cn(
+                        'group flex items-center gap-3 rounded-xl border px-3 py-2 text-left transition-colors',
+                        isSelected
+                          ? 'border-accent/60 bg-accent/10'
+                          : 'border-white/8 bg-white/[0.03] hover:border-white/20 hover:bg-white/[0.06]',
+                      )}
+                    >
+                      <span className={cn('flex h-8 w-8 items-center justify-center rounded-lg', isSelected ? 'bg-accent/25 text-accent-hi' : 'bg-white/8 text-white/60')}>
+                        <Volume2 size={14} />
+                      </span>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm text-white font-medium truncate">{v.name}</div>
+                        <div className="text-[11px] text-white/45 truncate font-mono">{v.voice_id}</div>
+                      </div>
+                      {v.labels && (
+                        <div className="hidden md:flex gap-1">
+                          {v.labels['gender'] && <GlassBadge tone="neutral">{v.labels['gender']}</GlassBadge>}
+                          {v.labels['language'] && <GlassBadge tone="info">{v.labels['language']}</GlassBadge>}
+                        </div>
+                      )}
+                      {v.preview_url && (
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); previewVoice(v.preview_url!); }}
+                          className="flex h-7 w-7 items-center justify-center rounded-lg bg-white/10 hover:bg-white/20 text-white/85 transition-colors"
+                          title="Ouvir prévia"
+                        >
+                          <Play size={11} />
+                        </button>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <GlassInput
+                type="text"
+                className="font-mono"
+                placeholder="EXAVITQu4vr4xnSDxMaL"
+                value={config.tts_voice_id}
+                onChange={(e) => setConfig((c) => ({ ...c, tts_voice_id: e.target.value }))}
+              />
+            )}
+            <p className="text-xs text-white/40 mt-1.5">
+              Default: <code>Sarah</code> (feminina suave, multilíngue).
+              {voices.length === 0 && config.tts_api_key && ' Clique em "Listar" pra escolher visualmente.'}
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-white/70 mb-1.5">Modelo TTS</label>
+            <select
+              className="w-full bg-white/[0.04] border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white focus:outline-none focus:border-accent/60 focus:ring-2 focus:ring-accent/20"
+              value={config.tts_model || 'eleven_flash_v2_5'}
+              onChange={(e) => setConfig((c) => ({ ...c, tts_model: e.target.value }))}
+            >
+              {TTS_MODELS.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+            </select>
+            <p className="text-xs text-white/40 mt-1.5">
+              Flash v2.5 ≈ $0.10/1k chars, latência ~75ms. Multilingual v2 ≈ $0.30/1k chars, qualidade superior.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <GlassButton
+              variant="primary"
+              size="sm"
+              onClick={testTts}
+              disabled={testingTts || !config.tts_api_key}
+            >
+              <Play size={13} />
+              {testingTts ? 'Sintetizando…' : 'Testar voz com "Prazer, Hiago!…"'}
+            </GlassButton>
+            {ttsTestError && (
+              <span className="text-xs text-rose-300 flex items-center gap-1">
+                <AlertCircle size={11} /> {ttsTestError}
+              </span>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-amber-400/20 bg-amber-400/[0.04] px-3 py-2.5">
+            <p className="text-xs text-amber-200/80 leading-relaxed">
+              <strong>Critério de uso:</strong> hoje só dispara áudio na <em>primeira saudação chamando o nome</em> do usuário
+              (logo após ele aceitar a LGPD e responder o nome). Marca <code>users.metadata.audio_intro_sent=true</code> e nunca repete.
             </p>
           </div>
         </div>

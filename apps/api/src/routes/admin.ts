@@ -139,8 +139,68 @@ export async function adminRoute(app: FastifyInstance) {
       vision_model: typeof body['vision_model'] === 'string' ? (body['vision_model'] as string) : undefined,
       audio_model: typeof body['audio_model'] === 'string' ? (body['audio_model'] as string) : undefined,
       xarlote_enabled: typeof body['xarlote_enabled'] === 'boolean' ? (body['xarlote_enabled'] as boolean) : undefined,
+      tts_enabled: typeof body['tts_enabled'] === 'boolean' ? (body['tts_enabled'] as boolean) : undefined,
+      tts_api_key: typeof body['tts_api_key'] === 'string' ? (body['tts_api_key'] as string) : undefined,
+      tts_voice_id: typeof body['tts_voice_id'] === 'string' ? (body['tts_voice_id'] as string) : undefined,
+      tts_model: typeof body['tts_model'] === 'string' ? (body['tts_model'] as string) : undefined,
     });
     return reply.send(updated);
+  });
+
+  // List voices disponíveis na conta ElevenLabs (usa key do prompts.json ou .env)
+  app.get('/tts/voices', async (_req, reply) => {
+    const cfg = loadPrompts();
+    const apiKey = cfg.tts_api_key || process.env['ELEVENLABS_API_KEY'] || '';
+    if (!apiKey) return reply.send({ voices: [], error: 'sem_api_key' });
+    const { listVoices } = await import('@iasaude/integrations');
+    const voices = await listVoices(apiKey);
+    return reply.send({ voices });
+  });
+
+  // Reseta a flag `audio_intro_sent` de um user pra ele receber o áudio na próxima msg.
+  // Útil quando o gatilho falhou (deploy sem TTS, erro LLM no turno crítico, etc).
+  app.post('/users/:id/reset-audio-intro', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const { data: user } = await db.from('users').select('id, metadata').eq('id', id).single();
+    if (!user) return reply.code(404).send({ error: 'user not found' });
+    const meta = (user.metadata as Record<string, unknown> | null) ?? {};
+    delete meta['audio_intro_sent'];
+    delete meta['audio_intro_at'];
+    const { error } = await db.from('users').update({ metadata: meta }).eq('id', id);
+    if (error) return reply.code(500).send({ error: error.message });
+    return reply.send({ ok: true, userId: id });
+  });
+
+  // Preview rápido — sintetiza um texto curto e devolve o MP3 (audio/mpeg).
+  // Usa voice_id/model do body se vier, senão cai pro default do prompts.json.
+  app.post('/tts/test', async (req, reply) => {
+    const cfg = loadPrompts();
+    const apiKey = cfg.tts_api_key || process.env['ELEVENLABS_API_KEY'] || '';
+    if (!apiKey) return reply.code(400).send({ error: 'ElevenLabs API key não configurada' });
+
+    const body = (req.body ?? {}) as { text?: string; voiceId?: string; modelId?: string; name?: string };
+    const greetingName = (body.name || 'Hiago').trim();
+    const text = (body.text && body.text.trim().length > 0)
+      ? body.text.trim()
+      : `Prazer, ${greetingName}! Me conta, o que você precisa hoje? Quer ajuda com algum remédio, dúvida de saúde, ou algo nesse sentido?`;
+
+    try {
+      const { synthesizeSpeech } = await import('@iasaude/integrations');
+      const result = await synthesizeSpeech(text, {
+        apiKey,
+        voiceId: body.voiceId || cfg.tts_voice_id,
+        modelId: body.modelId || cfg.tts_model,
+        languageCode: 'pt',
+        timeoutMs: 30_000,
+      });
+      reply.header('Content-Type', result.mime);
+      reply.header('X-TTS-Model', result.model);
+      reply.header('X-TTS-Voice', result.voiceId);
+      reply.header('X-TTS-Chars', String(result.charsBilled));
+      return reply.send(result.buffer);
+    } catch (err) {
+      return reply.code(502).send({ error: String(err).slice(0, 300) });
+    }
   });
 
   // Reset all dev/test data — messages, conversations, orders, quotes, users, logs
