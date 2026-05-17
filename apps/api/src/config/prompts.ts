@@ -38,6 +38,11 @@ export interface PromptsConfig {
   tts_voice_id: string;
   /** Modelo TTS — `eleven_flash_v2_5` (recomendado, suporta pt) ou `eleven_multilingual_v2`. */
   tts_model: string;
+  /**
+   * Velocidade da fala (0.7-1.2). Default 1.10 — 10% mais rápido que o
+   * neutro pra Xarlote não soar arrastada. Acima de 1.15 fica robótico.
+   */
+  tts_speed: number;
 }
 
 const defaults: PromptsConfig = {
@@ -55,6 +60,7 @@ const defaults: PromptsConfig = {
   tts_voice_id: 'm151rjrbWXbBqyq56tly',
   // Multilingual v2 — melhor pronúncia PT-BR, suporta <break/> SSML.
   tts_model: 'eleven_multilingual_v2',
+  tts_speed: 1.10,
 };
 
 /**
@@ -74,6 +80,10 @@ export function loadPrompts(): PromptsConfig {
   if (process.env['TTS_ENABLED']) envOverrides.tts_enabled = process.env['TTS_ENABLED'] === 'true' || process.env['TTS_ENABLED'] === '1';
   if (process.env['TTS_VOICE_ID']) envOverrides.tts_voice_id = process.env['TTS_VOICE_ID']!;
   if (process.env['TTS_MODEL']) envOverrides.tts_model = process.env['TTS_MODEL']!;
+  if (process.env['TTS_SPEED']) {
+    const n = parseFloat(process.env['TTS_SPEED']!);
+    if (!isNaN(n) && n >= 0.7 && n <= 1.2) envOverrides.tts_speed = n;
+  }
 
   let fileOverrides: Partial<PromptsConfig> = {};
   try {

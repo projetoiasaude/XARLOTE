@@ -101,6 +101,7 @@ export async function sendOutboundAudio(
       voiceId: cfg.tts_voice_id,
       modelId: cfg.tts_model,
       languageCode: 'pt',
+      speed: cfg.tts_speed,
       timeoutMs: 30_000,
     });
     await writeLog('info', 'tts', `Áudio sintetizado [${synth.model}/${synth.voiceId}] ${synth.buffer.length}B em ${Date.now() - ttsStart}ms (${synth.charsBilled} chars)`, {

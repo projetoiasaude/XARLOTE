@@ -65,6 +65,7 @@ interface PromptsConfig {
   tts_api_key: string;
   tts_voice_id: string;
   tts_model: string;
+  tts_speed: number;
 }
 
 interface ElVoice {
@@ -89,6 +90,7 @@ const DEFAULT_CFG: PromptsConfig = {
   audio_model: 'openai/gpt-4o-audio-preview', xarlote_enabled: true,
   tts_enabled: false, tts_api_key: '',
   tts_voice_id: XARLOTE_VOICE_ID, tts_model: 'eleven_multilingual_v2',
+  tts_speed: 1.10,
 };
 
 export default function PromptsPage() {
@@ -141,7 +143,8 @@ export default function PromptsPage() {
     config.tts_enabled !== original.tts_enabled ||
     config.tts_api_key !== original.tts_api_key ||
     config.tts_voice_id !== original.tts_voice_id ||
-    config.tts_model !== original.tts_model;
+    config.tts_model !== original.tts_model ||
+    config.tts_speed !== original.tts_speed;
 
   async function loadVoices() {
     setLoadingVoices(true);
@@ -244,6 +247,7 @@ export default function PromptsPage() {
         tts_api_key: config.tts_api_key,
         tts_voice_id: config.tts_voice_id,
         tts_model: config.tts_model,
+        tts_speed: config.tts_speed,
       };
       const res = await fetch(`${API}/admin/prompts`, {
         method: 'PUT',
@@ -653,6 +657,35 @@ export default function PromptsPage() {
             <p className="text-xs text-white/40 mt-1.5">
               Flash v2.5 ≈ $0.10/1k chars, latência ~75ms. Multilingual v2 ≈ $0.30/1k chars, qualidade superior.
             </p>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-xs font-medium text-white/70">
+                Velocidade da fala
+              </label>
+              <span className="text-xs font-mono tabular-nums text-accent-hi">
+                {(config.tts_speed ?? 1.10).toFixed(2)}x
+              </span>
+            </div>
+            <input
+              type="range"
+              min={0.7}
+              max={1.2}
+              step={0.01}
+              value={config.tts_speed ?? 1.10}
+              onChange={(e) => setConfig((c) => ({ ...c, tts_speed: parseFloat(e.target.value) }))}
+              className="w-full h-2 bg-white/[0.06] rounded-full appearance-none cursor-pointer accent-accent"
+              style={{
+                background: `linear-gradient(to right, rgb(124 135 255) 0%, rgb(124 135 255) ${((config.tts_speed - 0.7) / 0.5) * 100}%, rgba(255,255,255,0.06) ${((config.tts_speed - 0.7) / 0.5) * 100}%, rgba(255,255,255,0.06) 100%)`,
+              }}
+            />
+            <div className="flex justify-between text-[10px] text-white/35 mt-1 font-mono">
+              <span>0.70 lento</span>
+              <span>1.00 neutro</span>
+              <span>1.10 padrão</span>
+              <span>1.20 rápido</span>
+            </div>
           </div>
 
           <div className="flex items-center gap-2">

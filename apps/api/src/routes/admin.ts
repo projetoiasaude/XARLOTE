@@ -143,6 +143,7 @@ export async function adminRoute(app: FastifyInstance) {
       tts_api_key: typeof body['tts_api_key'] === 'string' ? (body['tts_api_key'] as string) : undefined,
       tts_voice_id: typeof body['tts_voice_id'] === 'string' ? (body['tts_voice_id'] as string) : undefined,
       tts_model: typeof body['tts_model'] === 'string' ? (body['tts_model'] as string) : undefined,
+      tts_speed: typeof body['tts_speed'] === 'number' ? (body['tts_speed'] as number) : undefined,
     });
     return reply.send(updated);
   });
@@ -197,7 +198,7 @@ export async function adminRoute(app: FastifyInstance) {
     const apiKey = cfg.tts_api_key || process.env['ELEVENLABS_API_KEY'] || '';
     if (!apiKey) return reply.code(400).send({ error: 'ElevenLabs API key não configurada' });
 
-    const body = (req.body ?? {}) as { text?: string; voiceId?: string; modelId?: string; name?: string };
+    const body = (req.body ?? {}) as { text?: string; voiceId?: string; modelId?: string; name?: string; speed?: number };
     const greetingName = (body.name || 'Hiago').trim();
     const text = (body.text && body.text.trim().length > 0)
       ? body.text.trim()
@@ -210,6 +211,7 @@ export async function adminRoute(app: FastifyInstance) {
         voiceId: body.voiceId || cfg.tts_voice_id,
         modelId: body.modelId || cfg.tts_model,
         languageCode: 'pt',
+        speed: typeof body.speed === 'number' ? body.speed : cfg.tts_speed,
         timeoutMs: 30_000,
       });
       reply.header('Content-Type', result.mime);

@@ -29,6 +29,12 @@ export interface TtsOptions {
   similarityBoost?: number;
   /** 0-1, default 0.5. Maior = mais dramático. */
   style?: number;
+  /**
+   * Velocidade da fala (0.7-1.2, default 1.0).
+   * Xarlote usa 1.10 por padrão — soa natural sem virar "leitor de rádio".
+   * Acima de 1.15 a prosódia começa a ficar artificial.
+   */
+  speed?: number;
   /** Boost de clareza/presença. Default true. */
   useSpeakerBoost?: number | boolean;
   /** Código de idioma — só usado por modelos Turbo v2.5/Flash v2.5. */
@@ -90,6 +96,8 @@ export async function synthesizeSpeech(
       similarity_boost: opts.similarityBoost ?? 0.85,
       // Style alto → mais dramatismo/entonação no momento de saudação.
       style: opts.style ?? 0.55,
+      // Speed 1.10 → 10% mais rápido que o default neutro (1.0), soa natural.
+      speed: opts.speed ?? 1.10,
       use_speaker_boost:
         typeof opts.useSpeakerBoost === 'boolean'
           ? opts.useSpeakerBoost
