@@ -2,22 +2,24 @@
  * Transcrição de áudio do WhatsApp.
  *
  * Providers suportados (via prefixo/sufixo do `model`):
- *   - `openai/gpt-4o-audio-preview` → OpenRouter chat-with-audio (input_audio na content array)
- *     [DEFAULT — funciona com a key OpenRouter existente]
- *   - `openai/whisper-1`             → OpenRouter `/audio/transcriptions` (NÃO funciona —
- *     OpenRouter não expõe esse endpoint hoje. Mantido por compat se mudar.)
+ *   - `elevenlabs/scribe_v1`        → ElevenLabs Speech-to-Text [DEFAULT ATUAL]
+ *     Endpoint POST /v1/speech-to-text multipart. Usa a MESMA api key do TTS
+ *     (já paga). PT-BR excelente. Devolve {text, language_code, words[]}.
+ *   - `openai/gpt-4o-audio-preview` → OpenRouter chat-with-audio (input_audio
+ *     na content array). Tava quebrado em 2026-05 — OpenRouter roteia pro
+ *     snapshot 2025-06-03 que não existe. Mantido pra quando voltar.
  *   - `whisper/whisper-1`           → OpenAI direto (precisa OPENAI_API_KEY)
  *   - `gemini/gemini-2.0-flash`     → Google Generative Language API (inlineData)
  *
  * O caller escolhe via settings UI. Audio do WhatsApp normalmente vem em
- * `audio/ogg` (Opus) ou `audio/mpeg` — gpt-4o-audio aceita os dois.
+ * `audio/ogg` (Opus) ou `audio/mpeg` — Scribe aceita os dois.
  */
 
 interface TranscribeResult {
   text: string;
   lang?: string;
   durationSeconds?: number;
-  provider: 'openrouter' | 'gemini';
+  provider: 'openrouter' | 'gemini' | 'elevenlabs';
   model: string;
 }
 
@@ -25,20 +27,26 @@ interface TranscribeOptions {
   model?: string;
   openRouterKey?: string;
   geminiKey?: string;
+  /** API key da ElevenLabs — usada pelo provider `elevenlabs/scribe_v1`. */
+  elevenLabsKey?: string;
   timeoutMs?: number;
 }
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+const ELEVENLABS_BASE = 'https://api.elevenlabs.io/v1';
 
 export async function transcribeAudio(
   audio: Buffer,
   mime: string,
   opts: TranscribeOptions = {}
 ): Promise<TranscribeResult> {
-  const model = opts.model || 'openai/gpt-4o-audio-preview';
+  const model = opts.model || 'elevenlabs/scribe_v1';
   const timeoutMs = opts.timeoutMs ?? 45_000;
 
+  if (model.startsWith('elevenlabs/')) {
+    return transcribeWithElevenLabs(audio, mime, model.replace(/^elevenlabs\//, ''), opts.elevenLabsKey, timeoutMs);
+  }
   if (model.startsWith('gemini/')) {
     return transcribeWithGemini(audio, mime, model.replace(/^gemini\//, ''), opts.geminiKey, timeoutMs);
   }
@@ -51,6 +59,62 @@ export async function transcribeAudio(
   }
   // Caminho legado /audio/transcriptions — OpenRouter não suporta (deixa por compat)
   return transcribeWithOpenRouter(audio, mime, model, opts.openRouterKey, timeoutMs);
+}
+
+/**
+ * ElevenLabs Speech-to-Text (Scribe v1) via POST /v1/speech-to-text multipart.
+ * Aceita audio/ogg, audio/mpeg, audio/wav, audio/m4a, audio/webm.
+ * Param `language_code=por` força PT-BR e dá precisão excelente em nomes BR.
+ */
+async function transcribeWithElevenLabs(
+  audio: Buffer,
+  mime: string,
+  model: string,
+  apiKeyOverride: string | undefined,
+  timeoutMs: number
+): Promise<TranscribeResult> {
+  const apiKey = apiKeyOverride ?? process.env['ELEVENLABS_API_KEY'] ?? '';
+  if (!apiKey) throw new Error('No ELEVENLABS_API_KEY for Scribe transcription.');
+
+  const filename = guessFilename(mime);
+  const form = new FormData();
+  form.append('file', new Blob([audio], { type: mime || 'audio/ogg' }), filename);
+  form.append('model_id', model || 'scribe_v1');
+  form.append('language_code', 'por');
+  // Diarize=false (não rotula speakers), tag_audio_events=false (sem "[laugh]" etc)
+  form.append('diarize', 'false');
+  form.append('tag_audio_events', 'false');
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${ELEVENLABS_BASE}/speech-to-text`, {
+      method: 'POST',
+      headers: { 'xi-api-key': apiKey },
+      body: form,
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => res.statusText);
+      throw new Error(`[transcribe elevenlabs ${res.status}] ${text.slice(0, 240)}`);
+    }
+    const data = (await res.json()) as {
+      text?: string;
+      language_code?: string;
+      language_probability?: number;
+      words?: Array<{ end?: number }>;
+    };
+    const lastWord = data.words?.[data.words.length - 1];
+    return {
+      text: (data.text ?? '').trim(),
+      lang: data.language_code,
+      durationSeconds: typeof lastWord?.end === 'number' ? lastWord.end : undefined,
+      provider: 'elevenlabs',
+      model: `elevenlabs/${model}`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**

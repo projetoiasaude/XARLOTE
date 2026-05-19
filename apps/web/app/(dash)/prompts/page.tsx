@@ -38,8 +38,9 @@ const VISION_MODELS = [
 ];
 
 const AUDIO_MODELS = [
-  { value: 'openai/gpt-4o-audio-preview', label: 'GPT-4o Audio — recomendado' },
-  { value: 'whisper/whisper-1', label: 'Whisper-1 (OpenAI direta)' },
+  { value: 'elevenlabs/scribe_v1', label: 'ElevenLabs Scribe v1 — recomendado (PT-BR excelente)' },
+  { value: 'openai/gpt-4o-audio-preview', label: 'GPT-4o Audio (OpenRouter — instável)' },
+  { value: 'whisper/whisper-1', label: 'Whisper-1 (OpenAI direta, precisa OPENAI_API_KEY)' },
   { value: 'gemini/gemini-2.0-flash', label: 'Gemini 2.0 Flash (Google direto)' },
   { value: 'gemini/gemini-2.5-flash', label: 'Gemini 2.5 Flash (Google direto)' },
 ];

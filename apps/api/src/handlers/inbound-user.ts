@@ -259,11 +259,12 @@ export async function processInboundUser(
       if (media) {
         downloadedMime = media.mime || downloadedMime;
         await writeLog('info', 'transcription', `Áudio baixado (${media.buffer.length} bytes, ${downloadedMime})`, { traceId });
-        const audioModel = promptsConfig.audio_model || 'openai/whisper-1';
+        const audioModel = promptsConfig.audio_model || 'elevenlabs/scribe_v1';
         const result = await transcribeAudio(media.buffer, downloadedMime, {
           model: audioModel,
           openRouterKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
           geminiKey: process.env['GOOGLE_GENAI_API_KEY'],
+          elevenLabsKey: promptsConfig.tts_api_key || process.env['ELEVENLABS_API_KEY'],
           timeoutMs: 30_000,
         });
         transcript = result.text;

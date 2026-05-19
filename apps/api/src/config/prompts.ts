@@ -51,7 +51,7 @@ const defaults: PromptsConfig = {
   llm_api_key: '',
   llm_model: 'openai/gpt-4.1-mini',
   vision_model: 'openai/gpt-4.1-mini',
-  audio_model: 'openai/gpt-4o-audio-preview',
+  audio_model: 'elevenlabs/scribe_v1',
   xarlote_enabled: true,
   tts_enabled: false,
   tts_api_key: '',
