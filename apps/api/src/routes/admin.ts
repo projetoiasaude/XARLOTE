@@ -251,7 +251,7 @@ export async function adminRoute(app: FastifyInstance) {
     const greetingName = (body.name || 'Hiago').trim();
     const text = (body.text && body.text.trim().length > 0)
       ? body.text.trim()
-      : `Prazer, ${greetingName}! Me conta, o que você precisa hoje? Quer ajuda com algum remédio, dúvida de saúde, ou algo nesse sentido?`;
+      : `Prazer ${greetingName}! Me conta, como posso te ajudar hoje? Quer cotar algum remédio, tirar uma dúvida, o que posso fazer por você hoje?`;
 
     try {
       const { synthesizeSpeech } = await import('@iasaude/integrations');

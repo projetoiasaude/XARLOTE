@@ -261,14 +261,17 @@ export function humanizeForVoice(text: string, opts: HumanizeOptions = {}): stri
   //    "…" (U+2026), "...", "...."
   out = out.replace(/…|\.{3,}/g, ' <break time="0.35s"/> ');
 
-  // 3. Pausa de sorriso após primeira vírgula da saudação
-  //    Identifica padrão típico: "Oi X," / "Olá X," / "Prazer X," nos primeiros 35 chars
-  if (opts.addBreaks !== false) {
-    out = out.replace(
-      /^((?:oi|olá|ola|prazer|opa|ei|e aí|eai)[^,.!?]{0,30}[,!])/i,
-      '$1 <break time="0.3s"/>',
-    );
-  }
+  // 3. Remove vírgula entre saudação e nome — fluência natural
+  //    "Prazer, Hiago!" → "Prazer Hiago!"
+  //    "Oi, Maria!" → "Oi Maria!"
+  //    Sem vírgula o TTS não força pausa estranha entre saudação+nome.
+  out = out.replace(
+    /^(Oi|Olá|Ola|Prazer|Opa|Ei|E aí|Eai|Bom dia|Boa tarde|Boa noite),\s+([A-ZÁÉÍÓÚÂÊÎÔÛÃÕ])/i,
+    '$1 $2',
+  );
+
+  // NOTA: removemos o <break time="0.3s"/> que era injetado após a saudação —
+  // ficava marcadamente artificial. O TTS já modula naturalmente.
 
   return out.trim();
 }
