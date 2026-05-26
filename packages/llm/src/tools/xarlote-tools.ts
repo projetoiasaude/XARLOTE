@@ -338,7 +338,7 @@ export const xarloteTools: ToolDefinition[] = [
     function: {
       name: 'red_flag_check',
       description:
-        'USE IMEDIATAMENTE quando perceber sinal sério de emergência ou risco. Não é pra alarme falso — só dispare quando tem indício forte. Exemplos: paciente fala em "me machucar", "suicídio", "não quero viver"; descreve dor no peito + falta de ar; descreve sintomas de AVC (rosto torto, fraqueza num lado, fala arrastada súbita); criança engoliu medicamento; overdose intencional; sangramento intenso. A tool registra o caso, dispara alerta interno e te dá orientação imediata pra você passar pro paciente.',
+        '🚨 OBRIGATÓRIO chamar IMEDIATAMENTE quando paciente mencionar QUALQUER sinal de emergência. Sem essa tool, OS BOTÕES NÃO APARECEM — você NÃO TEM como simular botões via texto. Use SEMPRE que aparecer: "dor no peito" (chest_pain), "falta de ar" grave (breathing_difficulty), "rosto torto/fraqueza num lado/fala arrastada" (stroke_signs), "quero me matar/não quero viver" (suicide_ideation), "tô me machucando/vou me cortar" (self_harm), "tomei muito remédio" (overdose), "sangrando muito" (severe_bleeding), reação alérgica grave (allergic_reaction_severe), criança engasgada/inconsciente (child_emergency). REGRA ABSOLUTA: se você está prestes a ESCREVER algo sobre emergência, dor no peito, SAMU 192, ou botões — VOLTA e chame essa tool ANTES. Após chamar, NÃO escreva mais nada nesse turno; a tool envia automaticamente os 3 botões clicáveis no WhatsApp do paciente.',
       parameters: {
         type: 'object',
         properties: {
