@@ -8,6 +8,13 @@ import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
+import {
+  handleStartTreatmentFromOrder, handleLogMedicationTaken, handleUpdateTreatmentStatus,
+  handleLogSymptom, handleSetDefaultAddress,
+  handleStartConsultationSearch, handleConfirmConsultation, handleCancelConsultation,
+  type StartTreatmentArgs, type LogMedicationTakenArgs, type UpdateTreatmentStatusArgs,
+  type LogSymptomArgs, type StartConsultationArgs,
+} from './tool-executor-v2.js';
 
 /**
  * Extrai um identificador curto do endereço pra usar na cotação com a farmácia:
@@ -86,6 +93,35 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         break;
       case 'confirm_order_selection':
         await handleConfirmOrder(tc.args as { order_id: string; quote_id: string }, ctx);
+        break;
+      // ─── Xarlote 2.0 ──────────────────────────────────────────────────────
+      case 'start_treatment_from_order':
+        await handleStartTreatmentFromOrder(tc.args as unknown as StartTreatmentArgs, ctx);
+        break;
+      case 'log_medication_taken':
+        await handleLogMedicationTaken(tc.args as unknown as LogMedicationTakenArgs, ctx);
+        break;
+      case 'update_treatment_status':
+        await handleUpdateTreatmentStatus(tc.args as unknown as UpdateTreatmentStatusArgs, ctx);
+        break;
+      case 'log_symptom':
+        await handleLogSymptom(tc.args as unknown as LogSymptomArgs, ctx);
+        break;
+      case 'query_my_addresses':
+        // Não faz nada server-side — a Xarlote já tem os endereços no user_360 context.
+        // Tool é "marker" pra a LLM saber que o user perguntou.
+        break;
+      case 'set_default_address':
+        await handleSetDefaultAddress(tc.args as unknown as { address_label: string }, ctx);
+        break;
+      case 'start_consultation_search':
+        await handleStartConsultationSearch(tc.args as unknown as StartConsultationArgs, ctx);
+        break;
+      case 'confirm_consultation_selection':
+        await handleConfirmConsultation(tc.args as unknown as { consultation_id: string; quote_id: string }, ctx);
+        break;
+      case 'cancel_consultation':
+        await handleCancelConsultation(tc.args as unknown as { consultation_id: string; reason: string }, ctx);
         break;
       default:
         break;

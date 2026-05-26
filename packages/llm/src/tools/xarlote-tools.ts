@@ -175,4 +175,152 @@ export const xarloteTools: ToolDefinition[] = [
       },
     },
   },
+
+  // ─────── Tools de tratamento longitudinal (Xarlote 2.0) ─────────────────
+  {
+    type: 'function',
+    function: {
+      name: 'start_treatment_from_order',
+      description: 'Após o paciente CONFIRMAR um pedido de medicamento de uso contínuo, registra como tratamento longitudinal: cria a row em treatments, registra inventário inicial e agenda lembretes diários. SÓ chame depois de confirm_order_selection bem-sucedido, e SÓ se o medicamento for de uso contínuo (ex: anti-hipertensivo, antidiabético, antidepressivo) — não pra remédio agudo (antibiótico de 7 dias, analgésico SOS).',
+      parameters: {
+        type: 'object',
+        properties: {
+          order_id: { type: 'string', description: 'ID do pedido confirmado' },
+          treatment_name: { type: 'string', description: 'Nome do tratamento (ex: "Tratamento de hipertensão")' },
+          condition: { type: 'string', description: 'Condição que o tratamento trata (ex: "hipertensão")' },
+          daily_consumption: { type: 'number', description: 'Comprimidos por dia (ex: 1, 0.5)' },
+          reminder_time: { type: 'string', description: 'Horário do lembrete diário em HH:MM 24h (ex: "08:00"). Pergunte ao paciente.' },
+          duration_days: { type: 'integer', description: 'Duração esperada em dias. Omita pra tratamentos indefinidos.' },
+        },
+        required: ['order_id', 'treatment_name', 'daily_consumption', 'reminder_time'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'log_medication_taken',
+      description: 'Registra que o paciente tomou (ou pulou) uma dose. Use quando o paciente responder a um lembrete confirmando ("tomei", "ok", "👍") ou negando ("esqueci", "pulei").',
+      parameters: {
+        type: 'object',
+        properties: {
+          medication_name: { type: 'string', description: 'Nome do medicamento' },
+          status: { type: 'string', enum: ['taken', 'skipped', 'snoozed'], description: 'taken=tomou, skipped=pulou, snoozed=vai tomar mais tarde' },
+          notes: { type: 'string', description: 'Notas opcionais (ex: "tomou junto com o almoço")' },
+        },
+        required: ['medication_name', 'status'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'update_treatment_status',
+      description: 'Atualiza o status de um tratamento ativo. Use quando o paciente disser que parou, pausou ou completou o tratamento.',
+      parameters: {
+        type: 'object',
+        properties: {
+          treatment_name: { type: 'string', description: 'Nome do tratamento ou medicamento principal' },
+          new_status: { type: 'string', enum: ['paused', 'completed', 'interrupted'], description: 'paused=pausa temporária, completed=terminou, interrupted=parou abruptamente (efeito colateral, médico mandou parar)' },
+          reason: { type: 'string', description: 'Motivo (importante pra audit)' },
+        },
+        required: ['treatment_name', 'new_status', 'reason'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'log_symptom',
+      description: 'Registra um sintoma reportado pelo paciente. Use quando ele se queixar de algo concreto: "dor de cabeça", "febre", "tontura", "náusea". NÃO faça diagnóstico.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Nome do sintoma em PT-BR (ex: "dor de cabeça")' },
+          intensity: { type: 'integer', minimum: 1, maximum: 10, description: 'Intensidade 1-10 se o paciente disser' },
+          duration_hours: { type: 'number', description: 'Há quanto tempo tem o sintoma' },
+          context: { type: 'string', description: 'Contexto: "depois do almoço", "ao acordar", "após exercício"' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'query_my_addresses',
+      description: 'Devolve a lista de endereços do paciente. Use quando ele disser "manda pra casa", "pro trabalho", "pro endereço de sempre" pra resolver qual endereço usar.',
+      parameters: {
+        type: 'object',
+        properties: {
+          label_hint: { type: 'string', description: 'Dica sobre qual endereço (ex: "casa", "trabalho", "padrão"). Opcional.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'set_default_address',
+      description: 'Marca um endereço como padrão do paciente. Use quando ele explicitamente pedir ("deixa esse como padrão") ou após detectar uso repetido (≥3 vezes mesmo endereço).',
+      parameters: {
+        type: 'object',
+        properties: {
+          address_label: { type: 'string', description: 'Label do endereço (ex: "casa", "trabalho")' },
+        },
+        required: ['address_label'],
+      },
+    },
+  },
+
+  // ─────── Tools de consulta médica (Xarlote 2.0) ─────────────────────────
+  {
+    type: 'function',
+    function: {
+      name: 'start_consultation_search',
+      description: 'Inicia busca por consulta médica: conversa com clínicas via WhatsApp paralelamente (igual cotação de farmácia) e devolve as melhores opções. SÓ chame depois de ter especialidade + urgência + cidade.',
+      parameters: {
+        type: 'object',
+        properties: {
+          specialty: { type: 'string', description: 'Especialidade médica (ex: "cardiologia", "endocrinologia", "clínico geral")' },
+          urgency: { type: 'string', enum: ['rotina', '72h', '24h', 'urgente'], description: 'Pra rotina pode esperar semanas; urgente é pra hoje/amanhã' },
+          modality: { type: 'string', enum: ['presencial', 'telemedicina', 'indiferente'], description: 'Se o paciente quer pessoalmente ou online' },
+          city: { type: 'string', description: 'Cidade onde quer marcar — usa default address do user se omitido' },
+          plan: { type: 'string', description: 'Plano de saúde do paciente (ex: "Unimed", "Bradesco Saúde"). Omita se for particular.' },
+          preferences: { type: 'object', description: 'Preferências extras: { genero_medico: "feminino", horario_pref: "manhã" }', properties: {} },
+        },
+        required: ['specialty', 'urgency'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'confirm_consultation_selection',
+      description: 'Após o paciente escolher uma das opções de consulta cotadas, confirma com a clínica e agenda. Espelho de confirm_order_selection.',
+      parameters: {
+        type: 'object',
+        properties: {
+          consultation_id: { type: 'string' },
+          quote_id: { type: 'string' },
+        },
+        required: ['consultation_id', 'quote_id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cancel_consultation',
+      description: 'Cancela uma consulta marcada.',
+      parameters: {
+        type: 'object',
+        properties: {
+          consultation_id: { type: 'string' },
+          reason: { type: 'string' },
+        },
+        required: ['consultation_id', 'reason'],
+      },
+    },
+  },
 ];

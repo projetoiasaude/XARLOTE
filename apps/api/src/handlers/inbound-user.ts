@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange } from '@iasaude/db';
+import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, buildConsentEvent } from '@iasaude/core';
 import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES } from '@iasaude/shared';
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard } from '@iasaude/shared';
@@ -224,14 +224,25 @@ export async function processInboundUser(
     });
   }
 
-  // 8. Build context for Xarlote
+  // 8. Build context for Xarlote — tenta perfil 360 unificado primeiro
   const history = await getConversationMessages(conversation.id, 30);
   const geminiHistory = trimHistory(messagesToHistory(history.slice(0, -1)), 20);
 
-  const { data: conditions } = await db.from('user_health_conditions').select('name').eq('user_id', user.id).eq('active', true);
-  const { data: allergies } = await db.from('user_allergies').select('substance').eq('user_id', user.id);
-  const { data: medications } = await db.from('user_medications').select('medication_name, dosage').eq('user_id', user.id).eq('active', true);
-  const { data: addresses } = await db.from('user_addresses').select('*').eq('user_id', user.id);
+  const user360 = await queryUser360(user.id);
+  // Fallback: se a RPC ainda não existe no banco, faz as queries individuais
+  // (compatibilidade com deploy intermediário enquanto migration não roda)
+  const { data: conditions } = user360
+    ? { data: user360.conditions.map((c) => ({ name: c.name })) }
+    : await db.from('user_health_conditions').select('name').eq('user_id', user.id).eq('active', true);
+  const { data: allergies } = user360
+    ? { data: user360.allergies.map((a) => ({ substance: a.substance })) }
+    : await db.from('user_allergies').select('substance').eq('user_id', user.id);
+  const { data: medications } = user360
+    ? { data: user360.active_treatments.flatMap((t) => t.medications.map((m) => ({ medication_name: m.name, dosage: m.dosage }))) }
+    : await db.from('user_medications').select('medication_name, dosage').eq('user_id', user.id).eq('active', true);
+  const { data: addresses } = user360
+    ? { data: user360.addresses }
+    : await db.from('user_addresses').select('*').eq('user_id', user.id);
 
   // Load active order summary (quoted = waiting for user to pick; confirming = waiting for pharmacy)
   const { data: activeOrder } = await db
@@ -280,6 +291,17 @@ export async function processInboundUser(
     memoryCards,
     activeOrderSummary,
   });
+
+  // Se temos user360 com tratamentos/sintomas/consultas/skills, anexa contexto rico
+  if (user360 && (
+    user360.active_treatments.length > 0 ||
+    user360.upcoming_consultations.length > 0 ||
+    user360.recent_symptoms.length > 0 ||
+    user360.favorite_pharmacies.length > 0 ||
+    user360.skills.length > 0
+  )) {
+    systemPrompt += `\n\n${formatUser360ForPrompt(user360)}`;
+  }
 
   if (promptsConfig.sara_suffix.trim()) {
     systemPrompt += `\n\n## INSTRUÇÕES ADICIONAIS (configuradas no dashboard)\n${promptsConfig.sara_suffix.trim()}`;

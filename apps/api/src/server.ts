@@ -9,6 +9,8 @@ import { adminRoute } from './routes/admin.js';
 import { dispatchReminders } from './workers/reminder-dispatcher.worker.js';
 import { startProfileEnricherWorker } from './workers/profile-enricher.worker.js';
 import { compactStaleConversations } from './workers/conversation-compactor.worker.js';
+import { startInventoryTrackerWorker } from './workers/inventory-tracker.worker.js';
+import { startAdherenceScorerWorker } from './workers/adherence-scorer.worker.js';
 
 async function main() {
   const app = Fastify({
@@ -43,7 +45,9 @@ async function main() {
     dispatchReminders().catch((e) => app.log.error(e, 'reminder dispatch initial failed'));
     startProfileEnricherWorker();
     setInterval(() => compactStaleConversations().catch((e) => app.log.error(e, 'compactor failed')), 60 * 60 * 1000);
-    console.log(`   Workers: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h)`);
+    startInventoryTrackerWorker();
+    startAdherenceScorerWorker();
+    console.log(`   Workers: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h), inventory-tracker (6h), adherence-scorer (24h)`);
   } catch (err) {
     app.log.error(err);
     process.exit(1);
