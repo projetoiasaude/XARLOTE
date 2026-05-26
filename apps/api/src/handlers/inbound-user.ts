@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory } from '@iasaude/db';
+import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange } from '@iasaude/db';
 import { isForgetMeRequest, buildConsentEvent } from '@iasaude/core';
 import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES } from '@iasaude/shared';
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard } from '@iasaude/shared';
@@ -85,6 +85,15 @@ export async function processInboundUser(
       // Persistimos o texto da mensagem normalmente em `messages` (pra aparecer no dashboard),
       // mas o envio real ao usuário usa sendMenu pra renderizar os botões clicáveis.
       await db.from('users').update({ onboarding_status: 'consent_pending' }).eq('id', user.id);
+      await auditUserStateChange({
+        userId: user.id,
+        action: 'user.onboarding.advanced',
+        before: { onboarding_status: 'not_started' },
+        after: { onboarding_status: 'consent_pending' },
+        reason: 'first_inbound_message',
+        traceId,
+        conversationId: conversation.id,
+      });
 
       await db.from('messages').insert({
         conversation_id: conversation.id,
@@ -127,6 +136,15 @@ export async function processInboundUser(
     });
 
     if (isRefuse) {
+      await auditUserStateChange({
+        userId: user.id,
+        action: 'user.onboarding.consent_refused',
+        before: { onboarding_status: 'consent_pending' },
+        after: { onboarding_status: 'consent_pending' },
+        reason: 'user_text_refuse',
+        traceId,
+        conversationId: conversation.id,
+      });
       const refuseMsg = `Tudo bem, sem pressão. Sem o aceite da LGPD eu não posso seguir com o atendimento. Quando quiser, é só me responder *Aceitar* aqui que a gente continua de onde parou.`;
       await sendOutbound(conversation.id, phoneE164, refuseMsg, traceId);
       return { traceId, conversationId: conversation.id };
@@ -143,6 +161,19 @@ export async function processInboundUser(
         lgpd_consent_message_id: inboundMsg.id,
       }).eq('id', user.id);
       user = { ...user, onboarding_status: 'profiling', lgpd_consent_at: new Date().toISOString() };
+      await auditUserStateChange({
+        userId: user.id,
+        action: 'user.onboarding.consent_accepted',
+        before: { onboarding_status: 'consent_pending' },
+        after: {
+          onboarding_status: 'profiling',
+          lgpd_consent_at: user.lgpd_consent_at,
+          lgpd_consent_version: consentPayload.policy_version,
+        },
+        reason: 'lgpd_accepted',
+        traceId,
+        conversationId: conversation.id,
+      });
 
       const welcomeMsg = `Boa! Pra gente começar, como você gosta de ser chamado(a)?`;
       await sendOutbound(conversation.id, phoneE164, welcomeMsg, traceId);
@@ -161,6 +192,15 @@ export async function processInboundUser(
     return { traceId, conversationId: conversation.id };
   }
   if (inbound.text?.toLowerCase().includes('confirmo apagar')) {
+    await writeAudit({
+      actorType: 'user',
+      action: 'user.forget_me.requested',
+      userId: user.id,
+      conversationId: conversation.id,
+      messageId: inboundMsg.id,
+      traceId,
+      reason: 'user_typed_confirmo_apagar',
+    });
     await handleForgetMe(user.id, conversation.id, phoneE164, traceId);
     return { traceId, conversationId: conversation.id };
   }
@@ -173,6 +213,15 @@ export async function processInboundUser(
   if (wasProfiling) {
     await db.from('users').update({ onboarding_status: 'active' }).eq('id', user.id);
     user = { ...user, onboarding_status: 'active' };
+    await auditUserStateChange({
+      userId: user.id,
+      action: 'user.onboarding.activated',
+      before: { onboarding_status: 'profiling' },
+      after: { onboarding_status: 'active' },
+      reason: 'user_replied_after_consent',
+      traceId,
+      conversationId: conversation.id,
+    });
   }
 
   // 8. Build context for Xarlote
@@ -371,6 +420,21 @@ export async function processInboundUser(
     return { traceId, conversationId: conversation.id };
   }
 
+  await writeEvent({
+    eventName: 'llm.completion',
+    userId: user.id,
+    conversationId: conversation.id,
+    traceId,
+    durationMs: llmResponse.latencyMs,
+    tokensIn: llmResponse.tokensIn,
+    tokensOut: llmResponse.tokensOut,
+    payload: {
+      model: llmResponse.model,
+      multimodal: isMultimodal,
+      tool_calls: llmResponse.toolCalls.map((t) => t.name),
+      text_length: llmResponse.text.length,
+    },
+  });
   await writeLog('info', 'llm', `Xarlote ← LLM [${llmResponse.model}] — ${llmResponse.tokensIn}in/${llmResponse.tokensOut}out tok, ${llmResponse.latencyMs}ms${llmResponse.toolCalls.length ? ` — tools: ${llmResponse.toolCalls.map((t) => t.name).join(', ')}` : ''}${llmResponse.text ? ` — "${llmResponse.text.slice(0, 60)}…"` : ''}`, {
     traceId, model: llmResponse.model, tokensIn: llmResponse.tokensIn, tokensOut: llmResponse.tokensOut, latencyMs: llmResponse.latencyMs,
     tools: llmResponse.toolCalls.map((t) => t.name),
@@ -490,6 +554,17 @@ async function resetAllData(dbClient: typeof db): Promise<void> {
 }
 
 async function handleForgetMe(userId: string, conversationId: string, phoneE164: string, traceId: string) {
+  // Audit ANTES de executar — caso algo falhe no meio, sabemos que foi tentado
+  await writeAudit({
+    actorType: 'user',
+    action: 'user.forget_me.executing',
+    userId,
+    conversationId,
+    traceId,
+    reason: 'lgpd_article_18',
+    metadata: { phone_e164: phoneE164 },
+  });
+
   // Record revocation
   await db.from('consent_events').insert({ user_id: userId, event_type: 'revoke', policy_version: '1.0', channel: 'whatsapp' });
 
@@ -501,6 +576,22 @@ async function handleForgetMe(userId: string, conversationId: string, phoneE164:
   await db.from('user_addresses').delete().eq('user_id', userId);
   await deleteUserMemory(userId);
   await db.from('users').update({ phone_e164: `deleted-${userId}`, full_name: null, preferred_name: null, deleted_at: new Date().toISOString() }).eq('id', userId);
+
+  await writeAudit({
+    actorType: 'user',
+    action: 'user.forget_me.executed',
+    userId,
+    conversationId,
+    traceId,
+    reason: 'lgpd_article_18',
+    metadata: {
+      phone_e164_anonymized: `deleted-${userId}`,
+      tables_cleared: [
+        'messages', 'user_health_conditions', 'user_allergies', 'user_medications',
+        'user_addresses', 'memory_cards_index',
+      ],
+    },
+  });
 
   const goodbye = 'Pronto, apaguei tudo. Se mudar de ideia, é só me chamar de novo.';
   await sendOutbound(conversationId, phoneE164, goodbye, traceId);

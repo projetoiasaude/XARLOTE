@@ -1,4 +1,4 @@
-import { db, writeLog } from '@iasaude/db';
+import { db, writeLog, writeEvent } from '@iasaude/db';
 import { isSimulatorMode, sendText, sendAudio } from '@iasaude/whatsapp';
 import { synthesizeSpeech, humanizeForVoice } from '@iasaude/integrations';
 import { SARA_INSTANCE } from '@iasaude/shared';
@@ -104,11 +104,26 @@ export async function sendOutboundAudio(
       speed: cfg.tts_speed,
       timeoutMs: 30_000,
     });
-    await writeLog('info', 'tts', `Áudio sintetizado [${synth.model}/${synth.voiceId}] ${synth.buffer.length}B em ${Date.now() - ttsStart}ms (${synth.charsBilled} chars)`, {
-      traceId, model: synth.model, voiceId: synth.voiceId, bytes: synth.buffer.length, latencyMs: Date.now() - ttsStart,
+    const ttsLatency = Date.now() - ttsStart;
+    await writeLog('info', 'tts', `Áudio sintetizado [${synth.model}/${synth.voiceId}] ${synth.buffer.length}B em ${ttsLatency}ms (${synth.charsBilled} chars)`, {
+      traceId, model: synth.model, voiceId: synth.voiceId, bytes: synth.buffer.length, latencyMs: ttsLatency,
+    });
+    await writeEvent({
+      eventName: 'tts.synthesized',
+      traceId, conversationId, durationMs: ttsLatency,
+      payload: {
+        model: synth.model, voice_id: synth.voiceId,
+        chars_billed: synth.charsBilled, bytes: synth.buffer.length,
+      },
     });
   } catch (err) {
     await writeLog('error', 'tts', `Falha ao sintetizar áudio (caindo pra texto): ${String(err).slice(0, 240)}`, { traceId });
+    await writeEvent({
+      eventName: 'tts.failed',
+      severity: 'error',
+      traceId, conversationId,
+      payload: { error: String(err).slice(0, 240) },
+    });
     await sendOutbound(conversationId, phoneE164, text, traceId, llmMeta);
     return false;
   }

@@ -7,7 +7,7 @@
  * inbound-user). Falhar é OK — não impacta a resposta da Xarlote.
  */
 import { Worker, type Job } from 'bullmq';
-import { db, saveMemoryCard, writeLog } from '@iasaude/db';
+import { db, saveMemoryCard, writeLog, writeAudit, auditMemoryWrite } from '@iasaude/db';
 import { chat, embed } from '@iasaude/llm';
 import { PROFILE_ENRICHER_SYSTEM } from '@iasaude/llm';
 import type { ProfileEnricherJob } from '@iasaude/shared';
@@ -205,7 +205,7 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
       // embedding falha não bloqueia — card vai sem embedding (cai no fallback de retrieval)
       await writeLog('warn', 'enrichment', `embed falhou: ${String(err).slice(0, 120)}`, { traceId });
     }
-    await saveMemoryCard({
+    const card = await saveMemoryCard({
       userId,
       conversationId,
       kind: c.kind,
@@ -215,6 +215,18 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
       source: 'inferred',
       embedding,
     });
+    if (card?.id) {
+      await auditMemoryWrite({
+        userId,
+        cardId: card.id,
+        kind: c.kind,
+        text: c.text,
+        confidence: c.confidence,
+        operation: 'saved',
+        conversationId,
+        traceId,
+      });
+    }
     saved++;
   }
 

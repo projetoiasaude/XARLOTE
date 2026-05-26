@@ -1,4 +1,4 @@
-import { db, writeLog } from '@iasaude/db';
+import { db, writeLog, auditToolCall, writeAudit } from '@iasaude/db';
 import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
@@ -59,6 +59,7 @@ interface ToolContext {
 
 export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<void> {
   const taskId = await recordTaskStart(tc, ctx);
+  const startedAt = Date.now();
 
   try {
     switch (tc.name) {
@@ -90,8 +91,27 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         break;
     }
     await db.from('assistant_tasks').update({ status: 'success', tool_output: tc.args, completed_at: new Date().toISOString() }).eq('id', taskId);
+    await auditToolCall({
+      toolName: tc.name,
+      userId: ctx.userId,
+      conversationId: ctx.conversationId,
+      traceId: ctx.traceId,
+      args: (tc.args as Record<string, unknown>) ?? {},
+      result: 'success',
+      durationMs: Date.now() - startedAt,
+    });
   } catch (err) {
     await db.from('assistant_tasks').update({ status: 'error', error: String(err), completed_at: new Date().toISOString() }).eq('id', taskId);
+    await auditToolCall({
+      toolName: tc.name,
+      userId: ctx.userId,
+      conversationId: ctx.conversationId,
+      traceId: ctx.traceId,
+      args: (tc.args as Record<string, unknown>) ?? {},
+      result: 'failure',
+      error: String(err).slice(0, 240),
+      durationMs: Date.now() - startedAt,
+    });
   }
 }
 

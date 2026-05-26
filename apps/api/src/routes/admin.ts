@@ -1,7 +1,21 @@
 import type { FastifyInstance } from 'fastify';
-import { db } from '@iasaude/db';
+import { db, writeAudit } from '@iasaude/db';
 import { loadPrompts, savePrompts } from '../config/prompts.js';
 import { buildXarloteSystemPrompt, buildAgentPharmacySystemPrompt } from '@iasaude/llm';
+
+/** Redacta valores sensíveis em config — não loga keys cruas no audit_log */
+function redactConfig(cfg: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...cfg };
+  for (const k of Object.keys(out)) {
+    if (k.endsWith('_api_key') || k.endsWith('_token') || k.endsWith('_secret')) {
+      const v = out[k];
+      if (typeof v === 'string' && v.length > 0) {
+        out[k] = v.slice(0, 8) + '…(redacted)';
+      }
+    }
+  }
+  return out;
+}
 
 export async function adminRoute(app: FastifyInstance) {
   // List conversations with pagination
@@ -128,9 +142,10 @@ export async function adminRoute(app: FastifyInstance) {
     return reply.send({ sara, agent_quoting: agentQuoting, agent_confirmation: agentConfirmation });
   });
 
-  // Update prompts config
+  // Update prompts config (com audit log)
   app.put('/prompts', async (req, reply) => {
     const body = req.body as Record<string, unknown>;
+    const before = loadPrompts();
     const updated = savePrompts({
       sara_suffix: typeof body['sara_suffix'] === 'string' ? (body['sara_suffix'] as string) : undefined,
       agent_override: typeof body['agent_override'] === 'string' ? (body['agent_override'] as string) : undefined,
@@ -144,6 +159,18 @@ export async function adminRoute(app: FastifyInstance) {
       tts_voice_id: typeof body['tts_voice_id'] === 'string' ? (body['tts_voice_id'] as string) : undefined,
       tts_model: typeof body['tts_model'] === 'string' ? (body['tts_model'] as string) : undefined,
       tts_speed: typeof body['tts_speed'] === 'number' ? (body['tts_speed'] as number) : undefined,
+    });
+    // Audit: diff before/after, com keys redactadas
+    const beforeRedacted = redactConfig(before as unknown as Record<string, unknown>);
+    const afterRedacted = redactConfig(updated as unknown as Record<string, unknown>);
+    const changedKeys = Object.keys(afterRedacted).filter((k) => JSON.stringify(beforeRedacted[k]) !== JSON.stringify(afterRedacted[k]));
+    await writeAudit({
+      actorType: 'admin',
+      action: 'prompts.config.updated',
+      reason: 'dashboard_save',
+      before: Object.fromEntries(changedKeys.map((k) => [k, beforeRedacted[k]])),
+      after: Object.fromEntries(changedKeys.map((k) => [k, afterRedacted[k]])),
+      metadata: { changed_keys: changedKeys },
     });
     return reply.send(updated);
   });
@@ -239,7 +266,74 @@ export async function adminRoute(app: FastifyInstance) {
     return reply.send({ ok: true, cleared: [...bigintTables, ...uuidTables] });
   });
 
-  // System logs
+  // Audit log — mudanças de estado em entidades (LGPD, debug, melhoria contínua)
+  app.get('/audit', async (req, reply) => {
+    const q = req.query as Record<string, string>;
+    const limit = Math.min(parseInt(q['limit'] ?? '100'), 500);
+    const userId = q['user_id'];
+    const action = q['action'];      // ex: 'user.onboarding.advanced'
+    const actorType = q['actor_type'];
+    const traceId = q['trace_id'];
+    const targetTable = q['target_table'];
+
+    let query = db.from('audit_log').select('*').order('occurred_at', { ascending: false }).limit(limit);
+    if (userId) query = query.eq('user_id', userId);
+    if (action) query = query.ilike('action', `${action}%`); // prefix match
+    if (actorType) query = query.eq('actor_type', actorType);
+    if (traceId) query = query.eq('trace_id', traceId);
+    if (targetTable) query = query.eq('target_table', targetTable);
+
+    const { data, error } = await query;
+    if (error) return reply.code(500).send({ error: error.message });
+    return reply.send(data);
+  });
+
+  // Audit log agregado — útil pro dashboard mostrar "ações por dia"
+  app.get('/audit/summary', async (req, reply) => {
+    const q = req.query as Record<string, string>;
+    const days = Math.min(parseInt(q['days'] ?? '7'), 90);
+    const { data, error } = await db
+      .from('audit_log')
+      .select('action, actor_type, occurred_at')
+      .gte('occurred_at', new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString());
+    if (error) return reply.code(500).send({ error: error.message });
+
+    // Agrupa por action no app (Supabase não tem GROUP BY trivial via REST)
+    const byAction = new Map<string, number>();
+    const byActor = new Map<string, number>();
+    for (const row of (data ?? []) as Array<{ action: string; actor_type: string }>) {
+      byAction.set(row.action, (byAction.get(row.action) ?? 0) + 1);
+      byActor.set(row.actor_type, (byActor.get(row.actor_type) ?? 0) + 1);
+    }
+    return reply.send({
+      total: data?.length ?? 0,
+      by_action: Object.fromEntries(byAction),
+      by_actor: Object.fromEntries(byActor),
+      window_days: days,
+    });
+  });
+
+  // Event log — telemetria/observabilidade granular
+  app.get('/events', async (req, reply) => {
+    const q = req.query as Record<string, string>;
+    const limit = Math.min(parseInt(q['limit'] ?? '200'), 1000);
+    const eventName = q['event_name'];
+    const severity = q['severity'];
+    const userId = q['user_id'];
+    const traceId = q['trace_id'];
+
+    let query = db.from('event_log').select('*').order('occurred_at', { ascending: false }).limit(limit);
+    if (eventName) query = query.ilike('event_name', `${eventName}%`);
+    if (severity) query = query.eq('severity', severity);
+    if (userId) query = query.eq('user_id', userId);
+    if (traceId) query = query.eq('trace_id', traceId);
+
+    const { data, error } = await query;
+    if (error) return reply.code(500).send({ error: error.message });
+    return reply.send(data);
+  });
+
+  // System logs (existente)
   app.get('/logs', async (req, reply) => {
     const q = req.query as Record<string, string>;
     const limit = parseInt(q['limit'] ?? '100');
