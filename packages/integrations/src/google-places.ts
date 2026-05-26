@@ -57,6 +57,92 @@ function isLikelyHumanPharmacy(name: string, types: string[]): boolean {
   return ok || types.length === 0;
 }
 
+// ─── Clínicas / Consultórios / Hospitais ────────────────────────────────────
+// Para CONSULTA MÉDICA. Diferente de farmácia: filtros por especialidade,
+// tipos diferentes (doctor, hospital), e termos de busca em PT-BR.
+
+const CLINIC_NAME_BLOCKLIST = [
+  'pet ',
+  'pets ',
+  'veterinár',
+  'animal',
+  'farmácia',
+  'drograria',
+  'drogaria',
+];
+
+const CLINIC_TYPE_BLOCKLIST = ['pet_store', 'veterinary_care', 'pharmacy', 'drugstore'];
+
+function isLikelyHumanClinic(name: string, types: string[]): boolean {
+  const n = name.toLowerCase();
+  if (CLINIC_NAME_BLOCKLIST.some((kw) => n.includes(kw))) return false;
+  if (types.some((t) => CLINIC_TYPE_BLOCKLIST.includes(t))) return false;
+  return types.some((t) =>
+    ['doctor', 'hospital', 'health', 'physiotherapist', 'dentist', 'clinic'].includes(t)
+  ) || types.length === 0;
+}
+
+/**
+ * Busca clínicas/consultórios próximos. `specialty` é usado como `keyword`
+ * pra refinar (ex: "cardiologista", "ginecologista", "ortopedista").
+ *
+ * Retorna no máximo `limit` resultados ordenados pelo score do Google.
+ * Cada PlaceResult já vem com lat/lng/address/rating/distância.
+ */
+export async function findNearbyClinics(
+  lat: number,
+  lng: number,
+  specialty: string,
+  radiusMeters = 5000,
+  limit = 8
+): Promise<PlaceResult[]> {
+  const res = await axios.get(NEARBY_SEARCH, {
+    params: {
+      location: `${lat},${lng}`,
+      radius: radiusMeters,
+      type: 'doctor', // Google trata "doctor" e "hospital" como categoria de saúde
+      keyword: specialty,
+      key: getKey(),
+      language: 'pt-BR',
+    },
+    timeout: 10_000,
+  });
+
+  if (res.data?.status !== 'OK' && res.data?.status !== 'ZERO_RESULTS') {
+    throw new Error(`Places API error (clinics): ${res.data?.status} — ${res.data?.error_message ?? ''}`);
+  }
+
+  const places: unknown[] = res.data?.results ?? [];
+  const filtered = places.filter((p: any) => {
+    const name = (p.name ?? '') as string;
+    const types = (p.types ?? []) as string[];
+    return isLikelyHumanClinic(name, types);
+  });
+
+  return filtered.slice(0, limit).map((p: any) => {
+    const vicinity: string = p.vicinity ?? '';
+    const parts = vicinity.split(',').map((s: string) => s.trim());
+    const city = parts.at(-1) ?? '';
+    const distKm = haversineKm(lat, lng, p.geometry?.location?.lat, p.geometry?.location?.lng);
+
+    return {
+      placeId: p.place_id as string,
+      name: (p.name ?? 'Clínica') as string,
+      address: vicinity,
+      city,
+      state: '',
+      lat: p.geometry?.location?.lat as number,
+      lng: p.geometry?.location?.lng as number,
+      phone: undefined,
+      website: undefined,
+      rating: p.rating as number | undefined,
+      userRatingCount: (p.user_ratings_total as number) ?? undefined,
+      distanceKm: distKm,
+      isOpen: p.opening_hours?.open_now as boolean | undefined,
+    };
+  });
+}
+
 export async function findNearbyPharmacies(
   lat: number,
   lng: number,

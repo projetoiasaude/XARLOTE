@@ -17,6 +17,10 @@
  */
 import { db, writeAudit, writeLog } from '@iasaude/db';
 import { sendOutbound } from './outbound.js';
+import { discoverClinics } from './clinic-discovery.js';
+import { initiateClinicNegotiation } from './agent-clinic.js';
+import { scheduleConsultationTimeout } from './consultation-consolidation.js';
+import { sendOutboundToSupplier } from './outbound-agent.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TIPOS
@@ -481,25 +485,88 @@ export async function handleSetDefaultAddress(args: { address_label: string }, c
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONSULTATION TOOLS (esqueleto — fluxo de cotação fica pra próxima sessão)
+// CONSULTATION FLOW — fluxo completo de marcação de consulta médica
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Inicia a busca de consulta:
+ *   1. Cria `consultations` (status='searching')
+ *   2. Descobre top 5 clínicas via Places + cache (find_clinics RPC)
+ *   3. Cria 1 `consultation_quotes` (pending) por clínica
+ *   4. Dispara `initiateClinicNegotiation` paralelo, staggered 2s
+ *   5. Agenda timer de consolidação (5min/10min)
+ *
+ * Idempotência: se já existe consultation ativa pro mesmo user+specialty
+ *  ou status searching/quoted, retorna esse status em vez de criar nova.
+ */
 export async function handleStartConsultationSearch(args: StartConsultationArgs, ctx: BaseToolCtx): Promise<void> {
-  // Cria a consultation em status='drafting'. Worker clinic-discoverer popula
-  // clínicas via Places API e dispara agent-clinic em paralelo (próxima sprint).
+  // 1. Idempotência — já tem consultation ativa?
+  const { data: existing } = await db
+    .from('consultations')
+    .select('id, status, specialty')
+    .eq('user_id', ctx.userId)
+    .in('status', ['searching', 'quoting', 'quoted', 'confirming'])
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (existing?.id) {
+    await writeLog('info', 'consultation', `start_consultation_search ignorado — já tem consulta ativa (${existing.status}, ${existing.specialty})`, { traceId: ctx.traceId });
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      `Você já tem uma busca de consulta em andamento (${existing.specialty}, status: ${existing.status}). Quer cancelar essa pra começar outra? Posso te ajudar.`,
+      ctx.traceId);
+    return;
+  }
+
+  // 2. Descobre lat/lng do paciente — vem do user_addresses default ou último order
+  let lat: number | null = null;
+  let lng: number | null = null;
+  let city: string | null = args.city ?? null;
+
+  {
+    const { data: addr } = await db
+      .from('user_addresses')
+      .select('latitude, longitude, city, state')
+      .eq('user_id', ctx.userId)
+      .eq('is_default', true)
+      .maybeSingle();
+    if (addr) {
+      lat = addr.latitude;
+      lng = addr.longitude;
+      city = city ?? addr.city;
+    }
+  }
+  if (lat == null || lng == null) {
+    const { data: ord } = await db
+      .from('orders')
+      .select('delivery_lat, delivery_lng')
+      .eq('user_id', ctx.userId)
+      .not('delivery_lat', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (ord) {
+      lat = ord.delivery_lat;
+      lng = ord.delivery_lng;
+    }
+  }
+
+  // 3. Cria consultation status='searching'
   const { data: c, error } = await db.from('consultations').insert({
     user_id: ctx.userId,
     conversation_id: ctx.conversationId,
-    status: 'drafting',
+    status: 'searching',
     specialty: args.specialty,
     urgency: args.urgency,
     modality: args.modality ?? 'indiferente',
-    city: args.city,
-    preferences: { ...args.preferences, plan: args.plan } as never,
+    city: city,
+    preferences: { ...(args.preferences ?? {}), plan: args.plan } as never,
   }).select('id').single();
 
   if (error || !c) {
     await writeLog('error', 'tool', `start_consultation_search: falha ao criar consultation: ${error?.message}`, { traceId: ctx.traceId });
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      `Tive um problema técnico aqui pra iniciar a busca de ${args.specialty} 😔 Pode tentar de novo daqui a pouco?`,
+      ctx.traceId);
     return;
   }
 
@@ -511,28 +578,137 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
     targetId: c.id,
     conversationId: ctx.conversationId,
     traceId: ctx.traceId,
-    metadata: {
-      specialty: args.specialty,
-      urgency: args.urgency,
-      modality: args.modality,
-      city: args.city,
-      plan: args.plan,
-    },
+    metadata: { specialty: args.specialty, urgency: args.urgency, modality: args.modality, city, plan: args.plan, lat, lng },
   });
 
-  // Por enquanto, devolve ao user uma mensagem de "em andamento". A integração
-  // com clínicas (agent-clinic) vem na próxima sprint.
+  // 4. Notifica paciente
   await sendOutbound(ctx.conversationId, ctx.phoneE164,
-    `Beleza! Vou buscar opções de ${args.specialty} pra você. Esse fluxo está sendo finalizado, te aviso assim que tiver as cotações. 💙`,
+    `Beleza! Vou procurar opções de ${args.specialty}${city ? ` em ${city}` : ''} agora 🔍 Pode demorar uns minutinhos — as clínicas costumam responder mais devagar que farmácia.`,
     ctx.traceId);
+
+  // 5. Discovery (assíncrono, pra não bloquear o turno LLM)
+  setImmediate(async () => {
+    try {
+      const candidates = await discoverClinics({
+        specialty: args.specialty,
+        city,
+        lat,
+        lng,
+        limit: 5,
+        traceId: ctx.traceId,
+      });
+
+      if (candidates.length === 0) {
+        await sendOutbound(ctx.conversationId, ctx.phoneE164,
+          `Não encontrei clínicas de ${args.specialty}${city ? ` em ${city}` : ''} com WhatsApp cadastrado 😔 Por enquanto não consigo cotar essa especialidade automaticamente. Posso te ajudar com outra coisa?`,
+          ctx.traceId);
+        await db.from('consultations').update({ status: 'failed' }).eq('id', c.id);
+        return;
+      }
+
+      // Cria consultation_quotes pending
+      const quoteIds: string[] = [];
+      for (const cand of candidates) {
+        const { data: q } = await db.from('consultation_quotes').insert({
+          consultation_id: c.id,
+          clinic_id: cand.id,
+          status: 'pending',
+          modality: args.modality === 'indiferente' ? null : args.modality,
+        }).select('id').single();
+        if (q?.id) quoteIds.push(q.id);
+      }
+
+      await writeLog('info', 'consultation', `${quoteIds.length} cotação(ões) de consulta criadas`, {
+        traceId: ctx.traceId, consultationId: c.id,
+        clinics: candidates.map((p, i) => `${i + 1}. ${p.name} (${p.distance_km?.toFixed(1)}km)`),
+      });
+
+      await sendOutbound(ctx.conversationId, ctx.phoneE164,
+        `Achei ${quoteIds.length} clínica${quoteIds.length > 1 ? 's' : ''} aqui e já estou entrando em contato ✨ assim que tiver respostas eu te aviso.`,
+        ctx.traceId);
+
+      // 6. Inicia negociações staggered 2s
+      const patientFirstName = await getPatientFirstName(ctx.userId);
+      for (let i = 0; i < quoteIds.length; i++) {
+        const idx = i;
+        const candidate = candidates[idx]!;
+        const quoteId = quoteIds[idx]!;
+        const delay = idx * 2000;
+        setTimeout(() => {
+          initiateClinicNegotiation({
+            quoteId,
+            consultationId: c.id,
+            clinicId: candidate.id,
+            clinicName: candidate.name,
+            clinicWhatsApp: candidate.whatsapp_e164,
+            ctx: {
+              specialty: args.specialty,
+              urgency: args.urgency,
+              modality: args.modality ?? 'indiferente',
+              patientCity: city,
+              plan: args.plan ?? null,
+              patientName: patientFirstName,
+              preferredTime: (args.preferences as any)?.['horario_pref'] ?? null,
+            },
+            userConversationId: ctx.conversationId,
+            userPhoneE164: ctx.phoneE164,
+            traceId: ctx.traceId,
+          }).catch((err) => writeLog('error', 'consultation', `Init clinic negotiation falhou: ${String(err)}`, { traceId: ctx.traceId }));
+        }, delay);
+      }
+
+      // 7. Schedule consolidation timeout
+      scheduleConsultationTimeout(c.id, ctx.conversationId, ctx.phoneE164, ctx.traceId);
+    } catch (err) {
+      await writeLog('error', 'consultation', `Discovery falhou: ${String(err).slice(0, 200)}`, { traceId: ctx.traceId });
+    }
+  });
 }
 
+/**
+ * Confirma a consulta selecionada:
+ *   - Atualiza consultation status='confirming', selected_quote_id, scheduled_at
+ *   - Marca consultation_quote.status='selected', outras 'rejected'
+ *   - Pede confirmação à clínica via agent-clinic (separate convo)
+ *   - Cria reminders: 1 dia antes + 2h antes
+ */
 export async function handleConfirmConsultation(args: { consultation_id: string; quote_id: string }, ctx: BaseToolCtx): Promise<void> {
-  const { data: before } = await db.from('consultations').select('status').eq('id', args.consultation_id).single();
+  const { data: before } = await db.from('consultations').select('status, specialty').eq('id', args.consultation_id).single();
+  if (!before) {
+    await writeLog('warn', 'consultation', `confirm_consultation: consultation ${args.consultation_id} não encontrada`, { traceId: ctx.traceId });
+    return;
+  }
+
+  // Carrega quote escolhida
+  const { data: q } = await db
+    .from('consultation_quotes')
+    .select('id, clinic_id, prescriber_id, proposed_datetime, modality, price_brl, plan_accepted, conversation_id')
+    .eq('id', args.quote_id)
+    .single();
+
+  if (!q) {
+    await writeLog('warn', 'consultation', `confirm_consultation: quote ${args.quote_id} não encontrada`, { traceId: ctx.traceId });
+    return;
+  }
+
+  // 1. Atualiza consultation
   await db.from('consultations').update({
     status: 'confirming',
     selected_quote_id: args.quote_id,
+    scheduled_at: q.proposed_datetime,
+    scheduled_clinic_id: q.clinic_id,
+    scheduled_prescriber_id: q.prescriber_id,
   }).eq('id', args.consultation_id);
+
+  // 2. Marca outras quotes como 'rejected'
+  await db.from('consultation_quotes')
+    .update({ status: 'rejected' })
+    .eq('consultation_id', args.consultation_id)
+    .neq('id', args.quote_id)
+    .eq('status', 'offered');
+
+  // 3. Marca escolhida como 'selected'
+  await db.from('consultation_quotes').update({ status: 'selected' }).eq('id', args.quote_id);
 
   await writeAudit({
     actorType: 'xarlote',
@@ -540,19 +716,102 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
     userId: ctx.userId,
     targetTable: 'consultations',
     targetId: args.consultation_id,
-    before: before ? { status: before.status } : undefined,
+    before: { status: before.status },
     after: { status: 'confirming', selected_quote_id: args.quote_id },
     conversationId: ctx.conversationId,
     traceId: ctx.traceId,
+    metadata: { clinic_id: q.clinic_id, scheduled_at: q.proposed_datetime },
+  });
+
+  // 4. Pede pra clínica confirmar o slot
+  if (q.conversation_id) {
+    const { data: conv } = await db.from('conversations').select('whatsapp_jid').eq('id', q.conversation_id).single();
+    const clinicPhone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
+    if (clinicPhone) {
+      const patientFirst = await getPatientFirstName(ctx.userId);
+      const dt = q.proposed_datetime ? formatBrDateTime(q.proposed_datetime) : 'o horário combinado';
+      const planLine = q.plan_accepted && q.plan_accepted.toLowerCase() !== 'particular'
+        ? ` Plano: ${q.plan_accepted}.`
+        : ` (Particular.)`;
+      const msg = `Oi! O paciente${patientFirst ? ` ${patientFirst}` : ''} confirmou — quer marcar pra ${dt}.${planLine} Vocês conseguem reservar esse horário? Obrigada!`;
+      await sendOutboundToSupplier(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId);
+    }
+  }
+
+  // 5. Cria reminders (1d antes + 2h antes) se proposed_datetime válido
+  if (q.proposed_datetime) {
+    const consultDate = new Date(q.proposed_datetime);
+    if (!isNaN(consultDate.getTime())) {
+      const oneDayBefore = new Date(consultDate.getTime() - 24 * 3600 * 1000);
+      const twoHoursBefore = new Date(consultDate.getTime() - 2 * 3600 * 1000);
+      const now = new Date();
+
+      if (oneDayBefore > now) {
+        await db.from('reminders').insert({
+          user_id: ctx.userId,
+          type: 'consultation',
+          title: `Consulta de ${before.specialty} amanhã`,
+          body: `Sua consulta com a clínica está marcada pra amanhã às ${consultDate.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' })}.`,
+          scheduled_at: oneDayBefore.toISOString(),
+          next_run_at: oneDayBefore.toISOString(),
+          status: 'pending',
+          payload: { consultation_id: args.consultation_id, quote_id: args.quote_id, kind: '1d_before' },
+        });
+      }
+      if (twoHoursBefore > now) {
+        await db.from('reminders').insert({
+          user_id: ctx.userId,
+          type: 'consultation',
+          title: `Consulta em 2 horas`,
+          body: `Sua consulta de ${before.specialty} é hoje em 2 horas. Não esquece! 💙`,
+          scheduled_at: twoHoursBefore.toISOString(),
+          next_run_at: twoHoursBefore.toISOString(),
+          status: 'pending',
+          payload: { consultation_id: args.consultation_id, quote_id: args.quote_id, kind: '2h_before' },
+        });
+      }
+    }
+  }
+
+  await writeLog('info', 'consultation', `Consulta confirmada — esperando clínica reconfirmar`, {
+    traceId: ctx.traceId, consultationId: args.consultation_id, quoteId: args.quote_id,
   });
 }
 
+/** Cancela consulta marcada/em busca. */
 export async function handleCancelConsultation(args: { consultation_id: string; reason: string }, ctx: BaseToolCtx): Promise<void> {
-  const { data: before } = await db.from('consultations').select('status').eq('id', args.consultation_id).single();
+  const { data: before } = await db.from('consultations').select('status, scheduled_at').eq('id', args.consultation_id).single();
+  if (!before) return;
+
   await db.from('consultations').update({
     status: 'cancelled',
     cancelled_reason: args.reason,
   }).eq('id', args.consultation_id);
+
+  // Cancela reminders relacionados
+  await db.from('reminders')
+    .update({ status: 'cancelled' })
+    .eq('user_id', ctx.userId)
+    .eq('type', 'consultation')
+    .eq('status', 'pending')
+    .filter('payload->>consultation_id', 'eq', args.consultation_id);
+
+  // Avisa a clínica se já tinha marcação confirmada
+  if (before.status === 'confirming' || before.status === 'scheduled') {
+    const { data: q } = await db.from('consultation_quotes')
+      .select('conversation_id')
+      .eq('consultation_id', args.consultation_id)
+      .eq('status', 'selected')
+      .maybeSingle();
+    if (q?.conversation_id) {
+      const { data: conv } = await db.from('conversations').select('whatsapp_jid').eq('id', q.conversation_id).single();
+      const clinicPhone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
+      if (clinicPhone) {
+        const msg = `Oi! Infelizmente o paciente precisou cancelar a consulta marcada. Desculpa o transtorno e obrigada pela disponibilidade!`;
+        await sendOutboundToSupplier(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId);
+      }
+    }
+  }
 
   await writeAudit({
     actorType: 'xarlote',
@@ -560,10 +819,93 @@ export async function handleCancelConsultation(args: { consultation_id: string; 
     userId: ctx.userId,
     targetTable: 'consultations',
     targetId: args.consultation_id,
-    before: before ? { status: before.status } : undefined,
+    before: { status: before.status },
     after: { status: 'cancelled' },
     reason: args.reason,
     conversationId: ctx.conversationId,
     traceId: ctx.traceId,
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SET_EMERGENCY_CONTACT
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface SetEmergencyContactArgs {
+  name: string;
+  phone_e164: string;
+  relation: string;
+}
+
+export async function handleSetEmergencyContact(args: SetEmergencyContactArgs, ctx: BaseToolCtx): Promise<void> {
+  // Normaliza phone — garante + no início e só dígitos depois
+  let phone = args.phone_e164.trim();
+  if (!phone.startsWith('+')) {
+    // Tenta inferir prefixo Brasil se o número tem 12-13 dígitos sem prefixo
+    const digits = phone.replace(/\D/g, '');
+    if (digits.length >= 10 && digits.length <= 13) {
+      phone = digits.startsWith('55') ? `+${digits}` : `+55${digits}`;
+    } else {
+      await writeLog('warn', 'tool', `set_emergency_contact: phone inválido "${args.phone_e164}"`, { traceId: ctx.traceId });
+      return;
+    }
+  }
+
+  const { data: before } = await db
+    .from('users')
+    .select('emergency_contact_name, emergency_contact_phone_e164, emergency_contact_relation')
+    .eq('id', ctx.userId)
+    .single();
+
+  const { error } = await db.from('users').update({
+    emergency_contact_name: args.name.trim().slice(0, 120),
+    emergency_contact_phone_e164: phone,
+    emergency_contact_relation: args.relation.trim().slice(0, 40),
+  }).eq('id', ctx.userId);
+
+  if (error) {
+    // Coluna pode não existir ainda (migration 0007 pendente) — falha silenciosa
+    if (error.message?.includes('column') || error.message?.includes('does not exist')) {
+      await writeLog('warn', 'tool', `set_emergency_contact: schema pendente (migration 0007)`, { traceId: ctx.traceId });
+      return;
+    }
+    await writeLog('error', 'tool', `set_emergency_contact: ${error.message}`, { traceId: ctx.traceId });
+    return;
+  }
+
+  await writeAudit({
+    actorType: 'xarlote',
+    action: 'user.emergency_contact.set',
+    userId: ctx.userId,
+    targetTable: 'users',
+    targetId: ctx.userId,
+    conversationId: ctx.conversationId,
+    traceId: ctx.traceId,
+    before: before ?? undefined,
+    after: { emergency_contact_name: args.name, emergency_contact_phone_e164: phone, emergency_contact_relation: args.relation },
+  });
+
+  await writeLog('info', 'tool', `Contato de emergência cadastrado: ${args.name} (${args.relation})`, {
+    traceId: ctx.traceId, userId: ctx.userId,
+  });
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+async function getPatientFirstName(userId: string): Promise<string | null> {
+  const { data: u } = await db.from('users').select('preferred_name, full_name').eq('id', userId).single();
+  const name = u?.preferred_name || u?.full_name;
+  if (!name) return null;
+  return String(name).split(/\s+/)[0] ?? null;
+}
+
+function formatBrDateTime(iso: string): string {
+  try {
+    const d = new Date(iso);
+    const date = d.toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: '2-digit', timeZone: 'America/Sao_Paulo' });
+    const time = d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
+    return `${date} às ${time}`;
+  } catch {
+    return iso;
+  }
 }

@@ -160,21 +160,8 @@ export const xarloteTools: ToolDefinition[] = [
       },
     },
   },
-  {
-    type: 'function',
-    function: {
-      name: 'send_emergency_orientation',
-      description: 'Envia orientação de emergência (SAMU 192) quando há suspeita de situação grave.',
-      parameters: {
-        type: 'object',
-        properties: {
-          severity: { type: 'string', enum: ['moderate', 'high', 'critical'] },
-          symptoms_summary: { type: 'string' },
-        },
-        required: ['severity'],
-      },
-    },
-  },
+  // NOTA: send_emergency_orientation foi REMOVIDA. Use red_flag_check no lugar
+  // (que envia botões + escalonamento automático pro contato de emergência).
 
   // ─────── Tools de tratamento longitudinal (Xarlote 2.0) ─────────────────
   {
@@ -320,6 +307,72 @@ export const xarloteTools: ToolDefinition[] = [
           reason: { type: 'string' },
         },
         required: ['consultation_id', 'reason'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'set_emergency_contact',
+      description:
+        'Cadastra o contato de emergência do paciente. Use quando o paciente mencionar quem deve ser avisado em caso de emergência (ex: "minha mãe Maria, número tal", "meu marido João, +55..."). Salva nome + telefone + relação. Em caso futuro de red flag, esse contato será avisado automaticamente.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Nome completo ou apelido do contato.' },
+          phone_e164: {
+            type: 'string',
+            description: 'Número em formato E.164 com +. Ex: "+5511999998888". Converta se o paciente passou em outro formato.',
+          },
+          relation: {
+            type: 'string',
+            description: 'Relação com o paciente: "mãe", "pai", "cônjuge", "filho(a)", "irmão(ã)", "amigo(a)", "cuidador(a)", "vizinho(a)", "médico(a)".',
+          },
+        },
+        required: ['name', 'phone_e164', 'relation'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'red_flag_check',
+      description:
+        'USE IMEDIATAMENTE quando perceber sinal sério de emergência ou risco. Não é pra alarme falso — só dispare quando tem indício forte. Exemplos: paciente fala em "me machucar", "suicídio", "não quero viver"; descreve dor no peito + falta de ar; descreve sintomas de AVC (rosto torto, fraqueza num lado, fala arrastada súbita); criança engoliu medicamento; overdose intencional; sangramento intenso. A tool registra o caso, dispara alerta interno e te dá orientação imediata pra você passar pro paciente.',
+      parameters: {
+        type: 'object',
+        properties: {
+          category: {
+            type: 'string',
+            enum: [
+              'self_harm',
+              'suicide_ideation',
+              'chest_pain',
+              'stroke_signs',
+              'overdose',
+              'severe_bleeding',
+              'breathing_difficulty',
+              'allergic_reaction_severe',
+              'child_emergency',
+              'other_critical',
+            ],
+            description: 'Categoria do sinal detectado.',
+          },
+          severity: {
+            type: 'string',
+            enum: ['high', 'critical'],
+            description: 'high = risco real mas paciente lúcido; critical = situação ativa e imediata.',
+          },
+          evidence: {
+            type: 'string',
+            description: 'Trecho/parafrase da fala do paciente que motivou o alerta (1-2 frases). Sem nome, sem CPF.',
+          },
+          context: {
+            type: 'string',
+            description: 'Contexto adicional (sintomas associados, duração, fator de risco conhecido).',
+          },
+        },
+        required: ['category', 'severity', 'evidence'],
       },
     },
   },

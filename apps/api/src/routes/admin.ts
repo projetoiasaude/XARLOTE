@@ -102,6 +102,28 @@ export async function adminRoute(app: FastifyInstance) {
     });
   });
 
+  // Set/update emergency contact (usado pelo dashboard pra cadastro manual)
+  app.patch<{ Params: { id: string }; Body: { emergency_contact_name?: string; emergency_contact_phone_e164?: string; emergency_contact_relation?: string } }>(
+    '/users/:id/emergency-contact',
+    async (req, reply) => {
+      const { id } = req.params;
+      const { emergency_contact_name, emergency_contact_phone_e164, emergency_contact_relation } = req.body ?? {};
+
+      if (emergency_contact_phone_e164 && !emergency_contact_phone_e164.startsWith('+')) {
+        return reply.code(400).send({ error: 'phone deve estar em formato E.164 (com +)' });
+      }
+
+      const { error } = await db.from('users').update({
+        emergency_contact_name: emergency_contact_name?.trim().slice(0, 120) ?? null,
+        emergency_contact_phone_e164: emergency_contact_phone_e164 ?? null,
+        emergency_contact_relation: emergency_contact_relation?.trim().slice(0, 40) ?? null,
+      }).eq('id', id);
+
+      if (error) return reply.code(500).send({ error: error.message });
+      return reply.send({ ok: true });
+    },
+  );
+
   // List suppliers
   app.get('/suppliers', async (req, reply) => {
     const q = req.query as Record<string, string>;
@@ -330,6 +352,176 @@ export async function adminRoute(app: FastifyInstance) {
 
     const { data, error } = await query;
     if (error) return reply.code(500).send({ error: error.message });
+    return reply.send(data);
+  });
+
+  // ─── Treatments (admin view) ─────────────────────────────────────────────
+  app.get('/treatments', async (req, reply) => {
+    const q = req.query as Record<string, string>;
+    const limit = Math.min(parseInt(q['limit'] ?? '100'), 500);
+    const status = q['status'] ?? 'active';
+
+    let query = db
+      .from('treatments')
+      .select('id, user_id, name, status, condition_id, started_at, ended_at, users(full_name, preferred_name), user_health_conditions(name)')
+      .order('started_at', { ascending: false })
+      .limit(limit);
+
+    if (status && status !== 'all') {
+      query = query.eq('status', status);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      // Tabela ainda não existe (migration 0003 não rodou) → devolve vazio
+      if (error.message?.includes('does not exist')) return reply.send([]);
+      return reply.code(500).send({ error: error.message });
+    }
+
+    const ids = (data ?? []).map((t: any) => t.id);
+    let medCounts: Record<string, number> = {};
+    let inventoryFlags: Record<string, boolean> = {};
+    let adherenceMap: Record<string, number | null> = {};
+
+    if (ids.length > 0) {
+      const { data: meds } = await db.from('user_medications').select('treatment_id').in('treatment_id', ids);
+      medCounts = (meds ?? []).reduce((acc: Record<string, number>, m: any) => {
+        if (m.treatment_id) acc[m.treatment_id] = (acc[m.treatment_id] ?? 0) + 1;
+        return acc;
+      }, {});
+
+      const userIds = Array.from(new Set((data ?? []).map((t: any) => t.user_id)));
+      const { data: usersWithScore } = await db.from('users').select('id, adherence_score_30d').in('id', userIds);
+      adherenceMap = (usersWithScore ?? []).reduce((acc: Record<string, number | null>, u: any) => {
+        acc[u.id] = u.adherence_score_30d ?? null;
+        return acc;
+      }, {});
+
+      // Inventory low check
+      const { data: invs } = await db
+        .from('medication_inventory')
+        .select('treatment_id')
+        .in('treatment_id', ids)
+        .not('reorder_offered_at', 'is', null);
+      inventoryFlags = (invs ?? []).reduce((acc: Record<string, boolean>, i: any) => {
+        if (i.treatment_id) acc[i.treatment_id] = true;
+        return acc;
+      }, {});
+    }
+
+    const result = (data ?? []).map((t: any) => ({
+      id: t.id,
+      user_id: t.user_id,
+      user_name: t.users?.preferred_name ?? t.users?.full_name ?? null,
+      name: t.name,
+      status: t.status,
+      condition_name: t.user_health_conditions?.name ?? null,
+      started_at: t.started_at,
+      ended_at: t.ended_at,
+      medication_count: medCounts[t.id] ?? 0,
+      adherence_score_30d: adherenceMap[t.user_id] ?? null,
+      inventory_low: inventoryFlags[t.id] ?? false,
+    }));
+
+    return reply.send(result);
+  });
+
+  // ─── Consultations (admin view) ──────────────────────────────────────────
+  app.get('/consultations', async (req, reply) => {
+    const q = req.query as Record<string, string>;
+    const limit = Math.min(parseInt(q['limit'] ?? '100'), 500);
+    const status = q['status'] ?? 'active';
+
+    let query = db
+      .from('consultations')
+      .select('id, user_id, status, specialty, urgency, modality, city, scheduled_at, scheduled_clinic_id, user_rating, created_at, users(full_name, preferred_name), clinics:scheduled_clinic_id(name)')
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (status === 'active') {
+      query = query.in('status', ['searching', 'quoting', 'quoted', 'confirming']);
+    } else if (status === 'scheduled') {
+      query = query.eq('status', 'scheduled');
+    } else if (status === 'completed') {
+      query = query.eq('status', 'completed');
+    }
+    // 'all' → sem filtro
+
+    const { data, error } = await query;
+    if (error) {
+      if (error.message?.includes('does not exist')) return reply.send([]);
+      return reply.code(500).send({ error: error.message });
+    }
+
+    const ids = (data ?? []).map((c: any) => c.id);
+    const quotesByConsult: Record<string, { offered: number; total: number }> = {};
+    if (ids.length > 0) {
+      const { data: quotes } = await db
+        .from('consultation_quotes')
+        .select('consultation_id, status')
+        .in('consultation_id', ids);
+      for (const q of quotes ?? []) {
+        const cid = (q as any).consultation_id;
+        if (!cid) continue;
+        if (!quotesByConsult[cid]) quotesByConsult[cid] = { offered: 0, total: 0 };
+        quotesByConsult[cid].total++;
+        if ((q as any).status === 'offered') quotesByConsult[cid].offered++;
+      }
+    }
+
+    const result = (data ?? []).map((c: any) => ({
+      id: c.id,
+      user_id: c.user_id,
+      user_name: c.users?.preferred_name ?? c.users?.full_name ?? null,
+      status: c.status,
+      specialty: c.specialty,
+      urgency: c.urgency,
+      modality: c.modality,
+      city: c.city,
+      scheduled_at: c.scheduled_at,
+      scheduled_clinic_name: c.clinics?.name ?? null,
+      user_rating: c.user_rating,
+      quotes_offered: quotesByConsult[c.id]?.offered ?? 0,
+      quotes_total: quotesByConsult[c.id]?.total ?? 0,
+      created_at: c.created_at,
+    }));
+
+    return reply.send(result);
+  });
+
+  // ─── Clinics directory ───────────────────────────────────────────────────
+  app.get('/clinics', async (req, reply) => {
+    const q = req.query as Record<string, string>;
+    const limit = Math.min(parseInt(q['limit'] ?? '200'), 1000);
+
+    const { data, error } = await db
+      .from('clinics')
+      .select('id, name, type, specialties, city, state, address, phone_e164, whatsapp_e164, rating, total_consultations, response_rate, last_contacted_at, blacklist_reason, created_at')
+      .order('total_consultations', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      if (error.message?.includes('does not exist')) return reply.send([]);
+      return reply.code(500).send({ error: error.message });
+    }
+    return reply.send(data);
+  });
+
+  // ─── Daily metrics ───────────────────────────────────────────────────────
+  app.get('/metrics', async (req, reply) => {
+    const q = req.query as Record<string, string>;
+    const days = Math.min(parseInt(q['days'] ?? '14'), 90);
+
+    const { data, error } = await db
+      .from('daily_metrics')
+      .select('*')
+      .order('day', { ascending: false })
+      .limit(days);
+
+    if (error) {
+      if (error.message?.includes('does not exist')) return reply.send([]);
+      return reply.code(500).send({ error: error.message });
+    }
     return reply.send(data);
   });
 

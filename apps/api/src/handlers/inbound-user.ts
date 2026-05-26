@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt } from '@iasaude/db';
+import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, buildConsentEvent } from '@iasaude/core';
 import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES } from '@iasaude/shared';
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard } from '@iasaude/shared';
@@ -76,6 +76,27 @@ export async function processInboundUser(
     await resetAllData(db);
     await sendOutbound(conversation.id, phoneE164, '🔄 Reset completo! Pode começar do zero.', traceId);
     return { traceId, conversationId: conversation.id };
+  }
+
+  // 5a.1 RED FLAG — se há pending ativo e mensagem parece resposta de botão,
+  // processa AGORA e retorna. Crítico: não pode passar pelo LLM normal.
+  if (inbound.text && inbound.text.trim().length > 0 && inbound.text.length <= 60) {
+    try {
+      const { handleRedFlagButtonResponse } = await import('./red-flag-handler.js');
+      const handled = await handleRedFlagButtonResponse({
+        userId: user.id,
+        conversationId: conversation.id,
+        phoneE164,
+        buttonLabel: inbound.text.trim(),
+        traceId,
+      });
+      if (handled) {
+        return { traceId, conversationId: conversation.id };
+      }
+    } catch (err) {
+      // Falha aqui é não-bloqueante — segue pro fluxo normal
+      await writeLog('warn', 'red_flag', `button response check falhou: ${String(err).slice(0, 120)}`, { traceId });
+    }
   }
 
   // 5. Handle consent flow
@@ -301,6 +322,17 @@ export async function processInboundUser(
     user360.skills.length > 0
   )) {
     systemPrompt += `\n\n${formatUser360ForPrompt(user360)}`;
+  }
+
+  // Skills emergentes — padrões aprendidos pelo skill-extractor. Falha silenciosa
+  // se a tabela ainda não existe (migration pendente).
+  try {
+    const skills = await loadUserSkills(user.id);
+    if (skills.length > 0) {
+      systemPrompt += `\n\n${formatSkillsForPrompt(skills)}`;
+    }
+  } catch (err) {
+    await writeLog('warn', 'skills', `loadUserSkills falhou: ${String(err).slice(0, 120)}`, { traceId });
   }
 
   if (promptsConfig.sara_suffix.trim()) {

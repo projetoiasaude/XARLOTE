@@ -4,6 +4,7 @@ import { usePathname } from 'next/navigation';
 import { motion } from 'framer-motion';
 import {
   MessageCircle, ShoppingBag, Activity, Users, Store, Zap, SlidersHorizontal,
+  Pill, Stethoscope, Building2, Shield, TrendingUp,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -21,8 +22,13 @@ const nav: NavItem[] = [
   { href: '/simulator', label: 'Simulador', icon: Zap },
   { href: '/conversations', label: 'Conversas', icon: MessageCircle },
   { href: '/orders', label: 'Pedidos', icon: ShoppingBag },
+  { href: '/treatments', label: 'Tratamentos', icon: Pill },
+  { href: '/consultations', label: 'Consultas', icon: Stethoscope },
   { href: '/users', label: 'Usuários', icon: Users },
   { href: '/suppliers', label: 'Farmácias', icon: Store },
+  { href: '/clinics', label: 'Clínicas', icon: Building2 },
+  { href: '/audit', label: 'Auditoria', icon: Shield },
+  { href: '/metrics', label: 'Métricas', icon: TrendingUp },
   { href: '/logs', label: 'Logs', icon: Activity },
   { href: '/prompts', label: 'Prompts', icon: SlidersHorizontal },
 ];

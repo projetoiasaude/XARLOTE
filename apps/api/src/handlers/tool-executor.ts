@@ -12,9 +12,11 @@ import {
   handleStartTreatmentFromOrder, handleLogMedicationTaken, handleUpdateTreatmentStatus,
   handleLogSymptom, handleSetDefaultAddress,
   handleStartConsultationSearch, handleConfirmConsultation, handleCancelConsultation,
+  handleSetEmergencyContact,
   type StartTreatmentArgs, type LogMedicationTakenArgs, type UpdateTreatmentStatusArgs,
-  type LogSymptomArgs, type StartConsultationArgs,
+  type LogSymptomArgs, type StartConsultationArgs, type SetEmergencyContactArgs,
 } from './tool-executor-v2.js';
+import { handleRedFlagCheck, type RedFlagArgs } from './red-flag-handler.js';
 
 /**
  * Extrai um identificador curto do endereço pra usar na cotação com a farmácia:
@@ -86,7 +88,14 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown> }, ctx);
         break;
       case 'send_emergency_orientation':
-        await sendOutbound(ctx.conversationId, ctx.phoneE164, '⚠️ Se for uma emergência, liga agora pro SAMU: *192*. Não espere! Estou aqui se precisar de mais ajuda. 💙', ctx.traceId);
+        // DEPRECATED — redireciona pra red_flag_check (que envia botões).
+        // Mantido como fallback compat enquanto modelos antigos do LLM ainda usam.
+        await writeLog('warn', 'tool', 'send_emergency_orientation chamada (deprecated) — redirecionando pra red_flag_check', { traceId: ctx.traceId });
+        await handleRedFlagCheck({
+          category: 'other_critical',
+          severity: 'high',
+          evidence: (tc.args as { symptoms_summary?: string }).symptoms_summary ?? 'situação reportada como emergência',
+        }, ctx);
         break;
       case 'get_order_status':
         await handleGetOrderStatus(ctx);
@@ -122,6 +131,15 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         break;
       case 'cancel_consultation':
         await handleCancelConsultation(tc.args as unknown as { consultation_id: string; reason: string }, ctx);
+        break;
+      case 'red_flag_check': {
+        // Handler envia BOTÕES diretos pra uazapi + agenda escalation 60s.
+        // Não devolve texto pra Xarlote — paciente vai responder via botão.
+        await handleRedFlagCheck(tc.args as unknown as RedFlagArgs, ctx);
+        break;
+      }
+      case 'set_emergency_contact':
+        await handleSetEmergencyContact(tc.args as unknown as SetEmergencyContactArgs, ctx);
         break;
       default:
         break;

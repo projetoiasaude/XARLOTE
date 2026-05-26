@@ -284,16 +284,31 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   }
 }
 
-// Called from webhook for real uazapi messages on the agent instance
+// Called from webhook for real uazapi messages on the agent instance.
+// AGENT_INSTANCE serve tanto pra farmácia quanto pra clínica — diferenciamos
+// pelo `party_type` da conversa salva no DB.
 export async function processInboundSupplierFromWebhook(inbound: NormalizedInbound): Promise<void> {
   const { data: conv } = await db
     .from('conversations')
-    .select('id')
+    .select('id, party_type')
     .eq('whatsapp_instance', AGENT_INSTANCE)
     .eq('whatsapp_jid', inbound.from.jid)
     .single();
 
   if (!conv) return;
+
+  // Roteamento por party_type — clinic vai pro agent-clinic, supplier fica aqui
+  if ((conv as { party_type?: string }).party_type === 'clinic') {
+    // Lazy import pra evitar ciclo
+    const { processInboundClinic } = await import('./agent-clinic.js');
+    await processInboundClinic({
+      conversationId: conv.id,
+      clinicPhone: inbound.from.phoneE164,
+      text: inbound.text ?? '',
+      traceId: randomUUID(),
+    });
+    return;
+  }
 
   await processInboundSupplier({
     conversationId: conv.id,

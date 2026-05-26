@@ -4,3 +4,4 @@ export * from './queries.js';
 export * from './memory.js';
 export * from './audit.js';
 export * from './user360.js';
+export * from './skills.js';

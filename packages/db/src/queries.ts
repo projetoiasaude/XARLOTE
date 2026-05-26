@@ -32,9 +32,10 @@ export async function updateUser(id: string, patch: Partial<User>): Promise<void
 export async function findOrCreateConversation(
   instance: string,
   jid: string,
-  partyType: 'user' | 'supplier',
+  partyType: 'user' | 'supplier' | 'clinic',
   userId?: string | null,
-  supplierId?: string | null
+  supplierId?: string | null,
+  clinicId?: string | null,
 ): Promise<Conversation> {
   const { data: existing } = await db
     .from('conversations')
@@ -44,17 +45,23 @@ export async function findOrCreateConversation(
     .single();
   if (existing) return existing;
 
+  const insertRow: Record<string, unknown> = {
+    party_type: partyType,
+    user_id: userId ?? null,
+    supplier_id: supplierId ?? null,
+    whatsapp_instance: instance,
+    whatsapp_jid: jid,
+    status: 'active',
+    memory_cards: [],
+  };
+  // clinic_id só existe após migration 0005 — só inclui no insert se foi pedido
+  if (clinicId !== undefined && clinicId !== null) {
+    insertRow['clinic_id'] = clinicId;
+  }
+
   const { data, error } = await db
     .from('conversations')
-    .insert({
-      party_type: partyType,
-      user_id: userId ?? null,
-      supplier_id: supplierId ?? null,
-      whatsapp_instance: instance,
-      whatsapp_jid: jid,
-      status: 'active',
-      memory_cards: [],
-    })
+    .insert(insertRow)
     .select()
     .single();
   if (error) throw error;

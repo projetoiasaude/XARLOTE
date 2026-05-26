@@ -11,6 +11,11 @@ import { startProfileEnricherWorker } from './workers/profile-enricher.worker.js
 import { compactStaleConversations } from './workers/conversation-compactor.worker.js';
 import { startInventoryTrackerWorker } from './workers/inventory-tracker.worker.js';
 import { startAdherenceScorerWorker } from './workers/adherence-scorer.worker.js';
+import { startConsultationFeedbackWorker } from './workers/consultation-feedback.worker.js';
+import { startKnowledgeGraphBuilderWorker } from './workers/knowledge-graph-builder.worker.js';
+import { startSkillExtractorWorker } from './workers/skill-extractor.worker.js';
+import { startAnomalyDetectorWorker } from './workers/anomaly-detector.worker.js';
+import { startMetricsAggregatorWorker } from './workers/metrics-aggregator.worker.js';
 
 async function main() {
   const app = Fastify({
@@ -47,7 +52,12 @@ async function main() {
     setInterval(() => compactStaleConversations().catch((e) => app.log.error(e, 'compactor failed')), 60 * 60 * 1000);
     startInventoryTrackerWorker();
     startAdherenceScorerWorker();
-    console.log(`   Workers: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h), inventory-tracker (6h), adherence-scorer (24h)`);
+    startConsultationFeedbackWorker();
+    startKnowledgeGraphBuilderWorker();
+    startSkillExtractorWorker();
+    startAnomalyDetectorWorker();
+    startMetricsAggregatorWorker();
+    console.log(`   Workers: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h), inventory-tracker (6h), adherence-scorer (24h), consultation-feedback (1h), kg-builder (6h), skill-extractor (24h), anomaly-detector (10min), metrics-aggregator (1h)`);
   } catch (err) {
     app.log.error(err);
     process.exit(1);

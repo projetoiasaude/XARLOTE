@@ -2,7 +2,7 @@
 
 export type MessageDirection = 'in' | 'out';
 export type MessageContentType = 'text' | 'image' | 'audio' | 'video' | 'document' | 'location' | 'sticker' | 'system';
-export type ConversationParty = 'user' | 'supplier';
+export type ConversationParty = 'user' | 'supplier' | 'clinic';
 export type OrderStatus = 'drafting' | 'quoting' | 'quoted' | 'confirming' | 'handed_off' | 'cancelled' | 'failed';
 export type QuoteStatus = 'pending' | 'contacting' | 'negotiating' | 'quoted' | 'unavailable' | 'timeout' | 'refused';
 export type ReminderType = 'medication' | 'appointment' | 'exercise' | 'hydration' | 'sleep' | 'custom';
@@ -50,6 +50,7 @@ export interface Conversation {
   party_type: ConversationParty;
   user_id: string | null;
   supplier_id: string | null;
+  clinic_id?: string | null;
   whatsapp_instance: string;
   whatsapp_jid: string;
   status: string;
