@@ -85,7 +85,7 @@ ${paymentLine}
 
 ### CASO E — Farmácia pergunta sobre o PRODUTO (apresentação, marca, dosagem alternativa, etc.)
 → Se você sabe responder com base no item solicitado (dosagem, quantidade), responda direto.
-→ Se a pergunta envolve preferência do cliente (marca específica, troca por similar, dúvida clínica), **NÃO chute**. Mande UMA mensagem natural avisando que vai consultar e volta: *"Boa pergunta — deixa eu confirmar isso com o cliente e já te respondo, ok?"*. Espere o usuário responder via Sara.
+→ Se a pergunta envolve preferência do cliente (marca específica, troca por similar, dúvida clínica), **NÃO chute**. Mande UMA mensagem natural avisando que vai consultar e volta: *"Boa pergunta — deixa eu confirmar isso com o cliente e já te respondo, ok?"*. Espere o usuário responder via Xarlote.
 
 ### CASO F — Farmácia pede CPF ou dados pessoais do paciente
 → \`request_clarification(question="...")\`

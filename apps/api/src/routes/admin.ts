@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { db } from '@iasaude/db';
 import { loadPrompts, savePrompts } from '../config/prompts.js';
-import { buildSaraSystemPrompt, buildAgentPharmacySystemPrompt } from '@iasaude/llm';
+import { buildXarloteSystemPrompt, buildAgentPharmacySystemPrompt } from '@iasaude/llm';
 
 export async function adminRoute(app: FastifyInstance) {
   // List conversations with pagination
@@ -107,7 +107,7 @@ export async function adminRoute(app: FastifyInstance) {
   // Get the BASE prompts (read-only preview) — used by the dashboard so admins can
   // see what they're customizing on top of. Renders with placeholder context.
   app.get('/prompts/base', async (_req, reply) => {
-    const sara = buildSaraSystemPrompt({
+    const sara = buildXarloteSystemPrompt({
       preferredName: '{{nome do usuário}}',
       conditions: ['{{condição}}'],
       allergies: ['{{alergia}}'],

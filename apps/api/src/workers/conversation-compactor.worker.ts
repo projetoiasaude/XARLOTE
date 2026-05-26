@@ -3,7 +3,7 @@
  *
  * Roda 1×/hora. Procura conversas com mais de 50 mensagens, condensa as 30
  * mais antigas em 1 card episódico, e mantém só as 20 mais recentes no
- * contexto da Sara. Mensagens originais ficam no BD (pra LGPD), mas saem
+ * contexto da Xarlote. Mensagens originais ficam no BD (pra LGPD), mas saem
  * do payload da próxima turn.
  *
  * Observação: o "sair do contexto" é gerenciado por `getConversationMessages(_, 30)`

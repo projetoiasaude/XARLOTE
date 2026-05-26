@@ -11,3 +11,7 @@ coverage/
 # Runtime config persistido (API keys, override de prompts) — não pode comitar
 apps/api/data/prompts.json
 
+
+# Redis dump local
+*.rdb
+tsconfig.tsbuildinfo

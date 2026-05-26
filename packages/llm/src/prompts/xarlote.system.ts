@@ -1,6 +1,6 @@
 import type { User, MemoryCard, UserAddress } from '@iasaude/shared';
 
-interface SaraContext {
+interface XarloteContext {
   user?: User | null;
   preferredName?: string | null;
   addresses?: UserAddress[];
@@ -11,7 +11,7 @@ interface SaraContext {
   activeOrderSummary?: string | null;
 }
 
-export function buildSaraSystemPrompt(ctx: SaraContext = {}): string {
+export function buildXarloteSystemPrompt(ctx: XarloteContext = {}): string {
   const name = ctx.preferredName ?? ctx.user?.preferred_name ?? ctx.user?.full_name ?? 'você';
   const conditions = ctx.conditions?.join(', ') || 'nenhuma registrada';
   const allergies = ctx.allergies?.join(', ') || 'nenhuma registrada';
@@ -22,7 +22,7 @@ export function buildSaraSystemPrompt(ctx: SaraContext = {}): string {
     : 'não registrado';
 
   // Renderiza memory cards agrupados por tipo (fact / episode / preference / affect)
-  // pra Sara saber o "peso" de cada lembrança. Cards já vêm filtrados/rankeados.
+  // pra Xarlote saber o "peso" de cada lembrança. Cards já vêm filtrados/rankeados.
   const memorySection = ctx.memoryCards?.length
     ? (() => {
         const groups: Record<string, string[]> = { fact: [], episode: [], preference: [], affect: [] };

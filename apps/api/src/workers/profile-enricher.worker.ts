@@ -4,7 +4,7 @@
  *   - memory_cards: fact / episode / preference / affect (com embedding pra retrieval)
  *
  * Roda em background depois de cada turn do usuário (enfileirado pelo
- * inbound-user). Falhar é OK — não impacta a resposta da Sara.
+ * inbound-user). Falhar é OK — não impacta a resposta da Xarlote.
  */
 import { Worker, type Job } from 'bullmq';
 import { db, saveMemoryCard, writeLog } from '@iasaude/db';

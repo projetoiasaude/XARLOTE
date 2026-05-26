@@ -3,7 +3,7 @@ import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessag
 import { isForgetMeRequest, buildConsentEvent } from '@iasaude/core';
 import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES } from '@iasaude/shared';
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard } from '@iasaude/shared';
-import { chat, buildSaraSystemPrompt, saraTools, messagesToHistory, trimHistory, embed, userContentWithImage, dataUrl, type ChatContent } from '@iasaude/llm';
+import { chat, buildXarloteSystemPrompt, xarloteTools, messagesToHistory, trimHistory, embed, userContentWithImage, dataUrl, type ChatContent } from '@iasaude/llm';
 import { sendMenu, isSimulatorMode, downloadMedia } from '@iasaude/whatsapp';
 import { transcribeAudio } from '@iasaude/integrations';
 import { Queue } from 'bullmq';
@@ -167,7 +167,7 @@ export async function processInboundUser(
 
   // 7. Mark active if still profiling.
   // Captura wasProfiling pra disparar voice intro: a 1ª msg após `Aceitar` é
-  // sempre o usuário dizendo o nome dele. A resposta da Sara nesse turno é a
+  // sempre o usuário dizendo o nome dele. A resposta da Xarlote nesse turno é a
   // saudação "Prazer, X!" que merece sair como áudio.
   const wasProfiling = user.onboarding_status === 'profiling';
   if (wasProfiling) {
@@ -221,7 +221,7 @@ export async function processInboundUser(
       }))
     : (Array.isArray(conversation.memory_cards) ? conversation.memory_cards : []);
 
-  let systemPrompt = buildSaraSystemPrompt({
+  let systemPrompt = buildXarloteSystemPrompt({
     user,
     preferredName: user.preferred_name,
     addresses: addresses ?? [],
@@ -245,7 +245,7 @@ export async function processInboundUser(
     userMsgContent = `[Localização compartilhada: lat ${inbound.location.lat}, lng ${inbound.location.lng}${inbound.location.name ? `, ${inbound.location.name}` : ''}]`;
     userMsgPreview = userMsgContent;
   } else if (inbound.contentType === 'audio') {
-    // Baixa o áudio do uazapi e transcreve antes da Sara ver.
+    // Baixa o áudio do uazapi e transcreve antes da Xarlote ver.
     // uazapi exige o `id` LONGO (com prefixo de número), não o messageid curto.
     // IMPORTANTE: usa `SARA_INSTANCE` ("sara") como chave do buildConfig — o
     // `inbound.instance` é o nome real da uazapi (ex: "VEDACIL-HIAGO") e
@@ -320,7 +320,7 @@ export async function processInboundUser(
     userMsgPreview = typeof userMsgContent === 'string' ? userMsgContent : '[multimodal]';
   }
 
-  // 10. Call LLM (Sara) — usa vision_model quando a mensagem é multimodal (imagem)
+  // 10. Call LLM (Xarlote) — usa vision_model quando a mensagem é multimodal (imagem)
   const isMultimodal = Array.isArray(userMsgContent);
   const model = isMultimodal
     ? (promptsConfig.vision_model || promptsConfig.llm_model || 'openai/gpt-4.1-mini')
@@ -337,7 +337,7 @@ export async function processInboundUser(
       apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
       systemInstruction: systemPrompt,
       history: geminiHistory,
-      tools: saraTools,
+      tools: xarloteTools,
       temperature: 0.4,
       maxOutputTokens: 1024,
       timeoutMs: 60_000,
@@ -352,7 +352,7 @@ export async function processInboundUser(
     const isPayment = errMsg.includes('402') || errMsg.includes('Payment Required') || errMsg.includes('credits');
 
     const errorTag = isAuth ? '[AUTH/KEY INVÁLIDA]' : isPayment ? '[SEM CRÉDITO]' : isQuota ? '[RATE LIMIT]' : '[ERRO LLM]';
-    await writeLog('error', 'llm', `${errorTag} Sara LLM error: ${errMsg.slice(0, 200)}`, {
+    await writeLog('error', 'llm', `${errorTag} Xarlote LLM error: ${errMsg.slice(0, 200)}`, {
       traceId, error: errMsg, isAuth, isQuota, isPayment,
     });
 
@@ -395,7 +395,7 @@ export async function processInboundUser(
   if (llmResponse.text.trim()) {
     const meta = (user.metadata as { audio_intro_sent?: boolean } | null | undefined) ?? {};
     const alreadyIntroed = meta.audio_intro_sent === true;
-    // Conta quantas msgs outbound a Sara já mandou pra esse user fora do consent flow.
+    // Conta quantas msgs outbound a Xarlote já mandou pra esse user fora do consent flow.
     // Se for a 1ª (= a próxima) E o user já consentiu E ainda não rolou intro,
     // dispara áudio. Robusto contra falhas anteriores (ex: deploy sem TTS).
     const { count: outCount } = await db
@@ -405,7 +405,7 @@ export async function processInboundUser(
       .eq('direction', 'out')
       .eq('sender_role', 'assistant');
     // outCount inclui a msg de consent + o "como gosta de ser chamado" do consent flow.
-    // Sara só começa a falar de fato APÓS o user passar de consent → profiling → active.
+    // Xarlote só começa a falar de fato APÓS o user passar de consent → profiling → active.
     // Então a 1ª resposta "real" dela = quando outCount <= 2 (consent + "como gosta de").
     const isFirstRealReply = (outCount ?? 99) <= 2;
     const shouldVoiceIntro =
@@ -417,10 +417,10 @@ export async function processInboundUser(
     await writeLog('info', 'outbound', `Xarlote → usuário ${shouldVoiceIntro ? '[ÁUDIO intro]' : ''}: "${replyText.slice(0, 100)}${replyText.length > 100 ? '…' : ''}"`, { traceId, voiceIntro: shouldVoiceIntro });
 
     if (shouldVoiceIntro) {
-      // Captura o nome a partir do texto da Sara se o enricher ainda não populou
-      // user.preferred_name (a Sara acabou de ouvir o nome nesse turno; o enricher
+      // Captura o nome a partir do texto da Xarlote se o enricher ainda não populou
+      // user.preferred_name (a Xarlote acabou de ouvir o nome nesse turno; o enricher
       // roda async DEPOIS). Heurística: pega a 1ª palavra capitalizada depois de
-      // "Oi", "Olá", "Prazer" — combina com como a Sara saúda.
+      // "Oi", "Olá", "Prazer" — combina com como a Xarlote saúda.
       const nameMatch = replyText.match(/(?:oi|olá|ola|prazer|opa|ei)[,\s]+([A-ZÁÉÍÓÚÂÊÔÃÕ][a-záéíóúâêôãõ]{1,30})/i);
       const inferredName = nameMatch?.[1] ?? null;
       const sentAudio = await sendOutboundAudio(conversation.id, phoneE164, replyText, traceId, {

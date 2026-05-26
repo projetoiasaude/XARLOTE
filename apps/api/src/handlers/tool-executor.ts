@@ -66,7 +66,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         await handleSaveProfileFact(tc.args as { category: string; payload: Record<string, unknown> }, ctx);
         break;
       case 'request_user_location':
-        // Sara will say it in text; nothing else needed
+        // Xarlote will say it in text; nothing else needed
         break;
       case 'parse_prescription_image':
         await handleParsePrescription(tc.args as { message_id: string }, ctx);
@@ -182,7 +182,7 @@ async function handleStartPharmacyOrder(
   // ─── IDEMPOTÊNCIA ──────────────────────────────────────────────────────────
   // Se já existe uma order ativa (quoting/quoted/confirming) pra esse usuário,
   // NÃO cria outra e NÃO reinicia contato com farmácias. Apenas atualiza status.
-  // (Sara costuma re-chamar essa tool quando usuário pressiona — proteção essencial.)
+  // (Xarlote costuma re-chamar essa tool quando usuário pressiona — proteção essencial.)
   const { data: existingActive } = await db
     .from('orders')
     .select('id, status')

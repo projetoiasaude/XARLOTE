@@ -10,7 +10,7 @@
  * Modelo default: `eleven_flash_v2_5` — latência ~75ms first byte, ~70%
  * mais barato que o Multilingual v2, qualidade ótima pra PT-BR.
  *
- * Voice ID default: Sarah (`EXAVITQu4vr4xnSDxMaL`) — premade feminina suave,
+ * Voice ID default: Xarloteh (`EXAVITQu4vr4xnSDxMaL`) — premade feminina suave,
  * funciona bem com PT via Flash v2.5. Configurável em /prompts.
  *
  * Saída: MP3 44.1kHz 128kbps por padrão (formato bem aceito por uazapi /send/media).
@@ -62,7 +62,7 @@ export interface TtsResult {
  * - Use case: informative_educational (combina com concierge de saúde)
  * - ~37k clones na library (validação de qualidade pela comunidade)
  *
- * Comparada com vozes premade inglesas (Sarah/Jessica/etc) tocadas via
+ * Comparada com vozes premade inglesas (Xarloteh/Jessica/etc) tocadas via
  * `multilingual_v2` → muito menos sotaque, prosódia PT-BR natural,
  * pronúncia correta de nomes ("Hiago" → "Iago" com H mudo), entonação
  * caloriosa nas perguntas.
@@ -164,7 +164,7 @@ export interface VoiceSummary {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Humanizer — transforma o texto que a Sara escreveu em "voice script"
+// Humanizer — transforma o texto que a Xarlote escreveu em "voice script"
 // otimizado pro ElevenLabs entregar áudio NATURAL em PT-BR.
 //
 // Princípios:

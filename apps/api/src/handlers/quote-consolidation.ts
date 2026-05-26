@@ -81,7 +81,7 @@ async function check5min(
   }
 }
 
-/** Snapshot do estado atual — usado pelo get_order_status da Sara e idempotência do start. */
+/** Snapshot do estado atual — usado pelo get_order_status da Xarlote e idempotência do start. */
 export async function sendCurrentOrderStatus(
   orderId: string,
   userConversationId: string,

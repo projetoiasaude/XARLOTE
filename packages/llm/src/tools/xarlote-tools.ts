@@ -1,6 +1,6 @@
 import type { ToolDefinition } from '../client.js';
 
-export const saraTools: ToolDefinition[] = [
+export const xarloteTools: ToolDefinition[] = [
   {
     type: 'function',
     function: {
