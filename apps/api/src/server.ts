@@ -12,6 +12,7 @@ import { compactStaleConversations } from './workers/conversation-compactor.work
 import { startInventoryTrackerWorker } from './workers/inventory-tracker.worker.js';
 import { startAdherenceScorerWorker } from './workers/adherence-scorer.worker.js';
 import { startConsultationFeedbackWorker } from './workers/consultation-feedback.worker.js';
+import { startConsultationDispatcherWorker } from './workers/consultation-dispatcher.worker.js';
 import { startKnowledgeGraphBuilderWorker } from './workers/knowledge-graph-builder.worker.js';
 import { startSkillExtractorWorker } from './workers/skill-extractor.worker.js';
 import { startAnomalyDetectorWorker } from './workers/anomaly-detector.worker.js';
@@ -53,6 +54,7 @@ async function main() {
     startInventoryTrackerWorker();
     startAdherenceScorerWorker();
     startConsultationFeedbackWorker();
+    startConsultationDispatcherWorker();
     startKnowledgeGraphBuilderWorker();
     startSkillExtractorWorker();
     startAnomalyDetectorWorker();
