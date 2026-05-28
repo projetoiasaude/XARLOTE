@@ -69,6 +69,7 @@ export interface Message {
   sender_role: 'user' | 'assistant' | 'supplier' | 'system';
   content_type: MessageContentType;
   content: string | null;
+  transcript?: string | null;
   media_storage_path: string | null;
   media_mime: string | null;
   media_duration_ms: number | null;
