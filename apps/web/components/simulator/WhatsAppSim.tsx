@@ -7,6 +7,7 @@ import {
 import { supabase } from '@/lib/supabase';
 import { apiUrl, formatTime } from '@/lib/utils';
 import type { RealtimeChannel } from '@supabase/supabase-js';
+import { ClinicSimPanel } from './ClinicSimPanel';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -767,6 +768,9 @@ export function WhatsAppSimulator() {
           </div>
         )}
       </div>
+
+      {/* Painel de simulação de clínica — flutuante, aparece quando há consulta em negociação */}
+      <ClinicSimPanel userConversationId={conversationId} />
     </div>
   );
 }

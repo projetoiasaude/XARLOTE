@@ -21,7 +21,7 @@ import {
 import { AGENT_INSTANCE } from '@iasaude/shared';
 import type { NormalizedInbound, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
-import { sendOutboundToSupplier } from './outbound-agent.js';
+import { sendOutboundToClinic } from './outbound-agent.js';
 import {
   consolidateConsultationQuotes,
   notifyUserConsultationQuoteArrived,
@@ -384,7 +384,7 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
 
   // 9. Envia resposta de texto pra clínica (se não finalizou)
   if (llmResponse.text.trim() && !shouldFinalize) {
-    await sendOutboundToSupplier(conversationId, clinicPhone, llmResponse.text.trim(), traceId);
+    await sendOutboundToClinic(conversationId, clinicPhone, llmResponse.text.trim(), traceId);
   } else if (!llmResponse.text.trim() && !shouldFinalize && llmResponse.toolCalls.length === 0) {
     await writeLog('warn', 'agent-clinic', 'Agente clínica retornou resposta vazia', { traceId, conversationId });
   }
@@ -509,7 +509,7 @@ export async function initiateClinicNegotiation(opts: {
     metadata: { clinic_id: clinicId, clinic_name: clinicName, specialty: ctx.specialty },
   });
 
-  await sendOutboundToSupplier(conv.id, clinicWhatsApp, opening, traceId);
+  await sendOutboundToClinic(conv.id, clinicWhatsApp, opening, traceId);
 }
 
 /** Marca quote como terminal e dispara consolidação se thresholds batem. */

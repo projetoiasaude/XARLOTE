@@ -216,4 +216,68 @@ export async function simulateRoute(app: FastifyInstance) {
 
     return reply.send({ ok: true, traceId });
   });
+
+  // ─── SIMULADOR DE CLÍNICA ────────────────────────────────────────────────────
+  // Lista as clínicas em negociação de uma consulta (pra você responder como cada uma)
+  app.get('/simulate/clinic-conversations/:userConversationId', async (req, reply) => {
+    const { userConversationId } = req.params as { userConversationId: string };
+    const { db } = await import('@iasaude/db');
+
+    // Acha a consulta ativa dessa conversa de usuário
+    const { data: consultation } = await db
+      .from('consultations')
+      .select('id, status, specialty')
+      .eq('conversation_id', userConversationId)
+      .in('status', ['searching', 'quoting', 'quoted', 'confirming'])
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!consultation) return reply.send({ consultation: null, clinics: [] });
+
+    // Cotações + clínica + conversa
+    const { data: quotes } = await db
+      .from('consultation_quotes')
+      .select('id, status, conversation_id, proposed_datetime, price_brl, clinic_id, clinics(name, phone_e164)')
+      .eq('consultation_id', consultation.id)
+      .order('created_at', { ascending: true });
+
+    const clinics = (quotes ?? []).map((q: any) => ({
+      quote_id: q.id,
+      status: q.status,
+      conversation_id: q.conversation_id,
+      clinic_name: q.clinics?.name ?? 'Clínica',
+      clinic_phone: q.clinics?.phone_e164 ?? null,
+      proposed_datetime: q.proposed_datetime,
+      price_brl: q.price_brl,
+    }));
+
+    return reply.send({ consultation, clinics });
+  });
+
+  // Mensagens de uma conversa de clínica específica
+  app.get('/simulate/clinic-messages/:conversationId', async (req, reply) => {
+    const { conversationId } = req.params as { conversationId: string };
+    const { db } = await import('@iasaude/db');
+    const { data: messages } = await db
+      .from('messages')
+      .select('id, direction, sender_role, content_type, content, created_at, trace_id')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: true })
+      .limit(50);
+    return reply.send({ messages: messages ?? [] });
+  });
+
+  // Você responde como a clínica → processa pela pipeline do agent-clinic
+  app.post('/simulate/clinic-reply', async (req, reply) => {
+    const Body = z.object({ conversationId: z.string().uuid(), text: z.string().min(1) });
+    const parsed = Body.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+    const { conversationId, text } = parsed.data;
+    const traceId = randomUUID();
+    const { processInboundClinic } = await import('../handlers/agent-clinic.js');
+    await processInboundClinic({ conversationId, clinicPhone: 'simulated', text, traceId });
+    return reply.send({ ok: true, traceId });
+  });
 }

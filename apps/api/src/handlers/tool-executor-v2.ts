@@ -20,7 +20,7 @@ import { sendOutbound } from './outbound.js';
 import { discoverClinics } from './clinic-discovery.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
 import { scheduleConsultationTimeout } from './consultation-consolidation.js';
-import { sendOutboundToSupplier } from './outbound-agent.js';
+import { sendOutboundToClinic } from './outbound-agent.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TIPOS
@@ -768,7 +768,7 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
         ? ` Plano: ${q.plan_accepted}.`
         : ` (Particular.)`;
       const msg = `Oi! O paciente${patientFirst ? ` ${patientFirst}` : ''} confirmou — quer marcar pra ${dt}.${planLine} Vocês conseguem reservar esse horário? Obrigada!`;
-      await sendOutboundToSupplier(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId);
+      await sendOutboundToClinic(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId);
     }
   }
 
@@ -842,7 +842,7 @@ export async function handleCancelConsultation(args: { consultation_id: string; 
       const clinicPhone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
       if (clinicPhone) {
         const msg = `Oi! Infelizmente o paciente precisou cancelar a consulta marcada. Desculpa o transtorno e obrigada pela disponibilidade!`;
-        await sendOutboundToSupplier(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId);
+        await sendOutboundToClinic(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId);
       }
     }
   }
