@@ -317,31 +317,53 @@ export async function adminRoute(app: FastifyInstance) {
     const q = req.query as Record<string, string>;
     const limit = Math.min(parseInt(q['limit'] ?? '120'), 400);
     const userId = q['user_id'];
-    const sinceId = q['since_log_id']; // pra polling incremental dos system_logs
+    const traceId = q['trace_id'];
+    // cursor keyset: devolve itens com ts <= before (ignora se não for ISO válido)
+    const before = q['before'] && !Number.isNaN(Date.parse(q['before'])) ? q['before'] : undefined;
+    const view = (q['view'] ?? 'all') as 'all' | 'decisions' | 'critical';
+    // sanitiza busca p/ não quebrar a sintaxe de or() do PostgREST
+    const search = (q['q'] ?? '').replace(/[,()]/g, ' ').trim().slice(0, 100);
 
-    // Busca as 3 fontes em paralelo
-    const [auditRes, eventRes, logRes] = await Promise.all([
-      (() => {
-        let aq = db.from('audit_log')
-          .select('id, occurred_at, actor_type, action, reason, metadata, before, after, trace_id, user_id, target_table, target_id')
-          .order('occurred_at', { ascending: false }).limit(limit);
-        if (userId) aq = aq.eq('user_id', userId);
-        return aq;
-      })(),
-      (() => {
-        let eq = db.from('event_log')
-          .select('id, occurred_at, event_name, severity, duration_ms, payload, trace_id, user_id')
-          .order('occurred_at', { ascending: false }).limit(limit);
-        if (userId) eq = eq.eq('user_id', userId);
-        return eq;
-      })(),
-      (() => {
-        let lq = db.from('system_logs')
-          .select('id, created_at, level, category, message, metadata, trace_id')
-          .order('created_at', { ascending: false }).limit(limit);
-        return lq;
-      })(),
-    ]);
+    const wantLogs = view !== 'decisions'; // "decisões" = só audit + event (sem o firehose de logs)
+    const critical = view === 'critical';
+
+    // Cada fonte já filtrada NO SERVIDOR (não traz tudo pra filtrar no app/browser).
+    const auditQ = (() => {
+      let aq = db.from('audit_log')
+        .select('id, occurred_at, actor_type, action, reason, metadata, before, after, trace_id, user_id, target_table, target_id')
+        .order('occurred_at', { ascending: false }).limit(limit);
+      if (userId) aq = aq.eq('user_id', userId);
+      if (traceId) aq = aq.eq('trace_id', traceId);
+      if (before) aq = aq.lte('occurred_at', before);
+      if (critical) aq = aq.or('action.ilike.%red_flag%,action.ilike.%failed%');
+      if (search) aq = aq.or(`action.ilike.%${search}%,reason.ilike.%${search}%,actor_type.ilike.%${search}%`);
+      return aq;
+    })();
+    const eventQ = (() => {
+      let eq = db.from('event_log')
+        .select('id, occurred_at, event_name, severity, duration_ms, payload, trace_id, user_id')
+        .order('occurred_at', { ascending: false }).limit(limit);
+      if (userId) eq = eq.eq('user_id', userId);
+      if (traceId) eq = eq.eq('trace_id', traceId);
+      if (before) eq = eq.lte('occurred_at', before);
+      if (critical) eq = eq.in('severity', ['critical', 'error', 'warn']);
+      if (search) eq = eq.ilike('event_name', `%${search}%`);
+      return eq;
+    })();
+    const logQ = wantLogs ? (() => {
+      let lq = db.from('system_logs')
+        .select('id, created_at, level, category, message, metadata, trace_id, user_id')
+        .neq('level', 'debug') // debug nunca entra na timeline
+        .order('created_at', { ascending: false }).limit(limit);
+      if (userId) lq = lq.eq('user_id', userId);
+      if (traceId) lq = lq.eq('trace_id', traceId);
+      if (before) lq = lq.lte('created_at', before);
+      if (critical) lq = lq.in('level', ['warn', 'error', 'critical']);
+      if (search) lq = lq.or(`message.ilike.%${search}%,category.ilike.%${search}%`);
+      return lq;
+    })() : Promise.resolve({ data: [] as any[] });
+
+    const [auditRes, eventRes, logRes] = await Promise.all([auditQ, eventQ, logQ]);
 
     interface TimelineItem {
       source: 'audit' | 'event' | 'log';
@@ -374,21 +396,22 @@ export async function adminRoute(app: FastifyInstance) {
         trace_id: e.trace_id, user_id: e.user_id,
       });
     }
-    for (const l of logRes.data ?? []) {
-      // Filtra ruído: debug logs não entram na timeline (poluem)
-      if (l.level === 'debug') continue;
+    for (const l of (logRes as { data: any[] | null }).data ?? []) {
       items.push({
         source: 'log', uid: `l${l.id}`, ts: l.created_at,
         level: l.level, actor: l.category, title: l.message,
         detail: l.metadata && Object.keys(l.metadata).length ? l.metadata : null,
-        trace_id: l.trace_id, user_id: null,
+        trace_id: l.trace_id, user_id: l.user_id ?? null,
       });
     }
 
-    // Ordena por timestamp desc, corta no limit
+    // Ordena desc e corta no limit. cursor = ts do item mais antigo da página
+    // (correto porque buscamos `limit` de cada fonte — nenhum item > cursor fica de fora).
     items.sort((x, y) => new Date(y.ts).getTime() - new Date(x.ts).getTime());
+    const sliced = items.slice(0, limit);
+    const nextCursor = sliced.length === limit ? sliced[sliced.length - 1]!.ts : null;
 
-    return reply.send(items.slice(0, limit));
+    return reply.send({ items: sliced, nextCursor });
   });
 
   // Audit log agregado — útil pro dashboard mostrar "ações por dia"
