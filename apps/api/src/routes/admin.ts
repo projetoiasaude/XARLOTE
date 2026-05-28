@@ -310,6 +310,87 @@ export async function adminRoute(app: FastifyInstance) {
     return reply.send(data);
   });
 
+  // ─── Timeline unificada — audit_log + event_log + system_logs ──────────────
+  // Pra acompanhar EM TEMPO REAL cada decisão/ação da IA num feed só.
+  // Cada item normalizado: { source, ts, level, actor, title, detail, trace_id, user_id }
+  app.get('/timeline', async (req, reply) => {
+    const q = req.query as Record<string, string>;
+    const limit = Math.min(parseInt(q['limit'] ?? '120'), 400);
+    const userId = q['user_id'];
+    const sinceId = q['since_log_id']; // pra polling incremental dos system_logs
+
+    // Busca as 3 fontes em paralelo
+    const [auditRes, eventRes, logRes] = await Promise.all([
+      (() => {
+        let aq = db.from('audit_log')
+          .select('id, occurred_at, actor_type, action, reason, metadata, before, after, trace_id, user_id, target_table, target_id')
+          .order('occurred_at', { ascending: false }).limit(limit);
+        if (userId) aq = aq.eq('user_id', userId);
+        return aq;
+      })(),
+      (() => {
+        let eq = db.from('event_log')
+          .select('id, occurred_at, event_name, severity, duration_ms, payload, trace_id, user_id')
+          .order('occurred_at', { ascending: false }).limit(limit);
+        if (userId) eq = eq.eq('user_id', userId);
+        return eq;
+      })(),
+      (() => {
+        let lq = db.from('system_logs')
+          .select('id, created_at, level, category, message, metadata, trace_id')
+          .order('created_at', { ascending: false }).limit(limit);
+        return lq;
+      })(),
+    ]);
+
+    interface TimelineItem {
+      source: 'audit' | 'event' | 'log';
+      uid: string;
+      ts: string;
+      level: string;
+      actor: string;
+      title: string;
+      detail: Record<string, unknown> | null;
+      trace_id: string | null;
+      user_id: string | null;
+    }
+
+    const items: TimelineItem[] = [];
+
+    for (const a of auditRes.data ?? []) {
+      items.push({
+        source: 'audit', uid: `a${a.id}`, ts: a.occurred_at,
+        level: String(a.action).includes('red_flag') || String(a.action).includes('failed') ? 'critical' : 'state',
+        actor: a.actor_type, title: a.action,
+        detail: { reason: a.reason, before: a.before, after: a.after, metadata: a.metadata, target: a.target_table ? `${a.target_table}/${a.target_id ?? ''}` : null },
+        trace_id: a.trace_id, user_id: a.user_id,
+      });
+    }
+    for (const e of eventRes.data ?? []) {
+      items.push({
+        source: 'event', uid: `e${e.id}`, ts: e.occurred_at,
+        level: e.severity, actor: 'system', title: e.event_name,
+        detail: { duration_ms: e.duration_ms, payload: e.payload },
+        trace_id: e.trace_id, user_id: e.user_id,
+      });
+    }
+    for (const l of logRes.data ?? []) {
+      // Filtra ruído: debug logs não entram na timeline (poluem)
+      if (l.level === 'debug') continue;
+      items.push({
+        source: 'log', uid: `l${l.id}`, ts: l.created_at,
+        level: l.level, actor: l.category, title: l.message,
+        detail: l.metadata && Object.keys(l.metadata).length ? l.metadata : null,
+        trace_id: l.trace_id, user_id: null,
+      });
+    }
+
+    // Ordena por timestamp desc, corta no limit
+    items.sort((x, y) => new Date(y.ts).getTime() - new Date(x.ts).getTime());
+
+    return reply.send(items.slice(0, limit));
+  });
+
   // Audit log agregado — útil pro dashboard mostrar "ações por dia"
   app.get('/audit/summary', async (req, reply) => {
     const q = req.query as Record<string, string>;

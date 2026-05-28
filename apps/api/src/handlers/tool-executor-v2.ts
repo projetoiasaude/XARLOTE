@@ -517,10 +517,23 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
     return;
   }
 
-  // 2. Descobre lat/lng do paciente — vem do user_addresses default ou último order
+  // 2. Descobre lat/lng + cidade do paciente.
+  //    Ordem: arg da tool → home_city do perfil → endereço default → último order.
   let lat: number | null = null;
   let lng: number | null = null;
   let city: string | null = args.city ?? null;
+  let stateUf: string | null = null;
+
+  // Lê perfil — home_city é a fonte preferida quando o paciente não disse cidade agora
+  const { data: profile } = await db
+    .from('users')
+    .select('home_city, home_state')
+    .eq('id', ctx.userId)
+    .maybeSingle();
+  if (!city && profile?.home_city) {
+    city = profile.home_city;
+    stateUf = profile.home_state ?? null;
+  }
 
   {
     const { data: addr } = await db
@@ -533,6 +546,7 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
       lat = addr.latitude;
       lng = addr.longitude;
       city = city ?? addr.city;
+      stateUf = stateUf ?? addr.state;
     }
   }
   if (lat == null || lng == null) {
@@ -548,6 +562,25 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
       lat = ord.delivery_lat;
       lng = ord.delivery_lng;
     }
+  }
+
+  // Se o paciente informou uma cidade nova nesse pedido, salva no perfil pra
+  // próxima vez a Xarlote só confirmar em vez de perguntar de novo.
+  if (args.city && args.city.trim() && args.city.trim().toLowerCase() !== (profile?.home_city ?? '').toLowerCase()) {
+    await db.from('users').update({
+      home_city: args.city.trim(),
+      ...(stateUf ? { home_state: stateUf } : {}),
+    }).eq('id', ctx.userId);
+    await writeAudit({
+      actorType: 'xarlote',
+      action: 'user.home_city.set',
+      userId: ctx.userId,
+      targetTable: 'users',
+      targetId: ctx.userId,
+      conversationId: ctx.conversationId,
+      traceId: ctx.traceId,
+      after: { home_city: args.city.trim() },
+    });
   }
 
   // 3. Cria consultation status='searching'
@@ -592,6 +625,7 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
       const candidates = await discoverClinics({
         specialty: args.specialty,
         city,
+        state: stateUf,
         lat,
         lng,
         limit: 5,
@@ -600,7 +634,7 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
 
       if (candidates.length === 0) {
         await sendOutbound(ctx.conversationId, ctx.phoneE164,
-          `Não encontrei clínicas de ${args.specialty}${city ? ` em ${city}` : ''} com WhatsApp cadastrado 😔 Por enquanto não consigo cotar essa especialidade automaticamente. Posso te ajudar com outra coisa?`,
+          `Puxa, não consegui encontrar ${args.specialty}${city ? ` em ${city}` : ''} agora 😔 Pode ser que eu não tenha achado clínicas com contato disponível na região. Quer que eu tente em outra cidade próxima, ou prefere telemedicina?`,
           ctx.traceId);
         await db.from('consultations').update({ status: 'failed' }).eq('id', c.id);
         return;

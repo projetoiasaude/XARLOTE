@@ -12,7 +12,17 @@
  * referência, mas não entram na lista de candidatos.
  */
 import { db, writeLog } from '@iasaude/db';
-import { findNearbyClinics, type PlaceResult } from '@iasaude/integrations';
+import { findNearbyClinics, geocodeAddress, getPlacePhone, type PlaceResult } from '@iasaude/integrations';
+
+/** Converte telefone BR cru ("(62) 3333-4444" / "6233334444") em E.164 (+55...). */
+function toE164BR(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length < 10) return null;            // muito curto pra ser válido
+  if (digits.startsWith('55') && digits.length >= 12) return `+${digits}`;
+  if (digits.length === 10 || digits.length === 11) return `+55${digits}`;
+  return `+${digits}`;
+}
 
 export interface ClinicCandidate {
   id: string;
@@ -50,8 +60,11 @@ export async function discoverClinics(opts: {
   limit?: number;
   traceId: string;
 }): Promise<ClinicCandidate[]> {
-  const { specialty, city, state, lat, lng, traceId } = opts;
+  const { specialty, city, state, traceId } = opts;
   const limit = opts.limit ?? 5;
+  // lat/lng mutáveis — podem ser preenchidos via geocode da cidade abaixo
+  let lat: number | null | undefined = opts.lat;
+  let lng: number | null | undefined = opts.lng;
 
   // 1. Cache via find_clinics RPC (se já existe na tabela)
   let cached: ClinicCandidate[] = [];
@@ -91,17 +104,35 @@ export async function discoverClinics(opts: {
     return cached.slice(0, limit);
   }
 
-  // 2. Fallback: Google Places (precisa de lat/lng pra buscar por raio)
+  // 2. Fallback: Google Places (precisa de lat/lng pra buscar por raio).
+  //    Se não temos lat/lng mas temos a CIDADE, geocodamos o centro da cidade.
+  //    Isso resolve o caso comum: paciente só disse "Goiânia" sem compartilhar localização.
+  if ((typeof lat !== 'number' || typeof lng !== 'number') && city) {
+    try {
+      const geo = await geocodeAddress(`${city}${state ? `, ${state}` : ''}, Brasil`);
+      if (geo) {
+        lat = geo.lat;
+        lng = geo.lng;
+        await writeLog('info', 'clinic-discovery', `Cidade "${city}" geocodada → ${lat?.toFixed(4)},${lng?.toFixed(4)}`, { traceId });
+      }
+    } catch (err) {
+      await writeLog('warn', 'clinic-discovery', `geocode da cidade "${city}" falhou: ${String(err).slice(0, 120)}`, { traceId });
+    }
+  }
+
   if (typeof lat !== 'number' || typeof lng !== 'number') {
-    await writeLog('warn', 'clinic-discovery', `sem lat/lng — não dá pra buscar Places, retornando só ${cached.length} do cache`, { traceId });
+    await writeLog('warn', 'clinic-discovery', `sem lat/lng e sem cidade geocodável — retornando só ${cached.length} do cache`, { traceId });
     return cached;
   }
 
+  // Raio maior quando buscamos pelo centro da cidade (vs localização exata do user)
+  const baseRadius = 8000;
+
   let places: PlaceResult[] = [];
   try {
-    places = await findNearbyClinics(lat, lng, specialty, 5000, 10);
+    places = await findNearbyClinics(lat, lng, specialty, baseRadius, 12);
     if (places.length < 3) {
-      places = await findNearbyClinics(lat, lng, specialty, 10000, 10);
+      places = await findNearbyClinics(lat, lng, specialty, baseRadius * 2, 12);
     }
     await writeLog('info', 'clinic-discovery', `Google Places retornou ${places.length} clínica(s) pra "${specialty}"`, {
       traceId,
@@ -114,12 +145,26 @@ export async function discoverClinics(opts: {
 
   if (places.length === 0) return cached;
 
-  // 3. Upsert das clínicas em `clinics` (sem whatsapp_e164 — precisa de captura manual depois)
+  // 3. Upsert das clínicas + captura de telefone como CANAL DE CONTATO.
+  //    O Places não retorna WhatsApp, mas retorna o telefone comercial (via Place Details).
+  //    No Brasil, a esmagadora maioria das clínicas atende WhatsApp no mesmo número fixo/celular.
+  //    Então tratamos o telefone do Places como whatsapp_e164 (canal de cotação) — igual
+  //    o fluxo de farmácia faz com supplier.phone_e164.
   const upserted: ClinicCandidate[] = [...cached];
   const cachedIds = new Set(cached.map((c) => c.id));
 
-  for (const p of places) {
+  // Busca telefone só das top-N (Place Details custa 1 request cada) — limita a 8 pra controlar custo.
+  const topPlaces = places.slice(0, 8);
+
+  for (const p of topPlaces) {
     try {
+      // Puxa telefone via Place Details (só se ainda não temos)
+      let phoneE164: string | null = null;
+      try {
+        const phone = await getPlacePhone(p.placeId);
+        phoneE164 = toE164BR(phone);
+      } catch { /* telefone opcional — sem ele, clínica fica no diretório mas não vira candidata */ }
+
       const { data: row } = await db.from('clinics').upsert({
         type: 'clinic',
         name: p.name,
@@ -131,18 +176,22 @@ export async function discoverClinics(opts: {
         lng: p.lng,
         rating: p.rating ?? null,
         specialties: [specialty],
+        phone_e164: phoneE164,
+        // Usa o telefone como canal WhatsApp (assumido). Captura manual pode refinar depois.
+        whatsapp_e164: phoneE164,
       }, { onConflict: 'google_place_id' }).select('id, name, whatsapp_e164, phone_e164, accepts_plans, specialties').single();
 
       if (!row?.id) continue;
       if (cachedIds.has(row.id)) continue;
 
-      // Só inclui na candidate list se tem whatsapp_e164
-      if (!row.whatsapp_e164) continue;
+      // Canal de contato: whatsapp_e164 (= telefone) OU phone_e164. Sem nenhum, pula.
+      const channel = row.whatsapp_e164 || row.phone_e164;
+      if (!channel) continue;
 
       upserted.push({
         id: row.id,
         name: row.name ?? p.name,
-        whatsapp_e164: row.whatsapp_e164,
+        whatsapp_e164: channel,
         phone_e164: row.phone_e164 ?? null,
         address: p.address,
         city: p.city || city || '',
@@ -160,6 +209,7 @@ export async function discoverClinics(opts: {
   }
 
   upserted.sort((a, b) => (a.distance_km ?? 999) - (b.distance_km ?? 999));
+  await writeLog('info', 'clinic-discovery', `${upserted.length} clínica(s) com canal de contato pra "${specialty}"`, { traceId });
   return upserted.slice(0, limit);
 }
 

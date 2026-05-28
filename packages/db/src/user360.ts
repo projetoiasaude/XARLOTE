@@ -106,6 +106,12 @@ export function formatUser360ForPrompt(snap: User360Snapshot): string {
   // Identidade básica
   const name = snap.user.preferred_name ?? snap.user.full_name ?? 'paciente';
   parts.push(`## PACIENTE\nNome: ${name}`);
+  // Cidade conhecida — Xarlote deve CONFIRMAR (não perguntar do zero) ao marcar consulta
+  const homeCity = snap.user['home_city'] as string | null | undefined;
+  const homeState = snap.user['home_state'] as string | null | undefined;
+  if (homeCity) {
+    parts.push(`Cidade: ${homeCity}${homeState ? `/${homeState}` : ''} (já conhecida — ao marcar consulta, CONFIRME "é em ${homeCity}, certo?" em vez de perguntar a cidade do zero)`);
+  }
   if (snap.user.health_summary) parts.push(`Resumo: ${snap.user.health_summary}`);
   if (snap.adherence_score_30d != null) {
     parts.push(`Adesão últimos 30 dias: ${Math.round(snap.adherence_score_30d * 100)}%`);
