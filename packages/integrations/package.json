@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "axios": "^1.7.0",
+    "axios": "^1.16.1",
     "@iasaude/shared": "workspace:*"
   },
   "devDependencies": {

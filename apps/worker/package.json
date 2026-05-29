@@ -16,14 +16,14 @@
     "@iasaude/llm": "workspace:*",
     "@iasaude/integrations": "workspace:*",
     "@iasaude/core": "workspace:*",
-    "bullmq": "^5.13.0",
-    "ioredis": "^5.4.1",
+    "bullmq": "^5.77.6",
+    "ioredis": "^5.11.0",
     "dotenv": "^16.4.5",
     "pino": "^9.4.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
-    "tsx": "^4.19.0",
+    "tsx": "^4.22.3",
     "typescript": "^5.4.0"
   }
 }
