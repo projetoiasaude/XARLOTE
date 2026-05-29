@@ -1,9 +1,11 @@
 import { Sidebar } from '@/components/layout/Sidebar';
 import { AmbientBackground } from '@/components/layout/AmbientBackground';
+import { ApiAuth } from '@/components/layout/ApiAuth';
 
 export default function DashLayout({ children }: { children: React.ReactNode }) {
   return (
     <div className="relative h-screen overflow-hidden bg-ink-base text-white">
+      <ApiAuth />
       <AmbientBackground />
       <div className="relative z-10 flex h-full">
         <Sidebar />

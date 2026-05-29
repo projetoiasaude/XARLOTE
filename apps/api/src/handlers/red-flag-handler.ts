@@ -180,13 +180,13 @@ export async function handleRedFlagCheck(args: RedFlagArgs, ctx: RedFlagCtx): Pr
       ctx.traceId);
   }
 
-  // 5. Agenda escalonamento em 60s
-  if (pendingId) {
-    setTimeout(() => {
-      escalateIfStillPending(pendingId!, ctx).catch((err) =>
-        writeLog('error', 'red_flag', `escalate falhou: ${String(err).slice(0, 200)}`, { traceId: ctx.traceId }),
-      );
-    }, ESCALATE_DELAY_MS);
+  // 5. O escalonamento em 60s é feito pelo worker DURÁVEL `red-flag-escalator`,
+  // que varre `red_flag_pending` vencidos (status='pending' AND expires_at<now).
+  // Sobrevive a restart/crash do processo — ao contrário do setTimeout em
+  // memória que existia aqui antes (perda silenciosa de escalonamento = risco
+  // de vida num app de saúde). pendingId logado pra rastreio.
+  if (!pendingId) {
+    await writeLog('error', 'red_flag', '⚠️ red_flag sem pendingId — escalonamento automático NÃO garantido (verifique red_flag_pending)', { traceId: ctx.traceId, userId: ctx.userId });
   }
 
   // Retorna string vazia — a mensagem foi por botões, Xarlote não precisa de mais texto
@@ -292,61 +292,69 @@ export async function handleRedFlagButtonResponse(opts: {
   return true;
 }
 
-/** Escalona se o paciente não respondeu em 60s. */
-async function escalateIfStillPending(pendingId: string, ctx: RedFlagCtx): Promise<void> {
-  let pending: { id: string; status: string; category: string; severity: string; evidence: string } | null = null;
-  try {
-    const { data } = await db
-      .from('red_flag_pending')
-      .select('id, status, category, severity, evidence')
-      .eq('id', pendingId)
-      .single();
-    pending = data;
-  } catch {
-    return;
-  }
-  if (!pending || pending.status !== 'pending') return; // já respondeu
+/**
+ * Linha de red_flag_pending JÁ reivindicada pelo worker (status='escalated').
+ * Worker faz o claim atômico (pending→escalated) antes de chamar isto, então
+ * dois workers nunca escalam a mesma linha.
+ */
+export interface RedFlagPendingRow {
+  id: string;
+  user_id: string;
+  conversation_id: string | null;
+  category: string;
+  severity?: string;
+  evidence?: string;
+  trace_id?: string | null;
+}
 
-  await writeLog('error', 'red_flag', `🚨 ESCALANDO red_flag_pending ${pendingId} — paciente não respondeu em 60s`, {
-    traceId: ctx.traceId,
-    userId: ctx.userId,
-    category: pending.category,
+/**
+ * Executa o escalonamento de um red flag vencido: avisa o contato de emergência
+ * e informa o paciente. Chamado pelo worker durável `red-flag-escalator`.
+ * NÃO altera status (o worker já marcou 'escalated' no claim).
+ */
+export async function escalatePending(row: RedFlagPendingRow): Promise<void> {
+  const traceId = row.trace_id ?? '';
+
+  // Reconstrói o telefone do paciente a partir da conversa (pode não existir)
+  let phoneE164: string | null = null;
+  if (row.conversation_id) {
+    try {
+      const { data: conv } = await db.from('conversations').select('whatsapp_jid').eq('id', row.conversation_id).single();
+      const jid = conv?.whatsapp_jid as string | undefined;
+      if (jid) phoneE164 = `+${jid.replace('@s.whatsapp.net', '')}`;
+    } catch { /* sem telefone — ainda assim avisamos o contato */ }
+  }
+
+  await writeLog('error', 'red_flag', `🚨 ESCALANDO red_flag ${row.id} — paciente não respondeu em 60s`, {
+    traceId, userId: row.user_id, category: row.category,
   });
 
-  // Marca como escalated
-  await db.from('red_flag_pending').update({
-    status: 'escalated',
-    escalated_at: new Date().toISOString(),
-  }).eq('id', pendingId);
-
   // Tenta avisar contato de emergência
-  const notified = await notifyEmergencyContact(ctx.userId, pending.category, ctx.traceId);
-
+  const notified = await notifyEmergencyContact(row.user_id, row.category, traceId);
   if (notified.ok) {
-    await db.from('red_flag_pending').update({ emergency_contact_notified: true }).eq('id', pendingId);
-
-    // Avisa o paciente que avisamos o contato
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      `Como você não respondeu, avisei ${notified.contactName ?? 'seu contato de emergência'} agora pelo WhatsApp 💙\n\nSe for emergência médica AGORA: *SAMU 192*.`,
-      ctx.traceId);
-  } else {
-    // Sem contato cadastrado — avisa paciente e o fundador via Telegram
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+    await db.from('red_flag_pending').update({ emergency_contact_notified: true }).eq('id', row.id);
+    if (phoneE164 && row.conversation_id) {
+      await sendOutbound(row.conversation_id, phoneE164,
+        `Como você não respondeu, avisei ${notified.contactName ?? 'seu contato de emergência'} agora pelo WhatsApp 💙\n\nSe for emergência médica AGORA: *SAMU 192*.`,
+        traceId);
+    }
+  } else if (phoneE164 && row.conversation_id) {
+    await sendOutbound(row.conversation_id, phoneE164,
       'Como você não respondeu e eu não tenho contato de emergência cadastrado, não consegui avisar ninguém 😔\n\nSe precisar AGORA: *SAMU 192* ou *CVV 188*. Estou aqui também.',
-      ctx.traceId);
+      traceId);
   }
 
   await writeAudit({
     actorType: 'system',
     actorId: 'red-flag-escalator',
     action: 'red_flag.escalated',
-    userId: ctx.userId,
-    conversationId: ctx.conversationId,
+    userId: row.user_id,
+    conversationId: row.conversation_id ?? undefined,
     targetTable: 'red_flag_pending',
-    targetId: pendingId,
-    traceId: ctx.traceId,
+    targetId: row.id,
+    traceId,
     metadata: {
-      category: pending.category,
+      category: row.category,
       contact_notified: notified.ok,
       contact_name: notified.contactName,
     },

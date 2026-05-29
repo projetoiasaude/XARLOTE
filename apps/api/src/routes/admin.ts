@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { db, writeAudit } from '@iasaude/db';
 import { loadPrompts, savePrompts } from '../config/prompts.js';
 import { buildXarloteSystemPrompt, buildAgentPharmacySystemPrompt } from '@iasaude/llm';
+import { requireAdminToken } from '../middleware/auth.js';
 
 /** Redacta valores sensíveis em config — não loga keys cruas no audit_log */
 function redactConfig(cfg: Record<string, unknown>): Record<string, unknown> {
@@ -18,6 +19,9 @@ function redactConfig(cfg: Record<string, unknown>): Record<string, unknown> {
 }
 
 export async function adminRoute(app: FastifyInstance) {
+  // 🔒 Toda rota /admin exige token de admin (F0.2). Escopado a este plugin.
+  app.addHook('preHandler', requireAdminToken);
+
   // List conversations with pagination
   app.get('/conversations', async (req, reply) => {
     const q = req.query as Record<string, string>;

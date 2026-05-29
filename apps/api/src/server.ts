@@ -17,11 +17,39 @@ import { startKnowledgeGraphBuilderWorker } from './workers/knowledge-graph-buil
 import { startSkillExtractorWorker } from './workers/skill-extractor.worker.js';
 import { startAnomalyDetectorWorker } from './workers/anomaly-detector.worker.js';
 import { startMetricsAggregatorWorker } from './workers/metrics-aggregator.worker.js';
+import { startOutboundWorkers } from './queues/outbound.queue.js';
+import { startRedFlagEscalatorWorker } from './workers/red-flag-escalator.worker.js';
+
+/**
+ * Allowlist de CORS. O dashboard é o único consumidor browser; webhooks da
+ * uazapi são server-to-server (não passam por CORS). Default seguro:
+ *   - CORS_ORIGINS (lista separada por vírgula) tem prioridade
+ *   - dev: qualquer localhost
+ *   - prod sem config: nega cross-origin de browser (false)
+ */
+function corsOrigins(): boolean | Array<string | RegExp> {
+  const env = process.env['CORS_ORIGINS'];
+  if (env) return env.split(',').map((s) => s.trim()).filter(Boolean);
+  if (process.env['NODE_ENV'] !== 'production') {
+    return [/^http:\/\/localhost:\d+$/, /^http:\/\/127\.0\.0\.1:\d+$/];
+  }
+  return false;
+}
 
 async function main() {
   const app = Fastify({
     logger: {
       level: process.env['LOG_LEVEL'] ?? 'info',
+      // Nunca logar segredos/cabeçalhos sensíveis no logger HTTP do Fastify.
+      redact: {
+        paths: [
+          'req.headers.authorization',
+          'req.headers["x-admin-token"]',
+          'req.headers.cookie',
+          'req.headers["x-api-key"]',
+        ],
+        censor: '[redacted]',
+      },
       transport:
         process.env['NODE_ENV'] !== 'production'
           ? { target: 'pino-pretty', options: { colorize: true } }
@@ -29,7 +57,7 @@ async function main() {
     },
   });
 
-  await app.register(cors, { origin: true });
+  await app.register(cors, { origin: corsOrigins() });
   await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } });
 
   app.register(healthRoute);
@@ -59,7 +87,9 @@ async function main() {
     startSkillExtractorWorker();
     startAnomalyDetectorWorker();
     startMetricsAggregatorWorker();
-    console.log(`   Workers: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h), inventory-tracker (6h), adherence-scorer (24h), consultation-feedback (1h), kg-builder (6h), skill-extractor (24h), anomaly-detector (10min), metrics-aggregator (1h)`);
+    startRedFlagEscalatorWorker();
+    startOutboundWorkers();
+    console.log(`   Workers: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h), inventory-tracker (6h), adherence-scorer (24h), consultation-feedback (1h), kg-builder (6h), skill-extractor (24h), anomaly-detector (10min), metrics-aggregator (1h), red-flag-escalator (10s), outbound-whatsapp (queue)`);
   } catch (err) {
     app.log.error(err);
     process.exit(1);

@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { normalizeWebhookPayload } from '@iasaude/whatsapp';
-import { db, writeLog } from '@iasaude/db';
+import { db, writeLog, redactPII } from '@iasaude/db';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { processInboundSupplierFromWebhook } from '../handlers/inbound-supplier.js';
 import type { UazapiWebhookPayload } from '@iasaude/whatsapp';
@@ -40,7 +40,8 @@ export async function webhookRoute(app: FastifyInstance) {
         instance: instanceName,
         external_event_id: eventId,
         event_type: eventType,
-        raw: body,
+        // LGPD (F0.5): não persistir payload bruto com PII — redige antes de gravar.
+        raw: redactPII(body),
       });
       if (dupError?.code === '23505') {
         return reply.send({ ok: true, skipped: 'duplicate' });

@@ -5,6 +5,7 @@ import { buildSimulatedInbound } from '@iasaude/whatsapp';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { processInboundSupplier } from '../handlers/inbound-supplier.js';
 import { loadPrompts } from '../config/prompts.js';
+import { requireAdminToken } from '../middleware/auth.js';
 
 const SimulateSchema = z.object({
   phone: z.string().min(8),
@@ -24,6 +25,17 @@ const PharmacyReplySchema = z.object({
 });
 
 export async function simulateRoute(app: FastifyInstance) {
+  // 🔒 F0.3 — Simulador é ferramenta de DEV. Em produção, todo o /api/simulate
+  // fica desativado (404) — inclui os destrutivos reset/reset-all. Em dev/local,
+  // exige token de admin (mesmo gate do /admin).
+  app.addHook('preHandler', async (req, reply) => {
+    if (process.env['NODE_ENV'] === 'production') {
+      reply.code(404).send({ error: 'not_found' });
+      return;
+    }
+    await requireAdminToken(req, reply);
+  });
+
   // ─── User inbound ─────────────────────────────────────────────────────────────
   app.post('/simulate/inbound', async (req, reply) => {
     const parsed = SimulateSchema.safeParse(req.body);

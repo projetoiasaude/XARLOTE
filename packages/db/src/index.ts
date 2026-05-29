@@ -5,3 +5,4 @@ export * from './memory.js';
 export * from './audit.js';
 export * from './user360.js';
 export * from './skills.js';
+export * from './redact.js';

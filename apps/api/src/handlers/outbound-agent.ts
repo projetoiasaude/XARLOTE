@@ -1,6 +1,7 @@
 import { db, writeLog } from '@iasaude/db';
-import { isSimulatorMode, sendText } from '@iasaude/whatsapp';
+import { isSimulatorMode } from '@iasaude/whatsapp';
 import { AGENT_INSTANCE } from '@iasaude/shared';
+import { dispatchOutbound } from '../queues/outbound.queue.js';
 
 /**
  * Sends a message from the agent to a pharmacy supplier.
@@ -41,13 +42,8 @@ export async function sendOutboundToSupplier(
     return;
   }
 
-  try {
-    await sendText(AGENT_INSTANCE, supplierPhone, text);
-  } catch (err) {
-    await writeLog('error', 'agent', `Falha ao enviar mensagem WA ao fornecedor: ${String(err)}`, {
-      traceId, supplierPhone,
-    });
-  }
+  // F0.7: envio via fila do agente (número distinto da Xarlote → limiter próprio).
+  await dispatchOutbound({ kind: 'text', instance: AGENT_INSTANCE, phoneE164: supplierPhone, text, traceId });
 }
 
 /**
@@ -90,10 +86,7 @@ export async function sendOutboundToClinic(
     return;
   }
 
-  try {
-    await sendText(AGENT_INSTANCE, clinicPhone, text);
-    await writeLog('info', 'clinic', `Mensagem REAL enviada pra clínica ${clinicPhone.slice(0, 8)}***`, { traceId, conversationId });
-  } catch (err) {
-    await writeLog('error', 'clinic', `Falha ao enviar WA pra clínica: ${String(err)}`, { traceId, clinicPhone });
-  }
+  // F0.7: envio via fila do agente com rate-limit.
+  await dispatchOutbound({ kind: 'text', instance: AGENT_INSTANCE, phoneE164: clinicPhone, text, traceId });
+  await writeLog('info', 'clinic', `Mensagem REAL enfileirada pra clínica ${clinicPhone.slice(0, 8)}***`, { traceId, conversationId });
 }

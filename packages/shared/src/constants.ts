@@ -41,8 +41,9 @@ export const FORGET_ME_PATTERNS = [
 export const QUEUE_NAMES = {
   INBOUND_USER: 'inbound-user',
   INBOUND_SUPPLIER: 'inbound-supplier',
-  OUTBOUND_SARA: 'outbound-whatsapp:sara',
-  OUTBOUND_AGENT: 'outbound-whatsapp:agent',
+  // BullMQ 5 não permite ':' no nome da fila — use '-'.
+  OUTBOUND_SARA: 'outbound-whatsapp-sara',
+  OUTBOUND_AGENT: 'outbound-whatsapp-agent',
   PHARMACY_DISCOVERY: 'pharmacy-discovery',
   PHARMACY_NEGOTIATION: 'pharmacy-negotiation',
   QUOTE_CONSOLIDATION: 'quote-consolidation',

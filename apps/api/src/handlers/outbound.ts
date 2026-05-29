@@ -1,8 +1,9 @@
 import { db, writeLog, writeEvent } from '@iasaude/db';
-import { isSimulatorMode, sendText, sendAudio } from '@iasaude/whatsapp';
+import { isSimulatorMode } from '@iasaude/whatsapp';
 import { synthesizeSpeech, humanizeForVoice } from '@iasaude/integrations';
 import { SARA_INSTANCE } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
+import { dispatchOutbound } from '../queues/outbound.queue.js';
 
 interface LlmMeta {
   model?: string;
@@ -38,18 +39,8 @@ export async function sendOutbound(
   // In simulator mode, do not call uazapi
   if (isSimulatorMode()) return;
 
-  // In production, send via uazapi
-  try {
-    await sendText(SARA_INSTANCE, phoneE164, text);
-  } catch (err) {
-    await db.from('system_logs').insert({
-      level: 'error',
-      category: 'outbound',
-      trace_id: traceId,
-      message: `Failed to send WA message: ${String(err)}`,
-      metadata: { phoneE164 },
-    });
-  }
+  // F0.7: envio via fila com rate-limit (evita ban). Fallback direto se a fila cair.
+  await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164, text, traceId });
 }
 
 /**
@@ -148,13 +139,17 @@ export async function sendOutboundAudio(
   // Em simulador não chama uazapi (mensagem já foi persistida pra aparecer no dashboard)
   if (isSimulatorMode()) return true;
 
-  try {
-    await sendAudio(SARA_INSTANCE, phoneE164, synth.buffer, { mime: synth.mime, ptv: true });
-    return true;
-  } catch (err) {
-    await writeLog('error', 'outbound', `Falha ao enviar áudio uazapi (já persistido em messages): ${String(err).slice(0, 200)}`, { traceId, phoneE164 });
-    // Áudio falhou no envio — manda texto também pra usuário não ficar mudo
-    try { await sendText(SARA_INSTANCE, phoneE164, text); } catch { /* ignore */ }
-    return false;
-  }
+  // F0.7: enfileira o áudio (com `text` de fallback embutido) com rate-limit.
+  // O worker tenta o áudio e, se falhar, manda o texto pra não deixar o usuário mudo.
+  await dispatchOutbound({
+    kind: 'audio',
+    instance: SARA_INSTANCE,
+    phoneE164,
+    audioBase64: synth.buffer.toString('base64'),
+    mime: synth.mime,
+    ptv: true,
+    text,
+    traceId,
+  });
+  return true;
 }

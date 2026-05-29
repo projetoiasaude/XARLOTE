@@ -1,4 +1,5 @@
 import { db } from './client.js';
+import { redactPII, maskString } from './redact.js';
 import type { User, Conversation, Message, Order, Quote, Supplier } from '@iasaude/shared';
 
 // ─── Users ──────────────────────────────────────────────────────────────────
@@ -151,5 +152,11 @@ export async function writeLog(
   message: string,
   meta: Record<string, unknown> = {}
 ): Promise<void> {
-  await db.from('system_logs').insert({ level, category, message, metadata: meta });
+  // LGPD (F0.5): redige PII na mensagem livre e nos metadados antes de gravar.
+  await db.from('system_logs').insert({
+    level,
+    category,
+    message: maskString(message),
+    metadata: redactPII(meta),
+  });
 }
