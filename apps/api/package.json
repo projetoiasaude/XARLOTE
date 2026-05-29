@@ -9,20 +9,21 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@iasaude/db": "workspace:*",
-    "@iasaude/shared": "workspace:*",
-    "@iasaude/whatsapp": "workspace:*",
-    "@iasaude/core": "workspace:*",
-    "@iasaude/llm": "workspace:*",
-    "@iasaude/integrations": "workspace:*",
     "@fastify/cors": "^9.0.1",
     "@fastify/multipart": "^8.3.0",
+    "@iasaude/core": "workspace:*",
+    "@iasaude/db": "workspace:*",
+    "@iasaude/integrations": "workspace:*",
+    "@iasaude/llm": "workspace:*",
+    "@iasaude/shared": "workspace:*",
+    "@iasaude/whatsapp": "workspace:*",
+    "@sentry/node": "^10.55.0",
+    "bullmq": "^5.13.0",
+    "dotenv": "^16.4.5",
     "fastify": "^4.28.0",
     "ioredis": "^5.4.1",
-    "zod": "^3.23.8",
-    "dotenv": "^16.4.5",
     "pino": "^9.4.0",
-    "bullmq": "^5.13.0"
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

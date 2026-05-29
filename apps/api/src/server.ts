@@ -21,6 +21,7 @@ import { startOutboundWorkers, closeOutbound } from './queues/outbound.queue.js'
 import { startRedFlagEscalatorWorker } from './workers/red-flag-escalator.worker.js';
 import { installShutdownHandlers, onShutdown } from './lifecycle.js';
 import { closeRedisClient } from './queue-config.js';
+import { initSentry, captureError, closeSentry } from './observability/sentry.js';
 
 /**
  * Allowlist de CORS. O dashboard é o único consumidor browser; webhooks da
@@ -39,6 +40,7 @@ function corsOrigins(): boolean | Array<string | RegExp> {
 }
 
 async function main() {
+  initSentry();
   const app = Fastify({
     logger: {
       level: process.env['LOG_LEVEL'] ?? 'info',
@@ -61,6 +63,11 @@ async function main() {
 
   await app.register(cors, { origin: corsOrigins() });
   await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } });
+
+  // Sentry (F1.B1): captura toda exceção de request/webhook (no-op se sem DSN).
+  app.addHook('onError', async (request, _reply, error) => {
+    captureError(error, { reqId: request.id, url: request.url, method: request.method });
+  });
 
   app.register(healthRoute);
   app.register(simulateRoute, { prefix: '/api' });
@@ -102,8 +109,10 @@ async function main() {
     onShutdown('outbound workers + filas', () => closeOutbound());
     onShutdown('profile-enricher worker', () => enricherWorker.close());
     onShutdown('redis client', () => closeRedisClient());
+    onShutdown('sentry flush', () => closeSentry());
     installShutdownHandlers(app);
   } catch (err) {
+    captureError(err, { phase: 'boot' });
     app.log.error(err);
     process.exit(1);
   }
