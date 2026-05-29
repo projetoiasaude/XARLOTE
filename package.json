@@ -1,6 +1,7 @@
 {
   "name": "ia-da-saude",
   "private": true,
+  "packageManager": "pnpm@9.15.9",
   "scripts": {
     "dev:api": "pnpm --filter @iasaude/api dev",
     "dev:worker": "pnpm --filter @iasaude/worker dev",
