@@ -84,15 +84,26 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   let isOrderConfirmation = false;
 
   {
-    const { data } = await db
+    // Busca TODAS as cotações abertas nesta conversa (não só a mais recente).
+    // A conversa de fornecedor é compartilhada por telefone, então pode haver
+    // mais de um pedido concorrente pra mesma farmácia. Sem código de referência
+    // não dá pra saber 100% a qual pedido a resposta se refere — atribuímos à
+    // mais recente, mas LOGAMOS a ambiguidade pra aparecer na auditoria.
+    const { data: openQuotes } = await db
       .from('quotes')
       .select('*, orders(*), suppliers(*)')
       .eq('conversation_id', conversationId)
       .in('status', ['pending', 'contacting', 'negotiating'])
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-    quote = data;
+      .order('created_at', { ascending: false });
+    if (openQuotes && openQuotes.length > 1) {
+      await writeLog(
+        'warn',
+        'supplier',
+        `⚠️ ${openQuotes.length} cotações abertas na mesma conversa de farmácia — resposta atribuída à mais recente (possível mistura; resolve 100% com código de referência)`,
+        { traceId, conversationId, openQuoteIds: (openQuotes as Array<{ id: string }>).map((q) => q.id) },
+      );
+    }
+    quote = openQuotes?.[0] ?? null;
   }
 
   if (!quote && conv.supplier_id) {
@@ -357,10 +368,18 @@ export async function initiatePharmacyNegotiation(
     .update({ conversation_id: conv.id, status: 'contacting', started_at: new Date().toISOString() })
     .eq('id', quoteId);
 
-  // Store user context on the conversation so consolidation can find it
-  await db.from('conversations')
-    .update({ memory_cards: [{ user_conversation_id: userConversationId, user_phone: userPhoneE164, order_id: orderId }] })
-    .eq('id', conv.id);
+  // "Book" da conversa: registra o contexto DESTE pedido acumulando por order_id
+  // (NÃO sobrescreve). Assim cotações concorrentes pra mesma farmácia coexistem
+  // sem uma apagar a outra. A notificação canônica deriva do pedido
+  // (orders.conversation_id), mas manter o registro por pedido aqui evita perda
+  // de contexto e prepara o roteamento por código de referência.
+  {
+    const { data: convRow } = await db.from('conversations').select('memory_cards').eq('id', conv.id).single();
+    const prior = Array.isArray(convRow?.memory_cards) ? (convRow!.memory_cards as Array<Record<string, unknown>>) : [];
+    const book = prior.filter((e) => e?.['order_id'] !== orderId);
+    book.push({ user_conversation_id: userConversationId, user_phone: userPhoneE164, order_id: orderId });
+    await db.from('conversations').update({ memory_cards: book }).eq('id', conv.id);
+  }
 
   // Build opening message via Agent LLM. Repassamos o setor REAL do usuário (não a cidade da farmácia).
   const cfg = loadPrompts();

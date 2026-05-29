@@ -67,15 +67,24 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   let isAppointmentConfirmation = false;
 
   {
-    const { data } = await db
+    // Todas as cotações abertas nesta conversa de clínica (conversa compartilhada
+    // por telefone). Mais de uma consulta concorrente pra mesma clínica =
+    // ambiguidade: atribuímos à mais recente e logamos pra auditoria.
+    const { data: openQuotes } = await db
       .from('consultation_quotes')
       .select('*, consultations(*), clinics(*)')
       .eq('conversation_id', conversationId)
       .in('status', ['pending', 'offered'])
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    quote = data;
+      .order('created_at', { ascending: false });
+    if (openQuotes && openQuotes.length > 1) {
+      await writeLog(
+        'warn',
+        'clinic',
+        `⚠️ ${openQuotes.length} cotações de consulta abertas na mesma conversa de clínica — resposta atribuída à mais recente (possível mistura; resolve 100% com código de referência)`,
+        { traceId, conversationId, openQuoteIds: (openQuotes as Array<{ id: string }>).map((q) => q.id) },
+      );
+    }
+    quote = openQuotes?.[0] ?? null;
   }
 
   // Se a consulta já foi escolhida e estamos esperando a clínica reconfirmar
@@ -441,16 +450,16 @@ export async function initiateClinicNegotiation(opts: {
     .update({ conversation_id: conv.id, status: 'pending' })
     .eq('id', quoteId);
 
-  // Store user-side context pra consolidation achar depois
-  await db.from('conversations')
-    .update({
-      memory_cards: [{
-        user_conversation_id: userConversationId,
-        user_phone: userPhoneE164,
-        consultation_id: consultationId,
-      }],
-    })
-    .eq('id', conv.id);
+  // "Book" da conversa: acumula o contexto por consultation_id (NÃO sobrescreve)
+  // — várias consultas concorrentes pra mesma clínica coexistem sem se apagar.
+  // A notificação canônica deriva da consultation (consultations.conversation_id).
+  {
+    const { data: convRow } = await db.from('conversations').select('memory_cards').eq('id', conv.id).single();
+    const prior = Array.isArray(convRow?.memory_cards) ? (convRow!.memory_cards as Array<Record<string, unknown>>) : [];
+    const book = prior.filter((e) => e?.['consultation_id'] !== consultationId);
+    book.push({ user_conversation_id: userConversationId, user_phone: userPhoneE164, consultation_id: consultationId });
+    await db.from('conversations').update({ memory_cards: book }).eq('id', conv.id);
+  }
 
   // Atualiza last_contacted_at da clínica
   await db.from('clinics').update({ last_contacted_at: new Date().toISOString() }).eq('id', clinicId);
