@@ -40,6 +40,7 @@ function queueNameFor(instance: string): string {
 }
 
 const queues = new Map<string, Queue>();
+const outboundWorkers: Worker[] = [];
 function queueFor(instance: string): Queue {
   const name = queueNameFor(instance);
   let q = queues.get(name);
@@ -128,5 +129,12 @@ export function startOutboundWorkers(): void {
         traceId: (job?.data as OutboundJob | undefined)?.traceId,
       });
     });
+    outboundWorkers.push(worker);
   }
+}
+
+/** Fecha workers e filas outbound graciosamente (graceful shutdown F1.A5). */
+export async function closeOutbound(): Promise<void> {
+  await Promise.allSettled(outboundWorkers.map((w) => w.close()));
+  await Promise.allSettled([...queues.values()].map((q) => q.close()));
 }

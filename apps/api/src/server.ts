@@ -17,8 +17,10 @@ import { startKnowledgeGraphBuilderWorker } from './workers/knowledge-graph-buil
 import { startSkillExtractorWorker } from './workers/skill-extractor.worker.js';
 import { startAnomalyDetectorWorker } from './workers/anomaly-detector.worker.js';
 import { startMetricsAggregatorWorker } from './workers/metrics-aggregator.worker.js';
-import { startOutboundWorkers } from './queues/outbound.queue.js';
+import { startOutboundWorkers, closeOutbound } from './queues/outbound.queue.js';
 import { startRedFlagEscalatorWorker } from './workers/red-flag-escalator.worker.js';
+import { installShutdownHandlers, onShutdown } from './lifecycle.js';
+import { closeRedisClient } from './queue-config.js';
 
 /**
  * Allowlist de CORS. O dashboard é o único consumidor browser; webhooks da
@@ -75,10 +77,10 @@ async function main() {
     // Bootstrap workers no MESMO processo da API (Railway tem 1 container só).
     // Antes ficavam no apps/worker via concurrently, mas isso quebrava o
     // healthcheck do Railway (que olhava `/health` e não recebia resposta).
-    setInterval(() => dispatchReminders().catch((e) => app.log.error(e, 'reminder dispatch failed')), 30_000);
+    const reminderTimer = setInterval(() => dispatchReminders().catch((e) => app.log.error(e, 'reminder dispatch failed')), 30_000);
     dispatchReminders().catch((e) => app.log.error(e, 'reminder dispatch initial failed'));
-    startProfileEnricherWorker();
-    setInterval(() => compactStaleConversations().catch((e) => app.log.error(e, 'compactor failed')), 60 * 60 * 1000);
+    const enricherWorker = startProfileEnricherWorker();
+    const compactorTimer = setInterval(() => compactStaleConversations().catch((e) => app.log.error(e, 'compactor failed')), 60 * 60 * 1000);
     startInventoryTrackerWorker();
     startAdherenceScorerWorker();
     startConsultationFeedbackWorker();
@@ -90,6 +92,17 @@ async function main() {
     startRedFlagEscalatorWorker();
     startOutboundWorkers();
     console.log(`   Workers: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h), inventory-tracker (6h), adherence-scorer (24h), consultation-feedback (1h), kg-builder (6h), skill-extractor (24h), anomaly-detector (10min), metrics-aggregator (1h), red-flag-escalator (10s), outbound-whatsapp (queue)`);
+
+    // Graceful shutdown (F1.A5): Railway manda SIGTERM em todo redeploy.
+    // Ordem: para HTTP (drena in-flight) → para crons → fecha workers/filas →
+    // fecha Redis. Os demais crons (start*Worker via setInterval) são scans
+    // idempotentes; perder um tick num redeploy é inofensivo (re-roda depois).
+    onShutdown('http server (drena in-flight)', () => app.close());
+    onShutdown('cron intervals', () => { clearInterval(reminderTimer); clearInterval(compactorTimer); });
+    onShutdown('outbound workers + filas', () => closeOutbound());
+    onShutdown('profile-enricher worker', () => enricherWorker.close());
+    onShutdown('redis client', () => closeRedisClient());
+    installShutdownHandlers(app);
   } catch (err) {
     app.log.error(err);
     process.exit(1);
