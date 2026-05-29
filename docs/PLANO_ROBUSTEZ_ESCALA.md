@@ -41,13 +41,27 @@ Toda decisão deste plano serve a 7 invariantes. Se um PR viola um deles, não e
 > pg_cron), índices no `system_logs`, `/timeline` com paginação keyset + filtros
 > server-side. Isso adianta parte de F2.14.
 
+> ### 🟢 Status 2026-05-29 — sessão de hardening (código)
+> Commits `7a88aa4`→`1b34ca1` na `main` (pushados). **Nada deployado ainda** —
+> tudo ativa junto no próximo `railway up`.
+> - **Feito + pushado:** F1.A5 graceful shutdown · F1.B5+F0.1 health checks
+>   (`/health` liveness, `/ready` + ping LLM via `GET /key`) · F1.B1 Sentry
+>   (env-gated) · F2.G5 rate-limit por usuário · F1.C6 Zod na resposta da LLM ·
+>   F1.C1 testes (vitest, 31 verdes — unit; integração cotação/consulta depois).
+> - **Pronto mas PARADO** na branch `ci-workflows` (push exige escopo `workflow`
+>   no PAT): F1.C2 CI · F1.D1 gitleaks · F1.D4 pnpm audit. **Dependabot já ativo.**
+> - **F0.2–F0.7:** código pronto+pushado, **deploy pendente** (fecha o gate F0).
+> - **Pendências do founder:** deploy Railway (+ `ADMIN_API_TOKEN`/`CORS_ORIGINS`,
+>   volume `apps/api/data`) · F0.9 backup banco · branch protection · token com
+>   escopo `workflow` · `SENTRY_DSN` (ativar Sentry).
+
 ---
 
 # FASE 0 — DESTRAVAR (não lançar sem isto)
 
 Buracos de segurança e de segurança-de-vida. Custo baixo, impacto existencial.
 
-- [ ] **F0.1 — Validar/rotacionar a chave OpenRouter (401 em prod).** _Por quê:_ vi `401 AUTH/KEY INVÁLIDA` no stream de críticos (26/05) — se persistir, a Xarlote está muda. _DoD:_ smoke test de chat passa em prod; healthcheck inclui um ping leve à LLM; alerta se voltar a dar 401. **S**
+- [x] **F0.1 — Validar/rotacionar a chave OpenRouter (401 em prod).** ✅ chave válida em prod; ping leve via `GET /key` agora no `/ready` (detecta 401 sem custo). _Por quê:_ vi `401 AUTH/KEY INVÁLIDA` no stream de críticos (26/05) — se persistir, a Xarlote está muda. _DoD:_ smoke test de chat passa em prod; healthcheck inclui um ping leve à LLM; alerta se voltar a dar 401. **S**
 - [ ] **F0.2 — Autenticação em `/admin/*`.** _Por quê:_ rotas 100% abertas hoje (`admin.ts`) — qualquer um lê PII clínico e troca sua chave LLM. _DoD:_ middleware exige token/sessão; sem token → 401; RBAC mínimo (papel `admin`); teste cobre rota protegida. **M**
 - [ ] **F0.3 — Blindar `/api/simulate/*`.** _Por quê:_ `reset-all`/`reset` apagam produção sem auth (`simulate.ts:180`). _DoD:_ desabilitado por env em prod (`NODE_ENV==='production'` → 404) **e** atrás de auth em dev/staging. **S**
 - [ ] **F0.4 — Travar CORS.** _Por quê:_ `origin:true` aceita qualquer site (`server.ts:32`). _DoD:_ allowlist explícita (dashboard local + domínio futuro); origem fora da lista bloqueada. **S**
