@@ -2,6 +2,8 @@
 // Base URL: https://openrouter.ai/api/v1
 // Models: https://openrouter.ai/models
 
+import { z } from 'zod';
+
 /**
  * Conteúdo multimodal — protocolo OpenAI Chat Completions.
  * `text` é texto puro; `image_url` é uma imagem (data URL ou http URL).
@@ -77,6 +79,29 @@ const DEFAULT_MODEL = 'openai/gpt-4.1-mini';
 // Doc: https://openrouter.ai/docs/features/model-routing
 const FALLBACK_MODELS = ['openai/gpt-4.1-mini', 'openai/gpt-4o-mini'];
 
+// Schema da resposta do OpenRouter (CLAUDE.md/F1.C6: validar resposta da LLM
+// com Zod). Lenient (.passthrough + campos opcionais) pra não rejeitar
+// variações válidas; só barra resposta genuinamente malformada.
+const OpenRouterResponseSchema = z
+  .object({
+    choices: z
+      .array(
+        z.object({
+          message: z.object({
+            content: z.string().nullish(),
+            tool_calls: z
+              .array(z.object({ function: z.object({ name: z.string(), arguments: z.string() }) }))
+              .nullish(),
+          }),
+        }),
+      )
+      .min(1),
+    usage: z
+      .object({ prompt_tokens: z.number().nullish(), completion_tokens: z.number().nullish() })
+      .nullish(),
+  })
+  .passthrough();
+
 function getApiKey(override?: string): string {
   const key = override ?? process.env['OPENROUTER_API_KEY'] ?? process.env['GOOGLE_GENAI_API_KEY'] ?? '';
   if (!key) throw new Error('No LLM API key configured. Set OPENROUTER_API_KEY or configure in the Prompts dashboard.');
@@ -136,17 +161,13 @@ async function callOpenRouter(
     throw new Error(`[${res.status} ${res.statusText}] ${text}`);
   }
 
-  const data = await res.json() as {
-    choices: Array<{
-      message: {
-        content: string | null;
-        tool_calls?: Array<{
-          function: { name: string; arguments: string };
-        }>;
-      };
-    }>;
-    usage?: { prompt_tokens: number; completion_tokens: number };
-  };
+  const rawJson = await res.json();
+  const parsed = OpenRouterResponseSchema.safeParse(rawJson);
+  if (!parsed.success) {
+    const where = parsed.error.issues.map((i) => i.path.join('.') || '(root)').join(', ');
+    throw new Error(`Resposta da LLM em formato inesperado (campos: ${where})`);
+  }
+  const data = parsed.data;
 
   const choice = data.choices[0];
   if (!choice) throw new Error('No choices in OpenRouter response');
