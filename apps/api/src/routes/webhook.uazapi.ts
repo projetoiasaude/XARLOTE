@@ -4,8 +4,10 @@ import { db, writeLog, redactPII } from '@iasaude/db';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { processInboundSupplierFromWebhook } from '../handlers/inbound-supplier.js';
 import type { UazapiWebhookPayload } from '@iasaude/whatsapp';
-import { AGENT_INSTANCE } from '@iasaude/shared';
+import { AGENT_INSTANCE, SARA_INSTANCE } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
+import { checkUserRateLimit } from '../middleware/rate-limit.js';
+import { dispatchOutbound } from '../queues/outbound.queue.js';
 
 export async function webhookRoute(app: FastifyInstance) {
   app.post<{ Params: { instance: string } }>('/uazapi/:instance', async (req, reply) => {
@@ -76,6 +78,25 @@ export async function webhookRoute(app: FastifyInstance) {
         );
         return reply.send({ ok: true, skipped: 'xarlote_disabled' });
       }
+      // Rate-limit por usuário (F2.G5): anti-flood. Fail-open; só pega rajada.
+      const rl = await checkUserRateLimit(normalized.from.phoneE164);
+      if (!rl.allowed) {
+        await writeLog('warn', 'webhook', `Rate-limit: ${rl.count} msgs (>${rl.limit}) — descartando`, {
+          instance: instanceName,
+          phone: normalized.from.phoneE164,
+        });
+        // Avisa UMA vez por janela (na borda) — sem spammar quem floodou.
+        if (rl.count === rl.limit + 1) {
+          await dispatchOutbound({
+            kind: 'text',
+            instance: SARA_INSTANCE,
+            phoneE164: normalized.from.phoneE164,
+            text: 'Opa, chegaram muitas mensagens de uma vez 😅 me dá um segundinho que já já te respondo!',
+          }).catch(() => { /* fila já trata o fallback */ });
+        }
+        return reply.send({ ok: true, skipped: 'rate_limited' });
+      }
+
       setImmediate(() => processInboundUser(normalized).catch((err) => req.log.error(err)));
     }
 
