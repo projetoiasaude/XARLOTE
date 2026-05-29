@@ -44,8 +44,13 @@ export function Sidebar() {
       <div className="glass glass-spec rounded-3xl h-full flex flex-col p-3 shadow-glass-lg">
         {/* Logo + branding */}
         <Link href="/" className="flex items-center gap-3 px-2 py-3 rounded-2xl hover:bg-white/[0.04] transition-colors">
-          <div className="relative h-10 w-10 shrink-0 rounded-2xl bg-gradient-to-br from-aurora-blue via-accent to-aurora-purple flex items-center justify-center text-white font-bold shadow-glass">
-            <span className="relative z-10 drop-shadow text-lg">X</span>
+          <div className="relative h-10 w-10 shrink-0 rounded-2xl bg-gradient-to-br from-aurora-blue via-accent to-aurora-purple flex items-center justify-center shadow-glass overflow-hidden">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src="/xarlote-logo.svg"
+              alt="Xarlote"
+              className="relative z-10 h-9 w-9 object-contain"
+            />
             <span
               aria-hidden
               className="absolute inset-0 rounded-2xl"
