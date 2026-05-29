@@ -9,14 +9,16 @@
     "build": "pnpm -r build",
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
+    "test": "vitest run",
     "dev": "concurrently \"pnpm dev:api\" \"pnpm dev:worker\" \"pnpm dev:web\"",
     "start:prod": "concurrently --kill-others-on-fail --names api,worker --prefix-colors blue,green \"pnpm --filter @iasaude/api start\" \"pnpm --filter @iasaude/worker start\""
   },
   "devDependencies": {
-    "typescript": "^5.4.0",
     "@types/node": "^20.14.0",
+    "concurrently": "^9.0.0",
     "prettier": "^3.3.0",
-    "concurrently": "^9.0.0"
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.7"
   },
   "engines": {
     "node": ">=20.0.0",
