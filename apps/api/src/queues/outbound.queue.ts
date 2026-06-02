@@ -92,7 +92,16 @@ async function rawSend(job: OutboundJob): Promise<void> {
  */
 export async function dispatchOutbound(job: OutboundJob): Promise<void> {
   try {
-    await queueFor(job.instance).add('send', job);
+    // FAIL-FAST: se o Redis estiver fora, o BullMQ (maxRetriesPerRequest:null)
+    // deixa o queue.add() pendurado pra sempre em vez de errar — e o fallback de
+    // envio direto nunca dispararia, deixando a Xarlote MUDA. Corremos contra um
+    // timeout curto pra garantir o failover pro envio direto.
+    await Promise.race([
+      queueFor(job.instance).add('send', job),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('queue.add timeout (Redis indisponível?)')), 2000),
+      ),
+    ]);
   } catch (err) {
     await writeLog('warn', 'outbound', `Fila indisponível — enviando direto (fallback): ${String(err).slice(0, 160)}`, {
       traceId: job.traceId, instance: job.instance, kind: job.kind,
