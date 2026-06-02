@@ -80,7 +80,7 @@ Buracos de segurança e de segurança-de-vida. Custo baixo, impacto existencial.
 Aqui o sistema vira confiável. Liberar pra dezenas/centenas de usuários reais.
 
 ### Workstream A — Arquitetura & Resiliência
-- [ ] **F1.A1 — Separar API de workers em processos/services distintos.** _Por quê:_ hoje 10 workers no mesmo processo da API (`server.ts:48`) — crash de worker derruba HTTP; scan pesado trava o event loop. _DoD:_ 2 services no Railway (api + worker) compartilhando o monorepo; crash de worker não afeta a API; deploy independente. **L**
+- [ ] **F1.A1 — Separar API de workers em processos/services distintos.** _Por quê:_ hoje 10 workers no mesmo processo da API (`server.ts:48`) — crash de worker derruba HTTP; scan pesado trava o event loop. _DoD:_ 2 services no Railway (api + worker) compartilhando o monorepo; crash de worker não afeta a API; deploy independente. _Conselho (02/06):_ a queda de 02/06 escancarou a fragilidade do container único — um leak em qualquer cron derruba o inbound do WhatsApp inteiro; resiliência é **arquitetura, não host** (migrar de host sem isto só muda o CEP do próximo incêndio). **L**
 - [ ] **F1.A2 — Crons sob lock (sem duplicação em N réplicas).** _Por quê:_ `setInterval` em cada réplica = cron rodando N vezes. _DoD:_ crons migrados pra BullMQ repeatable jobs **ou** pg_cron com advisory lock; rodar 2 réplicas não duplica execução; teste. **M**
 - [ ] **F1.A3 — Consolidação de cotação durável (farmácia + clínica).** _Por quê:_ `setTimeout`+`Set` em memória (`quote-consolidation.ts:6`); só clínica tem rescue. _DoD:_ estado em DB + dispatcher que resgata pendentes (estender o `consultation-dispatcher` pra farmácia); restart não perde consolidação; teste. **M**
 - [ ] **F1.A4 — Idempotência ponta-a-ponta.** _Por quê:_ replay de webhook ou retry pode duplicar pedido/mensagem. _DoD:_ chave de idempotência em sends e tool-calls que criam recursos; reprocessar o mesmo evento é no-op; teste de replay. **M**
@@ -92,6 +92,7 @@ Aqui o sistema vira confiável. Liberar pra dezenas/centenas de usuários reais.
 - [ ] **F1.B3 — Métricas + dashboard.** _DoD:_ painel com latência LLM (p50/p95/p99), taxa de erro, profundidade de fila, custo estimado/turno, msgs/s WhatsApp. **M**
 - [ ] **F1.B4 — Alertas acionáveis.** _DoD:_ alerta pra: fila travada, erro LLM sustentado, indício de ban WhatsApp, red-flag disparado, custo/hora acima do teto. **S**
 - [ ] **F1.B5 — Health checks profundos (liveness vs readiness).** _DoD:_ `/health` verifica DB + Redis + fila + LLM; readiness só fica verde quando dependências OK. **S**
+- [ ] **F1.B6 — Monitor de uptime externo + alerta de billing/plano.** _Por quê:_ a prod caiu em 02/06 por **trial do Railway expirado, SEM alerta** — descoberto só pela "Xarlote muda". É host-independente. _DoD:_ monitor externo (UptimeRobot/Healthchecks) batendo no `/health` com alerta em <5min; alerta de billing/expiração de plano configurado; o sino dispara antes do usuário perceber. **S**
 
 ### Workstream C — Qualidade & Entrega
 - [ ] **F1.C1 — Testes dos fluxos críticos.** _Por quê:_ zero testes hoje, num app com lógica de emergência. _DoD:_ unit + integration cobrindo red-flag, cotação farmácia, fluxo de consulta, consentimento, esquece-me; rodam no CI. **L**
@@ -100,6 +101,7 @@ Aqui o sistema vira confiável. Liberar pra dezenas/centenas de usuários reais.
 - [ ] **F1.C4 — Lockfile congelado no build.** _Por quê:_ `--no-frozen-lockfile` (`nixpacks.toml`) = build não-reproduzível. _DoD:_ build usa lockfile travado; falha se divergir. **S**
 - [ ] **F1.C5 — Lint no backend + pre-commit hooks.** _DoD:_ `pnpm -r lint` limpo no CI; hook bloqueia commit sujo. **S**
 - [ ] **F1.C6 — Zod em toda fronteira não-confiável.** _Por quê:_ resposta da LLM e webhook sem validação de schema (regra do CLAUDE.md violada em `client.ts:139`). _DoD:_ resposta da LLM e payload de webhook validados por Zod; malformado → fallback seguro, nunca crash. **M**
+- [ ] **F1.C7 — Dockerfile reproduzível (reduzir lock-in de host).** _Por quê:_ hoje só `nixpacks.toml` (específico do Railway); migrar de host (ex: F2.F6) exige containerizar do zero. _DoD:_ Dockerfile único que sobe api+workers idêntico em local/CI/prod; deploy portável entre Railway/Fly/qualquer host. **S**
 
 ### Workstream D — Segurança (aprofunda F0)
 - [ ] **F1.D1 — Gestão de segredos + scan no CI.** _DoD:_ todos os segredos em Railway/Vault; rotação documentada; `gitleaks` no CI bloqueia segredo commitado. **S**
@@ -124,16 +126,17 @@ Agora o sistema cresce horizontalmente e o custo fica previsível.
 - [ ] **F2.F3 — Outbox pattern para side-effects.** _DoD:_ todo efeito (send, audit, enrich) gravado transacionalmente numa outbox e consumido por worker; zero efeito perdido em falha parcial. **L**
 - [ ] **F2.F4 — Dead-letter queue + política de retry por fila.** _DoD:_ job que falha N vezes vai pra DLQ com alerta; reprocessamento manual possível. **M**
 - [ ] **F2.F5 — Circuit breakers nas integrações externas.** _Por quê:_ LLM/TTS/Places/uazapi caídos não podem derrubar o app. _DoD:_ breaker por dependência; quando aberto, degrada graciosamente (ex: responde sem voz, avisa atraso). **M**
+- [ ] **F2.F6 — Co-localizar compute na região do banco (sa-east-1/BR).** _Por quê:_ compute em Railway **US-West** × Supabase em **São Paulo** = ~150ms × 15-20 queries sequenciais ≈ **2-3s de rede MORTA por mensagem**. _DoD:_ compute em região BR (Fly.io GRU ou região BR do host); p95 compute↔DB cai de segundos pra <Xms; migração DELIBERADA (Dockerfile F1.C7 + janela controlada pra reapontar o webhook uazapi). _Conselho (02/06):_ co-localizar **mascara** o N+1 — a cura real é F2.G2; fazer os dois. Avaliar custo real (compute + Redis + egress) e lock-in/instabilidade do host antes de migrar. **M**
 
 ### Workstream G — Performance & Custo
 - [ ] **F2.G1 — Cache (Redis) para leituras quentes.** _DoD:_ `prompts.json`, `user360`, resultados de Places cacheados com invalidação correta; hit rate medido. **M**
-- [ ] **F2.G2 — Connection pooling + matar N+1 no inbound.** _Por quê:_ ~15-20 queries sequenciais por mensagem (`inbound-user.ts`). _DoD:_ Supabase pooler/PgBouncer; reduzir round-trips por turno; pool não satura sob carga. **M**
+- [ ] **F2.G2 — Connection pooling + matar N+1 no inbound.** _Por quê:_ ~15-20 queries sequenciais por mensagem (`inbound-user.ts`). _DoD:_ Supabase pooler/PgBouncer; reduzir round-trips por turno; pool não satura sob carga. _Conselho (02/06):_ é a **CURA real** da latência (a co-localização F2.F6 só a MASCARA): 15-20 queries em série × RTT é o que gera os 2-3s/msg — paralelizar/batchear derruba isso mesmo sem trocar de região. **M**
 - [ ] **F2.G3 — Prompt caching + enxugar system prompt.** _Por quê:_ ~8k tokens (`xarlote.system.ts`) a cada turno = custo dominante. _DoD:_ prompt caching do provider ligado; prompt modularizado (carrega só o necessário); custo/turno cai ≥40%; latência cai. **M**
 - [ ] **F2.G4 — Orçamento de tokens + truncamento inteligente.** _DoD:_ teto de tokens por turno; história/memória truncadas por relevância, não só por contagem; custo por conversa previsível. **M**
 - [ ] **F2.G5 — Rate limiting por usuário (anti-flood/abuso).** _DoD:_ usuário malicioso não estoura custo nem fila; limite por janela. **S**
 
 ### Workstream H — WhatsApp em escala
-- [ ] **F2.H1 — Migração para WhatsApp Business API oficial.** _Por quê:_ uazapi não-oficial tem teto baixo e risco de ban. _DoD:_ envio sancionado (lado usuário e/ou fornecedor); templates aprovados; número verificado. **L**
+- [ ] **F2.H1 — Migração para WhatsApp Business API oficial.** _Por quê:_ uazapi não-oficial tem teto baixo e risco de ban. _DoD:_ envio sancionado (lado usuário e/ou fornecedor); templates aprovados; número verificado. _Conselho (02/06):_ teto **EXISTENCIAL** — ban/rate-limit da uazapi derruba o produto inteiro, fora do controle de qualquer host; é o gargalo de escala do lado do canal, subir prioridade conforme o volume crescer. **L**
 - [ ] **F2.H2 — Pool de números + warming + detecção de ban** (se mantiver canal não-oficial em algum ponto). _DoD:_ ban de 1 número não derruba o serviço; rotação automática; alerta de ban. **L**
 
 ### Workstream I — Dados em escala
@@ -158,7 +161,7 @@ O que separa "funciona" de "absurdamente avançado" — e constrói o diferencia
 - [ ] **F3.K1 — Feature flags + canary/blue-green deploy.** _DoD:_ rollout gradual com kill-switch; reverter é 1 clique. **M**
 - [ ] **F3.K2 — SLOs + error budgets + runbooks + on-call.** _DoD:_ SLO definido (ex: 99.5% de respostas <Xs) e medido; runbook por tipo de alerta; rodízio de plantão. **M**
 - [ ] **F3.K3 — Chaos engineering + DR drills.** _DoD:_ exercícios que matam Redis/worker/LLM em staging; sistema degrada graciosamente; RTO/RPO medidos. **M**
-- [ ] **F3.K4 — Pen-test + postura LGPD formal.** _DoD:_ pen-test sem achados críticos; DPA, política de retenção e base legal documentadas; (futuro) trilha pra ISO 27001/SOC2. **L**
+- [ ] **F3.K4 — Pen-test + postura LGPD formal.** _DoD:_ pen-test sem achados críticos; DPA, política de retenção e base legal documentadas; (futuro) trilha pra ISO 27001/SOC2. _Conselho (02/06):_ incluir **SOBERANIA DE DADOS** — dado clínico de brasileiro é processado hoje em compute fora do país (US-West); o dado em repouso já está no BR (Supabase sa-east-1), mas co-localizar compute no BR (F2.F6) reforça a postura LGPD. **L**
 
 ### Workstream L — Produto transformador (o "wow")
 - [ ] **F3.L1 — Motor de cuidado proativo.** _Por quê:_ é o moat — ninguém mais lembra do seu remédio. _DoD:_ jobs proativos de adesão, recompra ("seu losartana acaba em 3 dias, já cotei, quer que eu peça?") e follow-up pós-consulta, todos consentidos e auditados. **L**
