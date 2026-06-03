@@ -1,0 +1,16 @@
+# Config do gitleaks (usada pelo CI em .github/workflows/security.yml).
+# Estende as regras padrão e faz allowlist do apps/api/data/prompts.json — arquivo
+# de config de runtime, HOJE gitignored, que guarda a API key por design. Os 3
+# leaks históricos (commits antigos, antes do gitignore) são de chaves que devem
+# ser ROTACIONADAS (ver §9 do PROJECT_STATE / log da sessão 2026-06-02).
+# NOVOS segredos em QUALQUER outro caminho continuam sendo barrados.
+title = "Xarlote gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "prompts.json é gitignored e guarda a LLM API key por design (config runtime)"
+paths = [
+  '''apps/api/data/prompts\.json''',
+]

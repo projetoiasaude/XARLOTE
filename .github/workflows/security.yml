@@ -31,13 +31,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: pnpm
       - name: Install (frozen lockfile)
         run: pnpm install --frozen-lockfile
-      - name: Audit (bloqueia em high/critical)
-        run: pnpm audit --audit-level high
+      # DoD F1.D4: "CVE crítico bloqueia merge". High/moderate são acompanhados
+      # via Dependabot (PRs automáticos), sem travar todo merge.
+      - name: Audit (bloqueia em critical)
+        run: pnpm audit --audit-level critical
