@@ -13,7 +13,7 @@ jobs:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0 # histórico completo pra varrer commits antigos
       # Usamos o binário OSS direto (MIT) em vez da gitleaks-action@v2, que
@@ -29,7 +29,7 @@ jobs:
     name: Dependency audit (pnpm)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
