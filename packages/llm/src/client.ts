@@ -3,6 +3,7 @@
 // Models: https://openrouter.ai/models
 
 import { z } from 'zod';
+import { getBreaker, CircuitOpenError } from '@iasaude/shared';
 
 /**
  * Conteúdo multimodal — protocolo OpenAI Chat Completions.
@@ -206,13 +207,23 @@ export async function chat(
   }
   messages.push({ role: 'user', content: userMessage });
 
+  // F2.F5: breaker do OpenRouter. Envolve CADA tentativa (não só o chat inteiro),
+  // então o circuito abre RÁPIDO numa queda sustentada (~5 tentativas falhas) e as
+  // chamadas seguintes falham na hora (CircuitOpenError) em vez de gastar ~13s+ de
+  // retries cada — a Xarlote degrada imediatamente. Cooldown de 30s, depois testa 1.
+  const breaker = getBreaker('openrouter', { failureThreshold: 5, cooldownMs: 30_000 });
+
   let attempt = 0;
   const maxAttempts = 3;
 
   while (true) {
     try {
-      return await callOpenRouter(apiKey, modelName, messages, opts.tools, temperature, maxTokens, timeoutMs);
+      return await breaker.execute(() =>
+        callOpenRouter(apiKey, modelName, messages, opts.tools, temperature, maxTokens, timeoutMs),
+      );
     } catch (err) {
+      // Circuito aberto: não adianta retentar — propaga já pro caller degradar.
+      if (err instanceof CircuitOpenError) throw err;
       const errMsg = String(err);
       const isTransient = errMsg.includes('503') || errMsg.includes('502') || errMsg.includes('529');
       const isRateLimit = errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('RESOURCE_EXHAUSTED');
