@@ -47,29 +47,31 @@ export async function processInboundUser(
     user.id
   );
 
-  // 3. Persist incoming message
-  const inboundMsg = await insertMessage({
-    conversation_id: conversation.id,
-    external_id: inbound.externalId,
-    direction: 'in',
-    sender_role: 'user',
-    content_type: inbound.contentType,
-    content: inbound.text ?? null,
-    media_storage_path: null,
-    media_mime: inbound.mediaMime ?? null,
-    media_duration_ms: inbound.mediaDurationMs ?? null,
-    location_lat: inbound.location?.lat ?? null,
-    location_lng: inbound.location?.lng ?? null,
-    raw_payload: inbound.raw,
-    llm_model: null,
-    llm_tokens_in: null,
-    llm_tokens_out: null,
-    llm_latency_ms: null,
-    trace_id: traceId,
-  });
-
-  // 4. Update conversation last_message_at
-  await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversation.id);
+  // 3+4. Persiste a mensagem de entrada + atualiza last_message_at da conversa EM
+  // PARALELO (F2.G2 — são independentes; insertMessage devolve o inboundMsg usado
+  // adiante, o update não retorna nada relevante). Mesma semântica de falha de antes.
+  const [inboundMsg] = await Promise.all([
+    insertMessage({
+      conversation_id: conversation.id,
+      external_id: inbound.externalId,
+      direction: 'in',
+      sender_role: 'user',
+      content_type: inbound.contentType,
+      content: inbound.text ?? null,
+      media_storage_path: null,
+      media_mime: inbound.mediaMime ?? null,
+      media_duration_ms: inbound.mediaDurationMs ?? null,
+      location_lat: inbound.location?.lat ?? null,
+      location_lng: inbound.location?.lng ?? null,
+      raw_payload: inbound.raw,
+      llm_model: null,
+      llm_tokens_in: null,
+      llm_tokens_out: null,
+      llm_latency_ms: null,
+      trace_id: traceId,
+    }),
+    db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversation.id),
+  ]);
 
   // 5a. Comando especial @teste — zera tudo e reinicia Xarlote
   if (inbound.text?.trim() === '@teste') {
@@ -245,13 +247,59 @@ export async function processInboundUser(
     });
   }
 
-  // 8. Build context for Xarlote — tenta perfil 360 unificado primeiro
-  const history = await getConversationMessages(conversation.id, 30);
-  const geminiHistory = trimHistory(messagesToHistory(history.slice(0, -1)), 20);
+  // 8. Build context for Xarlote — leituras de contexto em PARALELO (F2.G2).
+  // Estas só dependem de user.id / conversation.id e eram feitas em SÉRIE (~6-8
+  // round-trips ao banco em sa-east-1 ≈ 1-2s de rede morta por mensagem, ANTES de
+  // a LLM começar). Agora vão num Promise.all → o custo vira o round-trip mais
+  // lento, não a soma. A msg de entrada já foi persistida (passo 3), então o
+  // getConversationMessages enxerga o histórico completo (e o slice(0,-1) tira ela).
+  const promptsConfig = loadPrompts();
+  const llmKey = promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'];
 
-  const user360 = await queryUser360(user.id);
-  // Fallback: se a RPC ainda não existe no banco, faz as queries individuais
-  // (compatibilidade com deploy intermediário enquanto migration não roda)
+  // Sub-cadeia memória: embed(input) → match semântico (decay temporal aplicado).
+  // Embedda só com texto+key; falha é não-bloqueante (retrieval cai no last_seen_at).
+  const retrieveMemory = async (): Promise<Awaited<ReturnType<typeof retrieveRelevantCards>>> => {
+    let queryEmbedding: number[] | null = null;
+    if (inbound.text && inbound.text.length > 0 && llmKey) {
+      try {
+        queryEmbedding = await embed(inbound.text.slice(0, 1000), { apiKey: llmKey, timeoutMs: 6_000 });
+      } catch (err) {
+        await writeLog('warn', 'memory', `embed query falhou: ${String(err).slice(0, 120)}`, { traceId });
+      }
+    }
+    return retrieveRelevantCards(user.id, conversation.id, queryEmbedding, 8);
+  };
+
+  // Skills emergentes (skill-extractor) — falha silenciosa se a migration ainda
+  // não rodou (→ []), pra não derrubar o turno.
+  const loadSkillsSafe = async (): Promise<Awaited<ReturnType<typeof loadUserSkills>>> => {
+    try {
+      return await loadUserSkills(user.id);
+    } catch (err) {
+      await writeLog('warn', 'skills', `loadUserSkills falhou: ${String(err).slice(0, 120)}`, { traceId });
+      return [];
+    }
+  };
+
+  const [history, user360, activeOrderRes, relevantCards, skills] = await Promise.all([
+    getConversationMessages(conversation.id, 30),
+    queryUser360(user.id),
+    db.from('orders')
+      .select('id, status, items, summary')
+      .eq('user_id', user.id)
+      .in('status', ['quoting', 'quoted', 'confirming'])
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    retrieveMemory(),
+    loadSkillsSafe(),
+  ]);
+
+  const geminiHistory = trimHistory(messagesToHistory(history.slice(0, -1)), 20);
+  const activeOrderSummary = activeOrderRes.data?.summary ?? null;
+
+  // Perfil: 1 RPC unificada (user360). Fallback p/ queries individuais SÓ se a RPC
+  // não existir (deploy intermediário) — caso raro, tolera rodar em série.
   const { data: conditions } = user360
     ? { data: user360.conditions.map((c) => ({ name: c.name })) }
     : await db.from('user_health_conditions').select('name').eq('user_id', user.id).eq('active', true);
@@ -265,35 +313,6 @@ export async function processInboundUser(
     ? { data: user360.addresses }
     : await db.from('user_addresses').select('*').eq('user_id', user.id);
 
-  // Load active order summary (quoted = waiting for user to pick; confirming = waiting for pharmacy)
-  const { data: activeOrder } = await db
-    .from('orders')
-    .select('id, status, items, summary')
-    .eq('user_id', user.id)
-    .in('status', ['quoting', 'quoted', 'confirming'])
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  const activeOrderSummary = activeOrder?.summary ?? null;
-
-  const promptsConfig = loadPrompts();
-
-  // Memória semântica: top-K cards relevantes ao input atual (decay temporal aplicado).
-  // Embedda só se houver texto pra consultar; senão usa fallback last_seen_at.
-  let queryEmbedding: number[] | null = null;
-  if (inbound.text && inbound.text.length > 0 && (promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'])) {
-    try {
-      queryEmbedding = await embed(inbound.text.slice(0, 1000), {
-        apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
-        timeoutMs: 6_000,
-      });
-    } catch (err) {
-      // embedding não-bloqueante; fallback de retrieval cobre
-      await writeLog('warn', 'memory', `embed query falhou: ${String(err).slice(0, 120)}`, { traceId });
-    }
-  }
-  const relevantCards = await retrieveRelevantCards(user.id, conversation.id, queryEmbedding, 8);
   const memoryCards: MemoryCard[] = relevantCards.length
     ? relevantCards.map((c) => ({
         id: c.id, kind: c.kind, text: c.text, tags: c.tags,
@@ -324,15 +343,9 @@ export async function processInboundUser(
     systemPrompt += `\n\n${formatUser360ForPrompt(user360)}`;
   }
 
-  // Skills emergentes — padrões aprendidos pelo skill-extractor. Falha silenciosa
-  // se a tabela ainda não existe (migration pendente).
-  try {
-    const skills = await loadUserSkills(user.id);
-    if (skills.length > 0) {
-      systemPrompt += `\n\n${formatSkillsForPrompt(skills)}`;
-    }
-  } catch (err) {
-    await writeLog('warn', 'skills', `loadUserSkills falhou: ${String(err).slice(0, 120)}`, { traceId });
+  // Skills emergentes (já carregadas em paralelo acima).
+  if (skills.length > 0) {
+    systemPrompt += `\n\n${formatSkillsForPrompt(skills)}`;
   }
 
   if (promptsConfig.sara_suffix.trim()) {
@@ -513,24 +526,28 @@ export async function processInboundUser(
   if (llmResponse.text.trim()) {
     const meta = (user.metadata as { audio_intro_sent?: boolean } | null | undefined) ?? {};
     const alreadyIntroed = meta.audio_intro_sent === true;
-    // Conta quantas msgs outbound a Xarlote já mandou pra esse user fora do consent flow.
-    // Se for a 1ª (= a próxima) E o user já consentiu E ainda não rolou intro,
-    // dispara áudio. Robusto contra falhas anteriores (ex: deploy sem TTS).
-    const { count: outCount } = await db
-      .from('messages')
-      .select('id', { count: 'exact', head: true })
-      .eq('conversation_id', conversation.id)
-      .eq('direction', 'out')
-      .eq('sender_role', 'assistant');
-    // outCount inclui a msg de consent + o "como gosta de ser chamado" do consent flow.
-    // Xarlote só começa a falar de fato APÓS o user passar de consent → profiling → active.
-    // Então a 1ª resposta "real" dela = quando outCount <= 2 (consent + "como gosta de").
-    const isFirstRealReply = (outCount ?? 99) <= 2;
-    const shouldVoiceIntro =
-      promptsConfig.tts_enabled &&
-      !alreadyIntroed &&
-      user.lgpd_consent_at != null &&
-      (wasProfiling || isFirstRealReply);
+    // Voice intro só é possível se TTS ligado + ainda não rolou + user já consentiu.
+    // F2.G2: só nesse caso pagamos a query de contagem (1 round-trip). O caso comum
+    // (já introduzido / TTS off) pula direto, sem ir ao banco.
+    const voiceEligible =
+      promptsConfig.tts_enabled && !alreadyIntroed && user.lgpd_consent_at != null;
+    let shouldVoiceIntro = false;
+    if (voiceEligible) {
+      if (wasProfiling) {
+        // 1ª msg após o "Aceitar" — é a saudação "Prazer, X!", sempre por áudio.
+        shouldVoiceIntro = true;
+      } else {
+        // Conta as msgs outbound da Xarlote: a 1ª resposta "real" é quando
+        // outCount <= 2 (msg de consent + "como gosta de ser chamado").
+        const { count: outCount } = await db
+          .from('messages')
+          .select('id', { count: 'exact', head: true })
+          .eq('conversation_id', conversation.id)
+          .eq('direction', 'out')
+          .eq('sender_role', 'assistant');
+        shouldVoiceIntro = (outCount ?? 99) <= 2;
+      }
+    }
     const replyText = llmResponse.text.trim();
     await writeLog('info', 'outbound', `Xarlote → usuário ${shouldVoiceIntro ? '[ÁUDIO intro]' : ''}: "${replyText.slice(0, 100)}${replyText.length > 100 ? '…' : ''}"`, { traceId, voiceIntro: shouldVoiceIntro });
 
