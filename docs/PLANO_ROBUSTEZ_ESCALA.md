@@ -88,7 +88,7 @@ Aqui o sistema vira confiável. Liberar pra dezenas/centenas de usuários reais.
 
 ### Workstream B — Observabilidade
 - [ ] **F1.B1 — Error monitoring (Sentry) em api + worker + web.** _DoD:_ erro em prod gera evento com stack + trace_id + contexto do usuário (sem PII); alerta chega. **S**
-- [ ] **F1.B2 — Correlação por trace_id no pipeline inteiro.** _DoD:_ um trace_id rastreia da entrada do webhook até o envio da resposta, atravessando filas. **M**
+- [~] **F1.B2 — Correlação por trace_id no pipeline inteiro.** _DoD:_ um trace_id rastreia da entrada do webhook até o envio da resposta, atravessando filas. **M** — **🔄 CÓDIGO PRONTO (2026-06-07):** o traceId agora NASCE no webhook (ingresso), aceita `x-trace-id` de entrada (correlação distribuída) ou gera UUID, volta no header da resposta e desce pra `processInboundUser`/`processInboundSupplier` (antes geravam o próprio internamente) → logs de borda (rate-limit, desligada), filas (outbound + enricher já levavam), workers e tool-calls compartilham o mesmo id. **Erros do processamento async (`setImmediate`) agora vão pro Sentry COM o trace** (antes morriam num `req.log.error` invisível); `captureError` promove `traceId` a **tag** filtrável; enricher captura falhas com o trace. **Falta deploy.**
 - [ ] **F1.B3 — Métricas + dashboard.** _DoD:_ painel com latência LLM (p50/p95/p99), taxa de erro, profundidade de fila, custo estimado/turno, msgs/s WhatsApp. **M**
 - [ ] **F1.B4 — Alertas acionáveis.** _DoD:_ alerta pra: fila travada, erro LLM sustentado, indício de ban WhatsApp, red-flag disparado, custo/hora acima do teto. **S**
 - [ ] **F1.B5 — Health checks profundos (liveness vs readiness).** _DoD:_ `/health` verifica DB + Redis + fila + LLM; readiness só fica verde quando dependências OK. **S**

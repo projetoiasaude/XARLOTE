@@ -52,7 +52,12 @@ function redactContext(ctx: Record<string, unknown>): Record<string, unknown> {
 export function captureError(err: unknown, context?: Record<string, unknown>): void {
   if (!enabled) return;
   Sentry.captureException(err, (scope) => {
-    if (context) scope.setExtras(redactContext(context));
+    if (context) {
+      scope.setExtras(redactContext(context));
+      // F1.B2: traceId vira TAG (filtrável/buscável no Sentry) pra correlacionar
+      // um erro com toda a trilha de logs do mesmo turno (webhook → fila → worker).
+      if (typeof context['traceId'] === 'string') scope.setTag('trace_id', context['traceId']);
+    }
     return scope;
   });
 }

@@ -12,6 +12,7 @@ import { chat, embed } from '@iasaude/llm';
 import { PROFILE_ENRICHER_SYSTEM } from '@iasaude/llm';
 import type { ProfileEnricherJob } from '@iasaude/shared';
 import { QUEUE_NAMES } from '@iasaude/shared';
+import { captureError } from '../observability/sentry.js';
 import { getRedisConnection } from '../queue-config.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
@@ -106,6 +107,7 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
     parsed = JSON.parse(jsonMatch[0]) as EnrichOutput;
   } catch (err) {
     await writeLog('error', 'enrichment', `Enricher LLM falhou: ${String(err).slice(0, 200)}`, { traceId });
+    captureError(err, { traceId, phase: 'enricher-llm', conversationId });
     return;
   }
 
@@ -248,7 +250,9 @@ export function startProfileEnricherWorker(): Worker {
     concurrency: 2,
   });
   worker.on('failed', (job, err) => {
+    const traceId = (job?.data as ProfileEnricherJob | undefined)?.traceId;
     console.error(`[enricher] job ${job?.id} failed:`, err.message);
+    captureError(err, { traceId, phase: 'enricher-job', jobId: job?.id });
   });
   return worker;
 }

@@ -17,9 +17,11 @@ const enricherQueue = new Queue(QUEUE_NAMES.PROFILE_ENRICHER, {
 });
 
 export async function processInboundUser(
-  inbound: NormalizedInbound
+  inbound: NormalizedInbound,
+  // F1.B2: o traceId nasce no webhook (ingresso) e desce até aqui pra correlacionar
+  // todo o pipeline. Default randomUUID() mantém compat com callers diretos (simulate/testes).
+  traceId: string = randomUUID(),
 ): Promise<{ traceId: string; conversationId: string }> {
-  const traceId = randomUUID();
   const phoneE164 = inbound.from.phoneE164;
 
   await writeLog('info', 'webhook', `Inbound from ${phoneE164}`, {

@@ -298,7 +298,7 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
 // Called from webhook for real uazapi messages on the agent instance.
 // AGENT_INSTANCE serve tanto pra farmácia quanto pra clínica — diferenciamos
 // pelo `party_type` da conversa salva no DB.
-export async function processInboundSupplierFromWebhook(inbound: NormalizedInbound): Promise<void> {
+export async function processInboundSupplierFromWebhook(inbound: NormalizedInbound, traceId: string = randomUUID()): Promise<void> {
   const { data: conv } = await db
     .from('conversations')
     .select('id, party_type')
@@ -316,7 +316,7 @@ export async function processInboundSupplierFromWebhook(inbound: NormalizedInbou
       conversationId: conv.id,
       clinicPhone: inbound.from.phoneE164,
       text: inbound.text ?? '',
-      traceId: randomUUID(),
+      traceId,
     });
     return;
   }
@@ -325,7 +325,7 @@ export async function processInboundSupplierFromWebhook(inbound: NormalizedInbou
     conversationId: conv.id,
     supplierPhone: inbound.from.phoneE164,
     text: inbound.text ?? '',
-    traceId: randomUUID(),
+    traceId,
   });
 }
 
