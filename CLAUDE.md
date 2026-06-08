@@ -67,9 +67,9 @@ Pergunte ao fundador em vez de assumir. Não invente endpoints da uazapi — con
 
 ## Comandos úteis (após bootstrap)
 ```bash
-pnpm dev              # sobe api + worker + web local
-pnpm --filter api dev
-pnpm --filter worker dev
+pnpm dev              # sobe api (ROLE=all: HTTP + workers) + web local
+pnpm --filter api dev # só a API (ROLE=all por padrão = HTTP + workers no mesmo processo)
+pnpm dev:worker       # API em ROLE=worker (só os workers, porta 3010) — testar a separação F1.A1
 pnpm --filter web dev
 pnpm test
 pnpm lint

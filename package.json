@@ -4,14 +4,14 @@
   "packageManager": "pnpm@9.15.9",
   "scripts": {
     "dev:api": "pnpm --filter @iasaude/api dev",
-    "dev:worker": "pnpm --filter @iasaude/worker dev",
+    "dev:worker": "PORT=3010 ROLE=worker pnpm --filter @iasaude/api dev",
     "dev:web": "pnpm --filter @iasaude/web dev",
     "build": "pnpm -r build",
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
     "test": "vitest run",
-    "dev": "concurrently \"pnpm dev:api\" \"pnpm dev:worker\" \"pnpm dev:web\"",
-    "start:prod": "concurrently --kill-others-on-fail --names api,worker --prefix-colors blue,green \"pnpm --filter @iasaude/api start\" \"pnpm --filter @iasaude/worker start\""
+    "dev": "concurrently \"pnpm dev:api\" \"pnpm dev:web\"",
+    "start:prod": "concurrently --kill-others-on-fail --names api,worker --prefix-colors blue,green \"PORT=3001 ROLE=api pnpm --filter @iasaude/api start\" \"PORT=3010 ROLE=worker pnpm --filter @iasaude/api start\""
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

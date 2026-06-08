@@ -6,19 +6,8 @@ import { healthRoute } from './routes/health.js';
 import { simulateRoute } from './routes/simulate.js';
 import { webhookRoute } from './routes/webhook.uazapi.js';
 import { adminRoute } from './routes/admin.js';
-import { dispatchReminders } from './workers/reminder-dispatcher.worker.js';
-import { startProfileEnricherWorker } from './workers/profile-enricher.worker.js';
-import { compactStaleConversations } from './workers/conversation-compactor.worker.js';
-import { startInventoryTrackerWorker } from './workers/inventory-tracker.worker.js';
-import { startAdherenceScorerWorker } from './workers/adherence-scorer.worker.js';
-import { startConsultationFeedbackWorker } from './workers/consultation-feedback.worker.js';
-import { startConsultationDispatcherWorker } from './workers/consultation-dispatcher.worker.js';
-import { startKnowledgeGraphBuilderWorker } from './workers/knowledge-graph-builder.worker.js';
-import { startSkillExtractorWorker } from './workers/skill-extractor.worker.js';
-import { startAnomalyDetectorWorker } from './workers/anomaly-detector.worker.js';
-import { startMetricsAggregatorWorker } from './workers/metrics-aggregator.worker.js';
-import { startOutboundWorkers, closeOutbound } from './queues/outbound.queue.js';
-import { startRedFlagEscalatorWorker } from './workers/red-flag-escalator.worker.js';
+import { startAllWorkers } from './workers/start-all.js';
+import { closeOutbound } from './queues/outbound.queue.js';
 import { installShutdownHandlers, onShutdown } from './lifecycle.js';
 import { closeRedisClient } from './queue-config.js';
 import { initSentry, captureError, closeSentry } from './observability/sentry.js';
@@ -41,6 +30,20 @@ function corsOrigins(): boolean | Array<string | RegExp> {
 
 async function main() {
   initSentry();
+
+  // ROLE define o que este processo roda (F1.A1 — separação api/worker):
+  //   all (default) → HTTP + workers no mesmo processo (dev / single-box)
+  //   api           → só HTTP (service "api" no Railway)
+  //   worker        → só workers (service "worker" dedicado no Railway)
+  // Em qualquer role o HTTP sobe (nem que seja só pra /health do Railway/UptimeRobot).
+  const role = (process.env['ROLE'] ?? 'all').toLowerCase();
+  const runApi = role === 'all' || role === 'api';
+  const runWorkers = role === 'all' || role === 'worker';
+  if (!runApi && !runWorkers) {
+    console.error(`ROLE inválido: "${role}" — use all | api | worker`);
+    process.exit(1);
+  }
+
   const app = Fastify({
     logger: {
       level: process.env['LOG_LEVEL'] ?? 'info',
@@ -69,45 +72,40 @@ async function main() {
     captureError(error, { reqId: request.id, url: request.url, method: request.method });
   });
 
+  // /health e /ready em TODOS os roles (Railway healthcheck + UptimeRobot batem
+  // até no service worker).
   app.register(healthRoute);
-  app.register(simulateRoute, { prefix: '/api' });
-  app.register(webhookRoute, { prefix: '/webhook' });
-  app.register(adminRoute, { prefix: '/admin' });
+
+  // Rotas de negócio só no role de API (webhook/admin/simulate). No worker elas
+  // nem existem → superfície de ataque menor e zero risco de processar inbound
+  // em duplicidade.
+  if (runApi) {
+    app.register(simulateRoute, { prefix: '/api' });
+    app.register(webhookRoute, { prefix: '/webhook' });
+    app.register(adminRoute, { prefix: '/admin' });
+  }
 
   const port = Number(process.env['PORT'] ?? 3001);
 
   try {
     await app.listen({ port, host: '0.0.0.0' });
-    console.log(`\n🚀 API running on http://localhost:${port}`);
+    console.log(`\n🚀 ${runApi ? 'API' : 'Worker'} up on http://localhost:${port} (ROLE=${role})`);
     console.log(`   Mode: ${process.env['WHATSAPP_MODE'] ?? 'uazapi'}`);
 
-    // Bootstrap workers no MESMO processo da API (Railway tem 1 container só).
-    // Antes ficavam no apps/worker via concurrently, mas isso quebrava o
-    // healthcheck do Railway (que olhava `/health` e não recebia resposta).
-    const reminderTimer = setInterval(() => dispatchReminders().catch((e) => app.log.error(e, 'reminder dispatch failed')), 30_000);
-    dispatchReminders().catch((e) => app.log.error(e, 'reminder dispatch initial failed'));
-    const enricherWorker = startProfileEnricherWorker();
-    const compactorTimer = setInterval(() => compactStaleConversations().catch((e) => app.log.error(e, 'compactor failed')), 60 * 60 * 1000);
-    startInventoryTrackerWorker();
-    startAdherenceScorerWorker();
-    startConsultationFeedbackWorker();
-    startConsultationDispatcherWorker();
-    startKnowledgeGraphBuilderWorker();
-    startSkillExtractorWorker();
-    startAnomalyDetectorWorker();
-    startMetricsAggregatorWorker();
-    startRedFlagEscalatorWorker();
-    startOutboundWorkers();
-    console.log(`   Workers: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h), inventory-tracker (6h), adherence-scorer (24h), consultation-feedback (1h), kg-builder (6h), skill-extractor (24h), anomaly-detector (10min), metrics-aggregator (1h), red-flag-escalator (10s), outbound-whatsapp (queue)`);
-
     // Graceful shutdown (F1.A5): Railway manda SIGTERM em todo redeploy.
-    // Ordem: para HTTP (drena in-flight) → para crons → fecha workers/filas →
-    // fecha Redis. Os demais crons (start*Worker via setInterval) são scans
-    // idempotentes; perder um tick num redeploy é inofensivo (re-roda depois).
+    // Ordem: HTTP primeiro (para de aceitar + drena in-flight) → workers (crons +
+    // enricher, registrados dentro de startAllWorkers) → outbound → Redis → Sentry.
     onShutdown('http server (drena in-flight)', () => app.close());
-    onShutdown('cron intervals', () => { clearInterval(reminderTimer); clearInterval(compactorTimer); });
+
+    // Workers: só neste processo se ROLE incluir worker. Registram seus próprios
+    // disposers (cron intervals, enricher) via onShutdown, na ordem certa.
+    if (runWorkers) {
+      startAllWorkers(app.log);
+    } else {
+      console.log('   Workers: OFF (rodando em service dedicado — ROLE=worker)');
+    }
+
     onShutdown('outbound workers + filas', () => closeOutbound());
-    onShutdown('profile-enricher worker', () => enricherWorker.close());
     onShutdown('redis client', () => closeRedisClient());
     onShutdown('sentry flush', () => closeSentry());
     installShutdownHandlers(app);
