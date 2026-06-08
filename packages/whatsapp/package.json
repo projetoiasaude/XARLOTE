@@ -13,8 +13,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "axios": "^1.7.0",
-    "libphonenumber-js": "^1.11.0",
+    "axios": "^1.17.0",
+    "libphonenumber-js": "^1.13.6",
     "@iasaude/shared": "workspace:*"
   },
   "devDependencies": {
