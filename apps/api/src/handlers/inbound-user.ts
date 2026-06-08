@@ -502,10 +502,11 @@ export async function processInboundUser(
       multimodal: isMultimodal,
       tool_calls: llmResponse.toolCalls.map((t) => t.name),
       text_length: llmResponse.text.length,
+      cached_tokens: llmResponse.cachedTokens, // F2.G3: medir cache hit do prompt
     },
   });
-  await writeLog('info', 'llm', `Xarlote ← LLM [${llmResponse.model}] — ${llmResponse.tokensIn}in/${llmResponse.tokensOut}out tok, ${llmResponse.latencyMs}ms${llmResponse.toolCalls.length ? ` — tools: ${llmResponse.toolCalls.map((t) => t.name).join(', ')}` : ''}${llmResponse.text ? ` — "${llmResponse.text.slice(0, 60)}…"` : ''}`, {
-    traceId, model: llmResponse.model, tokensIn: llmResponse.tokensIn, tokensOut: llmResponse.tokensOut, latencyMs: llmResponse.latencyMs,
+  await writeLog('info', 'llm', `Xarlote ← LLM [${llmResponse.model}] — ${llmResponse.tokensIn}in (${llmResponse.cachedTokens} cache)/${llmResponse.tokensOut}out tok, ${llmResponse.latencyMs}ms${llmResponse.toolCalls.length ? ` — tools: ${llmResponse.toolCalls.map((t) => t.name).join(', ')}` : ''}${llmResponse.text ? ` — "${llmResponse.text.slice(0, 60)}…"` : ''}`, {
+    traceId, model: llmResponse.model, tokensIn: llmResponse.tokensIn, cachedTokens: llmResponse.cachedTokens, tokensOut: llmResponse.tokensOut, latencyMs: llmResponse.latencyMs,
     tools: llmResponse.toolCalls.map((t) => t.name),
   });
 

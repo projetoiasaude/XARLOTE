@@ -57,6 +57,8 @@ export interface ChatResponse {
   toolCalls: ToolCall[];
   tokensIn: number;
   tokensOut: number;
+  /** Tokens de input servidos do CACHE do provider (F2.G3). 0 = sem cache hit. */
+  cachedTokens: number;
   latencyMs: number;
   model: string;
 }
@@ -98,7 +100,12 @@ const OpenRouterResponseSchema = z
       )
       .min(1),
     usage: z
-      .object({ prompt_tokens: z.number().nullish(), completion_tokens: z.number().nullish() })
+      .object({
+        prompt_tokens: z.number().nullish(),
+        completion_tokens: z.number().nullish(),
+        // F2.G3: OpenAI/OpenRouter reportam tokens de input servidos do cache aqui.
+        prompt_tokens_details: z.object({ cached_tokens: z.number().nullish() }).nullish(),
+      })
       .nullish(),
   })
   .passthrough();
@@ -183,6 +190,7 @@ async function callOpenRouter(
     toolCalls,
     tokensIn: data.usage?.prompt_tokens ?? 0,
     tokensOut: data.usage?.completion_tokens ?? 0,
+    cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens ?? 0,
     latencyMs: Date.now() - start,
     model: modelName,
   };
