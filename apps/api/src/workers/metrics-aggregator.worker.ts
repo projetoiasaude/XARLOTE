@@ -17,6 +17,7 @@
  *   - TTS/STT
  */
 import { db, writeLog } from '@iasaude/db';
+import { withCronLock } from '../middleware/cron-lock.js';
 
 const POLL_INTERVAL_MS = 60 * 60 * 1000; // 1h
 
@@ -306,8 +307,8 @@ let interval: NodeJS.Timeout | null = null;
 export function startMetricsAggregatorWorker(): void {
   if (interval) return;
   setTimeout(() => {
-    void runOnce();
-    interval = setInterval(() => void runOnce(), POLL_INTERVAL_MS);
+    void withCronLock('metrics-aggregator', POLL_INTERVAL_MS, runOnce);
+    interval = setInterval(() => void withCronLock('metrics-aggregator', POLL_INTERVAL_MS, runOnce), POLL_INTERVAL_MS);
   }, 5 * 60 * 1000); // 1ª run após 5min
   void writeLog('info', 'metrics', 'metrics-aggregator worker iniciado (cada 1h)', {});
 }

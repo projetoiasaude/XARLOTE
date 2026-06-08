@@ -17,6 +17,7 @@
  */
 import { db, writeLog, writeAudit } from '@iasaude/db';
 import { sendOutbound } from '../handlers/outbound.js';
+import { withCronLock } from '../middleware/cron-lock.js';
 
 const POLL_INTERVAL_MS = 60 * 60 * 1000; // 1h
 const FEEDBACK_DELAY_HOURS = 24; // pede feedback 24h após consulta
@@ -100,8 +101,8 @@ export function startConsultationFeedbackWorker(): void {
   if (interval) return;
   // Roda 1ª vez após 15min do boot
   setTimeout(() => {
-    void runOnce();
-    interval = setInterval(() => void runOnce(), POLL_INTERVAL_MS);
+    void withCronLock('consultation-feedback', POLL_INTERVAL_MS, runOnce);
+    interval = setInterval(() => void withCronLock('consultation-feedback', POLL_INTERVAL_MS, runOnce), POLL_INTERVAL_MS);
   }, 15 * 60 * 1000);
   void writeLog('info', 'consultation-feedback', 'consultation-feedback worker iniciado (1x/h)', {});
 }

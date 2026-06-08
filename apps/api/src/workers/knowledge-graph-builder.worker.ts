@@ -13,6 +13,7 @@
  * Falha silenciosa: se RPC não existe ou tabelas faltam, loga e continua.
  */
 import { db, writeLog, writeAudit } from '@iasaude/db';
+import { withCronLock } from '../middleware/cron-lock.js';
 
 const POLL_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
 const LOOKBACK_HOURS = 48; // janela de scan: rows criadas nas últimas 48h
@@ -266,8 +267,8 @@ let interval: NodeJS.Timeout | null = null;
 export function startKnowledgeGraphBuilderWorker(): void {
   if (interval) return;
   setTimeout(() => {
-    void runOnce();
-    interval = setInterval(() => void runOnce(), POLL_INTERVAL_MS);
+    void withCronLock('knowledge-graph-builder', POLL_INTERVAL_MS, runOnce);
+    interval = setInterval(() => void withCronLock('knowledge-graph-builder', POLL_INTERVAL_MS, runOnce), POLL_INTERVAL_MS);
   }, 20 * 60 * 1000); // 1ª run após 20min
   void writeLog('info', 'kg-builder', 'knowledge-graph-builder worker iniciado (cada 6h)', {});
 }

@@ -17,6 +17,7 @@
  * `last_observed_at = now()` em vez de duplicar.
  */
 import { db, writeLog, writeAudit } from '@iasaude/db';
+import { withCronLock } from '../middleware/cron-lock.js';
 
 const POLL_INTERVAL_MS = 24 * 60 * 60 * 1000; // 1 dia
 const MIN_OCCURRENCES = 3;
@@ -282,8 +283,8 @@ let interval: NodeJS.Timeout | null = null;
 export function startSkillExtractorWorker(): void {
   if (interval) return;
   setTimeout(() => {
-    void runOnce();
-    interval = setInterval(() => void runOnce(), POLL_INTERVAL_MS);
+    void withCronLock('skill-extractor', POLL_INTERVAL_MS, runOnce);
+    interval = setInterval(() => void withCronLock('skill-extractor', POLL_INTERVAL_MS, runOnce), POLL_INTERVAL_MS);
   }, 30 * 60 * 1000); // 1ª run após 30min
   void writeLog('info', 'skill-extractor', 'skill-extractor worker iniciado (1x/dia)', {});
 }

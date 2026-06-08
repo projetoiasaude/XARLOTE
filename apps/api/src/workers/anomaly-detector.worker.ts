@@ -15,6 +15,7 @@
  */
 import { db, writeLog, writeEvent } from '@iasaude/db';
 import { sendTelegramAlert } from '../handlers/telegram-alerter.js';
+import { withCronLock } from '../middleware/cron-lock.js';
 
 const POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 min
 
@@ -196,8 +197,8 @@ export function startAnomalyDetectorWorker(): void {
   if (interval) return;
   // 1ª run após 3min do boot
   setTimeout(() => {
-    void runOnce();
-    interval = setInterval(() => void runOnce(), POLL_INTERVAL_MS);
+    void withCronLock('anomaly-detector', POLL_INTERVAL_MS, runOnce);
+    interval = setInterval(() => void withCronLock('anomaly-detector', POLL_INTERVAL_MS, runOnce), POLL_INTERVAL_MS);
   }, 3 * 60 * 1000);
   void writeLog('info', 'anomaly', 'anomaly-detector worker iniciado (cada 10min)', {});
 }

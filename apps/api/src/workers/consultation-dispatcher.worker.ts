@@ -17,6 +17,7 @@
 import { db, writeLog } from '@iasaude/db';
 import { initiateClinicNegotiation } from '../handlers/agent-clinic.js';
 import { scheduleConsultationTimeout } from '../handlers/consultation-consolidation.js';
+import { withCronLock } from '../middleware/cron-lock.js';
 
 const POLL_INTERVAL_MS = 30 * 1000; // 30s
 const MIN_AGE_MS = 60 * 1000;       // só resgata órfãs com > 60s (evita corrida com setTimeout)
@@ -136,8 +137,8 @@ export function startConsultationDispatcherWorker(): void {
   if (interval) return;
   // 1ª run após 45s (deixa o boot estabilizar)
   setTimeout(() => {
-    void runOnce();
-    interval = setInterval(() => void runOnce(), POLL_INTERVAL_MS);
+    void withCronLock('consultation-dispatcher', POLL_INTERVAL_MS, runOnce);
+    interval = setInterval(() => void withCronLock('consultation-dispatcher', POLL_INTERVAL_MS, runOnce), POLL_INTERVAL_MS);
   }, 45 * 1000);
   void writeLog('info', 'consultation-dispatcher', 'consultation-dispatcher worker iniciado (cada 30s)', {});
 }

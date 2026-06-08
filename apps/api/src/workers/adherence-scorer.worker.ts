@@ -6,6 +6,7 @@
  * Roda 1x/dia (23h BRT).
  */
 import { db, writeLog, writeAudit } from '@iasaude/db';
+import { withCronLock } from '../middleware/cron-lock.js';
 
 const POLL_INTERVAL_MS = 24 * 60 * 60 * 1000; // 1 dia
 const DROP_THRESHOLD = 0.2;                   // 20% queda
@@ -82,8 +83,8 @@ export function startAdherenceScorerWorker(): void {
   if (interval) return;
   // Roda 1ª vez após 10 minutos do boot
   setTimeout(() => {
-    void runOnce();
-    interval = setInterval(() => void runOnce(), POLL_INTERVAL_MS);
+    void withCronLock('adherence-scorer', POLL_INTERVAL_MS, runOnce);
+    interval = setInterval(() => void withCronLock('adherence-scorer', POLL_INTERVAL_MS, runOnce), POLL_INTERVAL_MS);
   }, 10 * 60 * 1000);
   void writeLog('info', 'adherence', 'adherence-scorer worker iniciado (1x/dia)', {});
 }

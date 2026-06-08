@@ -8,6 +8,7 @@
  */
 import { db, writeLog, writeAudit } from '@iasaude/db';
 import { sendOutbound } from '../handlers/outbound.js';
+import { withCronLock } from '../middleware/cron-lock.js';
 
 const POLL_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
 const THRESHOLD_DAYS = 7;
@@ -108,8 +109,8 @@ export function startInventoryTrackerWorker(): void {
   if (interval) return;
   // Roda 1ª vez após 5 minutos (não atropela startup) e depois a cada POLL_INTERVAL
   setTimeout(() => {
-    void runOnce();
-    interval = setInterval(() => void runOnce(), POLL_INTERVAL_MS);
+    void withCronLock('inventory-tracker', POLL_INTERVAL_MS, runOnce);
+    interval = setInterval(() => void withCronLock('inventory-tracker', POLL_INTERVAL_MS, runOnce), POLL_INTERVAL_MS);
   }, 5 * 60 * 1000);
   void writeLog('info', 'inventory', 'inventory-tracker worker iniciado (cada 6h)', {});
 }

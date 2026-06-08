@@ -30,6 +30,7 @@ import { startMetricsAggregatorWorker } from './metrics-aggregator.worker.js';
 import { startRedFlagEscalatorWorker } from './red-flag-escalator.worker.js';
 import { startOutboundWorkers } from '../queues/outbound.queue.js';
 import { onShutdown } from '../lifecycle.js';
+import { withCronLock } from '../middleware/cron-lock.js';
 
 /** Logger mínimo (compatível com app.log do Fastify e com console). */
 export interface WorkerLogger {
@@ -51,17 +52,21 @@ export function startAllWorkers(log: WorkerLogger): void {
   started = true;
 
   // ── Crons com setInterval cujo timer precisamos limpar no shutdown ──
+  // F1.A2: envolvidos em withCronLock — com N réplicas, só uma roda cada janela
+  // (reminder duplicado = WhatsApp duplicado; compactor duplicado = cards repetidos).
+  const REMINDER_MS = 30_000;
+  const COMPACTOR_MS = 60 * 60 * 1000;
   const reminderTimer = setInterval(
-    () => dispatchReminders().catch((e) => log.error(e, 'reminder dispatch failed')),
-    30_000,
+    () => withCronLock('reminder-dispatcher', REMINDER_MS, dispatchReminders).catch((e) => log.error(e, 'reminder dispatch failed')),
+    REMINDER_MS,
   );
-  dispatchReminders().catch((e) => log.error(e, 'reminder dispatch initial failed'));
+  withCronLock('reminder-dispatcher', REMINDER_MS, dispatchReminders).catch((e) => log.error(e, 'reminder dispatch initial failed'));
 
   const enricherWorker = startProfileEnricherWorker();
 
   const compactorTimer = setInterval(
-    () => compactStaleConversations().catch((e) => log.error(e, 'compactor failed')),
-    60 * 60 * 1000,
+    () => withCronLock('conversation-compactor', COMPACTOR_MS, compactStaleConversations).catch((e) => log.error(e, 'compactor failed')),
+    COMPACTOR_MS,
   );
 
   // ── Crons auto-contidos (setInterval interno; scans idempotentes — perder um
