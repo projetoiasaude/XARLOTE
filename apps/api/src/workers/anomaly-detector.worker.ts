@@ -15,6 +15,7 @@
  */
 import { db, writeLog, writeEvent } from '@iasaude/db';
 import { sendTelegramAlert } from '../handlers/telegram-alerter.js';
+import { estimateCostUsd } from '@iasaude/llm';
 import { withCronLock } from '../middleware/cron-lock.js';
 
 const POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 min
@@ -177,6 +178,72 @@ async function detectOrderFailureRate(): Promise<void> {
   } catch {}
 }
 
+// F1.B4: custo de LLM na última hora acima do teto (LLM_COST_HOURLY_USD_LIMIT,
+// default US$ 3). Usa o mesmo estimador com desconto de cache do dashboard.
+async function detectCostBudget(): Promise<void> {
+  try {
+    const limit = Number(process.env['LLM_COST_HOURLY_USD_LIMIT'] ?? 3);
+    const cutoff = new Date(Date.now() - 60 * 60_000).toISOString();
+    const { data } = await db
+      .from('event_log')
+      .select('tokens_in, tokens_out, payload')
+      .in('event_name', ['llm.completion', 'agent.completion', 'agent_clinic.completion'])
+      .gte('occurred_at', cutoff)
+      .limit(50000);
+    let cost = 0;
+    for (const e of data ?? []) {
+      const row = e as { tokens_in?: number; tokens_out?: number; payload?: Record<string, unknown> | null };
+      cost += estimateCostUsd(
+        String(row.payload?.['model'] ?? ''),
+        Number(row.tokens_in ?? 0),
+        Number(row.payload?.['cached_tokens'] ?? 0),
+        Number(row.tokens_out ?? 0),
+      );
+    }
+    if (cost > limit) {
+      await sendTelegramAlert({
+        title: 'Custo de LLM acima do teto',
+        body: `~US$ ${cost.toFixed(2)} na última hora (teto US$ ${limit.toFixed(2)}). Checar volume/abuso.`,
+        severity: 'high',
+        throttleKey: 'llm_cost_budget',
+      });
+      await writeEvent({
+        eventName: 'anomaly.llm_cost_over_budget',
+        severity: 'warn',
+        payload: { cost_usd: parseFloat(cost.toFixed(4)), limit_usd: limit, window_min: 60 },
+      });
+    }
+  } catch {}
+}
+
+// F1.B4: spike de falhas de ENVIO WhatsApp nos últimos 10min — possível ban/
+// rate-limit da uazapi (canal fora do nosso controle; um ban derruba o produto).
+async function detectSendFailureSpike(): Promise<void> {
+  try {
+    const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
+    const { count } = await db
+      .from('system_logs')
+      .select('id', { count: 'exact', head: true })
+      .eq('category', 'outbound')
+      .eq('level', 'error')
+      .gte('created_at', cutoff);
+    const n = count ?? 0;
+    if (n >= 5) {
+      await sendTelegramAlert({
+        title: 'Falhas de envio WhatsApp (possível ban/limite)',
+        body: `${n} erros de envio (outbound) nos últimos 10min. Pode ser ban/rate-limit da uazapi — checar a instância.`,
+        severity: 'high',
+        throttleKey: 'wa_send_failure_spike',
+      });
+      await writeEvent({
+        eventName: 'anomaly.wa_send_failure_spike',
+        severity: 'warn',
+        payload: { count: n, window_min: 10 },
+      });
+    }
+  } catch {}
+}
+
 async function runOnce(): Promise<void> {
   try {
     await Promise.all([
@@ -185,6 +252,8 @@ async function runOnce(): Promise<void> {
       detectLLMLatencyDegradation(),
       detectStuckConversations(),
       detectOrderFailureRate(),
+      detectCostBudget(),
+      detectSendFailureSpike(),
     ]);
   } catch (err) {
     await writeLog('error', 'anomaly', `worker crashed: ${String(err).slice(0, 200)}`, {});

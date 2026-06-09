@@ -1,4 +1,5 @@
 export * from './client.js';
+export * from './pricing.js';
 export * from './embeddings.js';
 export * from './tools/xarlote-tools.js';
 export * from './tools/agent-tools.js';

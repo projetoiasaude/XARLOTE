@@ -17,6 +17,7 @@
  *   - TTS/STT
  */
 import { db, writeLog } from '@iasaude/db';
+import { estimateCostUsd } from '@iasaude/llm';
 import { withCronLock } from '../middleware/cron-lock.js';
 
 const POLL_INTERVAL_MS = 60 * 60 * 1000; // 1h
@@ -116,7 +117,7 @@ async function computeDay(day: string): Promise<DailyMetrics> {
   try {
     const { data: llmEvents } = await db
       .from('event_log')
-      .select('duration_ms, payload')
+      .select('duration_ms, tokens_in, tokens_out, payload')
       .in('event_name', ['llm.completion', 'agent.completion', 'agent_clinic.completion'])
       .gte('occurred_at', startISO)
       .lte('occurred_at', endISO)
@@ -132,14 +133,19 @@ async function computeDay(day: string): Promise<DailyMetrics> {
     metrics.llm_p95_ms = percentile(durations, 0.95);
     metrics.llm_p99_ms = percentile(durations, 0.99);
 
+    // F1.B3: custo REAL a partir das colunas tokens_in/out + cached_tokens do
+    // payload, com desconto de cache (F2.G3). Antes lia payload.total_tokens /
+    // payload.cost_usd — campos que não existem → custo ficava zerado.
     let tokens = 0;
     let cost = 0;
     for (const e of llmEvents ?? []) {
-      const p = e.payload as Record<string, unknown> | null;
-      if (p) {
-        tokens += Number(p['total_tokens'] ?? 0);
-        cost += Number(p['cost_usd'] ?? 0);
-      }
+      const row = e as { tokens_in?: number; tokens_out?: number; payload?: Record<string, unknown> | null };
+      const tin = Number(row.tokens_in ?? 0);
+      const tout = Number(row.tokens_out ?? 0);
+      const cached = Number(row.payload?.['cached_tokens'] ?? 0);
+      const model = String(row.payload?.['model'] ?? '');
+      tokens += tin + tout;
+      cost += estimateCostUsd(model, tin, cached, tout);
     }
     metrics.llm_total_tokens = tokens;
     metrics.llm_total_cost_usd = parseFloat(cost.toFixed(4));
