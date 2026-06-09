@@ -13,9 +13,15 @@
 
 ---
 
-## 2. Estado atual — 2026-05-28
+## 2. Estado atual — 2026-06-08
 
-> ### 🚀 Xarlote 2.0 — Fases 0-8 implementadas, banco migrado, código commitado
+> ### ⭐ ATUAL (2026-06-08) — PRODUÇÃO HARDENED (veja o §9 log, no topo, pro detalhe completo)
+> **Arquitetura nova:** 2 services no Railway — **`ia-da-saude-api`** (`ROLE=api`, só HTTP) + **`worker`** (`ROLE=worker`, os 13 workers, sem domínio público), Redis + Supabase compartilhados. Decisão por env `ROLE` em `server.ts`; fonte dos workers em `workers/start-all.ts`; `apps/worker` legado deletado.
+> **F0/F1/F2 live:** split api/worker (F1.A1) · cron locks (F1.A2) · resgate durável de cotação (F1.A3) · idempotência (F1.A4) · graceful shutdown (F1.A5) · Sentry env-gated (F1.B1) · trace_id ponta-a-ponta (F1.B2) · métricas+alertas, custo real com cache (F1.B3/B4) · health checks (F1.B5) · 44 testes (F1.C1) · CI/CD+gitleaks+audit (F1.C2/D1/D4) · Zod (F1.C6) · rate-limit (F2.G5) · matou N+1 −1s/msg (F2.G2) · **prompt caching −73% custo input (F2.G3)** · circuit breaker LLM (F2.F5).
+> **Pendências grátis do founder:** `TELEGRAM_BOT_TOKEN`+`TELEGRAM_ALERT_CHAT_ID` (alertas), `SENTRY_DSN`, UptimeRobot, backup Supabase, volume `apps/api/data`.
+> **Próximo grande (estratégico):** F2.H1 WhatsApp Business API oficial (uazapi é teto existencial).
+>
+> ### 🚀 Xarlote 2.0 — Fases 0-8 implementadas, banco migrado, código commitado (HISTÓRICO 2026-05-28)
 >
 > **Persona renomeada Sara → Xarlote em todo o código** (constante `SARA_INSTANCE` e env `UAZAPI_SARA_TOKEN` mantidas por compat de deploy).
 >
@@ -72,7 +78,7 @@
 | **Controles de modelo no dashboard** | ✅ `/prompts` com dropdowns: LLM principal, modelo de visão, modelo de áudio, persistidos em `apps/api/data/prompts.json` |
 | **Página Perfil 360** | ✅ `/users/[id]` com memória agrupada por kind, badges de origem (`auto`/`usuário`), confidence bars, lembretes ativos |
 | **Reverse geocode (botão 📍)** | ✅ Nominatim primário (rua + setor + CEP) + Google fallback (a key do Google Maps tem só Places liberado, Geocoding nega) |
-| **API + Worker no mesmo processo** | ✅ healthcheck Railway exigia 1 processo único — workers (reminder-dispatcher, profile-enricher, compactor) movidos pra `apps/api/src/workers/` |
+| **API + Worker SEPARADOS** (F1.A1, 2026-06-08) | ✅ 2 services Railway via env `ROLE` (`api` / `worker`). ~~Antes rodavam no mesmo processo~~ — agora isolados (crash de worker não derruba o WhatsApp). Fonte: `workers/start-all.ts` |
 
 **uazapi instância Sara**: `WHATSAPP_MODE=uazapi`, `UAZAPI_SERVER_URL=https://criate.uazapi.com`, `UAZAPI_SARA_TOKEN` configurado. Nome da instância lido via `UAZAPI_SARA_INSTANCE` (padrão `sara`).
 
