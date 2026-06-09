@@ -5,6 +5,10 @@ const CHECK_3MIN_MS = 3 * 60 * 1000;
 const CHECK_5MIN_MS = 5 * 60 * 1000;
 const scheduledTimeouts = new Set<string>();
 
+// F1.A3: além de quantos minutos um pedido preso em 'quoting' é considerado órfão
+// (timer de consolidação perdido num restart) e resgatado pelo dispatcher.
+const RESCUE_WINDOW_MIN = Number(process.env['PHARMACY_RESCUE_WINDOW_MIN'] ?? 10);
+
 /**
  * Timers por pedido:
  *
@@ -35,6 +39,47 @@ export function scheduleQuoteTimeout(
       .catch((err) => writeLog('error', 'order', `5min check failed: ${String(err)}`, { traceId, orderId }))
       .finally(() => scheduledTimeouts.delete(orderId));
   }, CHECK_5MIN_MS);
+}
+
+/**
+ * F1.A3 — RESGATE DURÁVEL. Os timers de 3/5min vivem em memória
+ * (scheduleQuoteTimeout); se o processo reinicia no meio (deploy/crash), a
+ * consolidação se perde e o pedido fica 'quoting' PARA SEMPRE — o usuário nunca
+ * recebe as opções. Este scan roda no worker (consultation-dispatcher, a cada
+ * 30s) e consolida qualquer pedido preso em 'quoting' além de RESCUE_WINDOW_MIN.
+ * É SEGURO rodar junto com os setTimeouts: consolidateQuotes faz transição
+ * atômica quoting→quoted, então quem chegar segundo vira no-op.
+ */
+export async function rescueOrphanedPharmacyQuotes(): Promise<void> {
+  try {
+    const cutoff = new Date(Date.now() - RESCUE_WINDOW_MIN * 60_000).toISOString();
+    const { data: orders } = await db
+      .from('orders')
+      .select('id, conversation_id, created_at')
+      .eq('status', 'quoting')
+      .lt('created_at', cutoff)
+      .limit(50);
+
+    for (const o of orders ?? []) {
+      try {
+        if (!o.conversation_id) continue;
+        const { data: conv } = await db
+          .from('conversations')
+          .select('whatsapp_jid')
+          .eq('id', o.conversation_id)
+          .single();
+        const phone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
+        if (!phone) continue;
+        const traceId = `rescue-${o.id}`;
+        await writeLog('warn', 'order', `Resgatando pedido órfão preso em 'quoting' (>${RESCUE_WINDOW_MIN}min)`, { traceId, orderId: o.id });
+        await consolidateQuotesEarly(o.id, o.conversation_id, `+${phone}`, traceId);
+      } catch (err) {
+        await writeLog('error', 'order', `rescue de pedido falhou: ${String(err).slice(0, 160)}`, { orderId: o.id });
+      }
+    }
+  } catch (err) {
+    await writeLog('error', 'order', `rescueOrphanedPharmacyQuotes falhou: ${String(err).slice(0, 160)}`, {});
+  }
 }
 
 async function check3min(

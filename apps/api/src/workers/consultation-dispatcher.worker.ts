@@ -17,6 +17,7 @@
 import { db, writeLog } from '@iasaude/db';
 import { initiateClinicNegotiation } from '../handlers/agent-clinic.js';
 import { scheduleConsultationTimeout } from '../handlers/consultation-consolidation.js';
+import { rescueOrphanedPharmacyQuotes } from '../handlers/quote-consolidation.js';
 import { withCronLock } from '../middleware/cron-lock.js';
 
 const POLL_INTERVAL_MS = 30 * 1000; // 30s
@@ -24,6 +25,10 @@ const MIN_AGE_MS = 60 * 1000;       // só resgata órfãs com > 60s (evita corr
 const MAX_AGE_MS = 60 * 60 * 1000;  // ignora quotes velhas > 1h (consulta abandonada)
 
 async function runOnce(): Promise<void> {
+  // F1.A3: resgate durável de cotações de FARMÁCIA órfãs (independente da lógica
+  // de clínica abaixo, que tem early-returns). Idempotente.
+  await rescueOrphanedPharmacyQuotes();
+
   try {
     const now = Date.now();
     const olderThan = new Date(now - MIN_AGE_MS).toISOString();
