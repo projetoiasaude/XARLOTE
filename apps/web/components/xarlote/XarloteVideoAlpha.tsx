@@ -22,6 +22,8 @@ void main() {
 // Vídeo empilhado: cor na metade de cima, matte (alpha) na metade de baixo.
 // Com UNPACK_FLIP_Y, cor fica em v∈[0.5,1] e matte em v∈[0,0.5]; um épsilon
 // evita sangrar a costura no centro. alpha = vermelho do matte (é cinza).
+// Saída PRÉ-MULTIPLICADA (color*a, a): é o que o compositor do canvas espera no
+// iOS Safari — sem isso o Safari trata o canvas como opaco (vaza o fundo do vídeo).
 const FRAG = `
 precision mediump float;
 varying vec2 uv;
@@ -31,7 +33,7 @@ void main() {
   vec3 color = texture2D(tex, vec2(uv.x, mix(0.5 + E, 1.0 - E, uv.y))).rgb;
   float a = texture2D(tex, vec2(uv.x, mix(E, 0.5 - E, uv.y))).r;
   a = smoothstep(0.04, 0.6, a);
-  gl_FragColor = vec4(color, a);
+  gl_FragColor = vec4(color * a, a);
 }`;
 
 function compile(gl: WebGLRenderingContext, type: number, src: string) {
@@ -57,19 +59,23 @@ export function XarloteVideoAlpha({ src, size = 240, className, fallback }: Prop
     if (!canvas) return;
 
     const video = document.createElement('video');
-    video.src = src;
     video.muted = true;
+    video.defaultMuted = true;
     video.loop = true;
+    video.autoplay = true;
     video.playsInline = true;
+    video.setAttribute('muted', '');
     video.setAttribute('playsinline', '');
     video.setAttribute('webkit-playsinline', '');
-    video.crossOrigin = 'anonymous';
     video.preload = 'auto';
+    // src por último: garante que muted/playsInline já estejam setados antes do load
+    // (iOS exige isso pra autoplay inline). Mesma origem → sem crossOrigin (evita taint no Safari).
+    video.src = src;
     videoRef.current = video;
 
     const gl = canvas.getContext('webgl', {
       alpha: true,
-      premultipliedAlpha: false,
+      premultipliedAlpha: true,
       antialias: true,
     }) as WebGLRenderingContext | null;
     if (!gl) {
