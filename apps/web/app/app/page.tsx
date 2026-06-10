@@ -6,7 +6,8 @@ import { ArrowDown, Phone } from 'lucide-react';
 import { dayLabel } from '@/lib/xarlote/format';
 import { useXarloteApp } from '@/lib/xarlote/app-context';
 import { useXarloteChat } from '@/lib/xarlote/use-chat';
-import { XarloteMascot } from '@/components/xarlote/XarloteMascot';
+import { XarloteSwim } from '@/components/xarlote/XarloteSwim';
+import { LiquidCore } from '@/components/xarlote/LiquidCore';
 import { MessageBubble } from '@/components/xarlote/chat/MessageBubble';
 import { TypingIndicator } from '@/components/xarlote/chat/TypingIndicator';
 import { Composer } from '@/components/xarlote/chat/Composer';
@@ -65,7 +66,7 @@ function ChatScreen() {
       <header className="z-20 px-3 pt-safe">
         <div className="glass glass-spec mt-3 flex items-center gap-3 rounded-3xl px-4 py-2.5">
           <div className="relative">
-            <XarloteMascot size={42} mood={typing ? 'thinking' : 'idle'} glow={false} />
+            <LiquidCore size={40} mode={typing ? 'thinking' : 'idle'} />
             <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-[#0a0a22] bg-emerald-400" />
           </div>
           <div className="min-w-0 flex-1">
@@ -106,7 +107,7 @@ function ChatScreen() {
           </div>
         ) : messages.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center text-center">
-            <XarloteMascot size={130} mood="idle" />
+            <XarloteSwim size={170} />
             <p className="mt-4 text-base font-semibold">
               {firstName ? `Oi, ${firstName}!` : 'Oi! Eu sou a Xarlote.'}
             </p>

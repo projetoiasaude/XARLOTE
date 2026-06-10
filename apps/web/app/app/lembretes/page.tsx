@@ -19,7 +19,8 @@ import {
 } from 'lucide-react';
 import { GlassBadge, GlassButton, Skeleton } from '@/components/ui';
 import { Screen, screenItem } from '@/components/xarlote/Screen';
-import { XarloteMascot } from '@/components/xarlote/XarloteMascot';
+import { XarloteSwim } from '@/components/xarlote/XarloteSwim';
+import { LiquidCore } from '@/components/xarlote/LiquidCore';
 import { useXarloteApp } from '@/lib/xarlote/app-context';
 import { reminderAction } from '@/lib/xarlote/api';
 import { countdown, fullDateTime, humanizeRrule } from '@/lib/xarlote/format';
@@ -115,7 +116,7 @@ export default function LembretesPage() {
         </div>
       ) : active.length === 0 ? (
         <motion.div variants={screenItem} className="glass flex flex-col items-center rounded-3xl p-8 text-center">
-          <XarloteMascot size={110} />
+          <XarloteSwim size={150} />
           <p className="mt-3 text-sm font-medium">Nenhum lembrete programado</p>
           <p className="mt-1 max-w-[290px] text-xs text-white/50">
             Quando você começar um tratamento, a Xarlote cria os despertadores sozinha — horário certo, contagem de
@@ -140,7 +141,7 @@ export default function LembretesPage() {
             >
               <div className="absolute -right-8 -top-8 h-32 w-32 rounded-full bg-accent/20 blur-2xl" />
               <div className="relative flex items-center gap-4">
-                <XarloteMascot size={62} glow={false} />
+                <LiquidCore size={54} />
                 <div className="min-w-0 flex-1">
                   <p className="text-[10px] font-semibold uppercase tracking-widest text-accent-hi">próximo</p>
                   <p className="mt-0.5 truncate text-lg font-bold leading-tight">{next.title}</p>

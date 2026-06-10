@@ -6,7 +6,7 @@ import { Bike, ChevronDown, Crown, MapPin, ShoppingBag, Star, Stethoscope, Zap }
 import { GlassBadge, GlassButton, Skeleton, StatusPing } from '@/components/ui';
 import { Screen, screenItem } from '@/components/xarlote/Screen';
 import { LiquidStepper } from '@/components/xarlote/bits';
-import { XarloteMascot } from '@/components/xarlote/XarloteMascot';
+import { XarloteSwim } from '@/components/xarlote/XarloteSwim';
 import { useXarloteApp } from '@/lib/xarlote/app-context';
 import { brl, fullDateTime } from '@/lib/xarlote/format';
 import { supabase } from '@/lib/supabase';
@@ -217,7 +217,7 @@ export default function AtividadePage() {
         </div>
       ) : nothing ? (
         <motion.div variants={screenItem} className="glass flex flex-col items-center rounded-3xl p-8 text-center">
-          <XarloteMascot size={110} />
+          <XarloteSwim size={150} />
           <p className="mt-3 text-sm font-medium">Nada em andamento agora</p>
           <p className="mt-1 max-w-[290px] text-xs text-white/50">
             Peça um remédio ou uma consulta — a Xarlote contata as farmácias e clínicas por você e o progresso aparece

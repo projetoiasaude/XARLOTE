@@ -15,7 +15,7 @@ import {
 import { GlassBadge, GlassButton, Skeleton, Tabs } from '@/components/ui';
 import { Screen, screenItem } from '@/components/xarlote/Screen';
 import { CountUp, ProgressRing } from '@/components/xarlote/bits';
-import { XarloteMascot } from '@/components/xarlote/XarloteMascot';
+import { XarloteSwim } from '@/components/xarlote/XarloteSwim';
 import { useXarloteApp } from '@/lib/xarlote/app-context';
 import { countdown, shortDate } from '@/lib/xarlote/format';
 import { cn, timeAgo } from '@/lib/utils';
@@ -99,7 +99,7 @@ export default function SaudePage() {
           </div>
         ) : (
           <motion.div variants={screenItem} className="glass flex flex-col items-center rounded-3xl p-8 text-center">
-            <XarloteMascot size={110} />
+            <XarloteSwim size={150} />
             <p className="mt-3 text-sm font-medium">Sua história de saúde nasce na conversa</p>
             <p className="mt-1 max-w-[280px] text-xs text-white/50">
               Conforme você fala com a Xarlote, remédios, condições e tudo mais vão aparecendo aqui — organizados sozinhos.
@@ -140,7 +140,7 @@ export default function SaudePage() {
 
       {!hasAnything && (
         <motion.div variants={screenItem} className="glass flex flex-col items-center rounded-3xl p-8 text-center">
-          <XarloteMascot size={100} />
+          <XarloteSwim size={140} />
           <p className="mt-3 text-sm font-medium">Tudo limpo por aqui (por enquanto)</p>
           <p className="mt-1 max-w-[280px] text-xs text-white/50">
             Conta pra Xarlote o que você toma e como anda sua saúde — ela organiza tudo aqui sozinha.

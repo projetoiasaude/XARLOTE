@@ -1,8 +1,8 @@
 'use client';
 import { motion } from 'framer-motion';
-import { XarloteMascot } from '../XarloteMascot';
+import { LiquidCore } from '../LiquidCore';
 
-/** “Xarlote está digitando” — mascote em modo thinking + pontos em onda. */
+/** “Xarlote está digitando” — núcleo líquido acelerado + pontos em onda. */
 export function TypingIndicator() {
   return (
     <motion.div
@@ -12,7 +12,7 @@ export function TypingIndicator() {
       transition={{ type: 'spring', stiffness: 360, damping: 26 }}
       className="flex items-end gap-2"
     >
-      <XarloteMascot size={34} mood="thinking" glow={false} />
+      <LiquidCore size={30} mode="thinking" />
       <div className="glass glass-spec flex items-center gap-1.5 rounded-3xl rounded-bl-lg px-4 py-3">
         {[0, 1, 2].map((i) => (
           <span

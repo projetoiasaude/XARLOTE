@@ -5,7 +5,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import { AlarmClock, CircleUserRound, HeartPulse, MessageCircle, Zap, type LucideIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useXarloteApp } from '@/lib/xarlote/app-context';
-import { XarloteMascot } from './XarloteMascot';
+import { LiquidCore } from './LiquidCore';
 
 interface NavItem {
   href: string;
@@ -177,7 +177,7 @@ export function OrbNav() {
           {typing && (
             <span className="absolute inset-0 rounded-full border-2 border-accent/70 animate-pulse-ring" />
           )}
-          <XarloteMascot size={54} mood={typing ? 'thinking' : open ? 'happy' : 'idle'} glow={false} />
+          <LiquidCore size={52} mode={typing ? 'thinking' : open ? 'active' : 'idle'} />
 
           {activeCount > 0 && (
             <span className="absolute -right-0.5 -top-0.5 flex h-5 min-w-5 items-center justify-center rounded-full bg-aurora-pink px-1 text-[10px] font-bold text-white shadow-glow-accent">

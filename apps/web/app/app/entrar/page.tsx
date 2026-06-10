@@ -4,7 +4,7 @@ import { useRouter } from 'next/navigation';
 import { motion } from 'framer-motion';
 import { ArrowRight, MessageCircle, ShieldCheck, Sparkles } from 'lucide-react';
 import { GlassButton, GlassInput } from '@/components/ui';
-import { XarloteMascot } from '@/components/xarlote/XarloteMascot';
+import { XarloteSwim } from '@/components/xarlote/XarloteSwim';
 import { useXarloteApp } from '@/lib/xarlote/app-context';
 import { fetchOverview } from '@/lib/xarlote/api';
 import { normalizePhoneInput } from '@/lib/xarlote/pairing';
@@ -27,7 +27,6 @@ export default function EntrarPage() {
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [unknown, setUnknown] = useState<string | null>(null); // telefone válido mas sem cadastro
-  const [happy, setHappy] = useState(false);
 
   async function submit() {
     setError(null);
@@ -40,9 +39,8 @@ export default function EntrarPage() {
     try {
       const overview = await fetchOverview(phone);
       if (overview) {
-        setHappy(true);
         pair(phone);
-        setTimeout(() => router.replace('/app'), 550);
+        setTimeout(() => router.replace('/app'), 450);
       } else {
         setUnknown(phone);
       }
@@ -63,7 +61,7 @@ export default function EntrarPage() {
     <main className="flex flex-1 flex-col items-center justify-center px-6 py-12 pt-safe pb-safe">
       <motion.div variants={stagger} initial="hidden" animate="show" className="flex w-full max-w-sm flex-col items-center">
         <motion.div variants={item}>
-          <XarloteMascot size={150} mood={happy ? 'happy' : 'idle'} />
+          <XarloteSwim size={210} />
         </motion.div>
 
         <motion.h1
