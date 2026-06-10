@@ -72,8 +72,8 @@ export function XarloteHero({ size = 240, className }: Props) {
           className="relative h-full w-full object-cover"
           style={{
             // funde as bordas do vídeo (fundo escuro) no fundo do app
-            WebkitMaskImage: 'radial-gradient(circle at 50% 50%, black 58%, transparent 76%)',
-            maskImage: 'radial-gradient(circle at 50% 50%, black 58%, transparent 76%)',
+            WebkitMaskImage: 'radial-gradient(circle at 50% 50%, black 46%, transparent 71%)',
+            maskImage: 'radial-gradient(circle at 50% 50%, black 46%, transparent 71%)',
           }}
           src={source}
           autoPlay
@@ -81,7 +81,20 @@ export function XarloteHero({ size = 240, className }: Props) {
           loop
           playsInline
           preload="auto"
+          onLoadedData={(e) => {
+            void e.currentTarget.play().catch(() => {});
+          }}
           onError={() => setSource(false)}
+        />
+      )}
+      {/* anel de cor do fundo por cima da borda — mata a diferença de tom do vídeo */}
+      {source && (
+        <div
+          className="pointer-events-none absolute inset-0"
+          style={{
+            background:
+              'radial-gradient(circle at 50% 50%, transparent 52%, rgba(4,4,26,0.55) 66%, rgba(4,4,26,0.92) 74%, transparent 86%)',
+          }}
         />
       )}
       {/* enquanto sonda, mostra o vetor pra não piscar vazio */}
