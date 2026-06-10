@@ -1,104 +1,64 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
-import { motion, useReducedMotion } from 'framer-motion';
+import { useEffect, useState } from 'react';
+import { motion } from 'framer-motion';
 import { cn } from '@/lib/utils';
 import { XarloteSwim } from './XarloteSwim';
+import { XarloteVideoAlpha } from './XarloteVideoAlpha';
 
 interface Props {
   size?: number;
   className?: string;
 }
 
+const ALPHA_SRC = '/xarlote-alpha.mp4';
+
 /**
- * Herói da tela de entrada — toca o VÍDEO 3D do mascote em loop
- * (`/xarlote-swim.webm` ou `/xarlote-swim.mp4` em `apps/web/public/`).
- * O vídeo é mascarado com gradiente radial pra fundir no fundo navy do app
- * (sem precisar de alpha). Enquanto o arquivo não existir, cai com elegância
- * no desenho vetorial animado (XarloteSwim).
+ * Herói da entrada — toca o VÍDEO 3D do mascote JÁ RECORTADO (fundo removido),
+ * recomposto no GPU (XarloteVideoAlpha) pra rodar em Android e iOS. O mascote
+ * flutua sobre o fundo aurora do app, sem moldura. Enquanto o arquivo não existe
+ * (ou sem GPU), cai com elegância no desenho vetorial animado.
  */
 export function XarloteHero({ size = 240, className }: Props) {
-  const reduced = useReducedMotion();
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  // null = sondando · 'webm'/'mp4' = achou vídeo · false = sem vídeo (fallback SVG)
-  const [source, setSource] = useState<string | false | null>(null);
+  // null = sondando · true = achou vídeo · false = sem vídeo (fallback SVG)
+  const [hasVideo, setHasVideo] = useState<boolean | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      for (const file of ['/xarlote-swim.webm', '/xarlote-swim.mp4']) {
-        try {
-          const res = await fetch(file, { method: 'HEAD', cache: 'no-store' });
-          const type = res.headers.get('content-type') ?? '';
-          if (res.ok && type.startsWith('video')) {
-            if (!cancelled) setSource(file);
-            return;
-          }
-        } catch {
-          /* segue pro próximo */
-        }
+      try {
+        const res = await fetch(ALPHA_SRC, { method: 'HEAD', cache: 'no-store' });
+        const type = res.headers.get('content-type') ?? '';
+        if (!cancelled) setHasVideo(res.ok && type.startsWith('video'));
+      } catch {
+        if (!cancelled) setHasVideo(false);
       }
-      if (!cancelled) setSource(false);
     })();
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // Acessibilidade: com reduced-motion, congela o vídeo no primeiro frame
-  useEffect(() => {
-    const v = videoRef.current;
-    if (v && reduced) v.pause();
-  }, [reduced, source]);
-
-  if (source === false) return <XarloteSwim size={size} className={className} />;
-
   return (
     <div className={cn('relative', className)} style={{ width: size, height: size }} aria-hidden>
-      {/* luz aurora por trás — integra o vídeo à cena */}
+      {/* luz aurora por trás — integra o mascote à cena */}
       <div
-        className="absolute inset-[2%] rounded-full opacity-55 blur-2xl"
+        className="absolute inset-[4%] rounded-full opacity-50 blur-2xl"
         style={{
           background:
-            'radial-gradient(circle at 42% 32%, rgba(99,124,250,0.5), rgba(155,92,246,0.34) 55%, rgba(217,70,239,0.18) 78%, transparent)',
+            'radial-gradient(circle at 46% 38%, rgba(99,124,250,0.5), rgba(155,92,246,0.32) 55%, rgba(217,70,239,0.16) 80%, transparent)',
         }}
       />
-      {source && (
-        <motion.video
-          ref={videoRef}
-          key={source}
+      {hasVideo === true && (
+        <motion.div
           initial={{ opacity: 0, scale: 0.97 }}
           animate={{ opacity: 1, scale: 1 }}
           transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
-          className="relative h-full w-full object-cover"
-          style={{
-            // funde as bordas do vídeo (fundo escuro) no fundo do app
-            WebkitMaskImage: 'radial-gradient(circle at 50% 50%, black 46%, transparent 71%)',
-            maskImage: 'radial-gradient(circle at 50% 50%, black 46%, transparent 71%)',
-          }}
-          src={source}
-          autoPlay
-          muted
-          loop
-          playsInline
-          preload="auto"
-          onLoadedData={(e) => {
-            void e.currentTarget.play().catch(() => {});
-          }}
-          onError={() => setSource(false)}
-        />
+          className="relative"
+        >
+          <XarloteVideoAlpha src={ALPHA_SRC} size={size} fallback={<XarloteSwim size={size} />} />
+        </motion.div>
       )}
-      {/* anel de cor do fundo por cima da borda — mata a diferença de tom do vídeo */}
-      {source && (
-        <div
-          className="pointer-events-none absolute inset-0"
-          style={{
-            background:
-              'radial-gradient(circle at 50% 50%, transparent 52%, rgba(4,4,26,0.55) 66%, rgba(4,4,26,0.92) 74%, transparent 86%)',
-          }}
-        />
-      )}
-      {/* enquanto sonda, mostra o vetor pra não piscar vazio */}
-      {source === null && (
+      {hasVideo !== true && (
         <div className="absolute inset-0 grid place-items-center">
           <XarloteSwim size={size * 0.92} />
         </div>
