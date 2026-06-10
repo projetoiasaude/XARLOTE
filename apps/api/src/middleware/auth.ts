@@ -56,3 +56,44 @@ export async function requireAdminToken(req: FastifyRequest, reply: FastifyReply
     return;
   }
 }
+
+let warnedMissingAppToken = false;
+
+/**
+ * Auth das rotas DO APP CLIENTE (`/app`). Diferente do admin: o bundle do app
+ * é PÚBLICO (qualquer um baixa o JS), então NÃO pode carregar o token de admin
+ * (que apaga banco / troca chave da LLM / lê tudo via /admin). Este gate aceita
+ * um `APP_API_TOKEN` dedicado (escopo só /app) — e também o admin, por conveniência
+ * em dev/local. Mesmo header (`x-admin-token` / Bearer).
+ *
+ * Risco residual conhecido (MVP): com o app-token público, dá pra consultar /app
+ * por telefone — é o mesmo nível de "auth" do pareamento atual (digitar o número).
+ * A blindagem real (Supabase Auth + OTP + RLS por usuário) é a próxima fase.
+ */
+export async function requireAppToken(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const accepted = [process.env['APP_API_TOKEN'], process.env['ADMIN_API_TOKEN']].filter(
+    (t): t is string => typeof t === 'string' && t.length > 0,
+  );
+  const isProd = process.env['NODE_ENV'] === 'production';
+
+  if (accepted.length === 0) {
+    if (isProd) {
+      reply.code(503).send({
+        error: 'app_auth_not_configured',
+        message: 'APP_API_TOKEN não configurado no servidor.',
+      });
+      return;
+    }
+    if (!warnedMissingAppToken) {
+      req.log.warn('⚠️  APP_API_TOKEN/ADMIN_API_TOKEN não definidos — /app está ABERTO (modo dev).');
+      warnedMissingAppToken = true;
+    }
+    return;
+  }
+
+  const provided = extractToken(req);
+  if (!provided || !accepted.some((t) => constantTimeEquals(provided, t))) {
+    reply.code(401).send({ error: 'unauthorized', message: 'Token do app ausente ou inválido.' });
+    return;
+  }
+}

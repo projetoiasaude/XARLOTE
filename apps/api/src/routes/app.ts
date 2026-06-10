@@ -5,7 +5,7 @@ import { buildSimulatedInbound } from '@iasaude/whatsapp';
 import { SARA_INSTANCE } from '@iasaude/shared';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { loadPrompts } from '../config/prompts.js';
-import { requireAdminToken } from '../middleware/auth.js';
+import { requireAppToken } from '../middleware/auth.js';
 
 /**
  * Rotas do XARLOTE APP (cliente final) — chat espelhado do WhatsApp + saúde 360 +
@@ -33,7 +33,8 @@ const ReminderActionSchema = z.object({
 });
 
 export async function appRoute(app: FastifyInstance) {
-  app.addHook('preHandler', requireAdminToken);
+  // Gate dedicado do app (NÃO o token de admin — bundle é público). Ver requireAppToken.
+  app.addHook('preHandler', requireAppToken);
 
   // ─── Overview agregado: tudo que as telas do app precisam, em 1 round-trip ────
   app.get<{ Params: { phone: string } }>('/overview/:phone', async (req, reply) => {

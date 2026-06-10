@@ -2,7 +2,10 @@
 import { useEffect } from 'react';
 
 const API = process.env['NEXT_PUBLIC_API_URL'] ?? 'http://localhost:3001';
-const TOKEN = process.env['NEXT_PUBLIC_ADMIN_API_TOKEN'] ?? '';
+// Em deploy público (app do cliente) usa-se o APP token (escopo só /app).
+// Em dev/local usa-se o ADMIN token (abre /admin do dashboard também).
+const TOKEN =
+  process.env['NEXT_PUBLIC_APP_API_TOKEN'] ?? process.env['NEXT_PUBLIC_ADMIN_API_TOKEN'] ?? '';
 
 /**
  * Injeta o header `x-admin-token` em TODA chamada fetch destinada à API
