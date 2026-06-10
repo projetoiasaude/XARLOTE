@@ -24,7 +24,13 @@ function corsOrigins(): boolean | Array<string | RegExp> {
   const env = process.env['CORS_ORIGINS'];
   if (env) return env.split(',').map((s) => s.trim()).filter(Boolean);
   if (process.env['NODE_ENV'] !== 'production') {
-    return [/^http:\/\/localhost:\d+$/, /^http:\/\/127\.0\.0\.1:\d+$/];
+    // Inclui IPs privados (192.168.x / 10.x) pra testar o app no celular via Wi-Fi local.
+    return [
+      /^http:\/\/localhost:\d+$/,
+      /^http:\/\/127\.0\.0\.1:\d+$/,
+      /^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:\d+$/,
+      /^http:\/\/10\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$/,
+    ];
   }
   return false;
 }
