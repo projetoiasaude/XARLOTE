@@ -4,7 +4,7 @@ import { useRouter } from 'next/navigation';
 import { motion } from 'framer-motion';
 import { ArrowRight, MessageCircle, ShieldCheck, Sparkles } from 'lucide-react';
 import { GlassButton, GlassInput } from '@/components/ui';
-import { XarloteSwim } from '@/components/xarlote/XarloteSwim';
+import { XarloteHero } from '@/components/xarlote/XarloteHero';
 import { useXarloteApp } from '@/lib/xarlote/app-context';
 import { fetchOverview } from '@/lib/xarlote/api';
 import { normalizePhoneInput } from '@/lib/xarlote/pairing';
@@ -61,7 +61,7 @@ export default function EntrarPage() {
     <main className="flex flex-1 flex-col items-center justify-center px-6 py-12 pt-safe pb-safe">
       <motion.div variants={stagger} initial="hidden" animate="show" className="flex w-full max-w-sm flex-col items-center">
         <motion.div variants={item}>
-          <XarloteSwim size={210} />
+          <XarloteHero size={240} />
         </motion.div>
 
         <motion.h1
