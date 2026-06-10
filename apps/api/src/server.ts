@@ -6,6 +6,7 @@ import { healthRoute } from './routes/health.js';
 import { simulateRoute } from './routes/simulate.js';
 import { webhookRoute } from './routes/webhook.uazapi.js';
 import { adminRoute } from './routes/admin.js';
+import { appRoute } from './routes/app.js';
 import { startAllWorkers } from './workers/start-all.js';
 import { closeOutbound } from './queues/outbound.queue.js';
 import { installShutdownHandlers, onShutdown } from './lifecycle.js';
@@ -83,6 +84,8 @@ async function main() {
     app.register(simulateRoute, { prefix: '/api' });
     app.register(webhookRoute, { prefix: '/webhook' });
     app.register(adminRoute, { prefix: '/admin' });
+    // Rotas do Xarlote App (cliente final) — ativas também em produção.
+    app.register(appRoute, { prefix: '/app' });
   }
 
   const port = Number(process.env['PORT'] ?? 3001);
