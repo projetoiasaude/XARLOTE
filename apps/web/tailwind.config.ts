@@ -73,6 +73,11 @@ export default {
         'fade-up': 'fadeUp 0.45s cubic-bezier(0.22, 1, 0.36, 1)',
         'fade-in': 'fadeIn 0.35s ease-out',
         'pulse-ring': 'pulseRing 1.6s ease-out infinite',
+        // ── Xarlote App ──
+        floaty: 'floaty 3.6s ease-in-out infinite',
+        breathe: 'breathe 2.8s ease-in-out infinite',
+        'dot-wave': 'dotWave 1.15s ease-in-out infinite',
+        'aurora-flow': 'auroraFlow 2.6s linear infinite',
       },
       keyframes: {
         orb1: {
@@ -102,6 +107,23 @@ export default {
         pulseRing: {
           '0%': { transform: 'scale(1)', opacity: '0.7' },
           '100%': { transform: 'scale(2.4)', opacity: '0' },
+        },
+        // ── Xarlote App ──
+        floaty: {
+          '0%, 100%': { transform: 'translateY(0px)' },
+          '50%': { transform: 'translateY(-5px)' },
+        },
+        breathe: {
+          '0%, 100%': { boxShadow: '0 0 28px -10px rgba(124,135,255,0.45)' },
+          '50%': { boxShadow: '0 0 44px -8px rgba(155,92,246,0.65)' },
+        },
+        dotWave: {
+          '0%, 60%, 100%': { transform: 'translateY(0)', opacity: '0.45' },
+          '30%': { transform: 'translateY(-4px)', opacity: '1' },
+        },
+        auroraFlow: {
+          '0%': { backgroundPosition: '0% 50%' },
+          '100%': { backgroundPosition: '200% 50%' },
         },
       },
     },
