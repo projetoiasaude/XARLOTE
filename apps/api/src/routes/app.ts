@@ -1,19 +1,20 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { db, findUserByPhone, writeEvent } from '@iasaude/db';
 import { buildSimulatedInbound } from '@iasaude/whatsapp';
-import { SARA_INSTANCE } from '@iasaude/shared';
+import { SARA_INSTANCE, nextOccurrence } from '@iasaude/shared';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { loadPrompts } from '../config/prompts.js';
 import { requireAppToken } from '../middleware/auth.js';
+import { checkUserRateLimit } from '../middleware/rate-limit.js';
 
 /**
  * Rotas do XARLOTE APP (cliente final) — chat espelhado do WhatsApp + saúde 360 +
  * lembretes + atividade. Diferente do /api/simulate (ferramenta de dev, 404 em prod),
  * estas rotas são DE PRODUTO e ficam ativas em produção.
  *
- * Auth: mesmo token compartilhado do dashboard (F0). Quando nascer a auth de usuário
- * final (Supabase Auth + OTP via WhatsApp), troca-se só este preHandler.
+ * Auth: token dedicado do app (F0). Quando nascer a auth de usuário final
+ * (Supabase Auth + OTP via WhatsApp), troca-se só este preHandler.
  */
 
 function normalizePhone(raw: string): string {
@@ -21,13 +22,58 @@ function normalizePhone(raw: string): string {
   return trimmed.startsWith('+') ? trimmed : `+${trimmed}`;
 }
 
+/** E.164 plausível: + e 10–15 dígitos. Barra lixo antes de tocar no banco. */
+function isValidPhone(phoneE164: string): boolean {
+  return /^\+\d{10,15}$/.test(phoneE164);
+}
+
+/**
+ * Variantes do 9º dígito BR: o WhatsApp às vezes registra o celular SEM o 9
+ * (+55 62 8345024x) enquanto a pessoa digita COM o 9 (+55 62 9 8345024x) — e
+ * vice-versa. Sem isso, o login no app dá user_not_found pra um usuário real.
+ */
+function brPhoneVariants(phoneE164: string): string[] {
+  const variants = [phoneE164];
+  const m = phoneE164.match(/^\+55(\d{2})(\d+)$/);
+  if (m) {
+    const [, ddd, subscriber] = m;
+    if (subscriber!.length === 9 && subscriber!.startsWith('9')) {
+      variants.push(`+55${ddd}${subscriber!.slice(1)}`); // remove o 9
+    } else if (subscriber!.length === 8) {
+      variants.push(`+55${ddd}9${subscriber}`); // insere o 9
+    }
+  }
+  return variants;
+}
+
+async function findAppUser(phoneE164: string) {
+  for (const candidate of brPhoneVariants(phoneE164)) {
+    const user = await findUserByPhone(candidate);
+    if (user) return user;
+  }
+  return null;
+}
+
+/** Anti-flood: o token do app é público (bundle) — sem isso, /inbound vira torneira de custo LLM. */
+async function appRateLimit(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const body = req.body as { phone?: string } | undefined;
+  const params = req.params as { phone?: string } | undefined;
+  const key = body?.phone ?? params?.phone ?? req.ip;
+  const result = await checkUserRateLimit(`app:${key}`);
+  if (!result.allowed) {
+    await reply.code(429).send({ error: 'rate_limited', message: 'Calma! Muitas mensagens em sequência. Tenta de novo em alguns segundos.' });
+  }
+}
+
+const PhoneSchema = z.object({ phone: z.string().min(8).max(20) });
+
 const InboundSchema = z.object({
-  phone: z.string().min(8),
+  phone: z.string().min(8).max(20),
   text: z.string().min(1).max(4000),
 });
 
 const ReminderActionSchema = z.object({
-  phone: z.string().min(8),
+  phone: z.string().min(8).max(20),
   action: z.enum(['done', 'snooze', 'cancel']),
   minutes: z.number().int().min(5).max(24 * 60).optional(),
 });
@@ -35,11 +81,15 @@ const ReminderActionSchema = z.object({
 export async function appRoute(app: FastifyInstance) {
   // Gate dedicado do app (NÃO o token de admin — bundle é público). Ver requireAppToken.
   app.addHook('preHandler', requireAppToken);
+  app.addHook('preHandler', appRateLimit);
 
   // ─── Overview agregado: tudo que as telas do app precisam, em 1 round-trip ────
-  app.get<{ Params: { phone: string } }>('/overview/:phone', async (req, reply) => {
-    const phoneE164 = normalizePhone(req.params.phone);
-    const user = await findUserByPhone(phoneE164);
+  // POST com phone no body (telefone na URL vazaria pros access logs — LGPD).
+  // O GET /overview/:phone segue como alias deprecado até o front 100% migrado.
+  const overviewHandler = async (phoneRaw: string, reply: FastifyReply) => {
+    const phoneE164 = normalizePhone(phoneRaw);
+    if (!isValidPhone(phoneE164)) return reply.code(400).send({ error: 'invalid_phone' });
+    const user = await findAppUser(phoneE164);
     if (!user) return reply.code(404).send({ error: 'user_not_found' });
 
     const uid = user.id;
@@ -144,7 +194,18 @@ export async function appRoute(app: FastifyInstance) {
       symptoms: sympt.data ?? [],
       medicationLog: medlog.data ?? [],
     });
+  };
+
+  app.post('/overview', async (req, reply) => {
+    const parsed = PhoneSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    return overviewHandler(parsed.data.phone, reply);
   });
+
+  // DEPRECADO (telefone na URL): remover quando o front estiver 100% no POST.
+  app.get<{ Params: { phone: string } }>('/overview/:phone', async (req, reply) =>
+    overviewHandler(req.params.phone, reply),
+  );
 
   // ─── Enviar mensagem pelo app → MESMO pipeline do WhatsApp ────────────────────
   app.post('/inbound', async (req, reply) => {
@@ -159,7 +220,13 @@ export async function appRoute(app: FastifyInstance) {
       });
     }
 
-    const phoneE164 = normalizePhone(parsed.data.phone);
+    let phoneE164 = normalizePhone(parsed.data.phone);
+    if (!isValidPhone(phoneE164)) return reply.code(400).send({ error: 'invalid_phone' });
+    // Canonicaliza pro telefone do usuário JÁ EXISTENTE (variante do 9º dígito BR)
+    // — senão o app criaria um usuário duplicado descolado da conversa real.
+    const existing = await findAppUser(phoneE164);
+    if (existing?.phone_e164) phoneE164 = existing.phone_e164;
+
     // name omitido de propósito: pushName só é usado na CRIAÇÃO de usuário novo;
     // pra quem já existe, nada é sobrescrito.
     const normalized = buildSimulatedInbound({
@@ -169,11 +236,21 @@ export async function appRoute(app: FastifyInstance) {
     });
     delete normalized.from.pushName;
 
-    const result = await processInboundUser(normalized);
+    let result: { traceId: string; conversationId: string };
+    try {
+      result = await processInboundUser(normalized);
+    } catch (err) {
+      req.log.error({ err }, 'processInboundUser falhou no /app/inbound');
+      return reply.code(502).send({
+        ok: false,
+        error: 'processing_failed',
+        message: 'Não consegui processar sua mensagem agora. Tenta de novo em instantes.',
+      });
+    }
 
     void writeEvent({
       eventName: 'app.message_sent',
-      userId: undefined,
+      userId: existing?.id,
       conversationId: result.conversationId,
       traceId: result.traceId,
       payload: { channel: 'xarlote_app', length: parsed.data.text.length },
@@ -188,12 +265,13 @@ export async function appRoute(app: FastifyInstance) {
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
 
     const phoneE164 = normalizePhone(parsed.data.phone);
-    const user = await findUserByPhone(phoneE164);
+    if (!isValidPhone(phoneE164)) return reply.code(400).send({ error: 'invalid_phone' });
+    const user = await findAppUser(phoneE164);
     if (!user) return reply.code(404).send({ error: 'user_not_found' });
 
     const { data: reminder } = await db
       .from('reminders')
-      .select('id, user_id, status, next_run_at')
+      .select('id, user_id, status, next_run_at, rrule')
       .eq('id', req.params.id)
       .maybeSingle();
 
@@ -201,9 +279,18 @@ export async function appRoute(app: FastifyInstance) {
     if (reminder.user_id !== user.id) return reply.code(403).send({ error: 'forbidden' });
 
     const action = parsed.data.action;
+    // Cancelado é terminal: done/snooze não ressuscitam (cancel de novo é no-op OK).
+    if (reminder.status === 'cancelled' && action !== 'cancel') {
+      return reply.code(409).send({ error: 'reminder_cancelled' });
+    }
+    // "done" num recorrente = concluiu o de HOJE → reagenda o próximo e segue
+    // pending (acknowledged mataria a recorrência). One-shot → acknowledged.
+    const nextRecurring = reminder.rrule ? nextOccurrence(reminder.rrule) : null;
     const patch: Record<string, unknown> =
       action === 'done'
-        ? { status: 'acknowledged' }
+        ? nextRecurring
+          ? { status: 'pending', next_run_at: nextRecurring.toISOString(), last_run_at: new Date().toISOString() }
+          : { status: 'acknowledged' }
         : action === 'cancel'
           ? { status: 'cancelled' }
           : {

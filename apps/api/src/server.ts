@@ -64,6 +64,17 @@ async function main() {
         ],
         censor: '[redacted]',
       },
+      // Telefone aparece em paths tipo /app/overview/+55... — mascara qualquer
+      // sequência longa de dígitos na URL logada (LGPD / CLAUDE.md regra 3).
+      serializers: {
+        req(req: { method: string; url: string; headers: Record<string, unknown>; socket?: { remoteAddress?: string } }) {
+          return {
+            method: req.method,
+            url: req.url.replace(/\d{8,}/g, (m) => `${m.slice(0, 4)}…${m.slice(-2)}`),
+            remoteAddress: req.socket?.remoteAddress,
+          };
+        },
+      },
       transport:
         process.env['NODE_ENV'] !== 'production'
           ? { target: 'pino-pretty', options: { colorize: true } }

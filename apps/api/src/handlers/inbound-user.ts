@@ -75,11 +75,19 @@ export async function processInboundUser(
     db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversation.id),
   ]);
 
-  // 5a. Comando especial @teste — zera tudo e reinicia Xarlote
+  // 5a. Comando especial @teste — zera tudo e reinicia Xarlote.
+  // SÓ em modo simulador (dev local): em produção isso apagaria o banco INTEIRO
+  // de todos os usuários — qualquer pessoa digitando "@teste" no WhatsApp real
+  // ou via POST /app/inbound destruiria dados clínicos + consent_events (LGPD).
   if (inbound.text?.trim() === '@teste') {
-    await resetAllData(db);
-    await sendOutbound(conversation.id, phoneE164, '🔄 Reset completo! Pode começar do zero.', traceId);
-    return { traceId, conversationId: conversation.id };
+    if (!isSimulatorMode()) {
+      await writeLog('warn', 'inbound', 'Comando @teste IGNORADO (só funciona em modo simulador)', { traceId, userId: user.id });
+      // segue o fluxo normal: a Xarlote trata como mensagem comum
+    } else {
+      await resetAllData(db);
+      await sendOutbound(conversation.id, phoneE164, '🔄 Reset completo! Pode começar do zero.', traceId);
+      return { traceId, conversationId: conversation.id };
+    }
   }
 
   // 5a.1 RED FLAG — se há pending ativo e mensagem parece resposta de botão,
@@ -649,6 +657,9 @@ async function handleForgetMe(userId: string, conversationId: string, phoneE164:
   await db.from('user_medications').delete().eq('user_id', userId);
   await db.from('user_addresses').delete().eq('user_id', userId);
   await deleteUserMemory(userId);
+  // Fonte CANÔNICA dos memory cards é o JSONB da conversa — deleteUserMemory só
+  // limpa o índice; sem isto, dados de saúde sobreviviam ao apagamento LGPD.
+  await db.from('conversations').update({ memory_cards: [] }).eq('user_id', userId);
   await db.from('users').update({ phone_e164: `deleted-${userId}`, full_name: null, preferred_name: null, deleted_at: new Date().toISOString() }).eq('id', userId);
 
   await writeAudit({
@@ -662,7 +673,7 @@ async function handleForgetMe(userId: string, conversationId: string, phoneE164:
       phone_e164_anonymized: `deleted-${userId}`,
       tables_cleared: [
         'messages', 'user_health_conditions', 'user_allergies', 'user_medications',
-        'user_addresses', 'memory_cards_index',
+        'user_addresses', 'memory_cards_index', 'conversations.memory_cards',
       ],
     },
   });
