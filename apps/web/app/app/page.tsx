@@ -6,7 +6,7 @@ import { ArrowDown, Phone } from 'lucide-react';
 import { dayLabel } from '@/lib/xarlote/format';
 import { useXarloteApp } from '@/lib/xarlote/app-context';
 import { useXarloteChat } from '@/lib/xarlote/use-chat';
-import { XarloteSwim } from '@/components/xarlote/XarloteSwim';
+import { XarloteLogo } from '@/components/xarlote/XarloteLogo';
 import { LiquidCore } from '@/components/xarlote/LiquidCore';
 import { MessageBubble } from '@/components/xarlote/chat/MessageBubble';
 import { TypingIndicator } from '@/components/xarlote/chat/TypingIndicator';
@@ -123,7 +123,7 @@ function ChatScreen() {
           </div>
         ) : messages.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center text-center">
-            <XarloteSwim size={170} />
+            <XarloteLogo size={170} />
             <p className="mt-4 text-base font-semibold">
               {firstName ? `Oi, ${firstName}!` : 'Oi! Eu sou a Xarlote.'}
             </p>

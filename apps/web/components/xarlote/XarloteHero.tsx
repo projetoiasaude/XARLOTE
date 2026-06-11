@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { cn } from '@/lib/utils';
-import { XarloteSwim } from './XarloteSwim';
+import { XarloteLogo } from './XarloteLogo';
 import { XarloteVideoAlpha } from './XarloteVideoAlpha';
 
 interface Props {
@@ -16,7 +16,7 @@ const ALPHA_SRC = '/xarlote-alpha.mp4';
  * Herói da entrada — toca o VÍDEO 3D do mascote JÁ RECORTADO (fundo removido),
  * recomposto no GPU (XarloteVideoAlpha) pra rodar em Android e iOS. O mascote
  * flutua sobre o fundo aurora do app, sem moldura. Enquanto o arquivo não existe
- * (ou sem GPU), cai com elegância no desenho vetorial animado.
+ * (ou sem GPU), cai com elegância na logo oficial.
  */
 export function XarloteHero({ size = 240, className }: Props) {
   // null = sondando · true = achou vídeo · false = sem vídeo (fallback SVG)
@@ -55,12 +55,12 @@ export function XarloteHero({ size = 240, className }: Props) {
           transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
           className="relative"
         >
-          <XarloteVideoAlpha src={ALPHA_SRC} size={size} fallback={<XarloteSwim size={size} />} />
+          <XarloteVideoAlpha src={ALPHA_SRC} size={size} fallback={<XarloteLogo size={size} glow={false} />} />
         </motion.div>
       )}
       {hasVideo !== true && (
         <div className="absolute inset-0 grid place-items-center">
-          <XarloteSwim size={size * 0.92} />
+          <XarloteLogo size={size * 0.82} glow={false} />
         </div>
       )}
     </div>

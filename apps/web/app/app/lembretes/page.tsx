@@ -19,7 +19,7 @@ import {
 } from 'lucide-react';
 import { GlassBadge, GlassButton, Skeleton } from '@/components/ui';
 import { Screen, screenItem } from '@/components/xarlote/Screen';
-import { XarloteSwim } from '@/components/xarlote/XarloteSwim';
+import { XarloteLogo } from '@/components/xarlote/XarloteLogo';
 import { LiquidCore } from '@/components/xarlote/LiquidCore';
 import { useXarloteApp } from '@/lib/xarlote/app-context';
 import { reminderAction } from '@/lib/xarlote/api';
@@ -119,7 +119,7 @@ export default function LembretesPage() {
         </div>
       ) : active.length === 0 ? (
         <motion.div variants={screenItem} className="glass flex flex-col items-center rounded-3xl p-8 text-center">
-          <XarloteSwim size={150} />
+          <XarloteLogo size={150} />
           <p className="mt-3 text-sm font-medium">Nenhum lembrete programado</p>
           <p className="mt-1 max-w-[290px] text-xs text-white/50">
             Quando você começar um tratamento, a Xarlote cria os despertadores sozinha — horário certo, contagem de

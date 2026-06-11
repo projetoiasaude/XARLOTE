@@ -7,7 +7,7 @@ interface Props {
   src: string;
   size?: number;
   className?: string;
-  /** mostrado se o WebGL/vídeo falhar (ex.: XarloteSwim vetorial) */
+  /** mostrado se o WebGL/vídeo falhar (ex.: a logo oficial) */
   fallback?: ReactNode;
 }
 

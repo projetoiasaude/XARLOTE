@@ -2,7 +2,7 @@
 import { useEffect, type ReactNode } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { useXarloteApp } from '@/lib/xarlote/app-context';
-import { XarloteSwim } from './XarloteSwim';
+import { XarloteLogo } from './XarloteLogo';
 
 /**
  * Sem aparelho pareado → /app/entrar. Enquanto hidrata o localStorage,
@@ -21,7 +21,7 @@ export function PairGuard({ children }: { children: ReactNode }) {
   if (!ready || (!phone && !onEntrar)) {
     return (
       <div className="relative z-10 flex min-h-dvh items-center justify-center">
-        <XarloteSwim size={150} />
+        <XarloteLogo size={150} />
       </div>
     );
   }
