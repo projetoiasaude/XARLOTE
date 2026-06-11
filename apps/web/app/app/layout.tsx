@@ -14,13 +14,21 @@ export const metadata: Metadata = {
     title: 'Xarlote',
     statusBarStyle: 'black-translucent',
   },
+  icons: {
+    // PNG do mascote 3D real (frame do vídeo) — iOS ignora SVG no home screen.
+    apple: '/apple-touch-icon.png',
+    icon: [
+      { url: '/xarlote-icon-192.png', sizes: '192x192', type: 'image/png' },
+      { url: '/xarlote-icon.svg', type: 'image/svg+xml' },
+    ],
+  },
 };
 
 export const viewport: Viewport = {
   themeColor: '#04041a',
   width: 'device-width',
   initialScale: 1,
-  maximumScale: 1,
+  // sem maximumScale: bloquear pinch-zoom é barreira de acessibilidade (WCAG 1.4.4)
   viewportFit: 'cover',
 };
 

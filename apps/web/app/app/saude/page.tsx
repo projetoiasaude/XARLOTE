@@ -82,7 +82,7 @@ function inventoryFor(invs: XarInventory[], medicationId: string): XarInventory 
 
 export default function SaudePage() {
   const router = useRouter();
-  const { overview, overviewLoading } = useXarloteApp();
+  const { overview, overviewLoading, overviewError, refreshOverview } = useXarloteApp();
   const [tlFilter, setTlFilter] = useState('tudo');
 
   const timeline = useMemo(() => (overview ? buildTimeline(overview) : []), [overview]);
@@ -97,6 +97,17 @@ export default function SaudePage() {
             <Skeleton variant="card" className="h-40" />
             <Skeleton variant="card" className="h-40" />
           </div>
+        ) : overviewError ? (
+          // API fora do ar/limitada ≠ usuário novo — sem isso, o erro renderizava
+          // o empty-state de onboarding (confuso pra quem já tem histórico)
+          <motion.div variants={screenItem} className="glass flex flex-col items-center rounded-3xl p-8 text-center">
+            <XarloteSwim size={130} />
+            <p className="mt-3 text-sm font-medium">Não consegui falar com a Xarlote agora</p>
+            <p className="mt-1 max-w-[280px] text-xs text-white/50">{overviewError}</p>
+            <GlassButton variant="primary" size="md" className="mt-4" onClick={() => void refreshOverview()}>
+              Tentar de novo
+            </GlassButton>
+          </motion.div>
         ) : (
           <motion.div variants={screenItem} className="glass flex flex-col items-center rounded-3xl p-8 text-center">
             <XarloteSwim size={150} />
@@ -118,7 +129,8 @@ export default function SaudePage() {
   const activeReminders = overview.reminders.filter((r) => ['pending', 'sent', 'snoozed'].includes(r.status)).length;
 
   const hasAnything =
-    overview.medications.length + overview.conditions.length + overview.allergies.length + overview.treatments.length + timeline.length > 0;
+    overview.medications.length + overview.conditions.length + overview.allergies.length +
+      overview.treatments.length + overview.prescribers.length + timeline.length > 0;
 
   return (
     <Screen title="Saúde 360" subtitle="tudo que a Xarlote acompanha por você">

@@ -43,12 +43,21 @@ export function useXarloteChat() {
     }
     if (conversationId) return;
     let cancelled = false;
-    const jid = `${phone.replace('+', '')}@s.whatsapp.net`;
+    // Variantes do 9º dígito BR: o WhatsApp às vezes registra sem o 9 — tenta
+    // os dois jids (senão usuário real vê "conversa vazia" até o overview chegar).
+    const digits = phone.replace('+', '');
+    const jids = [`${digits}@s.whatsapp.net`];
+    const br = /^55(\d{2})(\d+)$/.exec(digits);
+    if (br) {
+      const [, ddd, sub] = br;
+      if (sub!.length === 9 && sub!.startsWith('9')) jids.push(`55${ddd}${sub!.slice(1)}@s.whatsapp.net`);
+      else if (sub!.length === 8) jids.push(`55${ddd}9${sub}@s.whatsapp.net`);
+    }
     void supabase
       .from('conversations')
       .select('id')
       .eq('whatsapp_instance', 'sara')
-      .eq('whatsapp_jid', jid)
+      .in('whatsapp_jid', jids)
       .order('last_message_at', { ascending: false })
       .limit(1)
       .maybeSingle()
@@ -70,14 +79,29 @@ export function useXarloteChat() {
       .order('created_at', { ascending: false })
       .limit(PAGE);
     const server = ((data ?? []) as XarMessage[]).reverse();
+    const cutoff = Date.now() - 10 * 60_000;
     setMessages((prev) => {
-      const stillPending = prev.filter(
-        (m) => m.pending && !server.some((s) => s.direction === 'in' && s.content === m.content),
+      // Mantém otimistas (pending) E falhadas (failed — senão o botão de retry
+      // some num reload). Eco só casa com mensagem RECENTE — texto idêntico no
+      // histórico antigo não pode "engolir" a bolha que está sendo enviada.
+      const local = prev.filter(
+        (m) =>
+          (m.pending || m.failed) &&
+          !server.some(
+            (s) =>
+              s.direction === 'in' &&
+              s.content === m.content &&
+              new Date(s.created_at).getTime() > cutoff,
+          ),
       );
-      return [...server, ...stillPending];
+      return [...server, ...local];
     });
+    // Resposta pode ter chegado por aqui (não pelo realtime — ex: onboarding de
+    // usuário novo, websocket caído) — destrava o "digitando…".
+    const last = server[server.length - 1];
+    if (last?.direction === 'out') stopTyping();
     setLoading(false);
-  }, []);
+  }, [stopTyping]);
 
   useEffect(() => {
     if (!conversationId) return;
@@ -114,6 +138,17 @@ export function useXarloteChat() {
     };
   }, [conversationId, loadMessages, stopTyping]);
 
+  // ── Recupera eventos perdidos: celular bloqueado/aba em background derruba o
+  //    websocket e o realtime perde INSERTs — ao voltar, recarrega do banco. ──
+  useEffect(() => {
+    if (!conversationId) return;
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void loadMessages(conversationId);
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [conversationId, loadMessages]);
+
   // ── Envio (otimista, pipeline real) ─────────────────────────────────────────
   const send = useCallback(
     async (text: string) => {
@@ -143,9 +178,14 @@ export function useXarloteChat() {
           void loadMessages(res.conversationId);
         }
       } catch {
+        // O POST pode falhar DEPOIS da mensagem já ter sido persistida (timeout
+        // na resposta da LLM, rede). Recarrega antes de marcar como falha — se
+        // ela está no servidor, o eco substitui a bolha e o retry (que geraria
+        // DUPLICATA na conversa real do WhatsApp) nem aparece.
+        if (conversationId) await loadMessages(conversationId).catch(() => {});
         stopTyping();
         setMessages((prev) =>
-          prev.map((m) => (m.id === tempId ? { ...m, pending: false, failed: true } : m)),
+          prev.map((m) => (m.id === tempId && m.pending ? { ...m, pending: false, failed: true } : m)),
         );
       }
     },

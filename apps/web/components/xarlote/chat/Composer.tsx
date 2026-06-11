@@ -19,6 +19,8 @@ export function Composer({ onSend, draft, disabled }: Props) {
     if (draft) {
       setText(draft);
       ref.current?.focus();
+      // o setText ainda não commitou — redimensiona no próximo frame
+      requestAnimationFrame(() => autoresize());
     }
   }, [draft]);
 
@@ -63,7 +65,8 @@ export function Composer({ onSend, draft, disabled }: Props) {
             }
           }}
           className={cn(
-            'max-h-[110px] min-h-[36px] flex-1 resize-none bg-transparent py-1.5 text-[15px] text-white',
+            // 16px no mínimo: fonte menor faz o iOS dar zoom automático no foco
+            'max-h-[110px] min-h-[36px] flex-1 resize-none bg-transparent py-1.5 text-[16px] text-white',
             'placeholder:text-white/35 focus:outline-none disabled:opacity-50',
           )}
         />

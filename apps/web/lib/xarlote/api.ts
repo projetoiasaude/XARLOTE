@@ -15,7 +15,13 @@ async function parseError(res: Response): Promise<string> {
 }
 
 export async function fetchOverview(phone: string): Promise<XarOverview | null> {
-  const res = await fetch(apiUrl(`/app/overview/${encodeURIComponent(phone)}`), { cache: 'no-store' });
+  // POST com phone no body — telefone na URL vazaria pros access logs (LGPD).
+  const res = await fetch(apiUrl('/app/overview'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone }),
+    cache: 'no-store',
+  });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(await parseError(res));
   return (await res.json()) as XarOverview;

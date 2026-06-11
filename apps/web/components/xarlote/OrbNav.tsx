@@ -26,6 +26,10 @@ const ITEMS: NavItem[] = [
 const RADIUS = 152;
 const angleFor = (i: number, total: number) => 86 + (i * 104) / (total - 1);
 
+// Cores das "luas" que orbitam o orb fechado (aurora-blue, accent, aurora-purple,
+// aurora-pink) — mesma paleta das bolhas que desabrocham.
+const SATELLITES = ['#3b6ef5', '#7c87ff', '#9b5cf6', '#d946ef'];
+
 /**
  * A Bolha da Xarlote — navegação radial. O mascote vive num orb de vidro
  * flutuante; tocar nele desabrocha as 5 bolhas em arco. O orb também é
@@ -64,11 +68,13 @@ export function OrbNav() {
     [pathname, router],
   );
 
-  // Esc fecha · dígitos 1-5 navegam com o menu aberto
+  // Esc fecha · dígitos 1-5 navegam com o menu aberto (nunca roubando digitação)
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setOpen(false);
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
       const n = parseInt(e.key, 10);
       if (n >= 1 && n <= ITEMS.length) go(ITEMS[n - 1]!.href);
     };
@@ -178,6 +184,35 @@ export function OrbNav() {
             <span className="absolute inset-0 rounded-full border-2 border-accent/70 animate-pulse-ring" />
           )}
           <LiquidCore size={52} mode={typing ? 'thinking' : open ? 'active' : 'idle'} />
+
+          {/* Satélites: 4 luas (uma por destino) orbitando o orb — a pista de que
+              tem um menu morando aqui. Ao abrir, elas somem: "viraram" as bolhas. */}
+          <AnimatePresence>
+            {!open && !typing && (
+              <motion.span
+                key="sats"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0, scale: 1.35 }}
+                transition={{ duration: 0.25 }}
+                aria-hidden
+                className="pointer-events-none absolute inset-0 animate-orbit"
+              >
+                {SATELLITES.map((color, i) => (
+                  <span
+                    key={color}
+                    className="absolute left-1/2 top-1/2 h-[6px] w-[6px] rounded-full"
+                    style={{
+                      backgroundColor: color,
+                      boxShadow: `0 0 6px ${color}`,
+                      // centra a lua no orb → gira o referencial → empurra pro raio
+                      transform: `translate(-50%, -50%) rotate(${(i * 360) / SATELLITES.length}deg) translateY(-31px)`,
+                    }}
+                  />
+                ))}
+              </motion.span>
+            )}
+          </AnimatePresence>
 
           {activeCount > 0 && (
             <span className="absolute -right-0.5 -top-0.5 flex h-5 min-w-5 items-center justify-center rounded-full bg-aurora-pink px-1 text-[10px] font-bold text-white shadow-glow-accent">

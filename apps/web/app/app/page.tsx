@@ -1,6 +1,6 @@
 'use client';
 import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { AnimatePresence, motion } from 'framer-motion';
 import { ArrowDown, Phone } from 'lucide-react';
 import { dayLabel } from '@/lib/xarlote/format';
@@ -28,8 +28,9 @@ function groupByDay(messages: XarMessage[]): Array<{ day: string; items: XarMess
 }
 
 function ChatScreen() {
+  const router = useRouter();
   const params = useSearchParams();
-  const draft = params.get('draft') ?? undefined;
+  const [draft, setDraft] = useState<string | undefined>(undefined);
   const { typing, overview } = useXarloteApp();
   const { messages, loading, send, retry } = useXarloteChat();
 
@@ -38,15 +39,30 @@ function ChatScreen() {
   const [nearBottom, setNearBottom] = useState(true);
   const [unseen, setUnseen] = useState(false);
 
+  // Consome o ?draft= UMA vez e limpa da URL — senão um reload/restauração do
+  // PWA repõe no composer um texto que já foi enviado.
+  useEffect(() => {
+    const d = params.get('draft');
+    if (d) {
+      setDraft(d);
+      router.replace('/app', { scroll: false });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params]);
+
   const groups = useMemo(() => groupByDay(messages), [messages]);
   const firstName = overview?.user.preferred_name?.split(' ')[0];
 
-  // Auto-scroll inteligente: gruda no fim só se você já estava no fim
+  // Auto-scroll inteligente: gruda no fim só se você já estava no fim.
+  // `unseen` só liga com mensagem NOVA (length) — não com "digitando…".
+  const prevCount = useRef(0);
   useEffect(() => {
+    const grew = messages.length > prevCount.current;
+    prevCount.current = messages.length;
     if (nearBottom) {
       bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
       setUnseen(false);
-    } else {
+    } else if (grew) {
       setUnseen(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

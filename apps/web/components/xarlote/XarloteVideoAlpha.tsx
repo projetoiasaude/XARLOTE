@@ -55,24 +55,11 @@ export function XarloteVideoAlpha({ src, size = 240, className, fallback }: Prop
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
+    if (failed) return; // já caiu pro fallback — não recria vídeo/GL
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const video = document.createElement('video');
-    video.muted = true;
-    video.defaultMuted = true;
-    video.loop = true;
-    video.autoplay = true;
-    video.playsInline = true;
-    video.setAttribute('muted', '');
-    video.setAttribute('playsinline', '');
-    video.setAttribute('webkit-playsinline', '');
-    video.preload = 'auto';
-    // src por último: garante que muted/playsInline já estejam setados antes do load
-    // (iOS exige isso pra autoplay inline). Mesma origem → sem crossOrigin (evita taint no Safari).
-    video.src = src;
-    videoRef.current = video;
-
+    // GL primeiro: se não há GPU, nem cria o <video> (evita download à toa).
     const gl = canvas.getContext('webgl', {
       alpha: true,
       premultipliedAlpha: true,
@@ -92,6 +79,21 @@ export function XarloteVideoAlpha({ src, size = 240, className, fallback }: Prop
       return;
     }
     gl.useProgram(prog);
+
+    const video = document.createElement('video');
+    video.muted = true;
+    video.defaultMuted = true;
+    video.loop = true;
+    video.autoplay = true;
+    video.playsInline = true;
+    video.setAttribute('muted', '');
+    video.setAttribute('playsinline', '');
+    video.setAttribute('webkit-playsinline', '');
+    video.preload = 'auto';
+    // src por último: garante que muted/playsInline já estejam setados antes do load
+    // (iOS exige isso pra autoplay inline). Mesma origem → sem crossOrigin (evita taint no Safari).
+    video.src = src;
+    videoRef.current = video;
 
     const buf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -122,12 +124,20 @@ export function XarloteVideoAlpha({ src, size = 240, className, fallback }: Prop
 
     const onError = () => setFailed(true);
     video.addEventListener('error', onError);
+    // autoplay pode ser bloqueado; tenta de novo no 1º toque/foco
+    const retryPlay = () => video.play().catch(() => {});
     video.play().catch(() => {
-      // autoplay pode ser bloqueado; tenta de novo no 1º toque/foco
-      const retry = () => video.play().catch(() => {});
-      window.addEventListener('pointerdown', retry, { once: true });
+      window.addEventListener('pointerdown', retryPlay, { once: true });
     });
     draw();
+
+    // GPU pode despejar o contexto (troca de aba longa, pressão de memória no
+    // mobile) — sem tratar, o canvas vira um quadrado congelado/preto.
+    const onContextLost = (e: Event) => {
+      e.preventDefault();
+      setFailed(true);
+    };
+    canvas.addEventListener('webglcontextlost', onContextLost);
 
     // Pausa quando fora da tela (economiza bateria); retoma ao voltar
     const onVis = () => {
@@ -136,14 +146,29 @@ export function XarloteVideoAlpha({ src, size = 240, className, fallback }: Prop
     };
     document.addEventListener('visibilitychange', onVis);
 
-    // Se em ~2.5s nada foi desenhado, assume falha → fallback
-    const guard = setTimeout(() => {
-      if (!uploaded) setFailed(true);
-    }, 2500);
+    // Guard de inicialização: rede lenta ganha mais tempo enquanto houver
+    // progresso de download; sem progresso nenhum (404/codec) → fallback.
+    let guardTries = 0;
+    let guard: ReturnType<typeof setTimeout>;
+    const armGuard = () => {
+      guard = setTimeout(() => {
+        if (uploaded) return;
+        const progressing = video.readyState >= 1 || video.networkState === HTMLMediaElement.NETWORK_LOADING;
+        if (progressing && guardTries < 4) {
+          guardTries += 1;
+          armGuard();
+        } else {
+          setFailed(true);
+        }
+      }, 2500);
+    };
+    armGuard();
 
     return () => {
       cancelAnimationFrame(raf);
       clearTimeout(guard);
+      window.removeEventListener('pointerdown', retryPlay);
+      canvas.removeEventListener('webglcontextlost', onContextLost);
       document.removeEventListener('visibilitychange', onVis);
       video.removeEventListener('error', onError);
       video.pause();
@@ -152,7 +177,7 @@ export function XarloteVideoAlpha({ src, size = 240, className, fallback }: Prop
       gl.deleteBuffer(buf);
       gl.deleteProgram(prog);
     };
-  }, [src]);
+  }, [src, failed]);
 
   if (failed && fallback) return <>{fallback}</>;
 

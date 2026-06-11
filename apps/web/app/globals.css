@@ -139,9 +139,20 @@
   .animate-floaty,
   .animate-breathe,
   .animate-dot-wave,
+  .animate-orbit,
   .animate-aurora-flow {
     animation: none !important;
   }
+}
+
+/* Satélites do OrbNav: as "luas" que orbitam o orb e pré-anunciam o menu */
+@keyframes orbit-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.animate-orbit {
+  animation: orbit-spin 16s linear infinite;
 }
 
 /* ────── Xarlote App ────────────────────────────────────────────────── */

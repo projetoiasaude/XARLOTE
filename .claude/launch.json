@@ -4,8 +4,14 @@
     {
       "name": "xarlote-web",
       "runtimeExecutable": "env",
-      "runtimeArgs": ["NEXT_PUBLIC_API_URL=http://192.168.1.193:3001", "pnpm", "--filter", "web", "dev"],
+      "runtimeArgs": ["NEXT_PUBLIC_API_URL=http://localhost:3001", "pnpm", "--filter", "web", "dev"],
       "port": 3002
+    },
+    {
+      "name": "xarlote-api",
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["ROLE=all", "WHATSAPP_MODE=simulator", "pnpm", "--filter", "@iasaude/api", "dev"],
+      "port": 3001
     }
   ]
 }

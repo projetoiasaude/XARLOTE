@@ -83,7 +83,10 @@ export default function LembretesPage() {
       ),
     );
     try {
-      await reminderAction(r.id, phone, action, action === 'snooze' ? 30 : undefined);
+      // A API é a verdade: "feito" num recorrente NÃO vira acknowledged — ela
+      // reagenda pro próximo horário (status pending + novo next_run_at).
+      const updated = await reminderAction(r.id, phone, action, action === 'snooze' ? 30 : undefined);
+      if (updated) setLocal((list) => list.map((it) => (it.id === r.id ? { ...it, ...updated } : it)));
       void refreshOverview();
     } catch {
       setLocal(prev); // rollback

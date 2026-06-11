@@ -232,7 +232,10 @@ export default function PerfilPage() {
               size="sm"
               variant="ghost"
               className="flex-1 text-rose-300/85 hover:bg-rose-500/10 hover:text-rose-200"
-              onClick={() => router.push('/app?draft=' + encodeURIComponent('esquecer'))}
+              onClick={() =>
+                // frase que CASA com FORGET_ME_PATTERNS — "esquecer" sozinho caía no LLM
+                router.push('/app?draft=' + encodeURIComponent('Quero apagar meus dados'))
+              }
             >
               <Trash2 size={13} /> Apagar tudo (LGPD)
             </GlassButton>

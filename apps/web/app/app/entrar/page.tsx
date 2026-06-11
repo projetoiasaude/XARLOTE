@@ -39,7 +39,9 @@ export default function EntrarPage() {
     try {
       const overview = await fetchOverview(phone);
       if (overview) {
-        pair(phone);
+        // Pareia com o telefone CANÔNICO do cadastro (a API resolve variantes do
+        // 9º dígito BR) — assim o jid derivado bate com a conversa real do WhatsApp.
+        pair(overview.user?.phone_e164 ?? phone);
         setTimeout(() => router.replace('/app'), 450);
       } else {
         setUnknown(phone);
