@@ -12,28 +12,21 @@
  */
 import { db, saveMemoryCard, writeLog } from '@iasaude/db';
 import { chat, embed } from '@iasaude/llm';
-import { readFileSync } from 'fs';
-import { join } from 'path';
 import { randomUUID } from 'crypto';
+import { loadPrompts } from '../config/prompts.js';
 
 const COMPACTION_THRESHOLD = 50;        // dispara quando conversa passa disso
 const COMPACTION_BATCH_SIZE = 30;       // condensa as N mais antigas dentre as não compactadas
 const KEEP_RECENT = 20;                  // mantém últimas 20 sempre
 
+// Config de modelos pela MESMA via da API (loadPrompts resolve via __dirname —
+// process.cwd() quebrava quando o worker não roda da raiz do repo).
 function loadModels(): { model: string; apiKey: string } {
-  try {
-    const raw = readFileSync(join(process.cwd(), 'apps/api/data/prompts.json'), 'utf-8');
-    const cfg = JSON.parse(raw);
-    return {
-      model: cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
-      apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'] || '',
-    };
-  } catch {
-    return {
-      model: process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
-      apiKey: process.env['OPENROUTER_API_KEY'] || '',
-    };
-  }
+  const cfg = loadPrompts();
+  return {
+    model: cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
+    apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'] || '',
+  };
 }
 
 const COMPACTOR_SYSTEM = `Você condensa conversas WhatsApp entre Xarlote e USUÁRIO em RESUMOS curtos preservando contexto importante de saúde.

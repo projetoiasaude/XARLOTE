@@ -67,6 +67,32 @@ export async function saveMemoryCard(input: SaveMemoryCardInput): Promise<Memory
     // tabela pode não existir ainda — ignora
   }
 
+  // 1b) Dedup SEMÂNTICO: as janelas de turno do enricher se sobrepõem e o mesmo
+  // fato volta PARAFRASEADO ("toma losartana de manhã" vs "usa losartana 50mg
+  // pela manhã") — o dedupe textual não pega. Reusa o match_user_memory com
+  // similaridade alta: se já existe card quase idêntico, só refresca.
+  if (input.embedding && input.embedding.length === 1536) {
+    try {
+      const { data: similar } = await db.rpc('match_user_memory', {
+        p_user_id: input.userId,
+        p_query_embedding: `[${input.embedding.join(',')}]`,
+        p_k: 1,
+        p_min_similarity: 0.92,
+      });
+      const hit = Array.isArray(similar) ? (similar[0] as MemoryCardIndexed | undefined) : undefined;
+      if (hit?.id && hit.kind === input.kind) {
+        const newConf = Math.min(1, (hit.confidence ?? 0.8) + 0.05);
+        await db
+          .from('memory_cards_index')
+          .update({ last_seen_at: now, confidence: newConf })
+          .eq('id', hit.id);
+        return { ...card, id: hit.id, text: hit.text, confidence: newConf };
+      }
+    } catch {
+      // RPC pode não existir — segue pro insert normal
+    }
+  }
+
   // 2) Insere indexado (com embedding se houver)
   try {
     const insertPayload: Record<string, unknown> = {

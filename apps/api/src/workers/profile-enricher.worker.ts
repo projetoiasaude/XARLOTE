@@ -14,8 +14,7 @@ import type { ProfileEnricherJob } from '@iasaude/shared';
 import { QUEUE_NAMES } from '@iasaude/shared';
 import { captureError } from '../observability/sentry.js';
 import { getRedisConnection } from '../queue-config.js';
-import { readFileSync } from 'fs';
-import { join } from 'path';
+import { loadPrompts } from '../config/prompts.js';
 
 interface EnrichOutput {
   facts?: Array<{ text: string; tags?: string[]; confidence: number }>;
@@ -30,25 +29,14 @@ interface EnrichOutput {
 
 const MIN_CONFIDENCE = 0.7;
 
-// Carrega config de modelos do prompts.json (mesmo arquivo que API usa).
-// Worker e API rodam no mesmo container Railway, então o caminho relativo bate.
+// Config de modelos pela MESMA via da API (loadPrompts resolve o prompts.json
+// via __dirname — process.cwd() quebrava quando o worker não roda da raiz do repo).
 function loadModels(): { model: string; apiKey: string } {
-  try {
-    const raw = readFileSync(
-      join(process.cwd(), 'apps/api/data/prompts.json'),
-      'utf-8'
-    );
-    const cfg = JSON.parse(raw) as { llm_model?: string; llm_api_key?: string };
-    return {
-      model: cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
-      apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'] || '',
-    };
-  } catch {
-    return {
-      model: process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
-      apiKey: process.env['OPENROUTER_API_KEY'] || '',
-    };
-  }
+  const cfg = loadPrompts();
+  return {
+    model: cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
+    apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'] || '',
+  };
 }
 
 async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
@@ -117,16 +105,23 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
   for (const a of parsed.allergies ?? []) {
     if (a.confidence < MIN_CONFIDENCE) continue;
     try {
-      const { error } = await db.from('user_allergies').upsert(
-        {
+      // check-then-insert: upsert com onConflict 'user_id,substance' ERRA porque
+      // essa unique constraint não existe no schema — alergia inferida nunca salvava.
+      const { data: existing } = await db
+        .from('user_allergies')
+        .select('id')
+        .eq('user_id', userId)
+        .ilike('substance', a.substance)
+        .maybeSingle();
+      if (!existing) {
+        const { error } = await db.from('user_allergies').insert({
           user_id: userId,
           substance: a.substance,
           severity: a.severity ?? null,
           source: 'inferred',
-        },
-        { onConflict: 'user_id,substance' }
-      );
-      if (!error) saved++;
+        });
+        if (!error) saved++;
+      }
     } catch {}
   }
   for (const c of parsed.conditions ?? []) {
@@ -176,6 +171,13 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
     if (ad.confidence < MIN_CONFIDENCE) continue;
     if (!ad.street && !ad.cep) continue;
     try {
+      // Dedupe: janelas de turno sobrepostas re-extraem o mesmo endereço — sem
+      // checagem, cada turno inseria uma linha nova.
+      let dupQuery = db.from('user_addresses').select('id').eq('user_id', userId).limit(1);
+      dupQuery = ad.street ? dupQuery.ilike('street', ad.street) : dupQuery.eq('cep', ad.cep!);
+      const { data: existing } = await dupQuery.maybeSingle();
+      if (existing) continue;
+
       const { error } = await db.from('user_addresses').insert({
         user_id: userId,
         label: ad.label ?? 'inferido',
@@ -231,6 +233,26 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
     }
     saved++;
   }
+
+  // 7. Backfill de embeddings: card que nasceu sem embedding (falha transitória
+  //    do /embeddings) ficava INVISÍVEL pro retrieval semântico pra sempre.
+  //    Cada turno re-tenta um lote pequeno — auto-cura sem job dedicado.
+  try {
+    const { data: orphans } = await db
+      .from('memory_cards_index')
+      .select('id, text')
+      .eq('user_id', userId)
+      .is('embedding', null)
+      .limit(10);
+    for (const o of orphans ?? []) {
+      try {
+        const emb = await embed(o.text, { apiKey, timeoutMs: 12_000 });
+        await db.from('memory_cards_index').update({ embedding: emb }).eq('id', o.id);
+      } catch {
+        break; // /embeddings instável agora — tenta de novo no próximo turno
+      }
+    }
+  } catch {}
 
   await writeLog('info', 'enrichment', `Enricher gravou ${saved} item(s)`, {
     traceId, conversationId, userId,
