@@ -11,6 +11,20 @@ interface XarloteContext {
   activeOrderSummary?: string | null;
 }
 
+/** "quinta-feira, 11/06/2026, 09:55" em America/Sao_Paulo — pro LLM agendar lembretes. */
+function nowBrasilia(): string {
+  return new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'America/Sao_Paulo',
+    weekday: 'long',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date());
+}
+
 export function buildXarloteSystemPrompt(ctx: XarloteContext = {}): string {
   const name = ctx.preferredName ?? ctx.user?.preferred_name ?? ctx.user?.full_name ?? 'você';
   const conditions = ctx.conditions?.join(', ') || 'nenhuma registrada';
@@ -288,7 +302,11 @@ Exemplo correto (usuário acabou de mandar "R. 14, 201 - St. Oeste, Goiânia"):
 - **start_pharmacy_order**: APENAS na PRIMEIRA vez que tiver medicamento(s) confirmado(s) + endereço/localização. **Nunca** chame de novo se já existe pedido ativo (status quoting/quoted/confirming).
 - **get_order_status**: sempre que o usuário perguntar status do pedido em andamento ("achou farmácias?", "tem novidade?", "demora?", "e aí?"). Essa tool entrega o status atual ao usuário sem reiniciar nada.
 - **save_user_profile_fact**: APENAS quando o usuário compartilha algo durável sobre si fora do contexto de pedido (ex: "tenho diabetes", "sou alérgico a dipirona", "salva esse meu endereço como padrão"). NUNCA use para o endereço fornecido durante uma cotação em curso.
-- **create_reminder**: quando o usuário pedir lembrete de medicação/consulta.
+- **create_reminder**: quando o usuário pedir QUALQUER lembrete/despertador ("me lembra de...", "me avisa quando...", "todo dia às 8h"). Você TEM esse poder — quando chegar a hora, VOCÊ manda mensagem proativa no WhatsApp e no app. Regras de agendamento:
+  - Único ("amanhã às 15h", "dia 20"): calcule a partir da seção AGORA e passe \`scheduled_at\` ISO **em UTC** (Brasília = UTC-3; 15h de Brasília = 18:00Z).
+  - Recorrente ("todo dia às 8h", "seg/qua/sex 7h"): passe \`rrule\` — \`FREQ=DAILY;BYHOUR=8;BYMINUTE=0\` ou \`FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=7;BYMINUTE=0\`. **BYHOUR/BYMINUTE são SEMPRE horário de Brasília** (o sistema converte sozinho — não converta pra UTC no rrule).
+  - Sempre passe \`body\`: a mensagem que VOCÊ vai mandar na hora, no seu tom (ex: "Oi Pedro! Hora da Losartana 💊 Já tomou?").
+  - Confirme horário com o usuário antes de criar se ele não disse explicitamente.
 - ❌ **send_emergency_orientation: REMOVIDA**. Para emergência use exclusivamente **red_flag_check** (ver seção "RED FLAG" acima — envia botões clicáveis + escalonamento automático pro contato de emergência em 60s).
 - **confirm_order_selection**: quando o usuário escolhe uma das opções de farmácia cotadas.
 
@@ -319,6 +337,9 @@ Exemplo correto (usuário acabou de mandar "R. 14, 201 - St. Oeste, Goiânia"):
 - **set_emergency_contact**: SEMPRE que o paciente pedir pra salvar/cadastrar/colocar contato de emergência. Se faltar algum dado (nome OU telefone OU relação), pergunte ESPECIFICAMENTE só o que falta — quando tiver os 3, chame a tool e confirme. NUNCA diga "não consigo salvar contato de emergência" — você TEM essa tool. Ver seção RED FLAG acima pra fluxo completo.
 
 Chame ferramentas em silêncio, não diga "vou chamar a ferramenta X".
+
+## AGORA
+Data e hora atuais (horário de Brasília): **${nowBrasilia()}**. Use isso pra calcular qualquer agendamento relativo ("amanhã", "daqui a 2 horas", "segunda que vem").
 
 ## CONTEXTO DESTE USUÁRIO (perfil + memória — USE estes dados, obedecendo TODAS as regras acima)
 Nome preferido: ${name}

@@ -16,6 +16,7 @@
  *   - Side-effects em transação quando possível
  */
 import { db, writeAudit, writeLog } from '@iasaude/db';
+import { nextOccurrence } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { discoverClinics } from './clinic-discovery.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
@@ -212,26 +213,28 @@ export async function handleStartTreatmentFromOrder(args: StartTreatmentArgs, ct
         : null,
     });
 
-    // Cria reminder diário (RRULE DAILY)
+    // Cria reminder diário (RRULE DAILY). O horário que o paciente pediu é
+    // horário de Brasília — nextOccurrence interpreta BYHOUR/BYMINUTE nesse tz
+    // (setHours() no relógio do servidor (UTC no Railway) disparava 3h mais cedo).
     const parts = args.reminder_time.split(':').map((s) => parseInt(s, 10));
     const hour = parts[0];
     const minute = parts[1] ?? 0;
     if (typeof hour === 'number' && !Number.isNaN(hour) && hour >= 0 && hour < 24) {
-      const nextRunAt = new Date();
-      nextRunAt.setHours(hour, minute, 0, 0);
-      if (nextRunAt <= new Date()) nextRunAt.setDate(nextRunAt.getDate() + 1);
-
-      await db.from('reminders').insert({
-        user_id: ctx.userId,
-        type: 'medication',
-        title: `Hora do ${item.name}${item.dosage ? ` ${item.dosage}` : ''}`,
-        body: `Lembre de tomar ${args.daily_consumption} cp. Já tomou?`,
-        scheduled_at: nextRunAt.toISOString(),
-        rrule: `FREQ=DAILY;BYHOUR=${hour};BYMINUTE=${minute}`,
-        next_run_at: nextRunAt.toISOString(),
-        status: 'pending',
-        medication_id: medId,
-      });
+      const rrule = `FREQ=DAILY;BYHOUR=${hour};BYMINUTE=${minute}`;
+      const nextRunAt = nextOccurrence(rrule);
+      if (nextRunAt) {
+        await db.from('reminders').insert({
+          user_id: ctx.userId,
+          type: 'medication',
+          title: `Hora do ${item.name}${item.dosage ? ` ${item.dosage}` : ''}`,
+          body: `Lembre de tomar ${args.daily_consumption} cp. Já tomou?`,
+          scheduled_at: nextRunAt.toISOString(),
+          rrule,
+          next_run_at: nextRunAt.toISOString(),
+          status: 'pending',
+          medication_id: medId,
+        });
+      }
     }
 
     medsCreated++;

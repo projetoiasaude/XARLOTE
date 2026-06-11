@@ -569,6 +569,11 @@ function safeParseISO(input: string): string | null {
     if (!/[T]/.test(normalized) && /^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
       normalized += 'T08:00:00-03:00';
     }
+    // Sem offset/Z explícito = horário de Brasília. new Date() interpretaria
+    // como hora LOCAL do servidor (UTC no Railway) → consulta 3h adiantada.
+    if (/T\d{2}:\d{2}/.test(normalized) && !/(Z|[+-]\d{2}:?\d{2})$/i.test(normalized)) {
+      normalized += '-03:00';
+    }
     const d = new Date(normalized);
     if (isNaN(d.getTime())) return null;
     return d.toISOString();

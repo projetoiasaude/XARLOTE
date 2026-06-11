@@ -3,6 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
+import { nextOccurrence } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -185,23 +186,54 @@ async function handleSaveProfileFact(
   args: { category: string; payload: Record<string, unknown> },
   ctx: ToolContext
 ) {
+  // O payload vem LIVRE do LLM — espalhar `...args.payload` direto no insert
+  // deixava qualquer chave inventada derrubar o insert (depois da Xarlote já
+  // ter dito "salvei!"). Filtra pra colunas conhecidas de cada tabela.
+  const pick = (keys: string[]): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
+    for (const k of keys) if (args.payload[k] !== undefined) out[k] = args.payload[k];
+    return out;
+  };
+
   switch (args.category) {
     case 'condition':
-      await db.from('user_health_conditions').insert({ user_id: ctx.userId, name: String(args.payload['name'] ?? ''), ...args.payload });
+      await db.from('user_health_conditions').insert({
+        user_id: ctx.userId,
+        name: String(args.payload['name'] ?? ''),
+        ...pick(['severity', 'notes', 'active']),
+        source: 'self_reported',
+      });
       break;
     case 'allergy':
-      await db.from('user_allergies').insert({ user_id: ctx.userId, substance: String(args.payload['substance'] ?? ''), ...args.payload });
+      await db.from('user_allergies').insert({
+        user_id: ctx.userId,
+        substance: String(args.payload['substance'] ?? args.payload['name'] ?? ''),
+        ...pick(['severity', 'reaction']),
+        source: 'self_reported',
+      });
       break;
     case 'medication':
-      await db.from('user_medications').insert({ user_id: ctx.userId, medication_name: String(args.payload['medication_name'] ?? args.payload['name'] ?? ''), ...args.payload });
+      await db.from('user_medications').insert({
+        user_id: ctx.userId,
+        medication_name: String(args.payload['medication_name'] ?? args.payload['name'] ?? ''),
+        ...pick(['dosage', 'frequency', 'form', 'active']),
+        source: 'self_reported',
+      });
       break;
     case 'address': {
-      const addr = args.payload;
-      await db.from('user_addresses').insert({ user_id: ctx.userId, label: String(addr['label'] ?? 'principal'), ...addr });
+      await db.from('user_addresses').insert({
+        user_id: ctx.userId,
+        label: String(args.payload['label'] ?? 'principal'),
+        ...pick(['street', 'number', 'complement', 'neighborhood', 'city', 'state', 'cep', 'is_default', 'latitude', 'longitude']),
+      });
       break;
     }
-    default:
-      await db.from('users').update({ metadata: args.payload }).eq('id', ctx.userId);
+    default: {
+      // MERGE no metadata — substituir o objeto inteiro apagava fatos anteriores.
+      const { data: u } = await db.from('users').select('metadata').eq('id', ctx.userId).maybeSingle();
+      const merged = { ...((u?.metadata as Record<string, unknown>) ?? {}), ...args.payload };
+      await db.from('users').update({ metadata: merged }).eq('id', ctx.userId);
+    }
   }
 }
 
@@ -543,16 +575,30 @@ async function handleGetOrderStatus(ctx: ToolContext) {
 }
 
 async function handleCreateReminder(
-  args: { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown> },
+  args: { type: string; title: string; body?: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown> },
   ctx: ToolContext
 ) {
+  // next_run_at é o que o dispatcher olha. Recorrente sem scheduled_at calcula
+  // o primeiro disparo pelo rrule (horário de Brasília) — antes ficava NULL e
+  // o lembrete NUNCA disparava.
+  const firstRun =
+    args.scheduled_at ??
+    (args.rrule ? nextOccurrence(args.rrule)?.toISOString() ?? null : null);
+
+  if (!firstRun) {
+    await writeLog('warn', 'tool', `create_reminder sem horário utilizável (scheduled_at=${args.scheduled_at ?? '∅'}, rrule=${args.rrule ?? '∅'}) — lembrete não agendado`, {
+      traceId: ctx.traceId, userId: ctx.userId,
+    });
+  }
+
   await db.from('reminders').insert({
     user_id: ctx.userId,
     type: args.type,
     title: args.title,
+    body: args.body ?? null,
     scheduled_at: args.scheduled_at ?? null,
     rrule: args.rrule ?? null,
-    next_run_at: args.scheduled_at ?? null,
+    next_run_at: firstRun,
     status: 'pending',
     payload: args.payload ?? {},
   });

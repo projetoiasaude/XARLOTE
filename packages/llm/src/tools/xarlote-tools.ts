@@ -144,7 +144,8 @@ export const xarloteTools: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'create_reminder',
-      description: 'Cria um lembrete para medicação, consulta, exercício ou outro hábito de saúde.',
+      description:
+        'Cria um lembrete/despertador. Quando chegar a hora, a Xarlote manda mensagem proativa no WhatsApp e no app. Use scheduled_at (único) OU rrule (recorrente) — pelo menos um dos dois.',
       parameters: {
         type: 'object',
         properties: {
@@ -152,9 +153,20 @@ export const xarloteTools: ToolDefinition[] = [
             type: 'string',
             enum: ['medication', 'appointment', 'exercise', 'hydration', 'sleep', 'custom'],
           },
-          title: { type: 'string' },
-          scheduled_at: { type: 'string', description: 'ISO datetime para lembretes únicos' },
-          rrule: { type: 'string', description: 'RRULE para lembretes recorrentes' },
+          title: { type: 'string', description: 'Título curto (aparece na tela de lembretes do app)' },
+          body: {
+            type: 'string',
+            description: 'A mensagem que a Xarlote vai enviar quando o lembrete disparar, no tom dela (ex: "Oi Pedro! Hora da Losartana 💊 Já tomou?")',
+          },
+          scheduled_at: {
+            type: 'string',
+            description: 'Lembrete ÚNICO: ISO datetime em UTC (Brasília = UTC-3, então 15h de Brasília = 18:00Z)',
+          },
+          rrule: {
+            type: 'string',
+            description:
+              'Lembrete RECORRENTE: RRULE com BYHOUR/BYMINUTE em HORÁRIO DE BRASÍLIA (não converta pra UTC). Ex: "FREQ=DAILY;BYHOUR=8;BYMINUTE=0" ou "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=7;BYMINUTE=30"',
+          },
         },
         required: ['type', 'title'],
       },
