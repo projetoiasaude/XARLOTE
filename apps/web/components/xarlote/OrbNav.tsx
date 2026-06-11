@@ -1,5 +1,5 @@
 'use client';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import { AlarmClock, CircleUserRound, HeartPulse, MessageCircle, Zap, type LucideIcon } from 'lucide-react';
@@ -40,19 +40,8 @@ export function OrbNav() {
   const pathname = usePathname();
   const router = useRouter();
   const reduced = useReducedMotion();
-  const { typing, overview, phone } = useXarloteApp();
+  const { typing, phone } = useXarloteApp();
   const [open, setOpen] = useState(false);
-
-  const activeCount = useMemo(() => {
-    if (!overview) return 0;
-    const liveOrders = overview.orders.filter((o) =>
-      ['drafting', 'quoting', 'quoted', 'confirming'].includes(o.status),
-    ).length;
-    const liveConsults = overview.consultations.filter((c) =>
-      ['searching', 'quoting', 'quoted', 'confirming'].includes(c.status),
-    ).length;
-    return liveOrders + liveConsults;
-  }, [overview]);
 
   const toggle = useCallback(() => {
     navigator.vibrate?.(8);
@@ -214,11 +203,6 @@ export function OrbNav() {
             )}
           </AnimatePresence>
 
-          {activeCount > 0 && (
-            <span className="absolute -right-0.5 -top-0.5 flex h-5 min-w-5 items-center justify-center rounded-full bg-aurora-pink px-1 text-[10px] font-bold text-white shadow-glow-accent">
-              {activeCount}
-            </span>
-          )}
         </motion.button>
       </nav>
     </>
