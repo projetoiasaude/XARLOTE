@@ -17,7 +17,7 @@
     "@iasaude/shared": "workspace:*"
   },
   "devDependencies": {
-    "@types/node": "^20.14.0",
+    "@types/node": "^25.9.3",
     "typescript": "^5.4.0"
   }
 }
