@@ -20,6 +20,7 @@ import { Avatar, GlassBadge, GlassButton, Skeleton } from '@/components/ui';
 import { Screen, screenItem } from '@/components/xarlote/Screen';
 import { ConfidenceBar, SourceBadge } from '@/components/xarlote/bits';
 import { useXarloteApp } from '@/lib/xarlote/app-context';
+import { unregisterPush } from '@/lib/xarlote/api';
 import { formatPhonePretty } from '@/lib/xarlote/pairing';
 import { cn } from '@/lib/utils';
 import type { MemoryKind, XarMemoryCard } from '@/lib/xarlote/types';
@@ -55,7 +56,18 @@ export default function PerfilPage() {
     URL.revokeObjectURL(url);
   }
 
-  function sair() {
+  async function sair() {
+    // Dá baixa no token de push deste aparelho (a conta que saiu não recebe mais
+    // notificações). Silencioso/no-op no navegador comum.
+    try {
+      const token = window.localStorage.getItem('xarlote.push.token');
+      if (token) {
+        await unregisterPush(token);
+        window.localStorage.removeItem('xarlote.push.token');
+      }
+    } catch {
+      /* ignore */
+    }
     unpair();
     router.replace('/app/entrar');
   }

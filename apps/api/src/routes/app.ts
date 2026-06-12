@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { db, findUserByPhone, writeEvent } from '@iasaude/db';
+import { db, findUserByPhone, writeEvent, registerDeviceToken, unregisterDeviceToken } from '@iasaude/db';
 import { buildSimulatedInbound } from '@iasaude/whatsapp';
 import { SARA_INSTANCE, nextOccurrence } from '@iasaude/shared';
 import { processInboundUser } from '../handlers/inbound-user.js';
@@ -76,6 +76,17 @@ const ReminderActionSchema = z.object({
   phone: z.string().min(8).max(20),
   action: z.enum(['done', 'snooze', 'cancel']),
   minutes: z.number().int().min(5).max(24 * 60).optional(),
+});
+
+const PushRegisterSchema = z.object({
+  phone: z.string().min(8).max(20),
+  token: z.string().min(10).max(4096),
+  platform: z.enum(['ios', 'android', 'web']),
+  appVersion: z.string().max(40).optional(),
+});
+
+const PushUnregisterSchema = z.object({
+  token: z.string().min(10).max(4096),
 });
 
 export async function appRoute(app: FastifyInstance) {
@@ -314,5 +325,27 @@ export async function appRoute(app: FastifyInstance) {
       .single();
 
     return reply.send({ ok: true, reminder: updated });
+  });
+
+  // ─── Push: registrar token do aparelho (app nativo) ───────────────────────────
+  app.post('/push/register', async (req, reply) => {
+    const parsed = PushRegisterSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+    const phoneE164 = normalizePhone(parsed.data.phone);
+    if (!isValidPhone(phoneE164)) return reply.code(400).send({ error: 'invalid_phone' });
+    const user = await findAppUser(phoneE164);
+    if (!user) return reply.code(404).send({ error: 'user_not_found' });
+
+    await registerDeviceToken(user.id, parsed.data.token, parsed.data.platform, parsed.data.appVersion);
+    return reply.send({ ok: true });
+  });
+
+  // ─── Push: dar baixa num token (logout / desinstalação) ───────────────────────
+  app.post('/push/unregister', async (req, reply) => {
+    const parsed = PushUnregisterSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+    await unregisterDeviceToken(parsed.data.token);
+    return reply.send({ ok: true });
   });
 }

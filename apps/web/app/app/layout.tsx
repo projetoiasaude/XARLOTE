@@ -3,6 +3,7 @@ import { ApiAuth } from '@/components/layout/ApiAuth';
 import { XarloteBackground } from '@/components/xarlote/XarloteBackground';
 import { OrbNav } from '@/components/xarlote/OrbNav';
 import { PairGuard } from '@/components/xarlote/PairGuard';
+import { CapacitorBridge } from '@/components/xarlote/CapacitorBridge';
 import { XarloteAppProvider } from '@/lib/xarlote/app-context';
 
 export const metadata: Metadata = {
@@ -38,6 +39,7 @@ export default function XarloteAppLayout({ children }: { children: React.ReactNo
       <ApiAuth />
       <XarloteBackground />
       <XarloteAppProvider>
+        <CapacitorBridge />
         <PairGuard>
           <div className="relative z-10 mx-auto flex min-h-dvh w-full max-w-3xl flex-col">
             {children}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Xarlote</title>
+    <style>
+      html, body {
+        margin: 0; height: 100%;
+        background: #04041a; color: #fff;
+        font-family: -apple-system, system-ui, sans-serif;
+        display: grid; place-items: center; text-align: center;
+      }
+      .wrap { padding: 24px; opacity: 0.85; }
+      .dot { width: 10px; height: 10px; border-radius: 50%;
+        background: #7c87ff; margin: 16px auto 0; animation: pulse 1.4s ease-in-out infinite; }
+      @keyframes pulse { 0%,100% { opacity: .3; transform: scale(.8) } 50% { opacity: 1; transform: scale(1) } }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h2>Xarlote</h2>
+      <p>Conectando com sua agente de saúde…</p>
+      <div class="dot"></div>
+    </div>
+  </body>
+</html>

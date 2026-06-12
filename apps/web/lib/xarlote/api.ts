@@ -55,3 +55,26 @@ export async function reminderAction(
   const body = (await res.json()) as { reminder: XarReminder };
   return body.reminder;
 }
+
+/** Registra o token de push do aparelho (app nativo). Silencioso em falha. */
+export async function registerPush(
+  phone: string,
+  token: string,
+  platform: 'ios' | 'android' | 'web',
+  appVersion?: string,
+): Promise<void> {
+  await fetch(apiUrl('/app/push/register'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone, token, platform, appVersion }),
+  }).catch(() => {});
+}
+
+/** Dá baixa no token (logout). */
+export async function unregisterPush(token: string): Promise<void> {
+  await fetch(apiUrl('/app/push/unregister'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  }).catch(() => {});
+}

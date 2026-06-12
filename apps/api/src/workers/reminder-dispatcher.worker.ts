@@ -13,9 +13,10 @@
  * Recorrência: BYHOUR/BYMINUTE do rrule são SEMPRE horário de Brasília
  * (contrato com a LLM) — ver packages/shared/src/rrule.ts.
  */
-import { db, writeEvent, writeLog } from '@iasaude/db';
+import { db, writeEvent, writeLog, listDeviceTokens, deleteDeviceTokens } from '@iasaude/db';
 import { isSimulatorMode } from '@iasaude/whatsapp';
 import { SARA_INSTANCE, nextOccurrence } from '@iasaude/shared';
+import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
 
 interface DueReminder {
@@ -99,6 +100,23 @@ export async function dispatchReminders(): Promise<void> {
         phoneE164: user.phone_e164,
         text: msg,
       });
+    }
+
+    // 4. Push pro app nativo (acorda mesmo com o app fechado). No-op se FCM
+    //    não configurado; tokens mortos são limpos. Abre direto no chat.
+    try {
+      const tokens = await listDeviceTokens(reminder.user_id);
+      if (tokens.length) {
+        const title = reminder.type === 'medication' ? '💊 Hora do remédio' : 'Xarlote';
+        const result = await sendPush(tokens, {
+          title,
+          body: msg,
+          data: { kind: 'reminder', reminder_id: reminder.id, route: '/app' },
+        });
+        if (result.invalidTokens.length) await deleteDeviceTokens(result.invalidTokens);
+      }
+    } catch (err) {
+      await writeLog('warn', 'reminder', `push falhou: ${String(err).slice(0, 120)}`, { traceId: undefined });
     }
 
     void writeEvent({
