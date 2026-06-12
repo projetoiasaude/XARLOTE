@@ -23,5 +23,12 @@
       <p>Conectando com sua agente de saúde…</p>
       <div class="dot"></div>
     </div>
+    <script>
+      // Esta página é só o fallback offline da casca nativa — o app real vive no
+      // server.url (produção). Se alguém abrir isto num navegador, leva pro app.
+      setTimeout(function () {
+        window.location.replace('https://web-jade-ten-53.vercel.app/app');
+      }, 800);
+    </script>
   </body>
 </html>
