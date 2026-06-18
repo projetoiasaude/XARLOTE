@@ -35,13 +35,13 @@ export const viewport: Viewport = {
 
 export default function XarloteAppLayout({ children }: { children: React.ReactNode }) {
   return (
-    <div className="relative min-h-dvh bg-[#04041a] text-white">
+    <div className="relative min-h-svh bg-[#04041a] text-white">
       <ApiAuth />
       <XarloteBackground />
       <XarloteAppProvider>
         <CapacitorBridge />
         <PairGuard>
-          <div className="relative z-10 mx-auto flex min-h-dvh w-full max-w-3xl flex-col">
+          <div className="relative z-10 mx-auto flex min-h-svh w-full max-w-3xl flex-col">
             {children}
           </div>
         </PairGuard>

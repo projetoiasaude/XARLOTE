@@ -36,6 +36,9 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     font-feature-settings: 'cv11', 'ss01', 'ss03';
+    /* iOS: corta o "rubber-band"/scroll-chaining que faz a barra do Safari
+       mostrar/esconder e a UI de baixo (composer + orb) tremer. */
+    overscroll-behavior: none;
   }
   ::selection {
     background: rgba(124, 135, 255, 0.35);
