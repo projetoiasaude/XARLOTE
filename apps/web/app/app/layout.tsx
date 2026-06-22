@@ -34,14 +34,17 @@ export const viewport: Viewport = {
 };
 
 export default function XarloteAppLayout({ children }: { children: React.ReactNode }) {
+  // Casca FIXA (h-svh + overflow-hidden): o corpo da página NUNCA rola — só as
+  // áreas internas (chat thread / Screen) rolam. Sem scroll de corpo, a barra do
+  // Safari não mostra/esconde e a base para de tremer (sensação de app nativo).
   return (
-    <div className="relative min-h-svh bg-[#04041a] text-white">
+    <div className="relative h-svh overflow-hidden bg-[#04041a] text-white">
       <ApiAuth />
       <XarloteBackground />
       <XarloteAppProvider>
         <CapacitorBridge />
         <PairGuard>
-          <div className="relative z-10 mx-auto flex min-h-svh w-full max-w-3xl flex-col">
+          <div className="relative z-10 mx-auto flex h-full w-full max-w-3xl flex-col">
             {children}
           </div>
         </PairGuard>

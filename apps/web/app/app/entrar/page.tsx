@@ -60,7 +60,7 @@ export default function EntrarPage() {
   }
 
   return (
-    <main className="flex flex-1 flex-col items-center justify-center px-6 py-12 pt-safe pb-safe">
+    <main className="flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto overscroll-contain px-6 py-12 pt-safe pb-safe">
       <motion.div variants={stagger} initial="hidden" animate="show" className="flex w-full max-w-sm flex-col items-center">
         <motion.div variants={item}>
           <XarloteHero size={240} />

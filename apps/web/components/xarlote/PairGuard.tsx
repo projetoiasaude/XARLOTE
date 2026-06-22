@@ -20,7 +20,7 @@ export function PairGuard({ children }: { children: ReactNode }) {
 
   if (!ready || (!phone && !onEntrar)) {
     return (
-      <div className="relative z-10 flex min-h-dvh items-center justify-center">
+      <div className="relative z-10 flex h-full items-center justify-center">
         <XarloteLogo size={150} />
       </div>
     );

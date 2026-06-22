@@ -29,7 +29,7 @@ export const screenItem = {
 /** Casca padrão das telas internas — header grande + stagger + folga pro orb. */
 export function Screen({ title, subtitle, right, children, className }: Props) {
   return (
-    <main className={cn('flex-1 px-4 pt-safe', className)}>
+    <main className={cn('min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pt-safe', className)}>
       <motion.div variants={screenStagger} initial="hidden" animate="show" className="mx-auto w-full max-w-2xl pb-32 pt-6">
         <motion.header variants={screenItem} className="mb-5 flex items-end justify-between gap-3">
           <div>

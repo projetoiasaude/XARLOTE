@@ -77,7 +77,7 @@ function ChatScreen() {
   }
 
   return (
-    <main className="flex h-svh flex-col">
+    <main className="flex h-full min-h-0 flex-col">
       {/* Header de presença */}
       <header className="z-20 px-3 pt-safe">
         <div className="glass glass-spec mt-3 flex items-center gap-3 rounded-3xl px-4 py-2.5">
@@ -114,7 +114,7 @@ function ChatScreen() {
       </header>
 
       {/* Thread */}
-      <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto overscroll-contain px-4 py-4 no-scrollbar">
+      <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 no-scrollbar">
         {loading ? (
           <div className="space-y-3 pt-4">
             <Skeleton variant="card" className="h-12 w-2/3" />
