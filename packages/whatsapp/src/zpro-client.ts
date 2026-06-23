@@ -177,10 +177,12 @@ export async function zproSendAudio(
     // WABA: /voice (PTT) NÃO é suportado nesse canal (ERR_CHANNEL_NOT_SUPPORTED).
     // Mídia de áudio vai pelo /url (mesmo endpoint da imagem). Em ogg/opus o
     // WhatsApp renderiza como voice note.
+    // /url exige `body` não-vazio (validação do zpro). Em áudio o WhatsApp não
+    // mostra caption, então um espaço basta pra passar a validação.
     const data = await zproCall(cfg, '/url', {
       number,
       mediaUrl: audio,
-      body: '',
+      body: ' ',
       externalKey: randomUUID(),
       isClosed: false,
     });
