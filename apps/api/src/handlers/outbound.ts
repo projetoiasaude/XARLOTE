@@ -85,8 +85,11 @@ export async function sendOutboundAudio(
     await writeLog('info', 'tts', `Voice script humanizado: "${voiceScript.slice(0, 120)}…"`, { traceId, original: text.slice(0, 120) });
   }
 
-  // WhatsApp oficial (WABA via zpro) entrega voice note (PTT) só em ogg/opus +
-  // por URL. uazapi aceita mp3 base64. Sintetiza no formato certo por provedor.
+  // zpro/WABA: o áudio é hospedado e enviado por URL (/url). MP3 (audio/mpeg) é o
+  // formato mais CONFIÁVEL de entrega na Cloud API do WhatsApp — opus exige
+  // content-type 'audio/ogg; codecs=opus' + mono/16kHz e ainda assim só vira
+  // PTT-waveform se o canal setar voice:true (o zpro não expõe isso). MP3 entrega
+  // como áudio tocável, garantido. uazapi também usa mp3 (base64).
   const useZpro = providerFor(SARA_INSTANCE) === 'zpro';
 
   let synth: Awaited<ReturnType<typeof synthesizeSpeech>> | null = null;
@@ -98,7 +101,6 @@ export async function sendOutboundAudio(
       modelId: cfg.tts_model,
       languageCode: 'pt',
       speed: cfg.tts_speed,
-      outputFormat: useZpro ? 'opus_48000_64' : undefined,
       timeoutMs: 30_000,
     });
     const ttsLatency = Date.now() - ttsStart;
