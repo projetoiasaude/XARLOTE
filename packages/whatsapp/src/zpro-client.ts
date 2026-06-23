@@ -170,12 +170,24 @@ export async function zproSendAudio(
     const data = await zproCall(cfg, '/voice', { number, audio, externalKey: randomUUID(), isClosed: false });
     return { messageId: pickMessageId(data) };
   }
+  // Buffer → /base64. O fileName precisa BATER com o mime, senão o zpro/WABA pode
+  // recusar ou tratar como arquivo errado. (audio/mpeg→.mp3, audio/ogg→.ogg, …)
+  const mime = opts.mime ?? 'audio/ogg';
+  const ext = /mpeg|mp3/i.test(mime)
+    ? 'mp3'
+    : /ogg|opus/i.test(mime)
+      ? 'ogg'
+      : /wav/i.test(mime)
+        ? 'wav'
+        : /mp4|m4a|aac/i.test(mime)
+          ? 'm4a'
+          : 'mp3';
   const data = await zproCall(cfg, '/base64', {
     number,
     body: '',
     base64Data: audio.toString('base64'),
-    mimeType: opts.mime ?? 'audio/ogg',
-    fileName: 'audio.ogg',
+    mimeType: mime,
+    fileName: `audio.${ext}`,
     externalKey: randomUUID(),
     isClosed: false,
   });
