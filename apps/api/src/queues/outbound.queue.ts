@@ -85,7 +85,13 @@ async function rawSend(job: OutboundJob): Promise<void> {
       await sendAudio(job.instance, job.phoneE164, buf, { mime: job.mime ?? 'audio/mpeg', ptv: job.ptv ?? true });
     }
   } catch (err) {
-    // Áudio falhou — manda o texto pra não deixar o usuário mudo.
+    // Áudio falhou — LOGA o motivo (antes era engolido) e manda o texto pra não
+    // deixar o usuário mudo. O log revela por que o /voice (zpro/WABA) recusou.
+    await writeLog('warn', 'outbound', `Áudio falhou (caindo pra texto): ${String(err).slice(0, 450)}`, {
+      traceId: job.traceId,
+      instance: job.instance,
+      via: job.audioUrl ? 'voice-url' : 'base64',
+    });
     if (job.text) {
       await sendText(job.instance, job.phoneE164, job.text);
       return; // degradou pra texto com sucesso
