@@ -20,6 +20,7 @@ import { db, writeAudit, writeLog } from '@iasaude/db';
 import { sendMenu, sendText } from '@iasaude/whatsapp';
 import { SARA_INSTANCE } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
+import { getZproTicket } from '../middleware/zpro-ticket.js';
 
 export interface RedFlagArgs {
   category:
@@ -171,7 +172,7 @@ export async function handleRedFlagCheck(args: RedFlagArgs, ctx: RedFlagCtx): Pr
       BTN_CALL_EMERGENCY,
       BTN_NOTIFY_CONTACT,
       BTN_MISTAKE,
-    ], { type: 'button', footerText: footer });
+    ], { type: 'button', footerText: footer, ticketId: await getZproTicket(ctx.phoneE164) });
   } catch (err) {
     // Fallback: se botões falharem (ex: simulador, instância offline), manda texto direto
     await writeLog('warn', 'red_flag', `sendMenu falhou, caindo pra texto: ${String(err).slice(0, 120)}`, { traceId: ctx.traceId });

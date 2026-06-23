@@ -6,6 +6,7 @@ import { processInboundUser } from '../handlers/inbound-user.js';
 import { SARA_INSTANCE } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { checkUserRateLimit } from '../middleware/rate-limit.js';
+import { setZproTicket } from '../middleware/zpro-ticket.js';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
 import { captureError } from '../observability/sentry.js';
 
@@ -82,6 +83,10 @@ export async function webhookZproRoute(app: FastifyInstance) {
         );
         return reply.send({ ok: true, skipped: 'no-normalized' });
       }
+
+      // Guarda o ticketId desta conversa (24h) pra botões PROATIVOS (red-flag,
+      // lembretes) que não têm um inbound fresco na hora do envio.
+      void setZproTicket(normalized.from.phoneE164, normalized.providerTicketId);
 
       // Interruptor mestre: Xarlote desligada no painel → ignora (200 pra não retentar).
       const cfg = loadPrompts();
