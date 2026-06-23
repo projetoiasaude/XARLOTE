@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import type { FastifyInstance } from 'fastify';
-import { normalizeZproWebhook, zproEventId } from '@iasaude/whatsapp';
+import { normalizeZproWebhook, zproEventId, isZproStatusEcho } from '@iasaude/whatsapp';
 import { db, writeLog, redactPII } from '@iasaude/db';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { SARA_INSTANCE } from '@iasaude/shared';
@@ -63,8 +63,13 @@ export async function webhookZproRoute(app: FastifyInstance) {
       }
 
       if (!normalized) {
-        // Aprendizado: registra as chaves de topo (sem valores) pra eu finalizar
-        // o normalizador. Não loga PII — só nomes de campo + tipos.
+        // Callback de status/echo (entrega/leitura da própria mensagem): ignora
+        // em SILÊNCIO — todo envio gera um, não pode virar ruído de warn.
+        if (isZproStatusEcho(body)) {
+          return reply.send({ ok: true, skipped: 'status_echo' });
+        }
+        // Mensagem de verdade que não normalizou: registra o shape redatado
+        // (sem PII) pra eu apertar o parser. Só nomes de campo de topo + raw redatado.
         const keys =
           body && typeof body === 'object' && !Array.isArray(body)
             ? Object.keys(body as Record<string, unknown>).join(',')

@@ -138,6 +138,21 @@ export function zproEventId(payload: unknown): string | undefined {
   return pickStr(payload, P.externalId);
 }
 
+/**
+ * É um callback de status/echo (entrega/leitura/ack/mensagem própria) e não uma
+ * mensagem recebida? Todo envio nosso gera um desses no mesmo webhook — a rota
+ * usa isso pra ignorar EM SILÊNCIO em vez de logar "não normalizado" (ruído).
+ */
+export function isZproStatusEcho(payload: unknown): boolean {
+  if (!payload || typeof payload !== 'object') return false;
+  if (pickBool(payload, P.fromMe)) return true;
+  if (get(payload, 'msg.ack') !== undefined || get(payload, 'ack') !== undefined) return true;
+  const status = (pickStr(payload, ['msg.status', 'status']) ?? '').toLowerCase();
+  if (['sended', 'sent', 'delivered', 'read', 'played', 'received'].includes(status)) return true;
+  const method = (pickStr(payload, P.method) ?? '').toLowerCase();
+  return !!method && !['message', 'messages', 'message_received', 'onmessage'].includes(method);
+}
+
 export function normalizeZproWebhook(
   payload: unknown,
   instance: string,
