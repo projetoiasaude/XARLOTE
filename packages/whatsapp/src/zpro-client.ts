@@ -39,6 +39,13 @@ async function zproCall(cfg: ZproConfig, path: string, body: unknown): Promise<u
       },
       timeout: 15_000,
     });
+    // O zpro às vezes responde 200 com `{success:false, error:...}` (ex.: formato
+    // de áudio que o WABA não entrega). Sem checar isso, o envio "falha em
+    // silêncio" — tratamos como erro pra o caller cair no fallback (texto).
+    const data = res.data as { success?: boolean; error?: string } | null;
+    if (data && typeof data === 'object' && data.success === false) {
+      throw new Error(`zpro ${path || '/text'} success=false: ${String(data.error ?? '').slice(0, 300)}`);
+    }
     return res.data;
   } catch (err) {
     // Propaga o CORPO da resposta de erro do zpro pra mensagem do Error — assim o

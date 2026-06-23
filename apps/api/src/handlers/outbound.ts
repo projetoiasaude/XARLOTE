@@ -1,9 +1,10 @@
 import { db, writeLog, writeEvent } from '@iasaude/db';
-import { isSimulatorMode } from '@iasaude/whatsapp';
+import { isSimulatorMode, providerFor } from '@iasaude/whatsapp';
 import { synthesizeSpeech, humanizeForVoice } from '@iasaude/integrations';
 import { SARA_INSTANCE } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
+import { uploadPublicAudio } from './audio-host.js';
 
 interface LlmMeta {
   model?: string;
@@ -84,6 +85,10 @@ export async function sendOutboundAudio(
     await writeLog('info', 'tts', `Voice script humanizado: "${voiceScript.slice(0, 120)}…"`, { traceId, original: text.slice(0, 120) });
   }
 
+  // WhatsApp oficial (WABA via zpro) entrega voice note (PTT) só em ogg/opus +
+  // por URL. uazapi aceita mp3 base64. Sintetiza no formato certo por provedor.
+  const useZpro = providerFor(SARA_INSTANCE) === 'zpro';
+
   let synth: Awaited<ReturnType<typeof synthesizeSpeech>> | null = null;
   const ttsStart = Date.now();
   try {
@@ -93,6 +98,7 @@ export async function sendOutboundAudio(
       modelId: cfg.tts_model,
       languageCode: 'pt',
       speed: cfg.tts_speed,
+      outputFormat: useZpro ? 'opus_48000_64' : undefined,
       timeoutMs: 30_000,
     });
     const ttsLatency = Date.now() - ttsStart;
@@ -139,13 +145,22 @@ export async function sendOutboundAudio(
   // Em simulador não chama uazapi (mensagem já foi persistida pra aparecer no dashboard)
   if (isSimulatorMode()) return true;
 
+  // zpro/WABA: sobe o áudio e manda por URL (/voice = PTT). Se o upload falhar,
+  // cai pro base64 (que no zpro provavelmente erra → fallback texto no worker).
+  const audioUrl = useZpro ? await uploadPublicAudio(synth.buffer, synth.mime, traceId) : null;
+  if (useZpro) {
+    await writeLog('info', 'tts', `Voice note via ${audioUrl ? '/voice (URL hospedada)' : 'base64 (upload falhou)'}`, {
+      traceId, hosted: !!audioUrl, mime: synth.mime,
+    });
+  }
+
   // F0.7: enfileira o áudio (com `text` de fallback embutido) com rate-limit.
   // O worker tenta o áudio e, se falhar, manda o texto pra não deixar o usuário mudo.
   await dispatchOutbound({
     kind: 'audio',
     instance: SARA_INSTANCE,
     phoneE164,
-    audioBase64: synth.buffer.toString('base64'),
+    ...(audioUrl ? { audioUrl } : { audioBase64: synth.buffer.toString('base64') }),
     mime: synth.mime,
     ptv: true,
     text,

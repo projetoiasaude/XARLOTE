@@ -25,7 +25,8 @@ export interface OutboundJob {
   instance: string;       // SARA_INSTANCE | AGENT_INSTANCE
   phoneE164: string;
   text?: string;          // texto (kind=text) ou fallback (kind=audio)
-  audioBase64?: string;   // buffer de áudio em base64 (kind=audio)
+  audioBase64?: string;   // buffer de áudio em base64 (kind=audio, via uazapi /base64)
+  audioUrl?: string;      // URL pública do áudio (kind=audio, via zpro /voice = PTT)
   mime?: string;
   ptv?: boolean;
   buttons?: string[];     // kind=menu
@@ -76,8 +77,13 @@ async function rawSend(job: OutboundJob): Promise<void> {
   }
   // kind === 'audio'
   try {
-    const buf = Buffer.from(job.audioBase64 ?? '', 'base64');
-    await sendAudio(job.instance, job.phoneE164, buf, { mime: job.mime ?? 'audio/mpeg', ptv: job.ptv ?? true });
+    if (job.audioUrl) {
+      // zpro/WABA: voice note (PTT) por URL via /voice.
+      await sendAudio(job.instance, job.phoneE164, job.audioUrl, { mime: job.mime ?? 'audio/ogg', ptv: job.ptv ?? true });
+    } else {
+      const buf = Buffer.from(job.audioBase64 ?? '', 'base64');
+      await sendAudio(job.instance, job.phoneE164, buf, { mime: job.mime ?? 'audio/mpeg', ptv: job.ptv ?? true });
+    }
   } catch (err) {
     // Áudio falhou — manda o texto pra não deixar o usuário mudo.
     if (job.text) {
