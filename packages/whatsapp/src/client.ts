@@ -217,49 +217,92 @@ export async function downloadMedia(instance: string, messageId: string): Promis
   return uazDownloadMedia(instance, messageId);
 }
 
-async function fetchUrlBuffer(url: string, bearer?: string): Promise<{ buffer: Buffer; mime: string } | null> {
+/**
+ * GET de uma URL → buffer. LANÇA em falha (com status no erro) — quem chama
+ * decide o fallback. `forceBearer`: manda o Bearer já na 1ª tentativa (URLs do
+ * Meta exigem isso); senão só retenta com Bearer em 401/403 (mídia do zpro).
+ */
+async function fetchUrlBuffer(
+  url: string,
+  bearer?: string,
+  forceBearer = false,
+): Promise<{ buffer: Buffer; mime: string }> {
+  const auth = bearer ? { Authorization: `Bearer ${bearer}` } : undefined;
   const doGet = (headers?: Record<string, string>) =>
     axios.get<ArrayBuffer>(url, { responseType: 'arraybuffer', timeout: 30_000, headers });
-  try {
-    const res = await doGet().catch((err: unknown) => {
-      // Mídia hospedada no zpro pode exigir o Bearer — tenta de novo com auth.
-      const status = (err as { response?: { status?: number } })?.response?.status;
-      if (bearer && (status === 401 || status === 403)) {
-        return doGet({ Authorization: `Bearer ${bearer}` });
-      }
-      throw err;
-    });
-    const mime = String(res.headers?.['content-type'] ?? 'application/octet-stream').split(';')[0]!.trim();
-    return { buffer: Buffer.from(res.data), mime };
-  } catch {
-    return null;
-  }
+  const res = await doGet(forceBearer ? auth : undefined).catch((err: unknown) => {
+    const status = (err as { response?: { status?: number } })?.response?.status;
+    if (auth && !forceBearer && (status === 401 || status === 403)) {
+      return doGet(auth);
+    }
+    throw err;
+  });
+  const mime = String(res.headers?.['content-type'] ?? 'application/octet-stream').split(';')[0]!.trim();
+  return { buffer: Buffer.from(res.data), mime };
+}
+
+function metaTokenFor(instance: string): string {
+  return (
+    process.env[`ZPRO_${instance.toUpperCase()}_META_TOKEN`] ??
+    process.env['META_WABA_ACCESS_TOKEN'] ??
+    ''
+  );
 }
 
 /**
  * Obtém o binário de uma mídia recebida, de forma agnóstica de provedor:
- *   - base64 inline (simulador / alguns provedores) → decodifica;
- *   - zpro: baixa a `mediaUrl` do webhook (com Bearer se necessário);
- *   - uazapi: usa o id longo + /message/download (caminho provado).
+ *   - base64 inline (simulador) → decodifica;
+ *   - zpro/WABA: baixa a `mediaUrl` do webhook. URLs do Meta (lookaside.fbsbx.com)
+ *     são protegidas → exigem o token do WhatsApp Business (ZPRO_*_META_TOKEN)
+ *     como Bearer. Mídia hospedada no próprio zpro usa o token do zpro.
+ *   - uazapi: id longo + /message/download (caminho provado).
  *
+ * Lança em falha de download (com status/host) pra o caller logar o motivo;
+ * retorna null só quando não há mídia pra baixar.
  * `instance` é a chave de config (ex.: SARA_INSTANCE), não o nome cru do webhook.
  */
 export async function fetchInboundMedia(
   inbound: NormalizedInbound,
   instance: string,
 ): Promise<{ buffer: Buffer; mime: string } | null> {
+  const cleanMime = (m?: string) => (m ? m.split(';')[0]!.trim() : undefined);
+
   if (inbound.mediaBase64) {
-    return { buffer: Buffer.from(inbound.mediaBase64, 'base64'), mime: inbound.mediaMime ?? 'application/octet-stream' };
+    return {
+      buffer: Buffer.from(inbound.mediaBase64, 'base64'),
+      mime: cleanMime(inbound.mediaMime) ?? 'application/octet-stream',
+    };
   }
+
   if (providerFor(instance) === 'zpro') {
-    if (!inbound.mediaUrl) return null;
-    const { token } = buildZproConfig(instance);
-    const got = await fetchUrlBuffer(inbound.mediaUrl, token);
-    if (got && (!got.mime || got.mime === 'application/octet-stream') && inbound.mediaMime) {
-      return { buffer: got.buffer, mime: inbound.mediaMime };
+    const url = inbound.mediaUrl;
+    if (!url) return null;
+    const isMeta = /(?:lookaside|fbsbx|fbcdn|graph\.facebook)\.com/i.test(url);
+    const metaToken = metaTokenFor(instance);
+    const bearer = isMeta ? metaToken : buildZproConfig(instance).token;
+    try {
+      const got = await fetchUrlBuffer(url, bearer || undefined, isMeta && !!metaToken);
+      // Se o content-type vier genérico, prefere o mime declarado no webhook.
+      const mime =
+        !got.mime || got.mime === 'application/octet-stream'
+          ? cleanMime(inbound.mediaMime) ?? got.mime
+          : got.mime;
+      return { buffer: got.buffer, mime };
+    } catch (err) {
+      const status = (err as { response?: { status?: number }; code?: string })?.response?.status;
+      let host = '?';
+      try {
+        host = new URL(url).host;
+      } catch {
+        /* ignore */
+      }
+      const hint = isMeta && !metaToken ? ' — falta ZPRO_*_META_TOKEN p/ baixar mídia do Meta' : '';
+      throw new Error(
+        `zpro media download ${status ?? (err as { code?: string })?.code ?? 'falhou'} host=${host}${hint}`,
+      );
     }
-    return got;
   }
+
   const longId = (inbound.raw as { message?: { id?: string } } | null)?.message?.id ?? inbound.externalId;
   return uazDownloadMedia(instance, longId);
 }
