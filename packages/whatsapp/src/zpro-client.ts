@@ -30,14 +30,35 @@ async function zproCall(cfg: ZproConfig, path: string, body: unknown): Promise<u
   if (!cfg.externalUrl) {
     throw new Error('zpro não configurado (ZPRO_BASE_URL / ZPRO_*_API_ID / ZPRO_*_TOKEN)');
   }
-  const res = await axios.post(`${cfg.externalUrl}${path}`, body, {
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${cfg.token}`,
-    },
-    timeout: 15_000,
-  });
-  return res.data;
+  try {
+    const res = await axios.post(`${cfg.externalUrl}${path}`, body, {
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${cfg.token}`,
+      },
+      timeout: 15_000,
+    });
+    return res.data;
+  } catch (err) {
+    // Propaga o CORPO da resposta de erro do zpro pra mensagem do Error — assim o
+    // log da fila outbound (que imprime String(err)) mostra POR QUE o zpro recusou
+    // (ex.: 400 com o campo faltante), em vez de só "AxiosError 400".
+    const ax = err as { response?: { status?: number; data?: unknown } };
+    const status = ax.response?.status;
+    if (status) {
+      let detail: string;
+      try {
+        detail =
+          typeof ax.response?.data === 'string'
+            ? ax.response.data
+            : JSON.stringify(ax.response?.data);
+      } catch {
+        detail = '<unserializable>';
+      }
+      throw new Error(`zpro ${path || '/text'} HTTP ${status}: ${detail.slice(0, 400)}`);
+    }
+    throw err;
+  }
 }
 
 /** O shape da resposta do zpro não é documentado — extraímos um id best-effort. */

@@ -64,23 +64,32 @@ function toE164(raw: string): string {
 
 // ── chaves candidatas (ajustar quando o payload real for capturado) ──────────
 
+// Ordem importa: o 1º path que casar vence. O shape REAL do backhub.criate.online
+// (WABA) aninha tudo sob `msg` + `ticket` — por isso os paths `msg.*`/`ticket.*`
+// vêm primeiro. Os demais ficam como rede de segurança p/ outras versões do zpro.
 const P = {
-  fromMe: ['fromMe', 'key.fromMe', 'data.fromMe', 'data.key.fromMe', 'message.fromMe', 'message.key.fromMe', 'msg.fromMe'],
-  isGroup: ['isGroup', 'group', 'data.isGroup', 'key.isGroup', 'ticket.isGroup'],
+  fromMe: ['msg.fromMe', 'msg.key.fromMe', 'fromMe', 'key.fromMe', 'data.fromMe', 'data.key.fromMe', 'message.fromMe', 'message.key.fromMe'],
+  isGroup: ['ticket.isGroup', 'msg.isGroup', 'isGroup', 'group', 'data.isGroup', 'key.isGroup', 'ticket.contact.isGroup'],
+  // method/event do envelope zpro — usado p/ ignorar status/ack (só processa 'message').
+  method: ['method', 'event', 'action', 'msg.method', 'type_event', 'eventType'],
   sender: [
+    'msg.from', 'ticket.contact.number',
     'number', 'from', 'sender', 'phone', 'jid',
     'contact.number', 'contact.id', 'contact.jid',
     'data.number', 'data.from', 'data.sender',
     'key.remoteJid', 'data.key.remoteJid', 'message.key.remoteJid',
-    'message.from', 'ticket.contact.number', 'ticket.contact.id',
+    'message.from', 'ticket.contact.id',
   ],
   pushName: [
+    'ticket.contact.name', 'ticket.contact.pushname', 'msg.profile.name', 'msg.pushName', 'msg.notifyName',
     'pushName', 'senderName', 'notifyName', 'name',
     'contact.name', 'contact.pushname', 'contact.pushName',
-    'data.pushName', 'data.notifyName', 'ticket.contact.name',
+    'data.pushName', 'data.notifyName',
   ],
-  type: ['type', 'messageType', 'mediaType', 'data.type', 'data.messageType', 'message.type', 'msg.type'],
+  type: ['msg.type', 'type', 'messageType', 'mediaType', 'data.type', 'data.messageType', 'message.type'],
   text: [
+    'msg.text.body', 'msg.text', 'msg.button.text', 'msg.caption',
+    'msg.image.caption', 'msg.video.caption', 'msg.document.caption', 'msg.audio.caption',
     'body', 'text', 'caption', 'content', 'msgBody',
     'message', 'data.body', 'data.text', 'data.caption',
     'message.conversation', 'message.extendedTextMessage.text',
@@ -88,6 +97,7 @@ const P = {
     'message.imageMessage.caption', 'message.videoMessage.caption', 'message.documentMessage.caption',
   ],
   buttonTitle: [
+    'msg.interactive.button_reply.title', 'msg.interactive.list_reply.title', 'msg.button.text',
     'selectedButtonText', 'buttonText', 'selectedDisplayText',
     'interactive.button_reply.title', 'interactive.list_reply.title',
     'message.buttonsResponseMessage.selectedDisplayText',
@@ -96,25 +106,31 @@ const P = {
     'data.selectedButtonText',
   ],
   buttonId: [
+    'msg.interactive.button_reply.id', 'msg.interactive.list_reply.id', 'msg.button.payload',
     'selectedButtonId', 'buttonId',
     'interactive.button_reply.id', 'interactive.list_reply.id',
     'message.buttonsResponseMessage.selectedButtonId',
     'message.listResponseMessage.singleSelectReply.selectedRowId',
   ],
   mediaUrl: [
+    'msg.audio.url', 'msg.image.url', 'msg.document.url', 'msg.video.url', 'msg.voice.url', 'msg.sticker.url',
+    'msg.audio.link', 'msg.image.link', 'msg.document.link', 'msg.media.url',
     'mediaUrl', 'mediaURL', 'url', 'fileUrl', 'fileURL', 'mediaPath',
     'media.url', 'data.mediaUrl', 'data.url', 'message.mediaUrl', 'attachment.url',
   ],
-  mime: ['mimetype', 'mimeType', 'mime', 'data.mimetype', 'media.mimetype', 'message.mimetype'],
-  duration: ['duration', 'seconds', 'data.duration', 'message.audioMessage.seconds'],
+  mime: [
+    'msg.audio.mime_type', 'msg.voice.mime_type', 'msg.image.mime_type', 'msg.document.mime_type', 'msg.video.mime_type',
+    'mimetype', 'mimeType', 'mime', 'data.mimetype', 'media.mimetype', 'message.mimetype',
+  ],
+  duration: ['msg.audio.seconds', 'msg.voice.seconds', 'duration', 'seconds', 'data.duration', 'message.audioMessage.seconds'],
   externalId: [
-    'id', 'messageId', 'wamid', 'key.id', 'data.id', 'data.key.id',
+    'msg.id', 'id', 'messageId', 'wamid', 'key.id', 'data.id', 'data.key.id',
     'message.id', 'message.key.id', 'msgId', 'data.messageId',
   ],
-  ticketId: ['ticketId', 'ticket.id', 'data.ticketId', 'ticket_id', 'data.ticket.id'],
-  timestamp: ['timestamp', 'messageTimestamp', 'data.timestamp', 't', 'date'],
-  lat: ['latitude', 'lat', 'location.latitude', 'location.lat', 'message.locationMessage.degreesLatitude', 'data.latitude'],
-  lng: ['longitude', 'lng', 'lon', 'location.longitude', 'location.lng', 'message.locationMessage.degreesLongitude', 'data.longitude'],
+  ticketId: ['ticket.id', 'ticketId', 'data.ticketId', 'ticket_id', 'data.ticket.id', 'msg.ticketId'],
+  timestamp: ['msg.timestamp', 'timestamp', 'messageTimestamp', 'data.timestamp', 't', 'date'],
+  lat: ['msg.location.latitude', 'latitude', 'lat', 'location.latitude', 'location.lat', 'message.locationMessage.degreesLatitude', 'data.latitude'],
+  lng: ['msg.location.longitude', 'longitude', 'lng', 'lon', 'location.longitude', 'location.lng', 'message.locationMessage.degreesLongitude', 'data.longitude'],
 };
 
 /** Acha um id de evento mesmo quando a mensagem não normaliza (idempotência/captura). */
@@ -131,6 +147,13 @@ export function normalizeZproWebhook(
   // Echo das próprias mensagens e grupos: ignora.
   if (pickBool(payload, P.fromMe)) return null;
   if (pickBool(payload, P.isGroup)) return null;
+
+  // Só mensagens RECEBIDAS. O zpro também posta status/ack/echo no mesmo webhook —
+  // o envelope traz `method` ('message' = recebida). Se vier outro method, ignora.
+  const method = (pickStr(payload, P.method) ?? '').toLowerCase();
+  if (method && !['message', 'messages', 'received', 'message_received', 'onmessage'].includes(method)) {
+    return null;
+  }
 
   const senderRaw = pickStr(payload, P.sender);
   if (!senderRaw) return null;

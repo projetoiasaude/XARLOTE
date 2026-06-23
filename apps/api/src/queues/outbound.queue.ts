@@ -136,7 +136,7 @@ export function startOutboundWorkers(): void {
       { connection, concurrency: 1, limiter: { max, duration } },
     );
     worker.on('failed', (job, err) => {
-      void writeLog('error', 'outbound', `Job ${name} falhou (tentativa ${job?.attemptsMade ?? '?'}): ${String(err).slice(0, 200)}`, {
+      void writeLog('error', 'outbound', `Job ${name} falhou (tentativa ${job?.attemptsMade ?? '?'}): ${String(err).slice(0, 500)}`, {
         traceId: (job?.data as OutboundJob | undefined)?.traceId,
       });
     });
