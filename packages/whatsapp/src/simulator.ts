@@ -2,7 +2,9 @@
 // Usado quando WHATSAPP_MODE=simulator (sem uazapi configurado).
 
 import type { SimulateInboundPayload, NormalizedInbound } from '@iasaude/shared';
+import { SARA_INSTANCE } from '@iasaude/shared';
 import { e164ToJid } from './normalize.js';
+import { zproConfigured } from './provider.js';
 
 export function buildSimulatedInbound(payload: SimulateInboundPayload): NormalizedInbound {
   const phoneE164 = payload.phone.startsWith('+') ? payload.phone : `+${payload.phone}`;
@@ -42,8 +44,10 @@ export function buildSimulatedInbound(payload: SimulateInboundPayload): Normaliz
 }
 
 export function isSimulatorMode(): boolean {
-  return (
-    process.env['WHATSAPP_MODE'] === 'simulator' ||
-    !process.env['UAZAPI_SARA_TOKEN']
-  );
+  // Simulador só quando explicitamente pedido, OU quando NENHUM provedor está
+  // configurado para a sara (nem zpro/oficial, nem uazapi). Antes checávamos só
+  // UAZAPI_SARA_TOKEN — o que ligaria o simulador por engano depois da migração
+  // pra API oficial (zpro), onde não há token uazapi.
+  if (process.env['WHATSAPP_MODE'] === 'simulator') return true;
+  return !zproConfigured(SARA_INSTANCE) && !process.env['UAZAPI_SARA_TOKEN'];
 }

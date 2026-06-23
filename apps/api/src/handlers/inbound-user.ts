@@ -4,7 +4,7 @@ import { isForgetMeRequest, buildConsentEvent } from '@iasaude/core';
 import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES } from '@iasaude/shared';
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard } from '@iasaude/shared';
 import { chat, buildXarloteSystemPrompt, xarloteTools, messagesToHistory, trimHistory, embed, userContentWithImage, dataUrl, type ChatContent } from '@iasaude/llm';
-import { sendMenu, isSimulatorMode, downloadMedia } from '@iasaude/whatsapp';
+import { sendMenu, isSimulatorMode, fetchInboundMedia } from '@iasaude/whatsapp';
 import { transcribeAudio } from '@iasaude/integrations';
 import { Queue } from 'bullmq';
 import { loadPrompts } from '../config/prompts.js';
@@ -142,6 +142,9 @@ export async function processInboundUser(
         try {
           await sendMenu(SARA_INSTANCE, phoneE164, ONBOARDING_CONSENT_MESSAGE, ['Aceitar', 'Recusar'], {
             type: 'button',
+            // zpro/WABA exige o ticketId pra renderizar botões — vem do webhook
+            // de entrada desta 1ª mensagem. No uazapi é ignorado.
+            ticketId: inbound.providerTicketId,
           });
         } catch (err) {
           await writeLog('error', 'outbound', `Failed to send consent menu: ${String(err)}`, { traceId });
@@ -381,7 +384,7 @@ export async function processInboundUser(
     let transcript = '';
     let downloadedMime = inbound.mediaMime ?? 'audio/ogg';
     try {
-      const media = await downloadMedia(SARA_INSTANCE, longId);
+      const media = await fetchInboundMedia(inbound, SARA_INSTANCE);
       if (media) {
         downloadedMime = media.mime || downloadedMime;
         await writeLog('info', 'transcription', `Áudio baixado (${media.buffer.length} bytes, ${downloadedMime})`, { traceId });
@@ -420,7 +423,7 @@ export async function processInboundUser(
       if (inbound.mediaBase64) {
         dataUrlValue = dataUrl(inbound.mediaBase64, inbound.mediaMime ?? 'image/jpeg');
       } else {
-        const media = await downloadMedia(SARA_INSTANCE, longId);
+        const media = await fetchInboundMedia(inbound, SARA_INSTANCE);
         if (media) {
           await writeLog('info', 'vision', `Imagem baixada (${media.buffer.length} bytes, ${media.mime})`, { traceId });
           dataUrlValue = dataUrl(media.buffer.toString('base64'), media.mime || 'image/jpeg');

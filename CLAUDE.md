@@ -39,9 +39,11 @@ Node 20 · TS 5 · Fastify 4 · BullMQ 5 · Redis 7 · **OpenRouter** (modelo pa
 - **Sara**: usa cards recuperados (top-K) no system prompt, agrupados por kind. Quando memória influencia ação, fala em voz alta (*"Lembrei que você é alérgico a dipirona…"*). Se confidence baixa, pergunta antes de assumir.
 - **Forget-me**: cascata via FK `on delete cascade` no `memory_cards_index` + `deleteUserMemory()` chamada no fluxo CONFIRMO APAGAR.
 
-## Mídia (uazapi)
-- **Download**: use o `id` LONGO da mensagem (`556298345024:3A...`), não o `messageid` curto. Endpoint POST `/message/download` com `{id}` retorna `{fileURL, mimetype}` — fazer GET na fileURL pra puxar buffer.
-- **buildConfig** em `packages/whatsapp/src/client.ts` resolve token via constante (`SARA_INSTANCE` = "sara"), NÃO via nome real da instância webhook (`VEDACIL-HIAGO`). Sempre passar `SARA_INSTANCE` em `downloadMedia()`.
+## WhatsApp — DUAL-PROVIDER (sara=zpro/oficial, agent=uazapi)
+- **Fachada única**: `packages/whatsapp/src/client.ts` exporta `sendText/sendMenu/sendImage/sendAudio/fetchInboundMedia/...` e despacha por **provider** (`provider.ts` → `providerFor(instance)`). Decisão por env `WHATSAPP_PROVIDER_<INSTANCE>` (`zpro`|`uazapi`); auto-detecta quando vazio. **Nunca** chame um provider direto fora do client — use a fachada (mantém os call-sites agnósticos).
+- **zpro (API Business oficial)** — leg `sara` (Xarlote). Contrato de SAÍDA confirmado (OpenAPI oficial): base `POST {ZPRO_BASE_URL}/v2/api/external/{ZPRO_<I>_API_ID}` + suffixes `/url`, `/base64`, `/voice`, `/sendButtonWABA`; auth `Authorization: Bearer`; número só-dígitos com DDI. **Botões WABA exigem `ticketId`** (vem do webhook de entrada → flui via `NormalizedInbound.providerTicketId` → `sendMenu`). Voz só por URL (`/voice`); Buffer cai pra `/base64`.
+- **zpro ENTRADA é NÃO-DOCUMENTADA**: `zpro-normalize.ts` é tolerante/provisório (tenta N chaves candidatas). A rota `webhook.zpro.ts` captura o payload redatado em `webhook_events`/system_logs — **finalize o parser contra o payload real capturado**, não invente o shape.
+- **Mídia recebida**: use `fetchInboundMedia(inbound, SARA_INSTANCE)` (agnóstico). zpro = baixa `inbound.mediaUrl` (Bearer se 401/403); uazapi = `/message/download` com o **`id` LONGO** (`556298345024:3A...`, não o `messageid` curto) → `{fileURL, mimetype}` → GET na fileURL. Sempre passe `SARA_INSTANCE` como chave de config (não o nome cru da instância do webhook, ex. `VEDACIL-HIAGO`).
 
 ## Dashboard — rotas
 - `http://localhost:3002/simulator` — simulador WhatsApp

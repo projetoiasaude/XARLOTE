@@ -30,6 +30,7 @@ export interface OutboundJob {
   ptv?: boolean;
   buttons?: string[];     // kind=menu
   footerText?: string;
+  ticketId?: number | string; // kind=menu no zpro/WABA (botões exigem ticket)
   traceId?: string;
 }
 
@@ -69,6 +70,7 @@ async function rawSend(job: OutboundJob): Promise<void> {
     await sendMenu(job.instance, job.phoneE164, job.text ?? '', job.buttons ?? [], {
       type: 'button',
       footerText: job.footerText,
+      ticketId: job.ticketId,
     });
     return;
   }

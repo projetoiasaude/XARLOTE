@@ -1,4 +1,23 @@
+// Client de WhatsApp — fachada ÚNICA de I/O, despacha por PROVEDOR.
+//
+// A interface pública (sendText, sendMenu, sendImage, sendAudio, downloadMedia,
+// fetchInboundMedia, …) é estável; cada função decide entre uazapi e zpro/WABA
+// pela instância (ver provider.ts). Assim NENHUM call-site precisa saber qual
+// provedor está ativo — sara→zpro (oficial), agent→uazapi.
 import axios from 'axios';
+import type { NormalizedInbound } from '@iasaude/shared';
+import { providerFor } from './provider.js';
+import {
+  buildZproConfig,
+  zproSendText,
+  zproSendMenu,
+  zproSendImage,
+  zproSendAudio,
+  zproCheckWhatsApp,
+  zproGetInstanceStatus,
+} from './zpro-client.js';
+
+// ─── uazapi (não-oficial) — implementação interna ────────────────────────────
 
 interface ClientConfig {
   serverUrl: string;
@@ -26,26 +45,19 @@ async function apiCall(cfg: ClientConfig, method: string, path: string, body?: u
   return res.data;
 }
 
-export async function sendText(instance: string, phoneE164: string, text: string): Promise<{ messageId: string }> {
+async function uazSendText(instance: string, phoneE164: string, text: string): Promise<{ messageId: string }> {
   const cfg = buildConfig(instance);
   const number = phoneE164.replace('+', '');
   const result = await apiCall(cfg, 'POST', '/send/text', { number, text });
   return { messageId: result?.messageid ?? result?.id ?? '' };
 }
 
-/**
- * Envia menu interativo (botões clicáveis) via uazapi.
- * Doc: https://docs.uazapi.com/endpoint/post/send~menu
- *
- * @param type - 'button' (até 3 opções), 'list', 'poll', etc.
- * @param choices - Array de opções (ex: ['Aceitar', 'Recusar']).
- */
-export async function sendMenu(
+async function uazSendMenu(
   instance: string,
   phoneE164: string,
   text: string,
   choices: string[],
-  opts: { type?: 'button' | 'list' | 'poll'; footerText?: string } = {}
+  opts: { type?: 'button' | 'list' | 'poll'; footerText?: string } = {},
 ): Promise<{ messageId: string }> {
   const cfg = buildConfig(instance);
   const number = phoneE164.replace('+', '');
@@ -59,7 +71,7 @@ export async function sendMenu(
   return { messageId: result?.messageid ?? result?.id ?? '' };
 }
 
-export async function sendImage(instance: string, phoneE164: string, imageUrl: string, caption?: string): Promise<{ messageId: string }> {
+async function uazSendImage(instance: string, phoneE164: string, imageUrl: string, caption?: string): Promise<{ messageId: string }> {
   const cfg = buildConfig(instance);
   const number = phoneE164.replace('+', '');
   const result = await apiCall(cfg, 'POST', '/send/media', {
@@ -71,19 +83,11 @@ export async function sendImage(instance: string, phoneE164: string, imageUrl: s
   return { messageId: result?.messageid ?? result?.id ?? '' };
 }
 
-/**
- * Envia mensagem de áudio (voice note) via uazapi /send/media com type=audio.
- *
- * @param audio  Buffer (encodado em base64 no payload) OU URL pública pra o arquivo.
- * @param mime   mime real do áudio — meramente informativo; uazapi aceita mp3/ogg/m4a.
- * @param ptv    Se true (default), envia como Push-To-Talk (a bolinha de microfone
- *               típica do WhatsApp). Se false, envia como anexo de áudio comum.
- */
-export async function sendAudio(
+async function uazSendAudio(
   instance: string,
   phoneE164: string,
   audio: Buffer | string,
-  opts: { mime?: string; ptv?: boolean } = {}
+  opts: { mime?: string; ptv?: boolean } = {},
 ): Promise<{ messageId: string }> {
   const cfg = buildConfig(instance);
   const number = phoneE164.replace('+', '');
@@ -97,12 +101,7 @@ export async function sendAudio(
   return { messageId: result?.messageid ?? result?.id ?? '' };
 }
 
-// uazapi não tem endpoint de presence isolado documentado de forma estável — desativado.
-export async function setPresence(_instance: string, _phoneE164: string, _state: 'composing' | 'paused'): Promise<void> {
-  return;
-}
-
-export async function checkWhatsApp(instance: string, phoneE164: string): Promise<{ exists: boolean; jid?: string }> {
+async function uazCheckWhatsApp(instance: string, phoneE164: string): Promise<{ exists: boolean; jid?: string }> {
   const cfg = buildConfig(instance);
   const number = phoneE164.replace('+', '');
   try {
@@ -114,7 +113,7 @@ export async function checkWhatsApp(instance: string, phoneE164: string): Promis
   }
 }
 
-export async function getInstanceStatus(instance: string): Promise<{ connected: boolean }> {
+async function uazGetInstanceStatus(instance: string): Promise<{ connected: boolean }> {
   const cfg = buildConfig(instance);
   try {
     const result = await apiCall(cfg, 'GET', '/instance/status');
@@ -125,43 +124,142 @@ export async function getInstanceStatus(instance: string): Promise<{ connected: 
 }
 
 /**
- * Baixa o conteúdo binário de uma mídia (áudio/imagem/doc) via uazapi.
- *
- * IMPORTANTE: o `messageId` aqui precisa ser o **id longo** do payload
- * (ex.: `556298345024:3A6A22A40561634EC12A`), NÃO o `messageid` curto.
- * Internamente uazapi devolve `{fileURL, mimetype}` apontando pro CDN dela
- * (ex.: `https://criate.uazapi.com/files/<sha>.jpg`) — fazemos um segundo
- * GET pra puxar o buffer.
- *
- * Retorna `null` em qualquer falha (caller decide o fallback de UX).
+ * Baixa mídia via uazapi a partir do **id longo** (ex.: `5562…:3A6A…`).
+ * uazapi devolve `{fileURL, mimetype}` (CDN) ou `{base64, mimetype}`.
  */
-export async function downloadMedia(
-  instance: string,
-  messageId: string
-): Promise<{ buffer: Buffer; mime: string } | null> {
+async function uazDownloadMedia(instance: string, messageId: string): Promise<{ buffer: Buffer; mime: string } | null> {
   const cfg = buildConfig(instance);
   try {
     const result = await apiCall(cfg, 'POST', '/message/download', { id: messageId });
-    // Caminho atual da uazapi: { fileURL, mimetype }
     if (result?.fileURL) {
-      const fileRes = await axios.get<ArrayBuffer>(result.fileURL, {
-        responseType: 'arraybuffer',
-        timeout: 30_000,
-      });
-      return {
-        buffer: Buffer.from(fileRes.data),
-        mime: result.mimetype || 'application/octet-stream',
-      };
+      const fileRes = await axios.get<ArrayBuffer>(result.fileURL, { responseType: 'arraybuffer', timeout: 30_000 });
+      return { buffer: Buffer.from(fileRes.data), mime: result.mimetype || 'application/octet-stream' };
     }
-    // Fallback legado: caso a API volte a entregar base64
     if (result?.base64) {
-      return {
-        buffer: Buffer.from(result.base64, 'base64'),
-        mime: result.mimetype || 'application/octet-stream',
-      };
+      return { buffer: Buffer.from(result.base64, 'base64'), mime: result.mimetype || 'application/octet-stream' };
     }
     return null;
   } catch {
     return null;
   }
+}
+
+// ─── Fachada pública (despacha por provedor) ─────────────────────────────────
+
+export async function sendText(instance: string, phoneE164: string, text: string): Promise<{ messageId: string }> {
+  return providerFor(instance) === 'zpro'
+    ? zproSendText(instance, phoneE164, text)
+    : uazSendText(instance, phoneE164, text);
+}
+
+/**
+ * Menu interativo (botões clicáveis).
+ * - uazapi: /send/menu (usa opts.type).
+ * - zpro/WABA: /sendButtonWABA (máx 3 botões; usa opts.ticketId quando houver).
+ */
+export async function sendMenu(
+  instance: string,
+  phoneE164: string,
+  text: string,
+  choices: string[],
+  opts: { type?: 'button' | 'list' | 'poll'; footerText?: string; ticketId?: number | string } = {},
+): Promise<{ messageId: string }> {
+  if (providerFor(instance) === 'zpro') {
+    return zproSendMenu(instance, phoneE164, text, choices, { footerText: opts.footerText, ticketId: opts.ticketId });
+  }
+  return uazSendMenu(instance, phoneE164, text, choices, { type: opts.type, footerText: opts.footerText });
+}
+
+export async function sendImage(instance: string, phoneE164: string, imageUrl: string, caption?: string): Promise<{ messageId: string }> {
+  return providerFor(instance) === 'zpro'
+    ? zproSendImage(instance, phoneE164, imageUrl, caption)
+    : uazSendImage(instance, phoneE164, imageUrl, caption);
+}
+
+/**
+ * Áudio (voice note). uazapi aceita Buffer (base64) ou URL; zpro faz PTT só por
+ * URL (/voice) e cai pra /base64 quando recebe Buffer.
+ */
+export async function sendAudio(
+  instance: string,
+  phoneE164: string,
+  audio: Buffer | string,
+  opts: { mime?: string; ptv?: boolean } = {},
+): Promise<{ messageId: string }> {
+  return providerFor(instance) === 'zpro'
+    ? zproSendAudio(instance, phoneE164, audio, { mime: opts.mime })
+    : uazSendAudio(instance, phoneE164, audio, opts);
+}
+
+// Nenhum provedor expõe presence isolado de forma estável — no-op.
+export async function setPresence(_instance: string, _phoneE164: string, _state: 'composing' | 'paused'): Promise<void> {
+  return;
+}
+
+export async function checkWhatsApp(instance: string, phoneE164: string): Promise<{ exists: boolean; jid?: string }> {
+  return providerFor(instance) === 'zpro'
+    ? zproCheckWhatsApp(instance, phoneE164)
+    : uazCheckWhatsApp(instance, phoneE164);
+}
+
+export async function getInstanceStatus(instance: string): Promise<{ connected: boolean }> {
+  return providerFor(instance) === 'zpro'
+    ? zproGetInstanceStatus(instance)
+    : uazGetInstanceStatus(instance);
+}
+
+/**
+ * Baixa mídia por id (compat uazapi). No zpro não há download por id — a mídia
+ * recebida vem com URL no próprio webhook, baixada por `fetchInboundMedia`.
+ */
+export async function downloadMedia(instance: string, messageId: string): Promise<{ buffer: Buffer; mime: string } | null> {
+  if (providerFor(instance) === 'zpro') return null;
+  return uazDownloadMedia(instance, messageId);
+}
+
+async function fetchUrlBuffer(url: string, bearer?: string): Promise<{ buffer: Buffer; mime: string } | null> {
+  const doGet = (headers?: Record<string, string>) =>
+    axios.get<ArrayBuffer>(url, { responseType: 'arraybuffer', timeout: 30_000, headers });
+  try {
+    const res = await doGet().catch((err: unknown) => {
+      // Mídia hospedada no zpro pode exigir o Bearer — tenta de novo com auth.
+      const status = (err as { response?: { status?: number } })?.response?.status;
+      if (bearer && (status === 401 || status === 403)) {
+        return doGet({ Authorization: `Bearer ${bearer}` });
+      }
+      throw err;
+    });
+    const mime = String(res.headers?.['content-type'] ?? 'application/octet-stream').split(';')[0]!.trim();
+    return { buffer: Buffer.from(res.data), mime };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Obtém o binário de uma mídia recebida, de forma agnóstica de provedor:
+ *   - base64 inline (simulador / alguns provedores) → decodifica;
+ *   - zpro: baixa a `mediaUrl` do webhook (com Bearer se necessário);
+ *   - uazapi: usa o id longo + /message/download (caminho provado).
+ *
+ * `instance` é a chave de config (ex.: SARA_INSTANCE), não o nome cru do webhook.
+ */
+export async function fetchInboundMedia(
+  inbound: NormalizedInbound,
+  instance: string,
+): Promise<{ buffer: Buffer; mime: string } | null> {
+  if (inbound.mediaBase64) {
+    return { buffer: Buffer.from(inbound.mediaBase64, 'base64'), mime: inbound.mediaMime ?? 'application/octet-stream' };
+  }
+  if (providerFor(instance) === 'zpro') {
+    if (!inbound.mediaUrl) return null;
+    const { token } = buildZproConfig(instance);
+    const got = await fetchUrlBuffer(inbound.mediaUrl, token);
+    if (got && (!got.mime || got.mime === 'application/octet-stream') && inbound.mediaMime) {
+      return { buffer: got.buffer, mime: inbound.mediaMime };
+    }
+    return got;
+  }
+  const longId = (inbound.raw as { message?: { id?: string } } | null)?.message?.id ?? inbound.externalId;
+  return uazDownloadMedia(instance, longId);
 }

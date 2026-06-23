@@ -1,5 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { db } from '@iasaude/db';
+import { providerFor } from '@iasaude/whatsapp';
+import { SARA_INSTANCE, AGENT_INSTANCE } from '@iasaude/shared';
 import { getRedisClient } from '../queue-config.js';
 import { loadPrompts } from '../config/prompts.js';
 
@@ -79,7 +81,9 @@ export async function healthRoute(app: FastifyInstance) {
   app.get('/health', async (_req, reply) => {
     return reply.send({
       ok: true,
-      whatsapp_mode: process.env['WHATSAPP_MODE'] ?? 'uazapi',
+      whatsapp_mode: process.env['WHATSAPP_MODE'] ?? 'live',
+      wa_provider_sara: providerFor(SARA_INSTANCE),
+      wa_provider_agent: providerFor(AGENT_INSTANCE),
       uptime_s: Math.round(process.uptime()),
       ts: new Date().toISOString(),
     });

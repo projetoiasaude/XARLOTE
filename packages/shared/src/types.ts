@@ -234,6 +234,10 @@ export interface NormalizedInbound {
   mediaMime?: string;
   mediaDurationMs?: number;
   location?: { lat: number; lng: number; name?: string; address?: string };
+  // Contexto do provedor (zpro/WABA): id do ticket aberto pra este contato, usado
+  // pra enviar botões interativos (/sendButtonWABA exige ticketId). Opcional —
+  // ausente no uazapi.
+  providerTicketId?: number | string;
   raw: unknown;
 }
 
