@@ -174,7 +174,16 @@ export async function zproSendAudio(
   const cfg = buildZproConfig(instance);
   const number = toNumber(phoneE164);
   if (typeof audio === 'string') {
-    const data = await zproCall(cfg, '/voice', { number, audio, externalKey: randomUUID(), isClosed: false });
+    // WABA: /voice (PTT) NÃO é suportado nesse canal (ERR_CHANNEL_NOT_SUPPORTED).
+    // Mídia de áudio vai pelo /url (mesmo endpoint da imagem). Em ogg/opus o
+    // WhatsApp renderiza como voice note.
+    const data = await zproCall(cfg, '/url', {
+      number,
+      mediaUrl: audio,
+      body: '',
+      externalKey: randomUUID(),
+      isClosed: false,
+    });
     return { messageId: pickMessageId(data) };
   }
   // Buffer → /base64. O fileName precisa BATER com o mime, senão o zpro/WABA pode
