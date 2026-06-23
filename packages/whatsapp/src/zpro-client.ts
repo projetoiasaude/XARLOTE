@@ -11,6 +11,7 @@
 //
 // externalUrl = `${ZPRO_BASE_URL}/v2/api/external/${ZPRO_<INSTANCE>_API_ID}`
 import axios from 'axios';
+import { randomUUID } from 'crypto';
 
 interface ZproConfig {
   externalUrl: string;
@@ -90,7 +91,12 @@ export async function zproSendText(
   text: string,
 ): Promise<{ messageId: string }> {
   const cfg = buildZproConfig(instance);
-  const data = await zproCall(cfg, '', { number: toNumber(phoneE164), body: text, isClosed: false });
+  const data = await zproCall(cfg, '', {
+    number: toNumber(phoneE164),
+    body: text,
+    externalKey: randomUUID(),
+    isClosed: false,
+  });
   return { messageId: pickMessageId(data) };
 }
 
@@ -117,6 +123,7 @@ export async function zproSendMenu(
   const body: Record<string, unknown> = {
     number: toNumber(phoneE164),
     message,
+    externalKey: randomUUID(),
   };
   top3.forEach((label, i) => {
     body[`button${i + 1}`] = label;
@@ -140,6 +147,7 @@ export async function zproSendImage(
     number: toNumber(phoneE164),
     mediaUrl: imageUrl,
     body: caption ?? '',
+    externalKey: randomUUID(),
     isClosed: false,
   });
   return { messageId: pickMessageId(data) };
@@ -159,7 +167,7 @@ export async function zproSendAudio(
   const cfg = buildZproConfig(instance);
   const number = toNumber(phoneE164);
   if (typeof audio === 'string') {
-    const data = await zproCall(cfg, '/voice', { number, audio, isClosed: false });
+    const data = await zproCall(cfg, '/voice', { number, audio, externalKey: randomUUID(), isClosed: false });
     return { messageId: pickMessageId(data) };
   }
   const data = await zproCall(cfg, '/base64', {
@@ -168,6 +176,7 @@ export async function zproSendAudio(
     base64Data: audio.toString('base64'),
     mimeType: opts.mime ?? 'audio/ogg',
     fileName: 'audio.ogg',
+    externalKey: randomUUID(),
     isClosed: false,
   });
   return { messageId: pickMessageId(data) };
