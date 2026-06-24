@@ -4,7 +4,7 @@ import { usePathname } from 'next/navigation';
 import { motion } from 'framer-motion';
 import {
   MessageCircle, ShoppingBag, Activity, Users, Store, Zap, SlidersHorizontal,
-  Pill, Stethoscope, Building2, Shield, TrendingUp,
+  Pill, Stethoscope, Building2, Shield, TrendingUp, LogOut,
   type LucideIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -104,6 +104,17 @@ export function Sidebar() {
           <div className="px-2 text-[10px] text-white/40 truncate font-mono">
             {modelLabel}
           </div>
+          <button
+            type="button"
+            onClick={async () => {
+              try { await fetch('/api/auth/logout', { method: 'POST' }); } catch { /* ignore */ }
+              window.location.href = '/login';
+            }}
+            className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-white/45 hover:text-white/85 hover:bg-white/[0.04] transition"
+          >
+            <LogOut size={14} className="shrink-0" />
+            <span>Sair</span>
+          </button>
         </div>
       </div>
     </aside>
