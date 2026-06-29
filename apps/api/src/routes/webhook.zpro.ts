@@ -3,7 +3,8 @@ import type { FastifyInstance } from 'fastify';
 import { normalizeZproWebhook, zproEventId, isZproStatusEcho } from '@iasaude/whatsapp';
 import { db, writeLog, redactPII } from '@iasaude/db';
 import { processInboundUser } from '../handlers/inbound-user.js';
-import { SARA_INSTANCE } from '@iasaude/shared';
+import { processInboundSupplierFromWebhook } from '../handlers/inbound-supplier.js';
+import { AGENT_INSTANCE, SARA_INSTANCE } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { checkUserRateLimit } from '../middleware/rate-limit.js';
 import { setZproTicket } from '../middleware/zpro-ticket.js';
@@ -85,9 +86,26 @@ export async function webhookZproRoute(app: FastifyInstance) {
       }
 
       // Guarda o ticketId desta conversa (24h) pra botões PROATIVOS (red-flag,
-      // lembretes) que não têm um inbound fresco na hora do envio.
+      // lembretes) que não têm um inbound fresco na hora do envio. Vale pras duas
+      // legs — é indexado por telefone.
       void setZproTicket(normalized.from.phoneE164, normalized.providerTicketId);
 
+      // Roteia por número: a leg `agent` (farmácias/clínicas) NÃO passa pelo
+      // interruptor da Xarlote nem pelo rate-limit por usuário — são respostas de
+      // estabelecimento, não de cliente. Espelha webhook.uazapi.ts.
+      const isAgentInstance =
+        instanceName === AGENT_INSTANCE || instanceName === process.env['ZPRO_AGENT_INSTANCE'];
+      if (isAgentInstance) {
+        setImmediate(() =>
+          processInboundSupplierFromWebhook(normalized, traceId).catch((err) => {
+            req.log.error({ traceId, err }, 'inbound-supplier (zpro) failed');
+            captureError(err, { traceId, phase: 'inbound-supplier-zpro' });
+          }),
+        );
+        return reply.send({ ok: true });
+      }
+
+      // ── Leg da Xarlote (cliente) ─────────────────────────────────────────────
       // Interruptor mestre: Xarlote desligada no painel → ignora (200 pra não retentar).
       const cfg = loadPrompts();
       if (!cfg.xarlote_enabled) {

@@ -299,13 +299,20 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
 // AGENT_INSTANCE serve tanto pra farmácia quanto pra clínica — diferenciamos
 // pelo `party_type` da conversa salva no DB.
 export async function processInboundSupplierFromWebhook(inbound: NormalizedInbound, traceId: string = randomUUID()): Promise<void> {
-  const { data: conv } = await db
+  // O jid salvo na negociação é sempre `<digitos>@s.whatsapp.net` (derivado do
+  // whatsapp_e164 do fornecedor). Dependendo do provider, o sender do inbound
+  // pode vir com outro sufixo (@c.us, @lid) — então casamos pelo jid cru E pelo
+  // jid canônico reconstruído do telefone (robusto pra uazapi e zpro).
+  const canonicalJid = `${inbound.from.phoneE164.replace(/\D/g, '')}@s.whatsapp.net`;
+  const jids = [...new Set([inbound.from.jid, canonicalJid])];
+  const { data: rows } = await db
     .from('conversations')
     .select('id, party_type')
     .eq('whatsapp_instance', AGENT_INSTANCE)
-    .eq('whatsapp_jid', inbound.from.jid)
-    .single();
+    .in('whatsapp_jid', jids)
+    .limit(1);
 
+  const conv = rows?.[0];
   if (!conv) return;
 
   // Roteamento por party_type — clinic vai pro agent-clinic, supplier fica aqui
