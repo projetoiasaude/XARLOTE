@@ -212,6 +212,44 @@ export async function zproSendAudio(
   return { messageId: pickMessageId(data) };
 }
 
+/**
+ * Envia um TEMPLATE (HSM) aprovado na Meta — abertura fria de conversa no WABA.
+ *
+ * ⚠️ CONTRATO A CONFIRMAR: o envio de template pela API EXTERNA do zpro NÃO está
+ * no OpenAPI que temos. Pra não INVENTAR endpoint (regra do projeto), o caminho é
+ * lido de `ZPRO_TEMPLATE_PATH` (ex.: "/template"): sem essa env, a função LANÇA —
+ * e o caller cai pro fallback de texto. Quando o fundador confirmar o contrato
+ * real do zpro, basta setar a env (e, se o shape do payload divergir, ajustar
+ * aqui). O payload segue o padrão da API externa (number + externalKey) com um
+ * bloco de template em formato WABA (name + language + body params na ordem dos
+ * slots {{1}}…). Auth e tratamento de erro reusam `zproCall`.
+ */
+export async function zproSendTemplate(
+  instance: string,
+  phoneE164: string,
+  template: { name: string; language: string; variables: string[] },
+): Promise<{ messageId: string }> {
+  const cfg = buildZproConfig(instance);
+  const path = process.env['ZPRO_TEMPLATE_PATH']?.trim();
+  if (!path) {
+    throw new Error('zpro template: endpoint não configurado (ZPRO_TEMPLATE_PATH) — contrato HSM a confirmar com o zpro');
+  }
+  const body = {
+    number: toNumber(phoneE164),
+    externalKey: randomUUID(),
+    template: {
+      name: template.name,
+      language: template.language,
+      // variáveis do CORPO na ORDEM dos slots {{1}},{{2}},… (aprovados na Meta)
+      components: template.variables.length
+        ? [{ type: 'body', parameters: template.variables.map((text) => ({ type: 'text', text })) }]
+        : [],
+    },
+  };
+  const data = await zproCall(cfg, path.startsWith('/') ? path : `/${path}`, body);
+  return { messageId: pickMessageId(data) };
+}
+
 // A API externa do zpro não expõe checagem de número nem status de instância de
 // forma documentada. Como nenhum caller depende disso hoje, devolvemos otimista
 // (não bloquear envio / não derrubar health-check).

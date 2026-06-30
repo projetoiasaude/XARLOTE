@@ -1,6 +1,6 @@
 import { db, writeLog } from '@iasaude/db';
 import { sendOutbound } from './outbound.js';
-import { sendOutboundToSupplier } from './outbound-agent.js';
+import { sendOutboundToSupplier, sendOutboundToClinic } from './outbound-agent.js';
 
 /**
  * Loop agêntico resolutivo (Fase 4).
@@ -13,14 +13,27 @@ import { sendOutboundToSupplier } from './outbound-agent.js';
  *      sempre: o rescue de pedidos órfãos assume após a janela);
  *   3. quando o cliente responde, devolve a resposta ao estabelecimento e a
  *      negociação continua de onde parou.
+ *
+ * Dois estabelecimentos, mesma mecânica:
+ *   - FARMÁCIA: `quotes` (FK order_id → orders → conversation do cliente) → devolve
+ *     a resposta via `sendOutboundToSupplier`.
+ *   - CLÍNICA:  `consultation_quotes` (FK consultation_id → consultations → conversation
+ *     do cliente) → devolve via `sendOutboundToClinic`.
+ * As funções abaixo são espelhos explícitos (mesmo padrão do resto do código:
+ * inbound-supplier ↔ agent-clinic, quote-consolidation ↔ consultation-consolidation).
  */
 
 // Janela em que a consolidação espera o cliente. Depois disso o gate libera e o
 // rescue (>10min) assume — garante que um cliente que some não trava o pedido.
 const CLARIFICATION_WAIT_MIN = 8;
 
+export type EstablishmentKind = 'pharmacy' | 'clinic';
+
 export interface PendingClarification {
+  kind: EstablishmentKind;
+  /** id da cotação (quotes.id ou consultation_quotes.id, conforme `kind`) */
   quoteId: string;
+  /** id do pedido-pai: orders.id (farmácia) ou consultations.id (clínica) */
   orderId: string;
   question: string;
   supplierConversationId: string;
@@ -28,7 +41,9 @@ export interface PendingClarification {
   supplierName: string;
 }
 
-/** O estabelecimento pediu um dado do paciente → marca a cotação e leva a pergunta ao cliente. */
+// ─── FARMÁCIA ────────────────────────────────────────────────────────────────
+
+/** A farmácia pediu um dado do paciente → marca a cotação e leva a pergunta ao cliente. */
 export async function relaySupplierQuestionToUser(
   quote: { id: string; order_id: string; conversation_id: string | null; suppliers?: { name?: string } | null },
   question: string,
@@ -56,7 +71,39 @@ export async function relaySupplierQuestionToUser(
   await writeLog('info', 'clarification', `❓ Pergunta da farmácia levada ao cliente: "${question.slice(0, 80)}"`, { traceId, quoteId: quote.id });
 }
 
-/** Há clarificação pendente (e ainda dentro da janela de espera) pra esse pedido? Gate da consolidação. */
+// ─── CLÍNICA ─────────────────────────────────────────────────────────────────
+
+/** A clínica pediu um dado do paciente → marca a cotação de consulta e leva a pergunta ao cliente. */
+export async function relayClinicQuestionToUser(
+  quote: { id: string; consultation_id: string; conversation_id: string | null; clinics?: { name?: string } | null },
+  question: string,
+  traceId: string,
+): Promise<void> {
+  await db.from('consultation_quotes').update({
+    clarification_status: 'awaiting_user',
+    clarification_question: question,
+    clarification_asked_at: new Date().toISOString(),
+  }).eq('id', quote.id);
+
+  // Conversa + telefone do CLIENTE (via consultation.conversation_id)
+  const { data: consultation } = await db.from('consultations').select('conversation_id').eq('id', quote.consultation_id).single();
+  if (!consultation?.conversation_id) {
+    await writeLog('warn', 'clarification', 'Consulta sem conversa do cliente — não dá pra levar a pergunta', { traceId, quoteId: quote.id });
+    return;
+  }
+  const { data: userConv } = await db.from('conversations').select('whatsapp_jid').eq('id', consultation.conversation_id).single();
+  const digits = userConv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
+  if (!digits) return;
+
+  const clinicName = quote.clinics?.name ?? 'a clínica';
+  const msg = `Oi! Pra marcar sua consulta com ${clinicName}, preciso confirmar uma coisinha: ${question}`;
+  await sendOutbound(consultation.conversation_id, `+${digits}`, msg, traceId);
+  await writeLog('info', 'clarification', `❓ Pergunta da clínica levada ao cliente: "${question.slice(0, 80)}"`, { traceId, quoteId: quote.id });
+}
+
+// ─── Gates de consolidação (por estabelecimento) ─────────────────────────────
+
+/** Há clarificação pendente (e dentro da janela) pra esse PEDIDO de farmácia? Gate da consolidação. */
 export async function hasPendingClarification(orderId: string): Promise<boolean> {
   const cutoff = new Date(Date.now() - CLARIFICATION_WAIT_MIN * 60_000).toISOString();
   const { data } = await db
@@ -69,8 +116,39 @@ export async function hasPendingClarification(orderId: string): Promise<boolean>
   return (data?.length ?? 0) > 0;
 }
 
-/** Acha a clarificação pendente do pedido ativo deste cliente (pro inbound do user). */
-export async function findPendingClarificationForUser(userConversationId: string): Promise<PendingClarification | null> {
+/** Há clarificação pendente (e dentro da janela) pra essa CONSULTA? Gate da consolidação da clínica. */
+export async function hasPendingClinicClarification(consultationId: string): Promise<boolean> {
+  const cutoff = new Date(Date.now() - CLARIFICATION_WAIT_MIN * 60_000).toISOString();
+  const { data } = await db
+    .from('consultation_quotes')
+    .select('id')
+    .eq('consultation_id', consultationId)
+    .eq('clarification_status', 'awaiting_user')
+    .gt('clarification_asked_at', cutoff)
+    .limit(1);
+  return (data?.length ?? 0) > 0;
+}
+
+// ─── Lookup unificado (pro inbound do user) ──────────────────────────────────
+
+/** Telefone do estabelecimento: conversa (whatsapp_jid) ou cadastro. */
+async function resolveEstablishmentPhone(
+  conversationId: string | null,
+  fallback: { whatsapp_e164?: string; phone_e164?: string } | null,
+): Promise<string> {
+  if (conversationId) {
+    const { data: conv } = await db.from('conversations').select('whatsapp_jid').eq('id', conversationId).single();
+    const digits = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
+    if (digits) return `+${digits}`;
+  }
+  return fallback?.whatsapp_e164 ?? fallback?.phone_e164 ?? '';
+}
+
+/** Pendência + quando foi perguntada — `_askedAt` é interno, só pro desempate temporal. */
+type PendingWithTime = PendingClarification & { _askedAt: string };
+
+/** Clarificação pendente de FARMÁCIA pro pedido ativo deste cliente. */
+async function findPendingPharmacyClarification(userConversationId: string): Promise<PendingWithTime | null> {
   const { data: orders } = await db
     .from('orders')
     .select('id')
@@ -81,7 +159,7 @@ export async function findPendingClarificationForUser(userConversationId: string
 
   const { data: quotes } = await db
     .from('quotes')
-    .select('id, order_id, conversation_id, clarification_question, suppliers(name, whatsapp_e164, phone_e164)')
+    .select('id, order_id, conversation_id, clarification_question, clarification_asked_at, suppliers(name, whatsapp_e164, phone_e164)')
     .in('order_id', orderIds)
     .eq('clarification_status', 'awaiting_user')
     .order('clarification_asked_at', { ascending: false })
@@ -89,49 +167,101 @@ export async function findPendingClarificationForUser(userConversationId: string
   const q = quotes?.[0];
   if (!q) return null;
 
-  // Telefone da farmácia: conversa do fornecedor (whatsapp_jid) ou cadastro.
-  let supplierPhone = '';
-  if (q.conversation_id) {
-    const { data: supConv } = await db.from('conversations').select('whatsapp_jid').eq('id', q.conversation_id).single();
-    const digits = supConv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
-    if (digits) supplierPhone = `+${digits}`;
-  }
   const sup = q.suppliers as { name?: string; whatsapp_e164?: string; phone_e164?: string } | null;
-  if (!supplierPhone) supplierPhone = sup?.whatsapp_e164 ?? sup?.phone_e164 ?? '';
-
   return {
+    kind: 'pharmacy',
     quoteId: q.id,
     orderId: q.order_id,
     question: q.clarification_question ?? '',
     supplierConversationId: q.conversation_id ?? '',
-    supplierPhone,
+    supplierPhone: await resolveEstablishmentPhone(q.conversation_id, sup),
     supplierName: sup?.name ?? 'a farmácia',
+    _askedAt: q.clarification_asked_at ?? '',
   };
 }
 
-/** O cliente respondeu → marca a cotação como `answered` e devolve a resposta ao estabelecimento. */
-export async function relayUserAnswerToSupplier(
+/** Clarificação pendente de CLÍNICA pra consulta ativa deste cliente. */
+async function findPendingClinicClarification(userConversationId: string): Promise<PendingWithTime | null> {
+  const { data: consultations } = await db
+    .from('consultations')
+    .select('id')
+    .eq('conversation_id', userConversationId)
+    .in('status', ['searching', 'quoting', 'quoted', 'confirming']);
+  const consultationIds = (consultations ?? []).map((c) => c.id);
+  if (!consultationIds.length) return null;
+
+  const { data: quotes } = await db
+    .from('consultation_quotes')
+    .select('id, consultation_id, conversation_id, clarification_question, clarification_asked_at, clinics(name, whatsapp_e164, phone_e164)')
+    .in('consultation_id', consultationIds)
+    .eq('clarification_status', 'awaiting_user')
+    .order('clarification_asked_at', { ascending: false })
+    .limit(1);
+  const q = quotes?.[0];
+  if (!q) return null;
+
+  const clinic = q.clinics as { name?: string; whatsapp_e164?: string; phone_e164?: string } | null;
+  return {
+    kind: 'clinic',
+    quoteId: q.id,
+    orderId: q.consultation_id,
+    question: q.clarification_question ?? '',
+    supplierConversationId: q.conversation_id ?? '',
+    supplierPhone: await resolveEstablishmentPhone(q.conversation_id, clinic),
+    supplierName: clinic?.name ?? 'a clínica',
+    _askedAt: q.clarification_asked_at ?? '',
+  };
+}
+
+/**
+ * Acha a clarificação pendente (farmácia OU clínica) do cliente. Quando há as duas,
+ * devolve a mais recente (a Xarlote levou a última pergunta ao cliente por último).
+ */
+export async function findPendingClarificationForUser(userConversationId: string): Promise<PendingClarification | null> {
+  const [pharmacy, clinic] = await Promise.all([
+    findPendingPharmacyClarification(userConversationId),
+    findPendingClinicClarification(userConversationId),
+  ]);
+  if (pharmacy && clinic) {
+    return clinic._askedAt > pharmacy._askedAt ? clinic : pharmacy;
+  }
+  return pharmacy ?? clinic;
+}
+
+// ─── Devolução da resposta ao estabelecimento ────────────────────────────────
+
+/**
+ * O cliente respondeu → marca a cotação como `answered` e devolve a resposta ao
+ * estabelecimento certo (farmácia via sendOutboundToSupplier, clínica via
+ * sendOutboundToClinic), conforme o `kind` da clarificação pendente.
+ */
+export async function relayUserAnswerToEstablishment(
   userConversationId: string,
   answer: string,
   traceId: string,
-): Promise<{ relayed: boolean; supplierName?: string }> {
+): Promise<{ relayed: boolean; kind?: EstablishmentKind; supplierName?: string }> {
   const pending = await findPendingClarificationForUser(userConversationId);
   if (!pending) return { relayed: false };
 
-  await db.from('quotes').update({
+  const answeredPatch = {
     clarification_status: 'answered',
     clarification_answer: answer,
     clarification_answered_at: new Date().toISOString(),
-  }).eq('id', pending.quoteId);
+  };
+  if (pending.kind === 'clinic') {
+    await db.from('consultation_quotes').update(answeredPatch).eq('id', pending.quoteId);
+  } else {
+    await db.from('quotes').update(answeredPatch).eq('id', pending.quoteId);
+  }
 
   if (pending.supplierConversationId && pending.supplierPhone) {
-    await sendOutboundToSupplier(
-      pending.supplierConversationId,
-      pending.supplierPhone,
-      `Sobre o que você perguntou: ${answer}`,
-      traceId,
-    );
+    const text = `Sobre o que você perguntou: ${answer}`;
+    if (pending.kind === 'clinic') {
+      await sendOutboundToClinic(pending.supplierConversationId, pending.supplierPhone, text, traceId);
+    } else {
+      await sendOutboundToSupplier(pending.supplierConversationId, pending.supplierPhone, text, traceId);
+    }
   }
-  await writeLog('info', 'clarification', `✅ Resposta do cliente devolvida à farmácia: "${answer.slice(0, 80)}"`, { traceId, quoteId: pending.quoteId });
-  return { relayed: true, supplierName: pending.supplierName };
+  await writeLog('info', 'clarification', `✅ Resposta do cliente devolvida à ${pending.kind === 'clinic' ? 'clínica' : 'farmácia'}: "${answer.slice(0, 80)}"`, { traceId, quoteId: pending.quoteId, kind: pending.kind });
+  return { relayed: true, kind: pending.kind, supplierName: pending.supplierName };
 }

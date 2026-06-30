@@ -1,7 +1,13 @@
 import { db, writeLog } from '@iasaude/db';
-import { isSimulatorMode } from '@iasaude/whatsapp';
+import { isSimulatorMode, zproConfigured } from '@iasaude/whatsapp';
 import { AGENT_INSTANCE } from '@iasaude/shared';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
+import { buildTemplatePayload, humanizeTemplate, type TemplateKey } from '../config/template-registry.js';
+
+/** O número do agente está pronto pra enviar de verdade? (uazapi OU zpro/WABA) */
+function agentChannelReady(): boolean {
+  return !!process.env['UAZAPI_AGENT_TOKEN'] || zproConfigured(AGENT_INSTANCE);
+}
 
 /**
  * Sends a message from the agent to a pharmacy supplier.
@@ -89,4 +95,83 @@ export async function sendOutboundToClinic(
   // F0.7: envio via fila do agente com rate-limit.
   await dispatchOutbound({ kind: 'text', instance: AGENT_INSTANCE, phoneE164: clinicPhone, text, traceId });
   await writeLog('info', 'clinic', `Mensagem REAL enfileirada pra clínica ${clinicPhone.slice(0, 8)}***`, { traceId, conversationId });
+}
+
+// ─── Abertura FRIA via TEMPLATE (HSM/WABA) — Fase 6 ──────────────────────────
+// A 1ª mensagem proativa no número oficial PRECISA ser template (a Meta rejeita
+// texto livre fora de janela). Estas funções persistem a versão humanizada (vista
+// no dashboard) e enfileiram kind='template' com a humanizada como fallback de
+// texto. Só são chamadas quando `templatesEnabled()` — ver os initiate*.
+
+/** Abertura fria pra FARMÁCIA via template. */
+export async function sendTemplateOpeningToSupplier(
+  conversationId: string,
+  supplierPhone: string,
+  templateKey: TemplateKey,
+  variables: string[],
+  traceId: string,
+): Promise<void> {
+  const human = humanizeTemplate(templateKey, variables);
+  // Valida o payload ANTES de persistir/despachar. Se a contagem/var falhar
+  // (buildTemplatePayload lança), degrada pra TEXTO — nunca deixa a abertura muda.
+  let payload;
+  try {
+    payload = buildTemplatePayload(templateKey, variables);
+  } catch (err) {
+    await writeLog('warn', 'agent', `Template inválido (${templateKey}) — caindo pra texto: ${String(err).slice(0, 200)}`, { traceId, conversationId });
+    await sendOutboundToSupplier(conversationId, supplierPhone, human, traceId);
+    return;
+  }
+
+  await db.from('messages').insert({
+    conversation_id: conversationId, direction: 'out', sender_role: 'assistant',
+    content_type: 'text', content: human, trace_id: traceId,
+  });
+  await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversationId);
+
+  if (isSimulatorMode() || !agentChannelReady()) {
+    await writeLog('info', 'agent', 'Abertura (template) salva — aguardando resposta manual no dashboard', { traceId, conversationId });
+    return;
+  }
+  await dispatchOutbound({
+    kind: 'template', instance: AGENT_INSTANCE, phoneE164: supplierPhone,
+    templateName: payload.name, templateLanguage: payload.language, templateVariables: payload.variables,
+    text: human, traceId,
+  });
+}
+
+/** Abertura fria pra CLÍNICA via template (respeita CLINIC_OUTBOUND_MODE=real). */
+export async function sendTemplateOpeningToClinic(
+  conversationId: string,
+  clinicPhone: string,
+  templateKey: TemplateKey,
+  variables: string[],
+  traceId: string,
+): Promise<void> {
+  const human = humanizeTemplate(templateKey, variables);
+  let payload;
+  try {
+    payload = buildTemplatePayload(templateKey, variables);
+  } catch (err) {
+    await writeLog('warn', 'clinic', `Template inválido (${templateKey}) — caindo pra texto: ${String(err).slice(0, 200)}`, { traceId, conversationId });
+    await sendOutboundToClinic(conversationId, clinicPhone, human, traceId);
+    return;
+  }
+
+  await db.from('messages').insert({
+    conversation_id: conversationId, direction: 'out', sender_role: 'assistant',
+    content_type: 'text', content: human, trace_id: traceId,
+  });
+  await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversationId);
+
+  const realMode = process.env['CLINIC_OUTBOUND_MODE'] === 'real';
+  if (!realMode || isSimulatorMode() || !agentChannelReady()) {
+    await writeLog('info', 'clinic', 'Abertura (template) pra clínica salva (modo simulação)', { traceId, conversationId });
+    return;
+  }
+  await dispatchOutbound({
+    kind: 'template', instance: AGENT_INSTANCE, phoneE164: clinicPhone,
+    templateName: payload.name, templateLanguage: payload.language, templateVariables: payload.variables,
+    text: human, traceId,
+  });
 }

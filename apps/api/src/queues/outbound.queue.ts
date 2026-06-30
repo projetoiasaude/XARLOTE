@@ -15,16 +15,16 @@
  * contato), que são enviadas diretamente pra ter prioridade/imediatismo.
  */
 import { Queue, Worker, type Job } from 'bullmq';
-import { sendText, sendAudio, sendMenu } from '@iasaude/whatsapp';
+import { sendText, sendAudio, sendMenu, sendTemplate } from '@iasaude/whatsapp';
 import { writeLog } from '@iasaude/db';
 import { AGENT_INSTANCE, QUEUE_NAMES } from '@iasaude/shared';
 import { getRedisConnection } from '../queue-config.js';
 
 export interface OutboundJob {
-  kind: 'text' | 'audio' | 'menu';
+  kind: 'text' | 'audio' | 'menu' | 'template';
   instance: string;       // SARA_INSTANCE | AGENT_INSTANCE
   phoneE164: string;
-  text?: string;          // texto (kind=text) ou fallback (kind=audio)
+  text?: string;          // texto (kind=text) ou FALLBACK (kind=audio | kind=template)
   audioBase64?: string;   // buffer de áudio em base64 (kind=audio, via uazapi /base64)
   audioUrl?: string;      // URL pública do áudio (kind=audio, via zpro /voice = PTT)
   mime?: string;
@@ -32,6 +32,10 @@ export interface OutboundJob {
   buttons?: string[];     // kind=menu
   footerText?: string;
   ticketId?: number | string; // kind=menu no zpro/WABA (botões exigem ticket)
+  // kind=template (HSM/WABA — abertura fria oficial). text = fallback humanizado.
+  templateName?: string;
+  templateLanguage?: string;
+  templateVariables?: string[];
   traceId?: string;
 }
 
@@ -73,6 +77,28 @@ async function rawSend(job: OutboundJob): Promise<void> {
       footerText: job.footerText,
       ticketId: job.ticketId,
     });
+    return;
+  }
+  if (job.kind === 'template') {
+    // Abertura fria oficial (WABA): manda o TEMPLATE aprovado. Se falhar (endpoint
+    // não confirmado, template reprovado, provider sem HSM), degrada pra TEXTO com a
+    // versão humanizada — nunca deixa a abertura muda.
+    try {
+      await sendTemplate(job.instance, job.phoneE164, {
+        name: job.templateName ?? '',
+        language: job.templateLanguage ?? 'pt_BR',
+        variables: job.templateVariables ?? [],
+      });
+    } catch (err) {
+      await writeLog('warn', 'outbound', `Template falhou (caindo pra texto): ${String(err).slice(0, 300)}`, {
+        traceId: job.traceId, instance: job.instance, template: job.templateName,
+      });
+      if (job.text) {
+        await sendText(job.instance, job.phoneE164, job.text);
+        return;
+      }
+      throw err;
+    }
     return;
   }
   // kind === 'audio'

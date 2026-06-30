@@ -396,7 +396,8 @@ export async function processInboundUser(
   // Loop agêntico: se uma farmácia/clínica está esperando um dado do cliente,
   // injeta a pergunta pendente pra Xarlote levar a resposta de volta.
   if (pendingClarif) {
-    systemPrompt += `\n\n## ⏳ PERGUNTA PENDENTE DE UM ESTABELECIMENTO\n${pendingClarif.supplierName} está aguardando uma resposta sua pra continuar o pedido:\n"${pendingClarif.question}"\n\nSe a mensagem do usuário responde isso (mesmo parcial), chame **relay_answer_to_establishment** com a resposta dele no campo \`answer\` — eu devolvo pro estabelecimento e a negociação segue. Se ele falar de OUTRA coisa, responda normal; a pergunta continua pendente.`;
+    const oQue = pendingClarif.kind === 'clinic' ? 'a consulta' : 'o pedido';
+    systemPrompt += `\n\n## ⏳ PERGUNTA PENDENTE DE UM ESTABELECIMENTO\n${pendingClarif.supplierName} está aguardando uma resposta sua pra continuar ${oQue}:\n"${pendingClarif.question}"\n\nSe a mensagem do usuário responde isso (mesmo parcial), chame **relay_answer_to_establishment** com a resposta dele no campo \`answer\` — eu devolvo pro estabelecimento e a negociação segue. Se ele falar de OUTRA coisa, responda normal; a pergunta continua pendente.`;
   }
 
   // 9. Build user message — texto, áudio (transcrito), imagem (multimodal vision), localização.
@@ -667,6 +668,7 @@ async function resetAllData(dbClient: typeof db): Promise<void> {
   await dbClient.from('user_allergies').delete().neq('id', '00000000-0000-0000-0000-000000000000');
   await dbClient.from('user_medications').delete().neq('id', '00000000-0000-0000-0000-000000000000');
   await dbClient.from('user_addresses').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+  await dbClient.from('user_exam_results').delete().neq('id', '00000000-0000-0000-0000-000000000000');
   await dbClient.from('conversations').delete().neq('id', '00000000-0000-0000-0000-000000000000');
   await dbClient.from('users').delete().neq('id', '00000000-0000-0000-0000-000000000000');
   await dbClient.from('system_logs').delete().neq('id', '00000000-0000-0000-0000-000000000000');
@@ -693,6 +695,7 @@ async function handleForgetMe(userId: string, conversationId: string, phoneE164:
   await db.from('user_allergies').delete().eq('user_id', userId);
   await db.from('user_medications').delete().eq('user_id', userId);
   await db.from('user_addresses').delete().eq('user_id', userId);
+  await db.from('user_exam_results').delete().eq('user_id', userId); // Fase 5: exame é dado clínico → apaga no forget-me
   await deleteUserMemory(userId);
   // Fonte CANÔNICA dos memory cards é o JSONB da conversa — deleteUserMemory só
   // limpa o índice; sem isto, dados de saúde sobreviviam ao apagamento LGPD.
@@ -710,7 +713,7 @@ async function handleForgetMe(userId: string, conversationId: string, phoneE164:
       phone_e164_anonymized: `deleted-${userId}`,
       tables_cleared: [
         'messages', 'user_health_conditions', 'user_allergies', 'user_medications',
-        'user_addresses', 'memory_cards_index', 'conversations.memory_cards',
+        'user_addresses', 'user_exam_results', 'memory_cards_index', 'conversations.memory_cards',
       ],
     },
   });

@@ -13,6 +13,7 @@ import {
   zproSendMenu,
   zproSendImage,
   zproSendAudio,
+  zproSendTemplate,
   zproCheckWhatsApp,
   zproGetInstanceStatus,
 } from './zpro-client.js';
@@ -189,6 +190,22 @@ export async function sendAudio(
   return providerFor(instance) === 'zpro'
     ? zproSendAudio(instance, phoneE164, audio, { mime: opts.mime })
     : uazSendAudio(instance, phoneE164, audio, opts);
+}
+
+/**
+ * Envia um TEMPLATE (HSM) aprovado — abertura fria de conversa no WABA oficial.
+ * Só o zpro (canal oficial) suporta HSM; uazapi não tem template → LANÇA pra o
+ * caller cair no fallback de texto. (Ver fila outbound: kind='template'.)
+ */
+export async function sendTemplate(
+  instance: string,
+  phoneE164: string,
+  template: { name: string; language: string; variables: string[] },
+): Promise<{ messageId: string }> {
+  if (providerFor(instance) === 'zpro') {
+    return zproSendTemplate(instance, phoneE164, template);
+  }
+  throw new Error('templates (HSM) só existem no canal oficial (zpro) — provider atual não suporta');
 }
 
 // Nenhum provedor expõe presence isolado de forma estável — no-op.

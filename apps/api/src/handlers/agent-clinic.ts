@@ -21,11 +21,13 @@ import {
 import { AGENT_INSTANCE } from '@iasaude/shared';
 import type { NormalizedInbound, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
-import { sendOutboundToClinic } from './outbound-agent.js';
+import { sendOutboundToClinic, sendTemplateOpeningToClinic } from './outbound-agent.js';
+import { templatesEnabled } from '../config/template-registry.js';
 import {
   consolidateConsultationQuotes,
   notifyUserConsultationQuoteArrived,
 } from './consultation-consolidation.js';
+import { relayClinicQuestionToUser } from './clarification.js';
 
 export interface ClinicInboundCtx {
   conversationId: string;
@@ -341,9 +343,18 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
         await writeLog('info', 'agent-clinic', 'Clínica confirmou especialidade — esperando horário', { traceId });
         break;
 
-      case 'request_clarification':
-        // Agente vai responder via texto na mesma rodada
+      case 'request_clarification': {
+        // Loop agêntico (Fase 4): a clínica precisa de um dado do paciente →
+        // leva a pergunta ao CLIENTE (sara) e marca a cotação como aguardando
+        // resposta (pausa a consolidação). O `llmResponse.text` segue como
+        // mensagem de espera pra clínica (etapa 9, abaixo).
+        const a = tc.args as { question?: string };
+        const question = (a.question ?? '').trim();
+        if (question) {
+          await relayClinicQuestionToUser(quote, question, traceId);
+        }
         break;
+      }
 
       case 'record_appointment_confirmation': {
         const a = tc.args as {
@@ -518,7 +529,14 @@ export async function initiateClinicNegotiation(opts: {
     metadata: { clinic_id: clinicId, clinic_name: clinicName, specialty: ctx.specialty },
   });
 
-  await sendOutboundToClinic(conv.id, clinicWhatsApp, opening, traceId);
+  // Fase 6: abertura fria oficial = template atendimento_clinica ({{1}}=especialidade,
+  // sem região — decisão do fundador). Ligado por WHATSAPP_TEMPLATES_ENABLED=true;
+  // desligado (default), segue o texto livre de hoje.
+  if (templatesEnabled()) {
+    await sendTemplateOpeningToClinic(conv.id, clinicWhatsApp, 'clinic_outreach', [ctx.specialty], traceId);
+  } else {
+    await sendOutboundToClinic(conv.id, clinicWhatsApp, opening, traceId);
+  }
 }
 
 /** Marca quote como terminal e dispara consolidação se thresholds batem. */

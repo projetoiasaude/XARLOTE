@@ -59,6 +59,45 @@ export const xarloteTools: ToolDefinition[] = [
   {
     type: 'function',
     function: {
+      name: 'save_exam_result',
+      description:
+        'Guarda no perfil do paciente um resultado de EXAME/LAUDO que ele compartilhou por foto (hemograma, raio-x, ultrassom, teste de covid, etc.). SÓ chame DEPOIS de o paciente CONFIRMAR que quer guardar. Você já viu a imagem pelo seu canal multimodal — preencha com o que LEU, sem interpretar clinicamente (não diga se está normal/alterado). NÃO use pra receita (use parse_prescription_image) nem pra foto comum.',
+      parameters: {
+        type: 'object',
+        properties: {
+          exam_type: {
+            type: 'string',
+            description: 'Tipo do exame: "sangue", "urina", "imagem" (raio-x/ultrassom/tomografia), "cardiologico" (ecg/ecocardio), "covid", "outro".',
+          },
+          title: { type: 'string', description: 'Nome do exame como aparece no laudo. Ex: "Hemograma completo", "Raio-X de tórax".' },
+          summary: {
+            type: 'string',
+            description: 'Resumo curto e NEUTRO do que está no laudo, sem interpretar (ex: "Hemograma com hemoglobina 13,5; leucócitos 7.200"). NUNCA escreva se está normal ou alterado.',
+          },
+          findings: {
+            type: 'array',
+            description: 'Marcadores/valores legíveis no exame. Liste o que conseguir ler.',
+            items: {
+              type: 'object',
+              properties: {
+                marker: { type: 'string', description: 'Nome do marcador (ex: "Hemoglobina", "Glicose")' },
+                value: { type: 'string', description: 'Valor lido (ex: "13.5", "98")' },
+                unit: { type: 'string', description: 'Unidade (ex: "g/dL", "mg/dL")' },
+                reference: { type: 'string', description: 'Faixa de referência impressa, se houver (ex: "12-16")' },
+              },
+              required: ['marker', 'value'],
+            },
+          },
+          exam_date: { type: 'string', description: 'Data do exame em AAAA-MM-DD, se estiver legível no laudo. Omita se não souber.' },
+          message_id: { type: 'string', description: 'ID da mensagem que contém a imagem do exame, se você souber.' },
+        },
+        required: ['exam_type', 'title'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'start_pharmacy_order',
       description: 'Inicia o fluxo de cotação de medicamentos em farmácias próximas ao usuário.',
       parameters: {

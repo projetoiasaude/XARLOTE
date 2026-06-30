@@ -16,7 +16,7 @@
  */
 import { db, writeLog } from '@iasaude/db';
 import { initiateClinicNegotiation } from '../handlers/agent-clinic.js';
-import { scheduleConsultationTimeout } from '../handlers/consultation-consolidation.js';
+import { scheduleConsultationTimeout, rescueStalledConsultations } from '../handlers/consultation-consolidation.js';
 import { rescueOrphanedPharmacyQuotes } from '../handlers/quote-consolidation.js';
 import { withCronLock } from '../middleware/cron-lock.js';
 
@@ -28,6 +28,11 @@ async function runOnce(): Promise<void> {
   // F1.A3: resgate durável de cotações de FARMÁCIA órfãs (independente da lógica
   // de clínica abaixo, que tem early-returns). Idempotente.
   await rescueOrphanedPharmacyQuotes();
+
+  // Fase 4: resgate durável de CONSULTAS presas em 'searching' (timers in-process
+  // que morreram OU consolidação adiada pelo gate de clarificação que não re-disparou).
+  // Idempotente: consolidateConsultationQuotes faz transição atômica + re-checa o gate.
+  await rescueStalledConsultations();
 
   try {
     const now = Date.now();

@@ -1,4 +1,4 @@
-import { db, writeLog, auditToolCall, writeAudit } from '@iasaude/db';
+import { db, writeLog, auditToolCall, writeAudit, saveMemoryCard } from '@iasaude/db';
 import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
@@ -9,7 +9,7 @@ import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
-import { relayUserAnswerToSupplier } from './clarification.js';
+import { relayUserAnswerToEstablishment } from './clarification.js';
 import {
   handleStartTreatmentFromOrder, handleLogMedicationTaken, handleUpdateTreatmentStatus,
   handleLogSymptom, handleSetDefaultAddress,
@@ -83,6 +83,9 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
       case 'parse_prescription_image':
         await handleParsePrescription(tc.args as { message_id: string }, ctx);
         break;
+      case 'save_exam_result':
+        await handleSaveExamResult(tc.args as unknown as SaveExamArgs, ctx);
+        break;
       case 'start_pharmacy_order':
         await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string }, ctx);
         break;
@@ -107,8 +110,9 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         break;
       case 'relay_answer_to_establishment':
         // Loop agêntico: o cliente respondeu a uma pergunta de farmácia/clínica.
-        // Devolve a resposta ao estabelecimento e a negociação continua.
-        await relayUserAnswerToSupplier(ctx.conversationId, (tc.args as { answer?: string }).answer ?? '', ctx.traceId);
+        // Devolve a resposta ao estabelecimento certo (farmácia ou clínica) e a
+        // negociação continua de onde parou.
+        await relayUserAnswerToEstablishment(ctx.conversationId, (tc.args as { answer?: string }).answer ?? '', ctx.traceId);
         break;
       // ─── Xarlote 2.0 ──────────────────────────────────────────────────────
       case 'start_treatment_from_order':
@@ -285,6 +289,98 @@ async function handleParsePrescription(args: { message_id: string }, ctx: ToolCo
       await db.from('prescription_items').insert({ prescription_id: prescription.id, ...item });
     }
   }
+}
+
+interface SaveExamArgs {
+  exam_type: string;
+  title: string;
+  summary?: string;
+  findings?: Array<{ marker: string; value: string; unit?: string; reference?: string }>;
+  exam_date?: string;
+  message_id?: string;
+}
+
+/**
+ * Valida a data do exame: formato AAAA-MM-DD, real (round-trip — rejeita 2026-13-40),
+ * e não-futura (laudo no futuro é alucinação). Retorna null se inválida — melhor não
+ * gravar data do que gravar lixo (ou estourar o INSERT na coluna `date`).
+ */
+function parseExamDate(input?: string): string | null {
+  if (!input || !/^\d{4}-\d{2}-\d{2}$/.test(input)) return null;
+  const d = new Date(`${input}T00:00:00Z`);
+  if (isNaN(d.getTime())) return null;
+  // round-trip: garante que 2026-02-30 / 2026-13-01 não "normalizem" pra outra data
+  if (d.toISOString().slice(0, 10) !== input) return null;
+  // não aceita data no futuro (tolera 1 dia de fuso)
+  if (d.getTime() > Date.now() + 24 * 60 * 60 * 1000) return null;
+  return input;
+}
+
+/**
+ * Fase 5 — guarda no perfil um resultado de exame que o paciente compartilhou
+ * (foto lida via vision). A Xarlote chama isto APÓS o paciente confirmar.
+ *
+ * LGPD: exame é dado clínico sensível → nada de valores em log ≥ info (CLAUDE.md #3),
+ * só tipo + contagem de marcadores. A row cai na cascata de forget-me (FK + delete
+ * explícito no handler de apagar). O memory card nasce sem embedding — o enricher
+ * faz backfill no próximo turn (loop de cards com embedding null).
+ */
+async function handleSaveExamResult(args: SaveExamArgs, ctx: ToolContext) {
+  if (!args.exam_type || !args.title) {
+    await writeLog('warn', 'exam', 'save_exam_result sem exam_type/title — ignorado', { traceId: ctx.traceId });
+    return;
+  }
+  const findings = Array.isArray(args.findings) ? args.findings : [];
+  const examDate = parseExamDate(args.exam_date);
+
+  const { data: row, error } = await db.from('user_exam_results').insert({
+    user_id: ctx.userId,
+    message_id: args.message_id ?? ctx.inboundMsg?.id ?? null,
+    conversation_id: ctx.conversationId,
+    exam_type: args.exam_type,
+    title: args.title,
+    summary: args.summary ?? null,
+    findings,
+    exam_date: examDate,
+    source: 'vision',
+  }).select('id').single();
+
+  if (error) {
+    await writeLog('error', 'exam', `Falha ao salvar exame: ${error.message}`, { traceId: ctx.traceId, userId: ctx.userId });
+    return;
+  }
+
+  // Memory card pra recall ("seu exame de X do dia Y"). Sem embedding agora — o
+  // enricher faz backfill no próximo turn (cards com embedding null).
+  const cardText = `Exame: ${args.title}${examDate ? ` (${examDate})` : ''}${args.summary ? ` — ${args.summary}` : ''}`.slice(0, 200);
+  try {
+    await saveMemoryCard({
+      userId: ctx.userId,
+      conversationId: ctx.conversationId,
+      kind: 'fact',
+      text: cardText,
+      tags: ['exame', args.exam_type],
+      confidence: 0.9,
+      source: 'self_reported',
+      embedding: null,
+    });
+  } catch { /* card é best-effort; a row do exame já está salva */ }
+
+  await writeAudit({
+    actorType: 'system',
+    actorId: 'xarlote',
+    action: 'exam_result.saved',
+    userId: ctx.userId,
+    targetTable: 'user_exam_results',
+    targetId: row?.id,
+    conversationId: ctx.conversationId,
+    traceId: ctx.traceId,
+    metadata: { exam_type: args.exam_type, markers: findings.length }, // sem valores clínicos
+  });
+
+  await writeLog('info', 'exam', `📄 Exame guardado no perfil (tipo=${args.exam_type}, ${findings.length} marcador(es))`, {
+    traceId: ctx.traceId, userId: ctx.userId, examId: row?.id,
+  });
 }
 
 async function handleStartPharmacyOrder(

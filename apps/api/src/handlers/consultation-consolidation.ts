@@ -12,10 +12,57 @@
  */
 import { db, writeLog, writeAudit } from '@iasaude/db';
 import { sendOutbound } from './outbound.js';
+import { hasPendingClinicClarification } from './clarification.js';
 
 const CHECK_5MIN_MS = 5 * 60 * 1000;
 const CHECK_10MIN_MS = 10 * 60 * 1000;
+// Resgate durável: > timers normais (10min) E > janela de clarificação (8min).
+const RESCUE_WINDOW_MIN = 12;
 const scheduledTimeouts = new Set<string>();
+
+/**
+ * RESGATE DURÁVEL de consultas (espelho de rescueOrphanedPharmacyQuotes).
+ *
+ * Os timers 5/10min e o modo eager vivem em memória — se o processo reinicia, OU
+ * se a consolidação foi adiada pelo gate de clarificação (loop agêntico) e nada
+ * mais re-dispara, a consulta fica presa em 'searching' PARA SEMPRE e o paciente
+ * nunca recebe as opções que já chegaram. Este scan roda no worker (a cada 30s) e
+ * consolida qualquer consulta presa além de RESCUE_WINDOW_MIN. Seguro junto com os
+ * timers: consolidateConsultationQuotes faz transição atômica searching→quoted
+ * (quem chegar segundo vira no-op) e re-checa o gate de clarificação (vira no-op
+ * enquanto pendente, prossegue após a janela de 8min).
+ */
+export async function rescueStalledConsultations(): Promise<void> {
+  try {
+    const cutoff = new Date(Date.now() - RESCUE_WINDOW_MIN * 60_000).toISOString();
+    const { data: rows, error } = await db
+      .from('consultations')
+      .select('id, conversation_id, created_at')
+      .eq('status', 'searching')
+      .lt('created_at', cutoff)
+      .limit(50);
+    if (error) {
+      if (error.message?.includes('does not exist')) return;
+      await writeLog('warn', 'consultation', `rescue query falhou: ${error.message}`, {});
+      return;
+    }
+    for (const c of rows ?? []) {
+      try {
+        if (!c.conversation_id) continue;
+        const { data: conv } = await db.from('conversations').select('whatsapp_jid').eq('id', c.conversation_id).single();
+        const phone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
+        if (!phone) continue;
+        const traceId = `rescue-consult-${c.id}`;
+        await writeLog('warn', 'consultation', `Resgatando consulta presa em 'searching' (>${RESCUE_WINDOW_MIN}min)`, { traceId, consultationId: c.id });
+        await consolidateConsultationQuotes(c.id, c.conversation_id, `+${phone}`, traceId);
+      } catch (err) {
+        await writeLog('error', 'consultation', `rescue de consulta falhou: ${String(err).slice(0, 160)}`, { consultationId: c.id });
+      }
+    }
+  } catch (err) {
+    await writeLog('error', 'consultation', `rescueStalledConsultations falhou: ${String(err).slice(0, 160)}`, {});
+  }
+}
 
 /**
  * Agenda os timers da consultation. Idempotente — só agenda uma vez.
@@ -136,6 +183,14 @@ async function consolidateConsultationQuotesEarly(
   userPhoneE164: string,
   traceId: string,
 ): Promise<void> {
+  // Loop agêntico (Fase 4): se uma clínica fez uma pergunta que ainda aguarda
+  // o paciente, NÃO consolida agora — espera a resposta (a janela libera sozinha
+  // após CLARIFICATION_WAIT_MIN, então nunca trava pra sempre).
+  if (await hasPendingClinicClarification(consultationId)) {
+    await writeLog('info', 'consultation', 'Consolidação adiada — clarificação de clínica pendente', { traceId, consultationId });
+    return;
+  }
+
   await db
     .from('consultation_quotes')
     .update({ status: 'timeout' })
@@ -177,6 +232,13 @@ export async function consolidateConsultationQuotes(
   userPhoneE164: string,
   traceId: string,
 ): Promise<void> {
+  // Loop agêntico (Fase 4): gate de clarificação — não apresenta opções enquanto
+  // uma clínica aguarda um dado do paciente (mesma proteção da consolidação de farmácia).
+  if (await hasPendingClinicClarification(consultationId)) {
+    await writeLog('info', 'consultation', 'Consolidação adiada — clarificação de clínica pendente', { traceId, consultationId });
+    return;
+  }
+
   // Idempotência
   const { data: c } = await db.from('consultations').select('status, specialty').eq('id', consultationId).single();
   if (!c || ['quoted', 'confirming', 'scheduled', 'cancelled', 'completed'].includes(c.status)) return;

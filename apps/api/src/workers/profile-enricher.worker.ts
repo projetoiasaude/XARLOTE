@@ -15,6 +15,7 @@ import { QUEUE_NAMES } from '@iasaude/shared';
 import { captureError } from '../observability/sentry.js';
 import { getRedisConnection } from '../queue-config.js';
 import { loadPrompts } from '../config/prompts.js';
+import { withUserLock } from '../concurrency/user-lock.js';
 
 interface EnrichOutput {
   facts?: Array<{ text: string; tags?: string[]; confidence: number }>;
@@ -101,6 +102,11 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
 
   let saved = 0;
 
+  // escala-segura (Fase 2): serializa SÓ os check-then-insert das tabelas
+  // estruturadas (rápidos, é onde mora a corrida). A extração via LLM (acima) e os
+  // embeddings dos memory cards (abaixo) rodam FORA do lock — são lentos (HTTP) e
+  // segurá-los aqui estouraria o TTL do lock, reabrindo a corrida que ele evita.
+  const acquired = await withUserLock(userId, async () => {
   // 5. Salva nas tabelas estruturadas (com source='inferred')
   for (const a of parsed.allergies ?? []) {
     if (a.confidence < MIN_CONFIDENCE) continue;
@@ -190,6 +196,16 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
       });
       if (!error) saved++;
     } catch {}
+  }
+  }); // withUserLock — fim da seção serializada (só os check-then-insert estruturados)
+
+  // Lock ocupado e não liberou na janela → o check-then-insert desta turn foi
+  // pulado (outro enricher do mesmo user está escrevendo). Observabilidade: loga
+  // com os ids pra não ser invisível. (Cards/embeddings abaixo seguem normalmente.)
+  if (acquired === null) {
+    await writeLog('warn', 'enrichment', 'Enricher: lock de usuário ocupado — inserts estruturados pulados nesta turn', {
+      traceId, conversationId, userId,
+    });
   }
 
   // 6. Memory cards (com embedding)

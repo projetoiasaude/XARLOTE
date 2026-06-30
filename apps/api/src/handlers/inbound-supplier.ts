@@ -10,9 +10,10 @@ import {
 import { AGENT_INSTANCE } from '@iasaude/shared';
 import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
-import { sendOutboundToSupplier } from './outbound-agent.js';
+import { sendOutboundToSupplier, sendTemplateOpeningToSupplier } from './outbound-agent.js';
 import { consolidateQuotes, notifyUserQuoteArrived } from './quote-consolidation.js';
 import { relaySupplierQuestionToUser } from './clarification.js';
+import { templatesEnabled } from '../config/template-registry.js';
 
 /**
  * Extrai "Rua/Avenida X, Setor Y" do endereço completo (Nominatim/ViaCEP / Google reverse).
@@ -434,7 +435,15 @@ export async function initiatePharmacyNegotiation(
     traceId, quoteId, supplierId: supplier.id,
   });
 
-  await sendOutboundToSupplier(conv.id, supplierPhone, opening, traceId);
+  // Fase 6: no número OFICIAL a abertura fria PRECISA ser template (Meta). Quando
+  // ligado (WHATSAPP_TEMPLATES_ENABLED=true), manda o template cotacao_medicamento
+  // ({{1}}=itens, {{2}}=região); o `opening` (LLM) vira só o fallback humanizado.
+  // Desligado (default / agente ainda no uazapi), segue o texto livre de hoje.
+  if (templatesEnabled()) {
+    await sendTemplateOpeningToSupplier(conv.id, supplierPhone, 'pharmacy_quote', [itemsText, userNeighborhood], traceId);
+  } else {
+    await sendOutboundToSupplier(conv.id, supplierPhone, opening, traceId);
+  }
 }
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
