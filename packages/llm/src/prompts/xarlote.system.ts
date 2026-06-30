@@ -9,6 +9,8 @@ interface XarloteContext {
   medications?: string[];
   memoryCards?: MemoryCard[];
   activeOrderSummary?: string | null;
+  /** Método de pagamento mais usado pelo usuário (pedidos anteriores) — confirmar, não re-perguntar. */
+  paymentPreference?: string | null;
 }
 
 /** "quinta-feira, 11/06/2026, 09:55" em America/Sao_Paulo — pro LLM agendar lembretes. */
@@ -30,9 +32,18 @@ export function buildXarloteSystemPrompt(ctx: XarloteContext = {}): string {
   const conditions = ctx.conditions?.join(', ') || 'nenhuma registrada';
   const allergies = ctx.allergies?.join(', ') || 'nenhuma registrada';
   const medications = ctx.medications?.join(', ') || 'nenhum registrado';
-  const defaultAddress = ctx.addresses?.find((a) => a.is_default);
-  const addressStr = defaultAddress
-    ? `${defaultAddress.street ?? ''}, ${defaultAddress.number ?? ''},${defaultAddress.neighborhood ?? ''}, ${defaultAddress.city ?? ''}`
+  // Lista TODOS os endereços rotulados (casa/trabalho/...), não só o padrão — pra
+  // Xarlote distinguir e perguntar "pra qual?" quando houver mais de um.
+  const fmtAddr = (a: UserAddress) =>
+    [a.street, a.number, a.neighborhood, a.city]
+      .map((p) => (p ?? '').toString().trim())
+      .filter(Boolean)
+      .join(', ');
+  const addrList = (ctx.addresses ?? []).filter((a) => fmtAddr(a));
+  const addressStr = addrList.length
+    ? addrList
+        .map((a) => `${a.label ? `${a.label}: ` : ''}${fmtAddr(a)}${a.is_default ? ' (padrão)' : ''}`)
+        .join('  |  ')
     : 'não registrado';
 
   // Renderiza memory cards agrupados por tipo (fact / episode / preference / affect)
@@ -286,8 +297,8 @@ Pode pedir proativamente: *"Já que estamos cadastrando, quem você quer que eu 
 **Objetivo: chegar na cotação com o MÍNIMO de perguntas (aplique a REGRA DE OURO).** Antes de perguntar qualquer coisa, preencha tudo que já dá assumir:
 - Se for imagem, você JÁ enxerga ela direto (multimodal). Leia os itens da receita e siga. Só use \`parse_prescription_image\` pra estruturar JSON formal (raro).
 - **Dose e quantidade**: se a pessoa já toma esse remédio (Medicamentos em uso / histórico), ASSUMA a dose dela + quantidade padrão (1 caixa de 30 pra uso contínuo). Não pergunte o que você já sabe. Só pergunte a dose se o remédio tem várias apresentações E você não sabe a dela.
-- **Endereço**: se tem endereço padrão salvo, ASSUMA ele. Se não tem, é quase sempre a ÚNICA coisa que você realmente precisa pedir.
-- **Pagamento**: confirme junto, na mesma frase. Nunca faça disso um turno separado.
+- **Endereço**: se há **um** endereço salvo, ASSUMA ele. Se há **mais de um** (ex.: casa e trabalho, ver "Endereços salvos" no contexto), pergunte curtinho **pra qual** vai a entrega (ou use \`query_my_addresses\` quando ele disser "pra casa"/"pro trabalho"). Se não há nenhum, é quase sempre a ÚNICA coisa que você realmente precisa pedir.
+- **Pagamento**: se houver "Forma de pagamento usual" no contexto, **CONFIRME ela em vez de perguntar do zero** (ex.: *"no pix de novo, certo?"*) e fala que lembrou. Se não houver registro, pergunte junto na mesma frase. Nunca faça do pagamento um turno separado.
 - **Junte tudo numa confirmação só e siga.** Não empilhe um formulário de 3 perguntas abertas, mas também NÃO faça 4 mensagens de 1 pergunta quando dava pra assumir e confirmar em 1.
 
 Exemplos do alvo (1 troca até a cotação):
@@ -372,7 +383,8 @@ Nome preferido: ${name}
 Condições registradas: ${conditions}
 Alergias: ${allergies}
 Medicamentos em uso: ${medications}
-Endereço padrão: ${addressStr}
+Endereços salvos: ${addressStr}
+Forma de pagamento usual: ${ctx.paymentPreference ?? 'não registrada'}
 
 ### Memória recuperada (por relevância semântica)
 ${memorySection}${activeOrderSection ? `\n\n${activeOrderSection}` : ''}`;

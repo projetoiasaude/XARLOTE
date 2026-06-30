@@ -294,7 +294,7 @@ export async function processInboundUser(
     }
   };
 
-  const [history, user360, activeOrderRes, relevantCards, skills] = await Promise.all([
+  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes] = await Promise.all([
     getConversationMessages(conversation.id, 30),
     queryUser360(user.id),
     db.from('orders')
@@ -306,10 +306,34 @@ export async function processInboundUser(
       .maybeSingle(),
     retrieveMemory(),
     loadSkillsSafe(),
+    // Histórico de pagamento: pra Xarlote CONFIRMAR a forma usual em vez de re-perguntar.
+    db.from('orders')
+      .select('payment_method')
+      .eq('user_id', user.id)
+      .not('payment_method', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(10),
   ]);
 
   const geminiHistory = trimHistory(messagesToHistory(history.slice(0, -1)), 20);
   const activeOrderSummary = activeOrderRes.data?.summary ?? null;
+
+  // Preferência de pagamento aprendida: método mais usado nos pedidos recentes
+  // (empate -> mais recente). Xarlote confirma ("no pix de novo?") em vez de perguntar.
+  const paymentPreference = (() => {
+    const rows = (paymentHistRes.data ?? []) as Array<{ payment_method: string | null }>;
+    const methods = rows.map((r) => r.payment_method).filter((m): m is string => !!m);
+    if (!methods.length) return null;
+    const counts = new Map<string, number>();
+    for (const m of methods) counts.set(m, (counts.get(m) ?? 0) + 1);
+    let best = methods[0]!;
+    let bestN = 0;
+    for (const m of methods) {
+      const n = counts.get(m)!;
+      if (n > bestN) { bestN = n; best = m; }
+    }
+    return best;
+  })();
 
   // Perfil: 1 RPC unificada (user360). Fallback p/ queries individuais SÓ se a RPC
   // não existir (deploy intermediário) — caso raro, tolera rodar em série.
@@ -343,6 +367,7 @@ export async function processInboundUser(
     medications: medications?.map((m) => `${m.medication_name}${m.dosage ? ` ${m.dosage}` : ''}`) ?? [],
     memoryCards,
     activeOrderSummary,
+    paymentPreference,
   });
 
   // Se temos user360 com tratamentos/sintomas/consultas/skills, anexa contexto rico

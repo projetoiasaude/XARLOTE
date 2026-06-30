@@ -36,4 +36,8 @@ DIFERENÇA ENTRE OS QUATRO TIPOS DE MEMORY CARD:
 
 Se um fato cabe nas tabelas estruturadas (allergies/conditions/medications/addresses), inclua APENAS lá — NÃO duplique como "fact". Inclua como "fact" só fatos que não se encaixam (ex: "tipo sanguíneo O+").
 
+ENDEREÇOS — o campo \`label\` é OBRIGATÓRIO e deve refletir o uso que o usuário deu: "casa" (mora, "minha casa", "em casa", "residência"), "trabalho" (trabalha, escritório, serviço, empresa) ou "outro". Só extraia um endereço quando o usuário disser que é um endereço DELE pra guardar (ex.: "minha casa fica na rua X", "trabalho no centro"). NÃO extraia o endereço pontual de uma entrega de cotação como cadastro — esse é descartável.
+
+PAGAMENTO — quando o usuário indicar como costuma pagar ("sempre pago no pix", "prefiro cartão", "pago em dinheiro"), extraia como \`preference\` com tag \`pagamento:<metodo>\` (ex.: \`pagamento:pix\`, \`pagamento:credito\`, \`pagamento:dinheiro\`).
+
 Sua resposta deve ser APENAS o JSON, sem texto antes ou depois, sem markdown.`;
