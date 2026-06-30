@@ -883,7 +883,7 @@ export async function handleSetEmergencyContact(args: SetEmergencyContactArgs, c
     if (digits.length >= 10 && digits.length <= 13) {
       phone = digits.startsWith('55') ? `+${digits}` : `+55${digits}`;
     } else {
-      await writeLog('warn', 'tool', `set_emergency_contact: phone inválido "${args.phone_e164}"`, { traceId: ctx.traceId });
+      await writeLog('warn', 'tool', `set_emergency_contact: phone inválido (${digits.length} dígitos)`, { traceId: ctx.traceId });
       return;
     }
   }

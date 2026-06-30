@@ -2,8 +2,7 @@
 import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { MapPin, Phone, Star, Ban, Store, Search } from 'lucide-react';
-import { supabase } from '@/lib/supabase';
-import { timeAgo } from '@/lib/utils';
+import { timeAgo, adminGet } from '@/lib/utils';
 import {
   GlassCard, GlassBadge, GlassInput, Avatar, SectionHeader, EmptyState,
   Tabs, type BadgeTone,
@@ -40,12 +39,10 @@ export default function SuppliersPage() {
   const [search, setSearch] = useState('');
 
   useEffect(() => {
-    supabase
-      .from('suppliers')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(100)
-      .then(({ data }) => setSuppliers((data as Supplier[]) ?? []));
+    // Leitura via API (service role + token do login). Supabase anon e bloqueado pelo RLS (is_staff).
+    adminGet<Supplier[]>('/admin/suppliers')
+      .then((data) => setSuppliers(data ?? []))
+      .catch(() => { /* falha transitoria — mantem */ });
   }, []);
 
   const visible = suppliers

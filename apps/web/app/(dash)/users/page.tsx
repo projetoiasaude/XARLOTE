@@ -3,8 +3,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
 import { Users as UsersIcon, Search } from 'lucide-react';
-import { supabase } from '@/lib/supabase';
-import { timeAgo } from '@/lib/utils';
+import { timeAgo, adminGet } from '@/lib/utils';
 import {
   GlassCard, GlassInput, GlassBadge, Avatar, SectionHeader, EmptyState,
   type BadgeTone,
@@ -33,15 +32,11 @@ export default function UsersPage() {
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
-    supabase
-      .from('users')
-      .select('id, phone_e164, preferred_name, full_name, onboarding_status, lgpd_consent_at, created_at')
-      .order('created_at', { ascending: false })
-      .limit(100)
-      .then(({ data }) => {
-        setUsers((data as User[]) ?? []);
-        setLoaded(true);
-      });
+    // Leitura via API (service role + token do login). Supabase anon e bloqueado pelo RLS (is_staff).
+    adminGet<User[]>('/admin/users?limit=200')
+      .then((data) => setUsers(data ?? []))
+      .catch(() => { /* falha transitoria — mantem */ })
+      .finally(() => setLoaded(true));
   }, []);
 
   const visible = users.filter(

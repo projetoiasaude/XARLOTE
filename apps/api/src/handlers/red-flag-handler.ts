@@ -407,7 +407,8 @@ async function notifyEmergencyContact(
 
   try {
     await sendText(SARA_INSTANCE, u.emergency_contact_phone_e164, msg);
-    await writeLog('warn', 'red_flag', `✉️ Contato de emergência ${contactName} avisado (${u.emergency_contact_phone_e164.slice(0, 8)}***)`, {
+    // LGPD #3: nada de telefone/nome do contato no log (warn é >=info). Rastreável por userId.
+    await writeLog('warn', 'red_flag', `✉️ Contato de emergência avisado`, {
       traceId, userId,
     });
     return { ok: true, contactName };
