@@ -3,8 +3,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
 import { MessageCircle, ArrowLeft, ShoppingBag, MapPin, Truck, Wallet, Timer } from 'lucide-react';
-import { supabase } from '@/lib/supabase';
-import { timeAgo } from '@/lib/utils';
+import { timeAgo, adminGet } from '@/lib/utils';
 import { PharmacyChatDrawer } from '@/components/chat/PharmacyChatDrawer';
 import {
   GlassCard, GlassBadge, GlassButton, SectionHeader, Avatar,
@@ -58,28 +57,37 @@ export default function OrderDetailPage({ params }: { params: { id: string } }) 
   const { id } = params;
   const [order, setOrder] = useState<Order | null>(null);
   const [quotes, setQuotes] = useState<Quote[]>([]);
+  const [loaded, setLoaded] = useState(false);
   const [chatQuote, setChatQuote] = useState<Quote | null>(null);
 
+  // Leitura via API (service role + token do login). Antes era Supabase anon
+  // direto, que o RLS (is_staff) bloqueia. "Tempo real" via polling leve.
   async function load() {
-    const { data: ord } = await supabase.from('orders').select('*').eq('id', id).single();
-    const { data: qs } = await supabase
-      .from('quotes')
-      .select('*, suppliers(name, whatsapp_e164)')
-      .eq('order_id', id);
-    setOrder(ord as Order);
-    setQuotes((qs as Quote[]) ?? []);
+    try {
+      const data = await adminGet<{ order: Order | null; quotes: Quote[] }>(`/admin/orders/${id}`);
+      setOrder(data.order ?? null);
+      setQuotes(data.quotes ?? []);
+    } catch {
+      /* falha transitória — mantém o estado anterior */
+    } finally {
+      setLoaded(true);
+    }
   }
 
-  useEffect(() => { load(); }, [id]);
-
   useEffect(() => {
-    const ch = supabase.channel(`order-${id}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'quotes', filter: `order_id=eq.${id}` }, load)
-      .subscribe();
-    return () => { ch.unsubscribe(); };
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
-  if (!order) return <p className="text-white/50 text-sm py-12 text-center">Carregando…</p>;
+  if (!order) {
+    return (
+      <p className="text-white/50 text-sm py-12 text-center">
+        {loaded ? 'Pedido não encontrado.' : 'Carregando…'}
+      </p>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -208,7 +216,7 @@ export default function OrderDetailPage({ params }: { params: { id: string } }) 
                     className="w-full"
                   >
                     <MessageCircle size={14} />
-                    Responder como farmácia
+                    Ver diálogo / responder
                   </GlassButton>
                 </div>
               </GlassCard>

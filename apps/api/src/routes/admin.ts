@@ -39,6 +39,25 @@ export async function adminRoute(app: FastifyInstance) {
     return reply.send(data);
   });
 
+  // Get one conversation + its messages (thread). Usado pelo detalhe da conversa
+  // e pelo PharmacyChatDrawer (diálogo da Xarlote-agente com a farmácia/clínica).
+  app.get<{ Params: { id: string } }>('/conversations/:id', async (req, reply) => {
+    const { id } = req.params;
+    const { data: conversation } = await db
+      .from('conversations')
+      .select('*, users(preferred_name, full_name, phone_e164)')
+      .eq('id', id)
+      .single();
+    if (!conversation) return reply.code(404).send({ error: 'Not found' });
+    const { data: messages } = await db
+      .from('messages')
+      .select('*')
+      .eq('conversation_id', id)
+      .order('created_at', { ascending: true })
+      .limit(200);
+    return reply.send({ conversation, messages: messages ?? [] });
+  });
+
   // List active orders
   app.get('/orders', async (req, reply) => {
     const q = req.query as Record<string, string>;

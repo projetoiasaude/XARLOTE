@@ -3,8 +3,7 @@ import { useEffect, useState, useRef } from 'react';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
 import { ArrowLeft, MapPin, Image as ImageIcon, Mic, FileText } from 'lucide-react';
-import { supabase } from '@/lib/supabase';
-import { formatTime } from '@/lib/utils';
+import { formatTime, adminGet } from '@/lib/utils';
 import { GlassPanel, GlassBadge, Avatar } from '@/components/ui';
 
 interface Message {
@@ -34,28 +33,23 @@ export default function ConversationDetailPage({ params }: { params: { id: strin
   const [conv, setConv] = useState<Conv | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    supabase
-      .from('conversations')
-      .select('id, whatsapp_jid, status, users(preferred_name, full_name, phone_e164)')
-      .eq('id', id)
-      .single()
-      .then(({ data }) => setConv(data as Conv | null));
-    supabase
-      .from('messages')
-      .select('*')
-      .eq('conversation_id', id)
-      .order('created_at')
-      .limit(100)
-      .then(({ data }) => setMessages((data as Message[]) ?? []));
-  }, [id]);
+  // Leitura via API (service role + token do login). Antes era Supabase anon
+  // direto, que o RLS (is_staff) bloqueia. "Tempo real" via polling leve.
+  async function load() {
+    try {
+      const data = await adminGet<{ conversation: Conv | null; messages: Message[] }>(`/admin/conversations/${id}`);
+      setConv(data.conversation ?? null);
+      setMessages(data.messages ?? []);
+    } catch {
+      /* falha transitória — mantém o estado anterior */
+    }
+  }
 
   useEffect(() => {
-    const ch = supabase.channel(`conv-detail-${id}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${id}` },
-        (p) => setMessages((prev) => [...prev, p.new as Message])
-      ).subscribe();
-    return () => { ch.unsubscribe(); };
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   useEffect(() => {

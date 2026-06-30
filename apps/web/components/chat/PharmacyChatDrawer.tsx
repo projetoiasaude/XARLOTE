@@ -2,9 +2,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 import { X, Send } from 'lucide-react';
-import { supabase } from '@/lib/supabase';
-import { apiUrl } from '@/lib/utils';
-import type { RealtimeChannel } from '@supabase/supabase-js';
+import { apiUrl, adminGet } from '@/lib/utils';
 import { Drawer, GlassBadge, GlassButton, Avatar } from '@/components/ui';
 
 interface ChatMsg {
@@ -23,9 +21,13 @@ interface Props {
 }
 
 /**
- * Drawer lateral pra simular o lado da farmácia em modo de teste.
+ * Drawer lateral pra ver o diálogo da Xarlote-agente com a farmácia (e simular o
+ * lado da farmácia em modo de teste).
  * Mensagens 'out' (Xarlote-agente → farmácia) ficam à esquerda.
  * Mensagens 'in' (farmácia → Xarlote-agente) ficam à direita.
+ *
+ * Leitura via API (service role + token do login) — Supabase anon é bloqueado
+ * pelo RLS (is_staff). "Tempo real" via polling leve enquanto o drawer está aberto.
  */
 export function PharmacyChatDrawer({ open, conversationId, pharmacyName, onClose }: Props) {
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
@@ -36,31 +38,17 @@ export function PharmacyChatDrawer({ open, conversationId, pharmacyName, onClose
   useEffect(() => {
     if (!open || !conversationId) return;
     let cancelled = false;
-    (async () => {
-      const { data } = await supabase
-        .from('messages')
-        .select('id, direction, sender_role, content, created_at')
-        .eq('conversation_id', conversationId)
-        .order('created_at', { ascending: true });
-      if (!cancelled) setMsgs((data as ChatMsg[]) ?? []);
-    })();
-    return () => { cancelled = true; };
-  }, [open, conversationId]);
-
-  useEffect(() => {
-    if (!open || !conversationId) return;
-    const ch: RealtimeChannel = supabase
-      .channel(`pharmacy-chat-${conversationId}`)
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversationId}` },
-        (payload) => {
-          const m = payload.new as ChatMsg;
-          setMsgs((prev) => (prev.find((x) => x.id === m.id) ? prev : [...prev, m]));
-        },
-      )
-      .subscribe();
-    return () => { ch.unsubscribe(); };
+    async function load() {
+      try {
+        const data = await adminGet<{ messages: ChatMsg[] }>(`/admin/conversations/${conversationId}`);
+        if (!cancelled) setMsgs(data.messages ?? []);
+      } catch {
+        /* falha transitória — mantém o estado anterior */
+      }
+    }
+    load();
+    const t = setInterval(load, 4000);
+    return () => { cancelled = true; clearInterval(t); };
   }, [open, conversationId]);
 
   useEffect(() => {
