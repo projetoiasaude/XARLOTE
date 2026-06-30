@@ -9,6 +9,7 @@ import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
+import { relayUserAnswerToSupplier } from './clarification.js';
 import {
   handleStartTreatmentFromOrder, handleLogMedicationTaken, handleUpdateTreatmentStatus,
   handleLogSymptom, handleSetDefaultAddress,
@@ -103,6 +104,11 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         break;
       case 'confirm_order_selection':
         await handleConfirmOrder(tc.args as { order_id: string; quote_id: string }, ctx);
+        break;
+      case 'relay_answer_to_establishment':
+        // Loop agêntico: o cliente respondeu a uma pergunta de farmácia/clínica.
+        // Devolve a resposta ao estabelecimento e a negociação continua.
+        await relayUserAnswerToSupplier(ctx.conversationId, (tc.args as { answer?: string }).answer ?? '', ctx.traceId);
         break;
       // ─── Xarlote 2.0 ──────────────────────────────────────────────────────
       case 'start_treatment_from_order':

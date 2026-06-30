@@ -12,6 +12,7 @@ import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { consolidateQuotes, notifyUserQuoteArrived } from './quote-consolidation.js';
+import { relaySupplierQuestionToUser } from './clarification.js';
 
 /**
  * Extrai "Rua/Avenida X, Setor Y" do endereço completo (Nominatim/ViaCEP / Google reverse).
@@ -263,9 +264,17 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         // Pharmacy confirmed they have the item — agent will ask for price next turn
         await writeLog('info', 'agent', 'Farmácia confirmou disponibilidade — aguardando preço', { traceId });
         break;
-      case 'request_clarification':
-        // Agent needs more info — it will ask via text response
+      case 'request_clarification': {
+        // Agente precisa de um dado do paciente → leva a pergunta ao CLIENTE
+        // (sara) e marca a cotação como aguardando resposta (pausa a consolidação).
+        // O `llmResponse.text` segue como mensagem de espera pra farmácia (etapa 10).
+        const a = tc.args as { question?: string };
+        const question = (a.question ?? '').trim();
+        if (question) {
+          await relaySupplierQuestionToUser(quote, question, traceId);
+        }
         break;
+      }
       case 'record_order_confirmation': {
         // Pharmacy confirmed the order is being prepared
         const a = tc.args as { estimated_delivery_minutes?: number; notes?: string };

@@ -10,6 +10,7 @@ import { Queue } from 'bullmq';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutbound, sendOutboundAudio } from './outbound.js';
 import { handleToolCall } from './tool-executor.js';
+import { findPendingClarificationForUser } from './clarification.js';
 
 // Queue pra disparar enricher async — instância única por processo
 const enricherQueue = new Queue(QUEUE_NAMES.PROFILE_ENRICHER, {
@@ -294,7 +295,7 @@ export async function processInboundUser(
     }
   };
 
-  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes] = await Promise.all([
+  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif] = await Promise.all([
     getConversationMessages(conversation.id, 30),
     queryUser360(user.id),
     db.from('orders')
@@ -313,6 +314,8 @@ export async function processInboundUser(
       .not('payment_method', 'is', null)
       .order('created_at', { ascending: false })
       .limit(10),
+    // Loop agêntico: pergunta pendente de farmácia/clínica aguardando o cliente.
+    findPendingClarificationForUser(conversation.id),
   ]);
 
   const geminiHistory = trimHistory(messagesToHistory(history.slice(0, -1)), 20);
@@ -388,6 +391,12 @@ export async function processInboundUser(
 
   if (promptsConfig.sara_suffix.trim()) {
     systemPrompt += `\n\n## INSTRUÇÕES ADICIONAIS (configuradas no dashboard)\n${promptsConfig.sara_suffix.trim()}`;
+  }
+
+  // Loop agêntico: se uma farmácia/clínica está esperando um dado do cliente,
+  // injeta a pergunta pendente pra Xarlote levar a resposta de volta.
+  if (pendingClarif) {
+    systemPrompt += `\n\n## ⏳ PERGUNTA PENDENTE DE UM ESTABELECIMENTO\n${pendingClarif.supplierName} está aguardando uma resposta sua pra continuar o pedido:\n"${pendingClarif.question}"\n\nSe a mensagem do usuário responde isso (mesmo parcial), chame **relay_answer_to_establishment** com a resposta dele no campo \`answer\` — eu devolvo pro estabelecimento e a negociação segue. Se ele falar de OUTRA coisa, responda normal; a pergunta continua pendente.`;
   }
 
   // 9. Build user message — texto, áudio (transcrito), imagem (multimodal vision), localização.

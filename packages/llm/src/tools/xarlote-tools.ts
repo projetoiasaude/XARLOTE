@@ -128,6 +128,20 @@ export const xarloteTools: ToolDefinition[] = [
   {
     type: 'function',
     function: {
+      name: 'relay_answer_to_establishment',
+      description: 'Use quando há uma PERGUNTA PENDENTE de uma farmácia/clínica (você verá "PERGUNTA PENDENTE DE UM ESTABELECIMENTO" no contexto) e a mensagem do usuário responde a ela. Eu devolvo a resposta ao estabelecimento e a negociação continua de onde parou. NÃO use se o usuário estiver falando de outra coisa.',
+      parameters: {
+        type: 'object',
+        properties: {
+          answer: { type: 'string', description: 'Resposta do usuário à pergunta do estabelecimento, curta e direta.' },
+        },
+        required: ['answer'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'cancel_order',
       description: 'Cancela uma order de medicamento em andamento.',
       parameters: {

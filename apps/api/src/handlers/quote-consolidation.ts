@@ -1,5 +1,6 @@
 import { db, writeLog } from '@iasaude/db';
 import { sendOutbound } from './outbound.js';
+import { hasPendingClarification } from './clarification.js';
 
 const CHECK_3MIN_MS = 3 * 60 * 1000;
 const CHECK_5MIN_MS = 5 * 60 * 1000;
@@ -226,6 +227,11 @@ async function consolidateQuotesEarly(
   userPhoneE164: string,
   traceId: string,
 ): Promise<void> {
+  // Não force timeout das cotações enquanto uma está aguardando o cliente.
+  if (await hasPendingClarification(orderId)) {
+    await writeLog('info', 'order', 'Consolidação (early) pausada — aguardando cliente', { traceId, orderId });
+    return;
+  }
   await db
     .from('quotes')
     .update({ status: 'timeout', completed_at: new Date().toISOString() })
@@ -263,6 +269,14 @@ export async function consolidateQuotes(
   // Guard: only consolidate once per order
   const { data: order } = await db.from('orders').select('status').eq('id', orderId).single();
   if (!order || ['quoted', 'confirming', 'handed_off', 'cancelled'].includes(order.status)) return;
+
+  // Loop agêntico: não fecha as opções enquanto uma farmácia espera um dado do
+  // cliente (clarificação). Auto-libera após a janela (hasPendingClarification só
+  // conta as recentes); o rescue de órfãos garante que nunca trava pra sempre.
+  if (await hasPendingClarification(orderId)) {
+    await writeLog('info', 'order', 'Consolidação pausada — aguardando resposta do cliente a uma clarificação', { traceId, orderId });
+    return;
+  }
 
   // Mark order as quoted immediately to prevent double-consolidation
   await db.from('orders').update({ status: 'quoted' }).eq('id', orderId).eq('status', 'quoting');
