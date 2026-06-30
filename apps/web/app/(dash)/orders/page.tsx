@@ -3,8 +3,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
 import { ShoppingBag } from 'lucide-react';
-import { supabase } from '@/lib/supabase';
-import { timeAgo } from '@/lib/utils';
+import { timeAgo, adminGet } from '@/lib/utils';
 import {
   GlassCard, GlassBadge, SectionHeader, EmptyState, type BadgeTone,
 } from '@/components/ui';
@@ -32,21 +31,22 @@ export default function OrdersPage() {
   const [loaded, setLoaded] = useState(false);
 
   async function load() {
-    const { data } = await supabase
-      .from('orders')
-      .select('id, status, items, created_at, users(preferred_name, phone_e164)')
-      .order('created_at', { ascending: false })
-      .limit(50);
-    setOrders((data as Order[]) ?? []);
-    setLoaded(true);
+    try {
+      const data = await adminGet<Order[]>('/admin/orders');
+      setOrders(data ?? []);
+    } catch {
+      /* falha transitória — mantém o estado anterior */
+    } finally {
+      setLoaded(true);
+    }
   }
 
-  useEffect(() => { load(); }, []);
+  // Leitura via API (service role + token do login). Antes era Supabase anon
+  // direto, que o RLS (is_staff) bloqueia. "Tempo real" via polling leve.
   useEffect(() => {
-    const ch = supabase.channel('orders-list')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'orders' }, load)
-      .subscribe();
-    return () => { ch.unsubscribe(); };
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
   }, []);
 
   return (

@@ -3,8 +3,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
 import { MessageCircle } from 'lucide-react';
-import { supabase } from '@/lib/supabase';
-import { timeAgo } from '@/lib/utils';
+import { timeAgo, adminGet } from '@/lib/utils';
 import { GlassCard, GlassBadge, Avatar, EmptyState, SectionHeader } from '@/components/ui';
 
 interface Conv {
@@ -20,24 +19,22 @@ export default function ConversationsPage() {
   const [loaded, setLoaded] = useState(false);
 
   async function load() {
-    const { data } = await supabase
-      .from('conversations')
-      .select('id, whatsapp_jid, last_message_at, status, users(preferred_name, full_name, phone_e164)')
-      .eq('party_type', 'user')
-      .order('last_message_at', { ascending: false, nullsFirst: false })
-      .limit(50);
-    setConvs((data as Conv[]) ?? []);
-    setLoaded(true);
+    try {
+      const data = await adminGet<Conv[]>('/admin/conversations');
+      setConvs(data ?? []);
+    } catch {
+      /* falha transitória — mantém o estado anterior */
+    } finally {
+      setLoaded(true);
+    }
   }
 
-  useEffect(() => { load(); }, []);
-
+  // Leitura via API (service role + token do login). Antes era Supabase anon
+  // direto, que o RLS (is_staff) bloqueia. "Tempo real" via polling leve.
   useEffect(() => {
-    const ch = supabase
-      .channel('conv-list')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'conversations' }, load)
-      .subscribe();
-    return () => { ch.unsubscribe(); };
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
   }, []);
 
   const name = (c: Conv) => c.users?.preferred_name ?? c.users?.full_name ?? c.users?.phone_e164 ?? c.whatsapp_jid.split('@')[0];
