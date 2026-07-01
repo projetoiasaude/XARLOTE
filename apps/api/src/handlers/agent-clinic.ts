@@ -86,12 +86,22 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     // Todas as cotações abertas nesta conversa de clínica (conversa compartilhada
     // por telefone). Mais de uma consulta concorrente pra mesma clínica =
     // ambiguidade: atribuímos à mais recente e logamos pra auditoria.
-    const { data: openQuotes } = await db
+    const { data: openQuotes, error: openErr } = await db
       .from('consultation_quotes')
-      .select('*, consultations(*), clinics(*)')
+      // ⚠️ Embed DESAMBIGUADO: existem DUAS FKs entre consultation_quotes e
+      // consultations (consultation_id → consultations, e consultations.selected_quote_id
+      // → consultation_quotes). Sem o hint, o PostgREST retorna PGRST201 (data=null) e a
+      // cotação "some" → a clínica respondia e a Xarlote ficava muda. clinics(*) é
+      // inequívoco (só a FK clinic_id).
+      .select('*, consultations!consultation_quotes_consultation_id_fkey(*), clinics(*)')
       .eq('conversation_id', conversationId)
       .in('status', ['pending', 'offered'])
       .order('created_at', { ascending: false });
+    // Torna VISÍVEL um erro de query (ex.: embed ambíguo) — antes era engolido em
+    // silêncio e a cotação parecia "não existir", travando a resposta à clínica.
+    if (openErr) {
+      await writeLog('error', 'clinic', `Erro ao buscar cotação da clínica: ${openErr.message}`, { traceId, conversationId });
+    }
     if (openQuotes && openQuotes.length > 1) {
       await writeLog(
         'warn',
@@ -107,7 +117,12 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   if (!quote) {
     const { data } = await db
       .from('consultation_quotes')
-      .select('*, consultations(*), clinics(*)')
+      // ⚠️ Embed DESAMBIGUADO: existem DUAS FKs entre consultation_quotes e
+      // consultations (consultation_id → consultations, e consultations.selected_quote_id
+      // → consultation_quotes). Sem o hint, o PostgREST retorna PGRST201 (data=null) e a
+      // cotação "some" → a clínica respondia e a Xarlote ficava muda. clinics(*) é
+      // inequívoco (só a FK clinic_id).
+      .select('*, consultations!consultation_quotes_consultation_id_fkey(*), clinics(*)')
       .eq('conversation_id', conversationId)
       .eq('status', 'selected')
       .order('created_at', { ascending: false })
