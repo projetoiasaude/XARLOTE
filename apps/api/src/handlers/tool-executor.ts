@@ -3,8 +3,8 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { nextOccurrence, isPlaceholderPhone } from '@iasaude/shared';
-import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim } from '@iasaude/integrations';
+import { nextOccurrence, isPlaceholderPhone, toE164BR } from '@iasaude/shared';
+import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
@@ -583,23 +583,37 @@ async function startPharmacyDiscovery(
 
   const top = pharmacies.slice(0, 5);
   const quoteIds: string[] = [];
+  let semTelefone = 0;
 
   for (const pharmacy of top) {
-    const { data: supplier } = await db.from('suppliers').upsert({
-      type: 'pharmacy',
-      name: pharmacy.name,
-      google_place_id: pharmacy.placeId,
-      address: pharmacy.address,
-      city: pharmacy.city,
-      state: pharmacy.state,
-      latitude: pharmacy.lat,
-      longitude: pharmacy.lng,
-      rating: pharmacy.rating,
-      reviews: pharmacy.userRatingCount,
-      status: 'active',
-    }, { onConflict: 'google_place_id' }).select('id').single();
+    // 📞 Puxa o TELEFONE REAL via Place Details — a busca básica do Places NÃO traz
+    // telefone. Sem isto, a farmácia ficava sem número e o código fabricava um FAKE
+    // (+555500000<id>) → disparo pra número aleatório (incidente 2026-07-01). Mesmo
+    // padrão da clínica. Custa 1 request por farmácia (top-5) — aceitável.
+    let phoneE164: string | null = null;
+    try {
+      phoneE164 = toE164BR(await getPlacePhone(pharmacy.placeId));
+    } catch (err) {
+      await writeLog('warn', 'places', `Falha ao buscar telefone da farmácia ${pharmacy.name}: ${String(err).slice(0, 120)}`, { traceId: ctx.traceId });
+    }
 
+    // Não sobrescreve um telefone já conhecido com null (se o Details falhar agora).
+    const upsertData: Record<string, unknown> = {
+      type: 'pharmacy', name: pharmacy.name, google_place_id: pharmacy.placeId,
+      address: pharmacy.address, city: pharmacy.city, state: pharmacy.state,
+      latitude: pharmacy.lat, longitude: pharmacy.lng, rating: pharmacy.rating,
+      reviews: pharmacy.userRatingCount, status: 'active',
+    };
+    if (phoneE164) { upsertData['phone_e164'] = phoneE164; upsertData['whatsapp_e164'] = phoneE164; }
+
+    const { data: supplier } = await db.from('suppliers').upsert(upsertData, { onConflict: 'google_place_id' })
+      .select('id, whatsapp_e164, phone_e164').single();
     if (!supplier?.id) continue;
+
+    // Só cria cotação (= só CONTATA) farmácia com telefone REAL. Sem número → fica no
+    // diretório mas NÃO é contatada. NUNCA fabricar número (ver isPlaceholderPhone).
+    const reachable = supplier.whatsapp_e164 || supplier.phone_e164;
+    if (!reachable || isPlaceholderPhone(reachable)) { semTelefone++; continue; }
 
     const { data: quote } = await db.from('quotes').insert({
       order_id: orderId,
@@ -609,6 +623,23 @@ async function startPharmacyDiscovery(
     }).select('id').single();
 
     if (quote?.id) quoteIds.push(quote.id);
+  }
+  if (semTelefone > 0) {
+    await writeLog('warn', 'places', `${semTelefone} farmácia(s) sem telefone no Places — NÃO contatadas (nunca fabricar número)`, { traceId: ctx.traceId, orderId });
+  }
+
+  // Nenhuma farmácia com telefone real → NÃO tem quem contatar. Avisa com franqueza
+  // (nunca fabricar número) e encerra o pedido em vez de fingir que contatou.
+  if (quoteIds.length === 0) {
+    await writeLog('warn', 'order', `Nenhuma farmácia com telefone/WhatsApp encontrada — pedido não pôde ser cotado`, { traceId: ctx.traceId, orderId, semTelefone });
+    await sendOutbound(
+      ctx.conversationId,
+      ctx.phoneE164,
+      'Achei farmácias aqui na sua região, mas nenhuma com WhatsApp disponível pra eu cotar agora 😕 Assim que eu tiver contatos de farmácias por aqui eu te aviso. Posso te ajudar em outra coisa?',
+      ctx.traceId,
+    );
+    await db.from('orders').update({ status: 'failed' }).eq('id', orderId);
+    return;
   }
 
   await writeLog('info', 'order', `${quoteIds.length} cotações criadas para o pedido — iniciando negociações`, {

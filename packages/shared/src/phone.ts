@@ -23,6 +23,16 @@ export function isPlaceholderPhone(phone: string | null | undefined): boolean {
   return digits.startsWith('555500000');
 }
 
+/** Converte telefone BR cru ("(62) 3333-4444" / "6233334444") em E.164 (+55...). */
+export function toE164BR(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length < 10) return null;            // muito curto pra ser válido
+  if (digits.startsWith('55') && digits.length >= 12) return `+${digits}`;
+  if (digits.length === 10 || digits.length === 11) return `+55${digits}`;
+  return `+${digits}`;
+}
+
 /** E.164 (com/sem o 9º dígito) — sempre inclui o original primeiro. */
 export function brPhoneVariants(phoneE164: string): string[] {
   const variants = [phoneE164];

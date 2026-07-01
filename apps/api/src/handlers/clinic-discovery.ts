@@ -13,16 +13,7 @@
  */
 import { db, writeLog } from '@iasaude/db';
 import { findNearbyClinics, geocodeAddress, getPlacePhone, type PlaceResult } from '@iasaude/integrations';
-
-/** Converte telefone BR cru ("(62) 3333-4444" / "6233334444") em E.164 (+55...). */
-function toE164BR(raw: string | null | undefined): string | null {
-  if (!raw) return null;
-  const digits = raw.replace(/\D/g, '');
-  if (digits.length < 10) return null;            // muito curto pra ser válido
-  if (digits.startsWith('55') && digits.length >= 12) return `+${digits}`;
-  if (digits.length === 10 || digits.length === 11) return `+55${digits}`;
-  return `+${digits}`;
-}
+import { toE164BR } from '@iasaude/shared';
 
 export interface ClinicCandidate {
   id: string;
