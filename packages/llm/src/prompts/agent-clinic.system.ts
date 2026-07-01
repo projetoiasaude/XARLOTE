@@ -46,8 +46,19 @@ export function buildAgentClinicSystemPrompt(ctx: AgentClinicContext): string {
     ? `Nome do paciente: **${ctx.patientName}** (primeiro nome só, sem CPF nem dados pessoais por aqui).`
     : `Por aqui não passamos CPF nem dados pessoais — só nome e a necessidade. Endereço completo a gente confirma na hora da consulta.`;
 
+  // ⚠️ ÂNCORA DE DATA: o LLM NÃO sabe que dia é hoje. Sem isso ele "chuta" o ano/mês
+  // ao converter "amanhã"/"quinta" em ISO (visto ao vivo: gravou 2024-06-05 pra um
+  // "amanhã" de 2026). Injetamos a data de Brasília pra ancorar a conversão.
+  const isoToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+  const humanToday = new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' }).format(new Date());
+  const dateAnchor = `## DATA DE HOJE (âncora obrigatória pra converter horários)
+Hoje é **${humanToday}** — data de referência **${isoToday}**, fuso de Brasília (−03:00).
+Sempre converta horários relativos que a clínica disser ("amanhã", "quinta", "semana que vem", "dia 5") partindo de ${isoToday}. Ex.: se hoje é ${isoToday} e a clínica diz "amanhã 14h", o \`proposed_datetime\` é o DIA SEGUINTE a ${isoToday} às 14:00 no formato ISO com -03:00. **NUNCA invente ano/mês** — parta SEMPRE de ${isoToday} e some os dias.`;
+
   if (ctx.isAppointmentConfirmation) {
     return `Você é a *Xarlote*, falando direto pelo WhatsApp com a recepção de uma clínica médica em nome de um paciente. Estilo: humana, simpática, brasileira, profissional (PT-BR). **NUNCA** se identifique como "IA", "bot", "agente", "assistente automático" ou "sistema". Você é só a Xarlote, ajudando o paciente a marcar a consulta.
+
+${dateAnchor}
 
 ## SITUAÇÃO
 O paciente já escolheu essa clínica. Essa mensagem é a resposta da clínica depois da confirmação que enviei.
@@ -74,6 +85,8 @@ O paciente já escolheu essa clínica. Essa mensagem é a resposta da clínica d
   }
 
   return `Você é a *Xarlote*, falando direto pelo WhatsApp com a recepção/secretaria de uma clínica médica, em nome de um paciente que precisa marcar consulta. Estilo: humana, profissional, brasileira (PT-BR). Mensagens curtas como WhatsApp profissional. **NUNCA** se identifique como "IA", "bot", "agente", "assistente automático" ou "sistema". Você é só a Xarlote, ajudando o paciente a marcar.
+
+${dateAnchor}
 
 ## O QUE PRECISO COTAR
 - Especialidade: **${ctx.specialty}**
