@@ -327,6 +327,11 @@ export async function adminRoute(app: FastifyInstance) {
   app.post<{ Body: { supplierPhone?: string; items?: OrderItem[]; city?: string } }>(
     '/test/pharmacy-negotiation',
     async (req, reply) => {
+      // Este endpoint DISPARA WhatsApp real + cria dados em prod. Além do admin token,
+      // exige confirmação explícita por header — evita disparo acidental/automatizado.
+      if (req.headers['x-confirm-live-send'] !== 'true') {
+        return reply.code(428).send({ error: 'confirm_required', message: 'Envio real: reenvie com o header x-confirm-live-send: true' });
+      }
       const supplierPhone = (req.body?.supplierPhone ?? '').trim();
       if (!supplierPhone) return reply.code(400).send({ error: 'supplierPhone é obrigatório (E.164, ex: +5562999999999)' });
       const items: OrderItem[] = Array.isArray(req.body?.items) && req.body!.items!.length

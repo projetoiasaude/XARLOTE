@@ -37,11 +37,12 @@ export async function sendOutboundToSupplier(
     .update({ last_message_at: new Date().toISOString() })
     .eq('id', conversationId);
 
-  // Modo simulador OU instância do agente não configurada (sem WhatsApp conectado
-  // pro lado das farmácias) → apenas persistimos a mensagem e o operador
-  // responde manualmente no dashboard como se fosse a farmácia.
-  const agentTokenConfigured = !!process.env['UAZAPI_AGENT_TOKEN'];
-  if (isSimulatorMode() || !agentTokenConfigured) {
+  // Modo simulador OU canal do agente não pronto (nem uazapi nem zpro configurados)
+  // → apenas persistimos a mensagem e o operador responde manual no dashboard.
+  // ⚠️ CRÍTICO: usar agentChannelReady() (zpro-aware), NÃO só UAZAPI_AGENT_TOKEN —
+  // senão, com o agente no zpro (token uazapi vazio), TODA resposta à farmácia era
+  // descartada em silêncio (só a abertura por template saía).
+  if (isSimulatorMode() || !agentChannelReady()) {
     await writeLog('info', 'agent', 'Mensagem do agente salva — aguardando resposta manual no dashboard (chat por farmácia)', {
       traceId, conversationId,
     });
@@ -82,10 +83,10 @@ export async function sendOutboundToClinic(
     .eq('id', conversationId);
 
   const realMode = process.env['CLINIC_OUTBOUND_MODE'] === 'real';
-  const agentTokenConfigured = !!process.env['UAZAPI_AGENT_TOKEN'];
 
-  // Default = simulação. Só manda real se CLINIC_OUTBOUND_MODE=real E não é simulador E tem token.
-  if (!realMode || isSimulatorMode() || !agentTokenConfigured) {
+  // Default = simulação. Só manda real se CLINIC_OUTBOUND_MODE=real E não simulador E
+  // o canal do agente pronto (uazapi OU zpro — agentChannelReady é zpro-aware).
+  if (!realMode || isSimulatorMode() || !agentChannelReady()) {
     await writeLog('info', 'clinic', 'Mensagem pra clínica salva (modo simulação) — responda pelo painel do simulador', {
       traceId, conversationId,
     });

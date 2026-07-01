@@ -42,11 +42,15 @@ async function senderHasActiveEstablishmentNegotiation(
   const convIds = (convs ?? []).map((c) => c.id);
   if (!convIds.length) return false;
 
+  // Só estados EM ANDAMENTO (a Xarlote aguarda resposta do estabelecimento AGORA).
+  // NÃO inclui 'quoted'/'selected' (terminais/persistentes): senão um número que
+  // um dia foi farmácia/clínica teria as msgs de CLIENTE sequestradas pro pipeline
+  // B2B pra sempre. O relay de clarificação acontece durante 'negotiating'/'offered'.
   const { data: openQuote } = await db
     .from('quotes')
     .select('id')
     .in('conversation_id', convIds)
-    .in('status', ['pending', 'contacting', 'negotiating', 'quoted'])
+    .in('status', ['pending', 'contacting', 'negotiating'])
     .limit(1);
   if ((openQuote?.length ?? 0) > 0) return true;
 
@@ -54,7 +58,7 @@ async function senderHasActiveEstablishmentNegotiation(
     .from('consultation_quotes')
     .select('id')
     .in('conversation_id', convIds)
-    .in('status', ['pending', 'offered', 'selected'])
+    .in('status', ['pending', 'offered'])
     .limit(1);
   return (openConsult?.length ?? 0) > 0;
 }

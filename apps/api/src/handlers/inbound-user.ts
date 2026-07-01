@@ -689,13 +689,26 @@ async function handleForgetMe(userId: string, conversationId: string, phoneE164:
   // Record revocation
   await db.from('consent_events').insert({ user_id: userId, event_type: 'revoke', policy_version: '1.0', channel: 'whatsapp' });
 
-  // Anonymize
-  await db.from('messages').delete().eq('conversation_id', conversationId);
-  await db.from('user_health_conditions').delete().eq('user_id', userId);
-  await db.from('user_allergies').delete().eq('user_id', userId);
-  await db.from('user_medications').delete().eq('user_id', userId);
-  await db.from('user_addresses').delete().eq('user_id', userId);
-  await db.from('user_exam_results').delete().eq('user_id', userId); // Fase 5: exame é dado clínico → apaga no forget-me
+  // LGPD Art.18 — apaga TODOS os dados clínicos/pessoais do usuário. Enumera TODAS
+  // as tabelas com user_id; filhos (quotes, consultation_quotes, prescription_items,
+  // etc) caem por ON DELETE CASCADE dos pais. Mantém só consent_events (prova do
+  // aceite/revogação) e audit_log (compliance append-only). system_logs já é redatado.
+  const FORGET_ME_TABLES = [
+    'symptoms_log', 'treatments', 'medication_inventory', 'medication_log',
+    'consultations', 'prescriptions', 'reminders', 'orders', 'assistant_tasks',
+    'red_flag_pending', 'feedback_events', 'agent_skills', 'entity_relations',
+    'device_tokens', 'event_log',
+    'user_health_conditions', 'user_allergies', 'user_medications', 'user_addresses', 'user_exam_results',
+  ] as const;
+
+  // Mensagens de TODAS as conversas do usuário (não só a atual).
+  const { data: userConvs } = await db.from('conversations').select('id').eq('user_id', userId);
+  for (const c of userConvs ?? []) await db.from('messages').delete().eq('conversation_id', c.id);
+
+  for (const t of FORGET_ME_TABLES) {
+    const { error } = await db.from(t as string).delete().eq('user_id', userId);
+    if (error) await writeLog('warn', 'lgpd', `forget-me: falha ao limpar ${t}: ${error.message}`, { traceId, userId });
+  }
   await deleteUserMemory(userId);
   // Fonte CANÔNICA dos memory cards é o JSONB da conversa — deleteUserMemory só
   // limpa o índice; sem isto, dados de saúde sobreviviam ao apagamento LGPD.
@@ -711,10 +724,7 @@ async function handleForgetMe(userId: string, conversationId: string, phoneE164:
     reason: 'lgpd_article_18',
     metadata: {
       phone_e164_anonymized: `deleted-${userId}`,
-      tables_cleared: [
-        'messages', 'user_health_conditions', 'user_allergies', 'user_medications',
-        'user_addresses', 'user_exam_results', 'memory_cards_index', 'conversations.memory_cards',
-      ],
+      tables_cleared: ['messages', ...FORGET_ME_TABLES, 'memory_cards_index', 'conversations.memory_cards'],
     },
   });
 

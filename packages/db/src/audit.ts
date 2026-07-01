@@ -12,6 +12,7 @@
  * Princípio: SE FALHARMOS EM AUDITAR, AUDITAMOS QUE FALHAMOS.
  */
 import { db } from './client.js';
+import { redactPII } from './redact.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPES
@@ -90,6 +91,12 @@ export interface EventInput {
  *   });
  */
 export async function writeAudit(input: AuditInput): Promise<void> {
+  // LGPD (CLAUDE.md #3): audit_log é append-only e o único caminho que preserva args
+  // de tool → redige PII (telefone/CPF/endereço/lat-lng/valores clínicos) NA ESCRITA,
+  // igual writeLog. Cobre TODOS os callers (incl. auditToolCall com args crus).
+  const before = input.before ? redactPII(input.before) : null;
+  const after = input.after ? redactPII(input.after) : null;
+  const metadata = input.metadata ? redactPII(input.metadata) : null;
   try {
     const { error } = await db.rpc('write_audit', {
       p_actor_type: input.actorType,
@@ -98,14 +105,14 @@ export async function writeAudit(input: AuditInput): Promise<void> {
       p_user_id: input.userId ?? null,
       p_target_table: input.targetTable ?? null,
       p_target_id: input.targetId ?? null,
-      p_before: (input.before ?? null) as never,
-      p_after: (input.after ?? null) as never,
+      p_before: (before ?? null) as never,
+      p_after: (after ?? null) as never,
       p_conversation_id: input.conversationId ?? null,
       p_message_id: input.messageId ?? null,
       p_trace_id: input.traceId ?? null,
       p_task_id: input.taskId ?? null,
       p_reason: input.reason ?? null,
-      p_metadata: (input.metadata ?? null) as never,
+      p_metadata: (metadata ?? null) as never,
     });
     if (error) {
       // Fallback: tenta inserir DIRETO se a RPC não existir ainda
@@ -117,14 +124,14 @@ export async function writeAudit(input: AuditInput): Promise<void> {
         user_id: input.userId ?? null,
         target_table: input.targetTable ?? null,
         target_id: input.targetId ?? null,
-        before: input.before ?? null,
-        after: input.after ?? null,
+        before,
+        after,
         conversation_id: input.conversationId ?? null,
         message_id: input.messageId ?? null,
         trace_id: input.traceId ?? null,
         task_id: input.taskId ?? null,
         reason: input.reason ?? null,
-        metadata: input.metadata ?? null,
+        metadata,
       }).then(() => undefined);
     }
   } catch (err) {
@@ -154,6 +161,7 @@ export async function writeAudit(input: AuditInput): Promise<void> {
  *   });
  */
 export async function writeEvent(input: EventInput): Promise<void> {
+  const payload = input.payload ? redactPII(input.payload) : {}; // LGPD: sem PII em event_log
   try {
     const { error } = await db.rpc('write_event', {
       p_event_name: input.eventName,
@@ -165,7 +173,7 @@ export async function writeEvent(input: EventInput): Promise<void> {
       p_tokens_in: input.tokensIn ?? null,
       p_tokens_out: input.tokensOut ?? null,
       p_cost_brl: input.costBrl ?? null,
-      p_payload: (input.payload ?? {}) as never,
+      p_payload: payload as never,
     });
     if (error) {
       await db.from('event_log').insert({
@@ -178,7 +186,7 @@ export async function writeEvent(input: EventInput): Promise<void> {
         tokens_in: input.tokensIn ?? null,
         tokens_out: input.tokensOut ?? null,
         cost_brl: input.costBrl ?? null,
-        payload: input.payload ?? {},
+        payload,
       }).then(() => undefined);
     }
   } catch {

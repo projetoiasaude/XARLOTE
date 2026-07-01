@@ -922,7 +922,8 @@ export async function handleSetEmergencyContact(args: SetEmergencyContactArgs, c
     after: { emergency_contact_name: args.name, emergency_contact_phone_e164: phone, emergency_contact_relation: args.relation },
   });
 
-  await writeLog('info', 'tool', `Contato de emergência cadastrado: ${args.name} (${args.relation})`, {
+  // LGPD: nome/telefone do contato NÃO vão pro log — só a relação (não identifica).
+  await writeLog('info', 'tool', `Contato de emergência cadastrado (${args.relation})`, {
     traceId: ctx.traceId, userId: ctx.userId,
   });
 }

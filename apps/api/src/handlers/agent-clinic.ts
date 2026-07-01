@@ -363,7 +363,10 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
           arrival_instructions?: string;
           notes?: string;
         };
-        const confISO = safeParseISO(a.confirmed_datetime);
+        // Se a clínica confirmar sem data parseável, cai pro horário JÁ ofertado
+        // (quote.proposed_datetime, ISO válido do record_consultation_quote) — senão
+        // a consulta ficava presa em 'confirming', sem virar 'scheduled' nem gerar lembrete.
+        const confISO = safeParseISO(a.confirmed_datetime) ?? (quote.proposed_datetime as string | null);
         const updates: Record<string, unknown> = {
           notes: [quote.notes, a.notes, a.arrival_instructions, a.confirmation_code ? `Código: ${a.confirmation_code}` : null]
             .filter(Boolean).join(' · '),

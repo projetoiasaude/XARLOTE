@@ -80,9 +80,7 @@ async function rawSend(job: OutboundJob): Promise<void> {
     return;
   }
   if (job.kind === 'template') {
-    // Abertura fria oficial (WABA): manda o TEMPLATE aprovado. Se falhar (endpoint
-    // não confirmado, template reprovado, provider sem HSM), degrada pra TEXTO com a
-    // versão humanizada — nunca deixa a abertura muda.
+    // Abertura fria oficial (WABA): manda o TEMPLATE aprovado.
     try {
       await sendTemplate(job.instance, job.phoneE164, {
         name: job.templateName ?? '',
@@ -90,11 +88,15 @@ async function rawSend(job: OutboundJob): Promise<void> {
         variables: job.templateVariables ?? [],
       });
     } catch (err) {
-      await writeLog('warn', 'outbound', `Template falhou (caindo pra texto): ${String(err).slice(0, 300)}`, {
+      // ⚠️ Numa ABERTURA FRIA o fallback de texto NÃO entrega (a Meta rejeita texto
+      // livre fora de janela). Então isto é ERRO ACIONÁVEL (anomaly-detector pega),
+      // não um warn silencioso: o estabelecimento ficou sem receber a abertura. Ainda
+      // tentamos o texto (se por acaso houver janela aberta, entrega; senão, já logamos).
+      await writeLog('error', 'outbound', `Abertura por template FALHOU (template=${job.templateName}) — estabelecimento pode não ter recebido: ${String(err).slice(0, 300)}`, {
         traceId: job.traceId, instance: job.instance, template: job.templateName,
       });
       if (job.text) {
-        await sendText(job.instance, job.phoneE164, job.text);
+        await sendText(job.instance, job.phoneE164, job.text).catch(() => { /* texto frio também pode falhar; já logamos o erro */ });
         return;
       }
       throw err;
