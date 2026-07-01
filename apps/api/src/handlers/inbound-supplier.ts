@@ -212,6 +212,8 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   // 9. Execute tool calls
   let shouldFinalize = false;
   let outcome = '';
+  let quoteRecorded = false;   // pra fallback determinístico quando o LLM não gera texto
+  let recordedFrete = 0;
 
   for (const tc of llmResponse.toolCalls) {
     switch (tc.name) {
@@ -221,6 +223,8 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
           eta_minutes?: number; payment_methods?: string[];
           pix_key?: string; payment_link?: string; notes?: string;
         };
+        quoteRecorded = true;
+        recordedFrete = a.delivery_fee ?? 0;
         const { error: qErr } = await db.from('quotes').update({
           status: 'quoted',
           subtotal: a.subtotal ?? null,
@@ -299,6 +303,17 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   const silentOutcome = outcome === 'unavailable' || outcome === 'timeout';
   if (llmResponse.text.trim() && !silentOutcome) {
     await sendOutboundToSupplier(conversationId, supplierPhone, llmResponse.text.trim(), traceId);
+  } else if (!llmResponse.text.trim() && quoteRecorded && !silentOutcome) {
+    // FALLBACK DETERMINÍSTICO: o gpt-4.1-mini às vezes registra a cotação via tool
+    // SEM gerar texto → a farmácia ficava no vácuo. Aqui garantimos uma resposta:
+    // se o frete ainda não veio, passamos o ENDEREÇO REAL e pedimos o frete; se já
+    // veio, despedida. (Não depende do LLM produzir texto.)
+    const addr = order?.delivery_address || userNeighborhood;
+    const fallbackMsg = recordedFrete > 0
+      ? 'Show, anotado! Vou confirmar com o cliente e já volto pra fechar, obrigada!'
+      : `Show, anotei! A entrega é em ${addr}. Quanto fica o frete pra esse endereço?`;
+    await sendOutboundToSupplier(conversationId, supplierPhone, fallbackMsg, traceId);
+    await writeLog('info', 'agent', 'Resposta determinística à farmácia (LLM não gerou texto)', { traceId, conversationId, freteConhecido: recordedFrete > 0 });
   } else if (!llmResponse.text.trim() && !shouldFinalize && llmResponse.toolCalls.length === 0) {
     // LLM returned nothing — log it
     await writeLog('warn', 'agent', 'Agente retornou resposta vazia sem tools — nenhuma ação tomada', { traceId, conversationId });
