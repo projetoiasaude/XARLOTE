@@ -22,6 +22,43 @@ import { captureError } from '../observability/sentry.js';
  * (redatado, sem PII) em system_logs/webhook_events na primeira passada, pra
  * gente apertar o normalizador contra o payload real.
  */
+/**
+ * O remetente é um estabelecimento (farmácia/clínica) com quem a Xarlote está
+ * NEGOCIANDO agora? Usado pra blindar a lane quando o webhook do número de disparo
+ * posta pra /sara. Só considera negociações ATIVAS (cotação/consulta aberta) pra
+ * não desviar por engano uma conversa antiga (e o teste de loop limpa os dados).
+ */
+async function senderHasActiveEstablishmentNegotiation(
+  inbound: import('@iasaude/shared').NormalizedInbound,
+): Promise<boolean> {
+  const canonicalJid = `${inbound.from.phoneE164.replace(/\D/g, '')}@s.whatsapp.net`;
+  const jids = [...new Set([inbound.from.jid, canonicalJid])];
+  const { data: convs } = await db
+    .from('conversations')
+    .select('id')
+    .eq('whatsapp_instance', AGENT_INSTANCE)
+    .in('whatsapp_jid', jids)
+    .limit(5);
+  const convIds = (convs ?? []).map((c) => c.id);
+  if (!convIds.length) return false;
+
+  const { data: openQuote } = await db
+    .from('quotes')
+    .select('id')
+    .in('conversation_id', convIds)
+    .in('status', ['pending', 'contacting', 'negotiating', 'quoted'])
+    .limit(1);
+  if ((openQuote?.length ?? 0) > 0) return true;
+
+  const { data: openConsult } = await db
+    .from('consultation_quotes')
+    .select('id')
+    .in('conversation_id', convIds)
+    .in('status', ['pending', 'offered', 'selected'])
+    .limit(1);
+  return (openConsult?.length ?? 0) > 0;
+}
+
 export async function webhookZproRoute(app: FastifyInstance) {
   app.post<{ Params: { instance: string }; Querystring: { key?: string } }>(
     '/zpro/:instance',
@@ -93,8 +130,25 @@ export async function webhookZproRoute(app: FastifyInstance) {
       // Roteia por número: a leg `agent` (farmácias/clínicas) NÃO passa pelo
       // interruptor da Xarlote nem pelo rate-limit por usuário — são respostas de
       // estabelecimento, não de cliente. Espelha webhook.uazapi.ts.
-      const isAgentInstance =
+      //
+      // BLINDAGEM DE LANE: não confiamos SÓ na URL. O zpro pode postar o webhook do
+      // número de disparo pra /sara (config do painel), e aí a resposta da farmácia
+      // cairia no pipeline de cliente (a Xarlote trataria a farmácia como paciente).
+      // Então, se a URL diz cliente MAS o remetente é um estabelecimento com quem a
+      // Xarlote está NEGOCIANDO agora (cotação/consulta aberta no AGENT_INSTANCE),
+      // roteamos pra leg de estabelecimento assim mesmo. Fail-safe: erro → cliente.
+      let isAgentInstance =
         instanceName === AGENT_INSTANCE || instanceName === process.env['ZPRO_AGENT_INSTANCE'];
+      if (!isAgentInstance) {
+        try {
+          if (await senderHasActiveEstablishmentNegotiation(normalized)) {
+            isAgentInstance = true;
+            await writeLog('info', 'webhook', 'Lane corrigida: remetente é estabelecimento em negociação → supplier pipeline (URL dizia cliente)', {
+              traceId, instance: instanceName, phone: normalized.from.phoneE164,
+            });
+          }
+        } catch { /* fail-safe: segue como cliente */ }
+      }
       if (isAgentInstance) {
         setImmediate(() =>
           processInboundSupplierFromWebhook(normalized, traceId).catch((err) => {

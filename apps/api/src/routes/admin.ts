@@ -1,7 +1,11 @@
+import { randomUUID } from 'crypto';
 import type { FastifyInstance } from 'fastify';
-import { db, writeAudit } from '@iasaude/db';
+import { db, writeAudit, findOrCreateConversation } from '@iasaude/db';
+import { SARA_INSTANCE, AGENT_INSTANCE } from '@iasaude/shared';
+import type { OrderItem } from '@iasaude/shared';
 import { loadPrompts, savePrompts } from '../config/prompts.js';
 import { buildXarloteSystemPrompt, buildAgentPharmacySystemPrompt } from '@iasaude/llm';
+import { initiatePharmacyNegotiation } from '../handlers/inbound-supplier.js';
 import { requireAdminToken } from '../middleware/auth.js';
 
 /** Redacta valores sensíveis em config — não loga keys cruas no audit_log */
@@ -309,6 +313,100 @@ export async function adminRoute(app: FastifyInstance) {
       if (error) return reply.code(500).send({ error: `Failed on ${table}: ${error.message}` });
     }
     return reply.send({ ok: true, cleared: [...bigintTables, ...uuidTables] });
+  });
+
+  // ─── TESTE DE LOOP REAL (Fase 6) ──────────────────────────────────────────
+  // Roda o fluxo de negociação do app 1x, de verdade, contra uma farmácia semeada
+  // (o número que você passar = você fazendo o papel da farmácia). Dispara o
+  // template oficial → você responde o preço → cai no supplier pipeline (blindagem)
+  // → agente registra a cotação → consolida. NÃO toca em farmácia real (usa só o
+  // número informado). Limpe depois com POST /admin/test/cleanup.
+  const TEST_USER_PHONE = '+5562000000009'; // usuário sintético (não é WhatsApp real)
+  const TEST_SUPPLIER_NAME = '🧪 Farmácia Teste (loop)';
+
+  app.post<{ Body: { supplierPhone?: string; items?: OrderItem[]; city?: string } }>(
+    '/test/pharmacy-negotiation',
+    async (req, reply) => {
+      const supplierPhone = (req.body?.supplierPhone ?? '').trim();
+      if (!supplierPhone) return reply.code(400).send({ error: 'supplierPhone é obrigatório (E.164, ex: +5562999999999)' });
+      const items: OrderItem[] = Array.isArray(req.body?.items) && req.body!.items!.length
+        ? req.body!.items!
+        : [{ name: 'Dipirona 1g', quantity: '1 caixa', substitutes_ok: true } as OrderItem];
+      const city = (req.body?.city ?? 'Setor Oeste, Goiânia').trim();
+      const traceId = `testloop-${randomUUID().slice(0, 8)}`;
+
+      // 1. Usuário sintético + conversa (SARA)
+      let userId: string;
+      const { data: existingUser } = await db.from('users').select('id').eq('phone_e164', TEST_USER_PHONE).maybeSingle();
+      if (existingUser?.id) userId = existingUser.id;
+      else {
+        const { data: u, error: uErr } = await db.from('users')
+          .insert({ id: randomUUID(), phone_e164: TEST_USER_PHONE, preferred_name: 'Teste Loop' })
+          .select('id').single();
+        if (uErr || !u) return reply.code(500).send({ error: `user: ${uErr?.message}` });
+        userId = u.id;
+      }
+      const userJid = `${TEST_USER_PHONE.replace(/\D/g, '')}@s.whatsapp.net`;
+      const userConv = await findOrCreateConversation(SARA_INSTANCE, userJid, 'user', userId);
+
+      // 2. Farmácia semeada = o número informado (você)
+      let supplierId: string;
+      const { data: existingSup } = await db.from('suppliers').select('id').eq('whatsapp_e164', supplierPhone).maybeSingle();
+      if (existingSup?.id) {
+        supplierId = existingSup.id;
+        await db.from('suppliers').update({ name: TEST_SUPPLIER_NAME, status: 'active' }).eq('id', supplierId);
+      } else {
+        const { data: s, error: sErr } = await db.from('suppliers')
+          .insert({ name: TEST_SUPPLIER_NAME, whatsapp_e164: supplierPhone, phone_e164: supplierPhone, status: 'active' })
+          .select('id').single();
+        if (sErr || !s) return reply.code(500).send({ error: `supplier: ${sErr?.message}` });
+        supplierId = s.id;
+      }
+
+      // 3. Order + quote de teste
+      const { data: order, error: oErr } = await db.from('orders')
+        .insert({ user_id: userId, conversation_id: userConv.id, items, delivery_address: city, status: 'quoting' })
+        .select('id').single();
+      if (oErr || !order) return reply.code(500).send({ error: `order: ${oErr?.message}` });
+      const { data: quote, error: qErr } = await db.from('quotes')
+        .insert({ order_id: order.id, supplier_id: supplierId, status: 'pending' })
+        .select('id').single();
+      if (qErr || !quote) return reply.code(500).send({ error: `quote: ${qErr?.message}` });
+
+      // 4. Dispara a negociação REAL (mesmo código do app; usa template se ligado)
+      await initiatePharmacyNegotiation(quote.id, order.id, items, city, 'pix', userConv.id, TEST_USER_PHONE, traceId);
+
+      await writeAudit({ actorType: 'system', actorId: 'admin-test', action: 'test.pharmacy_negotiation.started', targetTable: 'quotes', targetId: quote.id, traceId, metadata: { supplierPhone: supplierPhone.slice(0, 6) + '***', city } });
+      return reply.send({ ok: true, traceId, orderId: order.id, quoteId: quote.id, supplierId, userId, conversationId: userConv.id, note: 'Responda o template como se fosse a farmácia. Depois GET /admin/conversations/:id ou POST /admin/test/cleanup.' });
+    },
+  );
+
+  // Limpa os dados do teste de loop (usuário sintético + farmácia marcada 🧪).
+  app.post('/test/cleanup', async (_req, reply) => {
+    const cleaned: Record<string, number> = {};
+    // Usuário de teste → suas orders/quotes/mensagens/conversas
+    const { data: tu } = await db.from('users').select('id').eq('phone_e164', TEST_USER_PHONE).maybeSingle();
+    if (tu?.id) {
+      const { data: ords } = await db.from('orders').select('id').eq('user_id', tu.id);
+      const orderIds = (ords ?? []).map((o) => o.id);
+      if (orderIds.length) { await db.from('quotes').delete().in('order_id', orderIds); await db.from('orders').delete().in('id', orderIds); }
+      const { data: convs } = await db.from('conversations').select('id').eq('user_id', tu.id);
+      for (const c of convs ?? []) await db.from('messages').delete().eq('conversation_id', c.id);
+      await db.from('conversations').delete().eq('user_id', tu.id);
+      await db.from('users').delete().eq('id', tu.id);
+      cleaned['test_user'] = 1;
+    }
+    // Farmácia de teste (marcada) + sua conversa no AGENT
+    const { data: sups } = await db.from('suppliers').select('id').eq('name', TEST_SUPPLIER_NAME);
+    for (const s of sups ?? []) {
+      const { data: sconvs } = await db.from('conversations').select('id').eq('whatsapp_instance', AGENT_INSTANCE).eq('supplier_id', s.id);
+      for (const c of sconvs ?? []) { await db.from('messages').delete().eq('conversation_id', c.id); await db.from('quotes').delete().eq('conversation_id', c.id); }
+      await db.from('conversations').delete().eq('whatsapp_instance', AGENT_INSTANCE).eq('supplier_id', s.id);
+      await db.from('quotes').delete().eq('supplier_id', s.id);
+      await db.from('suppliers').delete().eq('id', s.id);
+    }
+    cleaned['test_suppliers'] = (sups ?? []).length;
+    return reply.send({ ok: true, cleaned });
   });
 
   // Audit log — mudanças de estado em entidades (LGPD, debug, melhoria contínua)
