@@ -63,7 +63,10 @@ export async function relaySupplierQuestionToUser(
   }
   const { data: userConv } = await db.from('conversations').select('whatsapp_jid').eq('id', order.conversation_id).single();
   const digits = userConv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
-  if (!digits) return;
+  if (!digits) {
+    await writeLog('warn', 'clarification', 'Sem telefone do cliente — pergunta da farmácia NÃO foi levada (cotação já marcada awaiting_user)', { traceId, quoteId: quote.id });
+    return;
+  }
 
   const supplierName = quote.suppliers?.name ?? 'a farmácia';
   const msg = `Oi! Pra fechar seu pedido com ${supplierName}, preciso confirmar uma coisinha: ${question}`;
@@ -93,7 +96,10 @@ export async function relayClinicQuestionToUser(
   }
   const { data: userConv } = await db.from('conversations').select('whatsapp_jid').eq('id', consultation.conversation_id).single();
   const digits = userConv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
-  if (!digits) return;
+  if (!digits) {
+    await writeLog('warn', 'clarification', 'Sem telefone do cliente — pergunta da clínica NÃO foi levada (cotação já marcada awaiting_user)', { traceId, quoteId: quote.id });
+    return;
+  }
 
   const clinicName = quote.clinics?.name ?? 'a clínica';
   const msg = `Oi! Pra marcar sua consulta com ${clinicName}, preciso confirmar uma coisinha: ${question}`;

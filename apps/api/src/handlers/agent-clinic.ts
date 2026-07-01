@@ -301,7 +301,9 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
           payment_methods: a.payment_methods ?? null,
           notes: a.notes ?? null,
           responded_at: new Date().toISOString(),
-        }).eq('id', quote.id);
+          // Guarda de idempotência: só grava enquanto pending/offered — um reprocesso/
+          // retry NÃO reverte 'selected'/'scheduled' de volta pra 'offered'.
+        }).eq('id', quote.id).in('status', ['pending', 'offered']);
 
         // Endereço — armazena na clinic se não tinha
         if (a.address) {
@@ -347,7 +349,7 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
           status: 'unavailable',
           notes: a.reason ?? null,
           responded_at: new Date().toISOString(),
-        }).eq('id', quote.id);
+        }).eq('id', quote.id).in('status', ['pending', 'offered']);
 
         await writeAudit({
           actorType: 'agent_clinic',
@@ -386,8 +388,14 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
         const a = tc.args as { question?: string };
         const question = (a.question ?? '').trim();
         if (question) {
-          await relayClinicQuestionToUser(quote, question, traceId);
+          // Marca ANTES do relay: mesmo que levar a pergunta ao paciente falhe, a
+          // etapa 9 ainda manda a cortesia "vou confirmar" pra clínica (sem abortar).
           clarificationRequested = true;
+          try {
+            await relayClinicQuestionToUser(quote, question, traceId);
+          } catch (err) {
+            await writeLog('error', 'agent-clinic', `Falha ao levar pergunta da clínica ao paciente: ${String(err)}`, { traceId, conversationId });
+          }
         }
         break;
       }

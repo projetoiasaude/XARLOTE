@@ -277,7 +277,13 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         const a = tc.args as { question?: string };
         const question = (a.question ?? '').trim();
         if (question) {
-          await relaySupplierQuestionToUser(quote, question, traceId);
+          // try/catch pra uma falha no relay não abortar o handler (a farmácia ainda
+          // recebe a resposta de espera do LLM na etapa 10).
+          try {
+            await relaySupplierQuestionToUser(quote, question, traceId);
+          } catch (err) {
+            await writeLog('error', 'agent', `Falha ao levar pergunta da farmácia ao cliente: ${String(err)}`, { traceId, conversationId });
+          }
         }
         break;
       }

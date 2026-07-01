@@ -125,9 +125,12 @@ async function check10min(
     await writeLog('info', 'consultation', `10min: ${offered} cotação(ões) — consolidando`, { traceId, consultationId });
     await consolidateConsultationQuotesEarly(consultationId, userConversationId, userPhoneE164, traceId);
   } else {
-    // Sem ofertas — entra em modo eager via preferences
+    // Sem ofertas — entra em modo eager via preferences. MERGE (não sobrescreve):
+    // preserva plan/horario_pref que a negociação com a clínica usa. Antes o objeto
+    // inteiro era substituído por { eager_consolidate:true }, apagando o contexto.
+    const { data: cur } = await db.from('consultations').select('preferences').eq('id', consultationId).single();
     await db.from('consultations').update({
-      preferences: { eager_consolidate: true },
+      preferences: { ...((cur?.preferences as Record<string, unknown> | null) ?? {}), eager_consolidate: true },
     }).eq('id', consultationId);
     await writeLog('info', 'consultation', `10min: 0 ofertas — modo eager ativado`, { traceId, consultationId });
   }
@@ -239,11 +242,20 @@ export async function consolidateConsultationQuotes(
     return;
   }
 
-  // Idempotência
-  const { data: c } = await db.from('consultations').select('status, specialty').eq('id', consultationId).single();
+  // Idempotência (fast-path)
+  const { data: c } = await db.from('consultations').select('status, specialty, preferences').eq('id', consultationId).single();
   if (!c || ['quoted', 'confirming', 'scheduled', 'cancelled', 'completed'].includes(c.status)) return;
 
-  await db.from('consultations').update({ status: 'quoted' }).eq('id', consultationId).eq('status', 'searching');
+  // Transição ATÔMICA searching→quoted: quem chegar em segundo casa 0 linhas e vira
+  // no-op. Sem isso, timer+eager+rescue disparando juntos apresentavam as opções
+  // ao paciente DUAS vezes (o .eq('status','searching') filtrava, mas o código
+  // seguia mesmo com 0 linhas afetadas). O .select('id') deixa o count visível.
+  const { data: transitioned } = await db.from('consultations')
+    .update({ status: 'quoted' }).eq('id', consultationId).eq('status', 'searching').select('id');
+  if (!transitioned || transitioned.length === 0) {
+    await writeLog('info', 'consultation', 'Consolidação já em curso/feita por outro processo — no-op', { traceId, consultationId });
+    return;
+  }
 
   const { data: quotes } = await db
     .from('consultation_quotes')

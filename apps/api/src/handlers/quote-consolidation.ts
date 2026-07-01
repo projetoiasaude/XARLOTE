@@ -278,8 +278,16 @@ export async function consolidateQuotes(
     return;
   }
 
-  // Mark order as quoted immediately to prevent double-consolidation
-  await db.from('orders').update({ status: 'quoted' }).eq('id', orderId).eq('status', 'quoting');
+  // Transição ATÔMICA quoting→quoted: quem chegar em segundo casa 0 linhas e vira
+  // no-op — evita apresentar as cotações ao cliente DUAS vezes quando timer/rescue
+  // disparam juntos (o .eq('status','quoting') filtrava, mas o código seguia mesmo
+  // com 0 linhas afetadas). O .select('id') expõe o count.
+  const { data: transitioned } = await db.from('orders')
+    .update({ status: 'quoted' }).eq('id', orderId).eq('status', 'quoting').select('id');
+  if (!transitioned || transitioned.length === 0) {
+    await writeLog('info', 'order', 'Consolidação já em curso/feita por outro processo — no-op', { traceId, orderId });
+    return;
+  }
 
   const { data: quotes } = await db
     .from('quotes')
