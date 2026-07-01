@@ -35,17 +35,28 @@ async function senderHasActiveEstablishmentNegotiation(
   const jids = [...new Set([inbound.from.jid, ...whatsappJidVariants(inbound.from.phoneE164)])];
   const { data: convs } = await db
     .from('conversations')
-    .select('id')
+    .select('id, last_message_at')
     .eq('whatsapp_instance', AGENT_INSTANCE)
     .in('whatsapp_jid', jids)
     .limit(5);
   const convIds = (convs ?? []).map((c) => c.id);
   if (!convIds.length) return false;
 
-  // Só estados EM ANDAMENTO (a Xarlote aguarda resposta do estabelecimento AGORA).
-  // NÃO inclui 'quoted'/'selected' (terminais/persistentes): senão um número que
-  // um dia foi farmácia/clínica teria as msgs de CLIENTE sequestradas pro pipeline
-  // B2B pra sempre. O relay de clarificação acontece durante 'negotiating'/'offered'.
+  // 🛑 FIX incidente 2026-07-01: se existe conversa de ESTABELECIMENTO no AGENT com
+  // atividade RECENTE (janela WABA de 24h), o remetente É um estabelecimento — mesmo
+  // que a cotação já esteja TERMINAL. Antes só cotação em andamento contava, então o
+  // follow-up da farmácia DEPOIS do "não temos" (ex.: "confere na farmácia X, tel Y")
+  // não era reconhecido e caía no ONBOARDING de USUÁRIO. Uma conversa no AGENT só
+  // existe porque NÓS contatamos um estabelecimento ali — nunca é cliente. A janela de
+  // 24h mantém o cuidado original (não sequestra pra sempre um número que mudou de dono).
+  const WINDOW_MS = 24 * 60 * 60 * 1000;
+  const recentEstablishment = (convs ?? []).some((c) => {
+    const t = (c as { last_message_at?: string | null }).last_message_at;
+    return t ? Date.now() - new Date(t).getTime() < WINDOW_MS : false;
+  });
+  if (recentEstablishment) return true;
+
+  // Fallback (conversas antigas, fora da janela): só estados EM ANDAMENTO.
   const { data: openQuote } = await db
     .from('quotes')
     .select('id')
