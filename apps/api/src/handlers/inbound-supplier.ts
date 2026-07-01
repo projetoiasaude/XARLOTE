@@ -438,7 +438,9 @@ export async function initiatePharmacyNegotiation(
         paymentMethod: paymentMethod ?? null,
       });
 
-  const itemsText = items.map((i) => `${i.name}${i.dosage ? ` ${i.dosage}` : ''}${i.quantity ? ` (${i.quantity})` : ''}`).join(', ');
+  // Default defensivo: lista vazia/nomes em branco não pode gerar template com
+  // variável vazia (a Meta rejeita) — cai pra um texto genérico válido.
+  const itemsText = items.map((i) => `${i.name}${i.dosage ? ` ${i.dosage}` : ''}${i.quantity ? ` (${i.quantity})` : ''}`).join(', ').trim() || 'os itens do pedido';
   const paymentClause = paymentMethod ? ` O pagamento vai ser via ${paymentMethod}.` : '';
   const fallbackOpening = `Oi, tudo bem? Aqui é a Xarlote, você teria ${itemsText}? Para entregar no ${userNeighborhood}, queria saber o preço e prazo de entrega, por favor.${paymentClause}`;
 

@@ -87,6 +87,11 @@ async function rawSend(job: OutboundJob): Promise<void> {
         language: job.templateLanguage ?? 'pt_BR',
         variables: job.templateVariables ?? [],
       });
+      // Loga o SUCESSO também (não só a falha) — senão o admin via só erros e fica
+      // sem saber se a abertura fria REALMENTE saiu (visibilidade assimétrica).
+      await writeLog('info', 'outbound', `Abertura por template enviada (template=${job.templateName})`, {
+        traceId: job.traceId, instance: job.instance, template: job.templateName,
+      });
     } catch (err) {
       // ⚠️ Numa ABERTURA FRIA o fallback de texto NÃO entrega (a Meta rejeita texto
       // livre fora de janela). Então isto é ERRO ACIONÁVEL (anomaly-detector pega),

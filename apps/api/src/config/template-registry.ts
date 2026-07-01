@@ -123,8 +123,14 @@ export function buildTemplatePayload(key: TemplateKey, variables: string[]): Tem
       `template "${key}" espera ${def.varCount} variável(is), recebeu ${variables.length} — ordem/contagem dos slots {{n}} precisa bater com a Meta`,
     );
   }
-  if (variables.some((v) => typeof v !== 'string' || v.trim() === '')) {
+  // LIMPA cada variável ANTES de validar/enviar: a Meta rejeita parâmetro em branco,
+  // com quebra de linha, ou > ~1024 chars. Colapsa espaços/newlines, trima e limita a
+  // 900. Validamos o valor JÁ LIMPO (um " " vira "" e é barrado) e enviamos o limpo.
+  const cleaned = variables.map((v) =>
+    typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, 900) : '',
+  );
+  if (cleaned.some((v) => v === '')) {
     throw new Error(`template "${key}": variável vazia — a Meta rejeita parâmetro em branco`);
   }
-  return { name: templateName(key), language: templateLanguage(), variables };
+  return { name: templateName(key), language: templateLanguage(), variables: cleaned };
 }

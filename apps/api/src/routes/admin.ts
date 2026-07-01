@@ -865,6 +865,7 @@ export async function adminRoute(app: FastifyInstance) {
     const q = req.query as Record<string, string>;
     const limit = parseInt(q['limit'] ?? '100');
     const level = q['level'];
+    const category = q['category'];
 
     let query = db
       .from('system_logs')
@@ -873,6 +874,7 @@ export async function adminRoute(app: FastifyInstance) {
       .limit(limit);
 
     if (level) query = query.eq('level', level);
+    if (category) query = query.eq('category', category); // ex: ?category=outbound (aberturas/envios)
 
     const { data, error } = await query;
     if (error) return reply.code(500).send({ error: error.message });

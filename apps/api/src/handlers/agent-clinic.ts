@@ -594,7 +594,10 @@ export async function initiateClinicNegotiation(opts: {
   // é assim que o template foi aprovado na Meta. Ligado por WHATSAPP_TEMPLATES_ENABLED
   // =true; desligado (default), segue o texto livre de hoje.
   if (templatesEnabled()) {
-    const necessidade = `uma consulta de ${ctx.specialty}`;
+    // Default defensivo: especialidade vazia/whitespace (input vago do paciente ou LLM
+    // sem valor) não pode gerar "uma consulta de " e travar o template — cai pra genérico.
+    const spec = (ctx.specialty ?? '').trim();
+    const necessidade = spec ? `uma consulta de ${spec}` : 'uma consulta médica';
     await sendTemplateOpeningToClinic(conv.id, clinicWhatsApp, 'clinic_outreach', [necessidade], traceId);
   } else {
     await sendOutboundToClinic(conv.id, clinicWhatsApp, opening, traceId);

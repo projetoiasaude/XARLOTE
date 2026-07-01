@@ -97,6 +97,15 @@ describe('buildTemplatePayload', () => {
   it('LANÇA com variável vazia (a Meta rejeita slot em branco)', () => {
     expect(() => buildTemplatePayload('pharmacy_quote', ['itens', '   '])).toThrow();
   });
+  it('LIMPA variáveis (trim + colapsa espaços/newlines) antes de enviar', () => {
+    const p = buildTemplatePayload('pharmacy_quote', ['  Dipirona   1g \n', ' Setor  Oeste ']);
+    expect(p.variables).toEqual(['Dipirona 1g', 'Setor Oeste']);
+  });
+  it('LIMITA o tamanho da variável (~900 chars, a Meta rejeita gigante)', () => {
+    const huge = 'x'.repeat(2000);
+    const p = buildTemplatePayload('clinic_outreach', [huge]);
+    expect(p.variables[0]!.length).toBe(900);
+  });
   it('respeita override de nome e idioma por env', () => {
     process.env['ZPRO_TEMPLATE_PHARMACY_QUOTE'] = 'cotacao_v2';
     process.env['ZPRO_TEMPLATE_LANG'] = 'pt_PT';
