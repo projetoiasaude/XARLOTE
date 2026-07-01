@@ -529,11 +529,13 @@ export async function initiateClinicNegotiation(opts: {
     metadata: { clinic_id: clinicId, clinic_name: clinicName, specialty: ctx.specialty },
   });
 
-  // Fase 6: abertura fria oficial = template atendimento_clinica ({{1}}=especialidade,
-  // sem região — decisão do fundador). Ligado por WHATSAPP_TEMPLATES_ENABLED=true;
-  // desligado (default), segue o texto livre de hoje.
+  // Fase 6: abertura fria oficial = template atendimento_clinica. {{1}} é a
+  // NECESSIDADE INTEIRA ("uma consulta de cardiologia"), não só a especialidade —
+  // é assim que o template foi aprovado na Meta. Ligado por WHATSAPP_TEMPLATES_ENABLED
+  // =true; desligado (default), segue o texto livre de hoje.
   if (templatesEnabled()) {
-    await sendTemplateOpeningToClinic(conv.id, clinicWhatsApp, 'clinic_outreach', [ctx.specialty], traceId);
+    const necessidade = `uma consulta de ${ctx.specialty}`;
+    await sendTemplateOpeningToClinic(conv.id, clinicWhatsApp, 'clinic_outreach', [necessidade], traceId);
   } else {
     await sendOutboundToClinic(conv.id, clinicWhatsApp, opening, traceId);
   }

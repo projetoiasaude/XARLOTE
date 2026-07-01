@@ -3,6 +3,7 @@ import {
   buildTemplatePayload,
   humanizeTemplate,
   templatesEnabled,
+  pharmacyColdOpen,
 } from '../apps/api/src/config/template-registry.js';
 
 // Limpa as envs que o registry lê, pra cada teste partir de estado conhecido.
@@ -12,6 +13,7 @@ const ENV_KEYS = [
   'ZPRO_TEMPLATE_PHARMACY_QUOTE',
   'ZPRO_TEMPLATE_CLINIC_OUTREACH',
   'ZPRO_TEMPLATE_GENERAL',
+  'ZPRO_TEMPLATE_COTACAO_APPROVED',
 ];
 const saved: Record<string, string | undefined> = {};
 beforeEach(() => {
@@ -38,17 +40,43 @@ describe('templatesEnabled (gate de segurança)', () => {
   });
 });
 
-describe('humanizeTemplate', () => {
-  it('farmácia: insere itens + região e se identifica como Xarlote', () => {
+describe('humanizeTemplate (bate com o corpo aprovado na Meta)', () => {
+  it('farmácia: corpo exato aprovado, com item {{1}} e região {{2}}', () => {
     const txt = humanizeTemplate('pharmacy_quote', ['Dipirona 1g (1 caixa)', 'Setor Oeste']);
-    expect(txt).toContain('Xarlote');
-    expect(txt).toContain('Dipirona 1g (1 caixa)');
-    expect(txt).toContain('Setor Oeste');
+    expect(txt).toBe(
+      'Oi, tudo bem? Aqui é a Xarlote, assistente de saúde. Você teria Dipirona 1g (1 caixa) disponível? É para entregar na região Setor Oeste. Consegue me passar o preço e o prazo de entrega, por favor?',
+    );
   });
-  it('clínica: insere a especialidade e NÃO pede região', () => {
-    const txt = humanizeTemplate('clinic_outreach', ['cardiologia']);
-    expect(txt).toContain('cardiologia');
+  it('clínica: corpo exato, {{1}} é a necessidade inteira; NÃO pede região', () => {
+    const txt = humanizeTemplate('clinic_outreach', ['uma consulta de cardiologia']);
+    expect(txt).toBe(
+      'Oi, tudo bem? Aqui é a Xarlote, assistente de saúde. Estou ajudando um paciente que precisa de uma consulta de cardiologia e gostaria de saber o valor e a disponibilidade de horário. Vocês conseguem me ajudar, por favor?',
+    );
     expect(txt.toLowerCase()).not.toContain('entregar');
+  });
+  it('geral (coringa): corpo exato com o assunto {{1}}', () => {
+    const txt = humanizeTemplate('general', ['um orçamento de fórmula manipulada']);
+    expect(txt).toBe(
+      'Oi, tudo bem? Aqui é a Xarlote, assistente de saúde. Estou ajudando um cliente e preciso falar com vocês sobre um orçamento de fórmula manipulada. Vocês conseguem me ajudar com isso? Fico no aguardo, obrigada!',
+    );
+  });
+});
+
+describe('pharmacyColdOpen (cotacao_medicamento ainda pendente → coringa)', () => {
+  it('DEFAULT (não aprovado): usa contato_geral com assunto "um orçamento de …"', () => {
+    const t = pharmacyColdOpen('Dipirona 1g (1 caixa)', 'Setor Oeste');
+    expect(t.key).toBe('general');
+    expect(t.variables).toHaveLength(1);
+    expect(t.variables[0]).toBe('um orçamento de Dipirona 1g (1 caixa) para entrega na região Setor Oeste');
+    // e o payload monta com o template aprovado contato_geral
+    expect(buildTemplatePayload(t.key, t.variables).name).toBe('contato_geral');
+  });
+  it('quando cotacao_medicamento aprovado: usa o dedicado (2 vars)', () => {
+    process.env['ZPRO_TEMPLATE_COTACAO_APPROVED'] = 'true';
+    const t = pharmacyColdOpen('Dipirona 1g (1 caixa)', 'Setor Oeste');
+    expect(t.key).toBe('pharmacy_quote');
+    expect(t.variables).toEqual(['Dipirona 1g (1 caixa)', 'Setor Oeste']);
+    expect(buildTemplatePayload(t.key, t.variables).name).toBe('cotacao_medicamento');
   });
 });
 

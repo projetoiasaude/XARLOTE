@@ -13,7 +13,7 @@ import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier, sendTemplateOpeningToSupplier } from './outbound-agent.js';
 import { consolidateQuotes, notifyUserQuoteArrived } from './quote-consolidation.js';
 import { relaySupplierQuestionToUser } from './clarification.js';
-import { templatesEnabled } from '../config/template-registry.js';
+import { templatesEnabled, pharmacyColdOpen } from '../config/template-registry.js';
 
 /**
  * Extrai "Rua/Avenida X, Setor Y" do endereço completo (Nominatim/ViaCEP / Google reverse).
@@ -436,11 +436,12 @@ export async function initiatePharmacyNegotiation(
   });
 
   // Fase 6: no número OFICIAL a abertura fria PRECISA ser template (Meta). Quando
-  // ligado (WHATSAPP_TEMPLATES_ENABLED=true), manda o template cotacao_medicamento
-  // ({{1}}=itens, {{2}}=região); o `opening` (LLM) vira só o fallback humanizado.
+  // ligado (WHATSAPP_TEMPLATES_ENABLED=true), pharmacyColdOpen escolhe o template:
+  // cotacao_medicamento se já aprovado, senão o coringa contato_geral (aprovado).
   // Desligado (default / agente ainda no uazapi), segue o texto livre de hoje.
   if (templatesEnabled()) {
-    await sendTemplateOpeningToSupplier(conv.id, supplierPhone, 'pharmacy_quote', [itemsText, userNeighborhood], traceId);
+    const t = pharmacyColdOpen(itemsText, userNeighborhood);
+    await sendTemplateOpeningToSupplier(conv.id, supplierPhone, t.key, t.variables, traceId);
   } else {
     await sendOutboundToSupplier(conv.id, supplierPhone, opening, traceId);
   }
