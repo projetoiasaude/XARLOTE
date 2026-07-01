@@ -66,11 +66,12 @@ export const agentPharmacyTools: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'request_clarification',
-      description: 'Precisa de informação adicional do usuário antes de continuar a negociação.',
+      description:
+        'Leva ao PACIENTE uma pergunta que SÓ ELE pode decidir (marca específica, trocar por similar/genérico, plano vs particular, CPF, dado clínico). NUNCA use pra endereço, rua, bairro, frete ou logística de entrega — isso NÃO é dúvida do paciente: você JÁ sabe a região e responde a farmácia direto (Caso D). NUNCA use pra perguntar preço/frete à farmácia — isso é texto normal pra ela (Caso A/B).',
       parameters: {
         type: 'object',
         properties: {
-          question: { type: 'string', description: 'Pergunta para o usuário' },
+          question: { type: 'string', description: 'Pergunta ao PACIENTE (decisão dele), na linguagem que ele entende. Não use pra endereço/frete.' },
         },
         required: ['question'],
       },
