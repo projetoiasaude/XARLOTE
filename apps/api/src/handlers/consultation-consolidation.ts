@@ -326,7 +326,9 @@ export async function consolidateConsultationQuotes(
     const modePart = q.modality ? ` · ${q.modality}` : '';
     const pricePart = q.price_brl != null ? (q.price_brl > 0 ? ` · R$${q.price_brl.toFixed(2)}` : ` · pelo plano`) : '';
     const planPart = q.plan_accepted && q.plan_accepted.toLowerCase() !== 'particular' ? ` · plano ${q.plan_accepted}` : '';
-    const addressPart = clinic?.city ? `\n   📍 ${clinic.city}` : '';
+    // Local = endereço da clínica (é pra lá que o paciente vai); cai pra cidade se não tiver.
+    const localText = clinic?.address || clinic?.city;
+    const addressPart = localText ? `\n   📍 ${localText}` : '';
 
     lines.push(`${NUMBERS[i] ?? `${i + 1}.`} *${clinic?.name ?? 'Clínica'}*\n   📅 ${dt}${doctorPart}${modePart}${pricePart}${planPart}${addressPart}`);
   }
