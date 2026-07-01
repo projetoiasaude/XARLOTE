@@ -4,7 +4,7 @@ import { normalizeZproWebhook, zproEventId, isZproStatusEcho } from '@iasaude/wh
 import { db, writeLog, redactPII } from '@iasaude/db';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { processInboundSupplierFromWebhook } from '../handlers/inbound-supplier.js';
-import { AGENT_INSTANCE, SARA_INSTANCE } from '@iasaude/shared';
+import { AGENT_INSTANCE, SARA_INSTANCE, whatsappJidVariants } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { checkUserRateLimit } from '../middleware/rate-limit.js';
 import { setZproTicket } from '../middleware/zpro-ticket.js';
@@ -31,8 +31,8 @@ import { captureError } from '../observability/sentry.js';
 async function senderHasActiveEstablishmentNegotiation(
   inbound: import('@iasaude/shared').NormalizedInbound,
 ): Promise<boolean> {
-  const canonicalJid = `${inbound.from.phoneE164.replace(/\D/g, '')}@s.whatsapp.net`;
-  const jids = [...new Set([inbound.from.jid, canonicalJid])];
+  // Casa por TODAS as variantes do 9º dígito BR (o WhatsApp entrega c/ ou sem o 9).
+  const jids = [...new Set([inbound.from.jid, ...whatsappJidVariants(inbound.from.phoneE164)])];
   const { data: convs } = await db
     .from('conversations')
     .select('id')

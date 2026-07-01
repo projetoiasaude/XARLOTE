@@ -7,7 +7,7 @@ import {
   messagesToHistory,
   trimHistory,
 } from '@iasaude/llm';
-import { AGENT_INSTANCE } from '@iasaude/shared';
+import { AGENT_INSTANCE, whatsappJidVariants } from '@iasaude/shared';
 import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier, sendTemplateOpeningToSupplier } from './outbound-agent.js';
@@ -313,8 +313,10 @@ export async function processInboundSupplierFromWebhook(inbound: NormalizedInbou
   // whatsapp_e164 do fornecedor). Dependendo do provider, o sender do inbound
   // pode vir com outro sufixo (@c.us, @lid) — então casamos pelo jid cru E pelo
   // jid canônico reconstruído do telefone (robusto pra uazapi e zpro).
-  const canonicalJid = `${inbound.from.phoneE164.replace(/\D/g, '')}@s.whatsapp.net`;
-  const jids = [...new Set([inbound.from.jid, canonicalJid])];
+  // Casa por TODAS as variantes do 9º dígito BR (o WhatsApp entrega c/ ou sem o 9)
+  // — senão a resposta da farmácia/clínica vinda com o número no formato "oposto"
+  // ao que salvamos não acha a conversa e a negociação trava.
+  const jids = [...new Set([inbound.from.jid, ...whatsappJidVariants(inbound.from.phoneE164)])];
   const { data: rows } = await db
     .from('conversations')
     .select('id, party_type')

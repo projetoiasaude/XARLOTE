@@ -18,7 +18,7 @@ import {
   trimHistory,
   type AgentClinicContext,
 } from '@iasaude/llm';
-import { AGENT_INSTANCE } from '@iasaude/shared';
+import { AGENT_INSTANCE, whatsappJidVariants } from '@iasaude/shared';
 import type { NormalizedInbound, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToClinic, sendTemplateOpeningToClinic } from './outbound-agent.js';
@@ -417,13 +417,15 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
 
 /** Recebe webhook do uazapi quando a instância do agente é a de clínica. */
 export async function processInboundClinicFromWebhook(inbound: NormalizedInbound): Promise<void> {
-  const { data: conv } = await db
+  // Casa por TODAS as variantes do 9º dígito BR (o WhatsApp entrega c/ ou sem o 9).
+  const jids = [...new Set([inbound.from.jid, ...whatsappJidVariants(inbound.from.phoneE164)])];
+  const { data: convs } = await db
     .from('conversations')
     .select('id')
     .eq('whatsapp_instance', AGENT_INSTANCE)
-    .eq('whatsapp_jid', inbound.from.jid)
-    .single();
-
+    .in('whatsapp_jid', jids)
+    .limit(1);
+  const conv = convs?.[0];
   if (!conv) return;
 
   await processInboundClinic({
