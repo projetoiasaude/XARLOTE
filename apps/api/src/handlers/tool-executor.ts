@@ -3,7 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { nextOccurrence } from '@iasaude/shared';
+import { nextOccurrence, isPlaceholderPhone } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -738,10 +738,10 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
 
   // 4. Send confirmation message to pharmacy via agent (tom humano, sem emojis)
   const supplier = quote.suppliers as { id: string; name: string; whatsapp_e164?: string; phone_e164?: string } | null;
-  if (supplier && quote.conversation_id) {
-    // Fallback to fake simulator phone (same scheme used in initiatePharmacyNegotiation)
-    const supplierPhone =
-      supplier.whatsapp_e164 || supplier.phone_e164 || `+555500000${supplier.id.slice(0, 4)}`;
+  // 🛑 Só confirma com fornecedor de telefone REAL (nunca fabrica número fake — ver
+  // incidente 2026-07-01). Sem telefone válido → pula (não há farmácia real pra avisar).
+  const supplierPhone = supplier?.whatsapp_e164 || supplier?.phone_e164 || null;
+  if (supplier && quote.conversation_id && supplierPhone && !isPlaceholderPhone(supplierPhone)) {
     const itemsList = items
       .map((i: OrderItem) => `- ${i.name}${i.dosage ? ` ${i.dosage}` : ''}${i.quantity ? ` (${i.quantity})` : ''}`)
       .join('\n');

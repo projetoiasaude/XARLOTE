@@ -7,7 +7,7 @@ import {
   messagesToHistory,
   trimHistory,
 } from '@iasaude/llm';
-import { AGENT_INSTANCE, whatsappJidVariants } from '@iasaude/shared';
+import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone } from '@iasaude/shared';
 import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier, sendTemplateOpeningToSupplier } from './outbound-agent.js';
@@ -401,8 +401,18 @@ export async function initiatePharmacyNegotiation(
 
   if (!supplier) return;
 
-  // In simulator, use a fake phone derived from supplier ID
-  const supplierPhone = supplier.whatsapp_e164 || supplier.phone_e164 || `+555500000${supplier.id.slice(0, 4)}`;
+  // 🛑 SÓ contata fornecedor com telefone REAL. Antes caía num número sintético
+  // (+555500000<id>) quando não havia telefone — e em produção isso DISPAROU pra
+  // números fake (incidente 2026-07-01). Sem WhatsApp/telefone real → pula + loga
+  // (nada de fabricar número). Marca a cotação como indisponível pra não travar o pedido.
+  const supplierPhone = supplier.whatsapp_e164 || supplier.phone_e164 || null;
+  if (!supplierPhone || isPlaceholderPhone(supplierPhone)) {
+    await writeLog('error', 'pharmacy', `Fornecedor ${supplier.name} SEM telefone real (whatsapp/phone nulos) — negociação PULADA (não fabrica número fake).`, {
+      traceId, quoteId, supplierId: supplier.id,
+    });
+    await db.from('quotes').update({ status: 'unavailable', notes: 'fornecedor sem telefone real', completed_at: new Date().toISOString() }).eq('id', quoteId);
+    return;
+  }
   const supplierJid = `${supplierPhone.replace(/\D/g, '')}@s.whatsapp.net`;
 
   // Create (or find) supplier conversation

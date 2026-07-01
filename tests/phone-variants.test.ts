@@ -1,5 +1,25 @@
 import { describe, it, expect } from 'vitest';
-import { brPhoneVariants, whatsappJidVariants } from '../packages/shared/src/phone.js';
+import { brPhoneVariants, whatsappJidVariants, isPlaceholderPhone } from '../packages/shared/src/phone.js';
+
+// Blinda a TRAVA do incidente 2026-07-01: números sintéticos (+555500000<id>) gerados
+// quando o fornecedor não tinha telefone real NÃO podem ir pro envio. Números BR reais passam.
+describe('isPlaceholderPhone (trava anti-número-fake)', () => {
+  it('barra os números sintéticos exatos do incidente', () => {
+    for (const fake of ['5555000006001', '5555000083', '555500000536', '555500000489', '55550000040', '+555500000abcd']) {
+      expect(isPlaceholderPhone(fake)).toBe(true);
+    }
+  });
+  it('barra vazio/nulo/curto', () => {
+    expect(isPlaceholderPhone(null)).toBe(true);
+    expect(isPlaceholderPhone('')).toBe(true);
+    expect(isPlaceholderPhone('+5562999')).toBe(true);
+  });
+  it('DEIXA passar número BR real (com e sem o 9)', () => {
+    expect(isPlaceholderPhone('+5562991592150')).toBe(false); // 13 díg
+    expect(isPlaceholderPhone('+556291592150')).toBe(false);  // 12 díg
+    expect(isPlaceholderPhone('+556232223344')).toBe(false);  // fixo 12 díg
+  });
+});
 
 describe('brPhoneVariants (9º dígito BR)', () => {
   it('com o 9 → gera também a versão sem o 9', () => {

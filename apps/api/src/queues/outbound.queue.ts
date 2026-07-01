@@ -17,7 +17,7 @@
 import { Queue, Worker, type Job } from 'bullmq';
 import { sendText, sendAudio, sendMenu, sendTemplate } from '@iasaude/whatsapp';
 import { writeLog } from '@iasaude/db';
-import { AGENT_INSTANCE, QUEUE_NAMES } from '@iasaude/shared';
+import { AGENT_INSTANCE, QUEUE_NAMES, isPlaceholderPhone } from '@iasaude/shared';
 import { getRedisConnection } from '../queue-config.js';
 
 export interface OutboundJob {
@@ -67,6 +67,16 @@ function queueFor(instance: string): Queue {
 
 /** Executa o envio real na uazapi. Áudio cai pra texto se falhar. */
 async function rawSend(job: OutboundJob): Promise<void> {
+  // 🛑 TRAVA DE SEGURANÇA (incidente 2026-07-01): NUNCA enviar pra número sintético/
+  // placeholder (+555500000<id>) ou inválido. Fornecedor/clínica sem telefone real
+  // gerava um número fake e o envio caía em número aleatório (spam/ban). Barra aqui,
+  // no ponto de envio, pegando qualquer job (enfileirado ou fallback direto).
+  if (isPlaceholderPhone(job.phoneE164)) {
+    await writeLog('error', 'outbound', `Envio BLOQUEADO — número placeholder/inválido (${job.phoneE164}). Estabelecimento sem telefone real; nada enviado.`, {
+      traceId: job.traceId, instance: job.instance, kind: job.kind, phone: job.phoneE164,
+    });
+    return;
+  }
   if (job.kind === 'text') {
     await sendText(job.instance, job.phoneE164, job.text ?? '');
     return;
