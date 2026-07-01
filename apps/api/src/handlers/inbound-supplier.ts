@@ -181,6 +181,7 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     : buildAgentPharmacySystemPrompt({
         items: order?.items ?? [],
         neighborhoodCity: userNeighborhood,
+        deliveryAddress: order?.delivery_address ?? null, // endereço real p/ a farmácia (Caso D/frete)
         paymentMethod: order?.payment_method ?? null,
         isOrderConfirmation,
       });
@@ -405,12 +406,14 @@ export async function initiatePharmacyNegotiation(
   }
 
   // Build opening message via Agent LLM. Repassamos o setor REAL do usuário (não a cidade da farmácia).
+  const { data: ordAddr } = await db.from('orders').select('delivery_address').eq('id', orderId).single();
   const cfg = loadPrompts();
   const systemPrompt = cfg.agent_override.trim()
     ? cfg.agent_override.trim()
     : buildAgentPharmacySystemPrompt({
         items,
         neighborhoodCity: userNeighborhood,
+        deliveryAddress: ordAddr?.delivery_address ?? null,
         paymentMethod: paymentMethod ?? null,
       });
 

@@ -337,7 +337,7 @@ export async function adminRoute(app: FastifyInstance) {
       const items: OrderItem[] = Array.isArray(req.body?.items) && req.body!.items!.length
         ? req.body!.items!
         : [{ name: 'Dipirona 1g', quantity: '1 caixa', substitutes_ok: true } as OrderItem];
-      const city = (req.body?.city ?? 'Setor Oeste, Goiânia').trim();
+      const city = (req.body?.city ?? 'Rua 14, nº 201, Setor Oeste, Goiânia - GO').trim();
       const traceId = `testloop-${randomUUID().slice(0, 8)}`;
 
       // 1. Usuário sintético + conversa (SARA)
