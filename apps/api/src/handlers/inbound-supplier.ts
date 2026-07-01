@@ -291,8 +291,12 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     }
   }
 
-  // 10. Send reply text to pharmacy (if not finalized)
-  if (llmResponse.text.trim() && !shouldFinalize) {
+  // 10. Envia o texto pra farmácia. Manda SEMPRE que houver texto, EXCETO nos
+  // outcomes silenciosos (unavailable/timeout — Caso C). Antes suprimia em QUALQUER
+  // finalize, então a farmácia dava o preço e ouvia SILÊNCIO (a despedida "anotado,
+  // vou confirmar com o cliente" do Caso A1 nunca saía).
+  const silentOutcome = outcome === 'unavailable' || outcome === 'timeout';
+  if (llmResponse.text.trim() && !silentOutcome) {
     await sendOutboundToSupplier(conversationId, supplierPhone, llmResponse.text.trim(), traceId);
   } else if (!llmResponse.text.trim() && !shouldFinalize && llmResponse.toolCalls.length === 0) {
     // LLM returned nothing — log it

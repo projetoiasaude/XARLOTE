@@ -405,8 +405,11 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     }
   }
 
-  // 9. Envia resposta de texto pra clínica (se não finalizou)
-  if (llmResponse.text.trim() && !shouldFinalize) {
+  // 9. Envia o texto pra clínica. Manda SEMPRE que houver texto, EXCETO nos outcomes
+  // silenciosos (unavailable/timeout). Antes suprimia em qualquer finalize → a clínica
+  // dava o horário e ouvia silêncio (a cortesia "anotei, vou confirmar" não saía).
+  const silentOutcome = outcome === 'unavailable' || outcome === 'timeout';
+  if (llmResponse.text.trim() && !silentOutcome) {
     await sendOutboundToClinic(conversationId, clinicPhone, llmResponse.text.trim(), traceId);
   } else if (!llmResponse.text.trim() && !shouldFinalize && llmResponse.toolCalls.length === 0) {
     await writeLog('warn', 'agent-clinic', 'Agente clínica retornou resposta vazia', { traceId, conversationId });
