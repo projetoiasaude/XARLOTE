@@ -6,6 +6,7 @@ import type { OrderItem } from '@iasaude/shared';
 import { loadPrompts, savePrompts } from '../config/prompts.js';
 import { buildXarloteSystemPrompt, buildAgentPharmacySystemPrompt } from '@iasaude/llm';
 import { initiatePharmacyNegotiation } from '../handlers/inbound-supplier.js';
+import { initiateClinicNegotiation } from '../handlers/agent-clinic.js';
 import { requireAdminToken } from '../middleware/auth.js';
 
 /** Redacta valores sensíveis em config — não loga keys cruas no audit_log */
@@ -386,7 +387,97 @@ export async function adminRoute(app: FastifyInstance) {
     },
   );
 
-  // Limpa os dados do teste de loop (usuário sintético + farmácia marcada 🧪).
+  // ─── TESTE DE LOOP REAL — CLÍNICA (Fase 4/6) ──────────────────────────────
+  // Espelho do teste de farmácia, mas pro fluxo de CONSULTA. Semeia consultation +
+  // clínica de teste (o número que você passar = você fazendo o papel da recepção da
+  // clínica), dispara a abertura oficial (template atendimento_clinica quando ligado)
+  // → você responde horário/preço → cai no clinic pipeline (blindagem + party_type)
+  // → agente registra a cotação → consolida. NÃO toca em clínica real (só o número
+  // informado). Limpe depois com POST /admin/test/cleanup.
+  //
+  // ⚠️ Pré-requisito de ENVIO REAL: CLINIC_OUTBOUND_MODE=real (senão a mensagem só é
+  // persistida, modo simulação — igual à salvaguarda de não mandar WhatsApp pra médico
+  // real durante beta). Ver sendOutboundToClinic/sendTemplateOpeningToClinic.
+  const TEST_CLINIC_NAME = '🧪 Clínica Teste (loop)';
+
+  app.post<{ Body: { clinicPhone?: string; specialty?: string; plan?: string; city?: string; modality?: 'presencial' | 'telemedicina' | 'indiferente' } }>(
+    '/test/clinic-negotiation',
+    async (req, reply) => {
+      if (req.headers['x-confirm-live-send'] !== 'true') {
+        return reply.code(428).send({ error: 'confirm_required', message: 'Envio real: reenvie com o header x-confirm-live-send: true' });
+      }
+      const clinicPhone = (req.body?.clinicPhone ?? '').trim();
+      if (!clinicPhone) return reply.code(400).send({ error: 'clinicPhone é obrigatório (E.164, ex: +5562999999999)' });
+      const specialty = (req.body?.specialty ?? 'clínico geral').trim();
+      const plan = (req.body?.plan ?? 'particular').trim();
+      const city = (req.body?.city ?? 'Setor Oeste, Goiânia - GO').trim();
+      const modality = req.body?.modality ?? 'presencial';
+      const realMode = process.env['CLINIC_OUTBOUND_MODE'] === 'real';
+      const traceId = `testclinic-${randomUUID().slice(0, 8)}`;
+
+      // 1. Usuário sintético + conversa (SARA) — mesmo usuário do teste de farmácia
+      let userId: string;
+      const { data: existingUser } = await db.from('users').select('id').eq('phone_e164', TEST_USER_PHONE).maybeSingle();
+      if (existingUser?.id) userId = existingUser.id;
+      else {
+        const { data: u, error: uErr } = await db.from('users')
+          .insert({ id: randomUUID(), phone_e164: TEST_USER_PHONE, preferred_name: 'Teste Loop' })
+          .select('id').single();
+        if (uErr || !u) return reply.code(500).send({ error: `user: ${uErr?.message}` });
+        userId = u.id;
+      }
+      const userJid = `${TEST_USER_PHONE.replace(/\D/g, '')}@s.whatsapp.net`;
+      const userConv = await findOrCreateConversation(SARA_INSTANCE, userJid, 'user', userId);
+
+      // 2. Clínica semeada = o número informado (você faz o papel da recepção)
+      let clinicId: string;
+      const { data: existingClinic } = await db.from('clinics').select('id').eq('whatsapp_e164', clinicPhone).maybeSingle();
+      if (existingClinic?.id) {
+        clinicId = existingClinic.id;
+        await db.from('clinics').update({ name: TEST_CLINIC_NAME, specialties: [specialty] }).eq('id', clinicId);
+      } else {
+        const { data: cl, error: clErr } = await db.from('clinics')
+          .insert({ name: TEST_CLINIC_NAME, type: 'clinic', specialties: [specialty], accepts_plans: [], whatsapp_e164: clinicPhone, phone_e164: clinicPhone, city })
+          .select('id').single();
+        if (clErr || !cl) return reply.code(500).send({ error: `clinic: ${clErr?.message}` });
+        clinicId = cl.id;
+      }
+
+      // 3. Consultation (status='searching') + consultation_quote (pending)
+      const { data: consultation, error: cErr } = await db.from('consultations')
+        .insert({ user_id: userId, conversation_id: userConv.id, status: 'searching', specialty, urgency: 'rotina', modality, city, preferences: { plan } as never })
+        .select('id').single();
+      if (cErr || !consultation) return reply.code(500).send({ error: `consultation: ${cErr?.message}` });
+      const { data: cQuote, error: cqErr } = await db.from('consultation_quotes')
+        .insert({ consultation_id: consultation.id, clinic_id: clinicId, status: 'pending', modality: modality === 'indiferente' ? null : modality })
+        .select('id').single();
+      if (cqErr || !cQuote) return reply.code(500).send({ error: `consultation_quote: ${cqErr?.message}` });
+
+      // 4. Dispara a negociação REAL (mesmo código do app; template se ligado)
+      await initiateClinicNegotiation({
+        quoteId: cQuote.id,
+        consultationId: consultation.id,
+        clinicId,
+        clinicName: TEST_CLINIC_NAME,
+        clinicWhatsApp: clinicPhone,
+        ctx: { specialty, urgency: 'rotina', modality, patientCity: city, plan, patientName: 'Teste', preferredTime: null },
+        userConversationId: userConv.id,
+        userPhoneE164: TEST_USER_PHONE,
+        traceId,
+      });
+
+      await writeAudit({ actorType: 'system', actorId: 'admin-test', action: 'test.clinic_negotiation.started', targetTable: 'consultation_quotes', targetId: cQuote.id, traceId, metadata: { clinicPhone: clinicPhone.slice(0, 6) + '***', specialty, plan, city } });
+      return reply.send({
+        ok: true, traceId, consultationId: consultation.id, quoteId: cQuote.id, clinicId, userId, conversationId: userConv.id,
+        clinicOutboundMode: realMode ? 'real' : 'simulacao',
+        note: realMode
+          ? 'Responda a abertura como se fosse a recepção da clínica. Depois GET /admin/conversations/:id ou POST /admin/test/cleanup.'
+          : '⚠️ CLINIC_OUTBOUND_MODE != real → a abertura foi SÓ PERSISTIDA (não enviada). Pra testar o disparo real, ligue CLINIC_OUTBOUND_MODE=real e redeploy.',
+      });
+    },
+  );
+
+  // Limpa os dados do teste de loop (usuário sintético + farmácia/clínica marcada 🧪).
   app.post('/test/cleanup', async (_req, reply) => {
     const cleaned: Record<string, number> = {};
     // Usuário de teste → suas orders/quotes/mensagens/conversas
@@ -395,6 +486,10 @@ export async function adminRoute(app: FastifyInstance) {
       const { data: ords } = await db.from('orders').select('id').eq('user_id', tu.id);
       const orderIds = (ords ?? []).map((o) => o.id);
       if (orderIds.length) { await db.from('quotes').delete().in('order_id', orderIds); await db.from('orders').delete().in('id', orderIds); }
+      // Consultas do usuário de teste → suas consultation_quotes
+      const { data: cons } = await db.from('consultations').select('id').eq('user_id', tu.id);
+      const consIds = (cons ?? []).map((c) => c.id);
+      if (consIds.length) { await db.from('consultation_quotes').delete().in('consultation_id', consIds); await db.from('consultations').delete().in('id', consIds); }
       const { data: convs } = await db.from('conversations').select('id').eq('user_id', tu.id);
       for (const c of convs ?? []) await db.from('messages').delete().eq('conversation_id', c.id);
       await db.from('conversations').delete().eq('user_id', tu.id);
@@ -411,6 +506,16 @@ export async function adminRoute(app: FastifyInstance) {
       await db.from('suppliers').delete().eq('id', s.id);
     }
     cleaned['test_suppliers'] = (sups ?? []).length;
+    // Clínica de teste (marcada) + sua conversa no AGENT + consultation_quotes
+    const { data: cls } = await db.from('clinics').select('id').eq('name', TEST_CLINIC_NAME);
+    for (const cl of cls ?? []) {
+      const { data: clconvs } = await db.from('conversations').select('id').eq('whatsapp_instance', AGENT_INSTANCE).eq('clinic_id', cl.id);
+      for (const c of clconvs ?? []) { await db.from('messages').delete().eq('conversation_id', c.id); await db.from('consultation_quotes').delete().eq('conversation_id', c.id); }
+      await db.from('conversations').delete().eq('whatsapp_instance', AGENT_INSTANCE).eq('clinic_id', cl.id);
+      await db.from('consultation_quotes').delete().eq('clinic_id', cl.id);
+      await db.from('clinics').delete().eq('id', cl.id);
+    }
+    cleaned['test_clinics'] = (cls ?? []).length;
     return reply.send({ ok: true, cleaned });
   });
 

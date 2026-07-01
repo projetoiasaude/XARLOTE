@@ -36,6 +36,20 @@ export interface ClinicInboundCtx {
   traceId: string;
 }
 
+/**
+ * Escolhe a mensagem de CORTESIA determinística pra clínica quando o LLM chamou uma
+ * tool mas NÃO gerou texto (bug conhecido do gpt-4.1-mini). Puro/testável.
+ * Prioridade: confirmação de agendamento > pergunta ao paciente > horário anotado.
+ */
+export function pickClinicFallbackMessage(flags: {
+  appointmentConfirmed: boolean;
+  clarificationRequested: boolean;
+}): string {
+  if (flags.appointmentConfirmed) return 'Perfeito, muito obrigada! Já passo as instruções pro paciente.';
+  if (flags.clarificationRequested) return 'Deixa eu confirmar isso com o paciente e já te respondo, tá? Obrigada!';
+  return 'Show, anotei o horário! Vou confirmar com o paciente e já volto pra fechar, obrigada!';
+}
+
 export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void> {
   const { conversationId, clinicPhone, text, traceId } = ctx;
   const t0 = Date.now();
@@ -203,6 +217,11 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   // 8. Executa tool calls
   let shouldFinalize = false;
   let outcome = '';
+  // Flags pro FALLBACK DETERMINÍSTICO (o gpt-4.1-mini às vezes chama tool SEM
+  // gerar texto → a clínica ficava no vácuo). Espelha o inbound-supplier.
+  let quoteRecorded = false;         // record_consultation_quote
+  let appointmentConfirmed = false;  // record_appointment_confirmation
+  let clarificationRequested = false; // request_clarification (levou pergunta ao paciente)
 
   for (const tc of llmResponse.toolCalls) {
     switch (tc.name) {
@@ -225,6 +244,7 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
           await writeLog('warn', 'consultation_quote', `proposed_datetime inválido: "${a.proposed_datetime}"`, { traceId });
           break;
         }
+        quoteRecorded = true;
 
         // Cria/atualiza prescriber se informado
         let prescriberId: string | null = quote.prescriber_id;
@@ -352,6 +372,7 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
         const question = (a.question ?? '').trim();
         if (question) {
           await relayClinicQuestionToUser(quote, question, traceId);
+          clarificationRequested = true;
         }
         break;
       }
@@ -397,6 +418,7 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
         });
 
         await writeLog('info', 'consultation', `✅ Consulta confirmada pela clínica — ${confISO}`, { traceId, quoteId: quote.id });
+        appointmentConfirmed = true;
         break;
       }
 
@@ -411,6 +433,13 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   const silentOutcome = outcome === 'unavailable' || outcome === 'timeout';
   if (llmResponse.text.trim() && !silentOutcome) {
     await sendOutboundToClinic(conversationId, clinicPhone, llmResponse.text.trim(), traceId);
+  } else if (!llmResponse.text.trim() && !silentOutcome && (quoteRecorded || appointmentConfirmed || clarificationRequested)) {
+    // FALLBACK DETERMINÍSTICO (paridade c/ farmácia): o gpt-4.1-mini às vezes chama
+    // a tool (registrou horário / confirmou / mandou pergunta ao paciente) SEM gerar
+    // texto → a clínica ouvia silêncio. Aqui garantimos uma cortesia sem depender do LLM.
+    const fallbackMsg = pickClinicFallbackMessage({ appointmentConfirmed, clarificationRequested });
+    await sendOutboundToClinic(conversationId, clinicPhone, fallbackMsg, traceId);
+    await writeLog('info', 'agent-clinic', 'Resposta determinística à clínica (LLM não gerou texto)', { traceId, conversationId, quoteRecorded, appointmentConfirmed, clarificationRequested });
   } else if (!llmResponse.text.trim() && !shouldFinalize && llmResponse.toolCalls.length === 0) {
     await writeLog('warn', 'agent-clinic', 'Agente clínica retornou resposta vazia', { traceId, conversationId });
   }
