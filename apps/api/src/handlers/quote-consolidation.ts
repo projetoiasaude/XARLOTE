@@ -4,11 +4,17 @@ import { hasPendingClarification } from './clarification.js';
 
 const CHECK_3MIN_MS = 3 * 60 * 1000;
 const CHECK_5MIN_MS = 5 * 60 * 1000;
+const PROGRESS_NOTE_MS = 10 * 60 * 1000; // aviso honesto de "ainda aguardando"
 const scheduledTimeouts = new Set<string>();
 
-// F1.A3: além de quantos minutos um pedido preso em 'quoting' é considerado órfão
-// (timer de consolidação perdido num restart) e resgatado pelo dispatcher.
-const RESCUE_WINDOW_MIN = Number(process.env['PHARMACY_RESCUE_WINDOW_MIN'] ?? 10);
+// JANELA REAL DE COTAÇÃO (recalibrada com dados do 1º dia real: 19/20 cotações
+// morreram no muro de 10min — farmácia de verdade demora 15-60min pra responder
+// WhatsApp). O pedido fica aberto até aqui; o modo eager (5min) consolida na
+// PRIMEIRA resposta que chegar, então janela longa NÃO atrasa quem responde rápido.
+const QUOTE_WINDOW_MIN = Number(
+  process.env['PHARMACY_QUOTE_WINDOW_MIN'] ?? process.env['PHARMACY_RESCUE_WINDOW_MIN'] ?? 45,
+);
+const RESCUE_WINDOW_MIN = QUOTE_WINDOW_MIN;
 
 /**
  * Timers por pedido:
@@ -40,6 +46,24 @@ export function scheduleQuoteTimeout(
       .catch((err) => writeLog('error', 'order', `5min check failed: ${String(err)}`, { traceId, orderId }))
       .finally(() => scheduledTimeouts.delete(orderId));
   }, CHECK_5MIN_MS);
+
+  // 10min sem NENHUMA resposta → aviso honesto de progresso (uma vez). A janela
+  // real segue aberta (QUOTE_WINDOW_MIN); farmácia costuma demorar. Sem isso o
+  // usuário ficava no vácuo achando que a Xarlote esqueceu dele.
+  setTimeout(() => {
+    void (async () => {
+      const { data: order } = await db.from('orders').select('status').eq('id', orderId).single();
+      if (!order || order.status !== 'quoting') return;
+      const { data: quotes } = await db.from('quotes').select('status').eq('order_id', orderId);
+      if ((quotes ?? []).some((q) => q.status === 'quoted')) return;
+      await sendOutbound(
+        userConversationId,
+        userPhoneE164,
+        'As farmácias ainda não responderam — elas costumam demorar um pouquinho no WhatsApp 🙏 Sigo insistindo aqui e te aviso na hora em que a primeira resposta chegar!',
+        traceId,
+      );
+    })().catch((err) => writeLog('warn', 'order', `progress note failed: ${String(err)}`, { traceId, orderId }));
+  }, PROGRESS_NOTE_MS);
 }
 
 /**

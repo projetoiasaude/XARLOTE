@@ -80,6 +80,29 @@ export const agentPharmacyTools: ToolDefinition[] = [
   {
     type: 'function',
     function: {
+      name: 'record_referral',
+      description:
+        'A farmácia INDICOU outro estabelecimento/número pra conseguir o item (ex: "não temos, mas a Farmácia X tem, o WhatsApp deles é (62) 99999-9999" ou "liga na nossa filial do centro"). Registre o telefone indicado — a Xarlote contata o indicado AUTOMATICAMENTE pra cotar. Use SEMPRE que aparecer um telefone/contato de outro lugar na resposta, junto com record_supplier_unavailable se esta farmácia não tem o item.',
+      parameters: {
+        type: 'object',
+        properties: {
+          referred_phone: {
+            type: 'string',
+            description: 'O telefone indicado, como a farmácia escreveu (ex: "(62) 99661-9531", "62 3333-4444").',
+          },
+          referred_name: {
+            type: 'string',
+            description: 'Nome do estabelecimento indicado, se falado (ex: "Farmácia Tamandaré", "nossa filial do centro").',
+          },
+          note: { type: 'string', description: 'Contexto da indicação, se houver.' },
+        },
+        required: ['referred_phone'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'finalize_supplier_contact',
       description: 'Encerra a negociação com a farmácia (sucesso, indisponível, timeout ou escalação).',
       parameters: {

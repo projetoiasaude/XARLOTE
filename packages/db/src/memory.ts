@@ -73,11 +73,14 @@ export async function saveMemoryCard(input: SaveMemoryCardInput): Promise<Memory
   // similaridade alta: se já existe card quase idêntico, só refresca.
   if (input.embedding && input.embedding.length === 1536) {
     try {
+      // 0.85 (era 0.92): paráfrases reais do mesmo fato ("toma losartana de manhã"
+      // vs "usa Losartana 50mg pela manhã") caem na faixa 0.85–0.92 — com 0.92
+      // viravam CÓPIAS no índice e poluíam o prompt com o mesmo fato repetido.
       const { data: similar } = await db.rpc('match_user_memory', {
         p_user_id: input.userId,
         p_query_embedding: `[${input.embedding.join(',')}]`,
         p_k: 1,
-        p_min_similarity: 0.92,
+        p_min_similarity: 0.85,
       });
       const hit = Array.isArray(similar) ? (similar[0] as MemoryCardIndexed | undefined) : undefined;
       if (hit?.id && hit.kind === input.kind) {

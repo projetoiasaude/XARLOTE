@@ -16,8 +16,10 @@ import { hasPendingClinicClarification } from './clarification.js';
 
 const CHECK_5MIN_MS = 5 * 60 * 1000;
 const CHECK_10MIN_MS = 10 * 60 * 1000;
-// Resgate durável: > timers normais (10min) E > janela de clarificação (8min).
-const RESCUE_WINDOW_MIN = 12;
+// JANELA REAL de resposta da clínica (recalibrada c/ dados do 1º dia real: recepção
+// demora — o muro de 12min matava a consulta antes da 1ª resposta). O check de 10min
+// só ativa modo eager (não falha); quem encerra de verdade é o rescue nesta janela.
+const RESCUE_WINDOW_MIN = Number(process.env['CLINIC_QUOTE_WINDOW_MIN'] ?? 45);
 const scheduledTimeouts = new Set<string>();
 
 /**

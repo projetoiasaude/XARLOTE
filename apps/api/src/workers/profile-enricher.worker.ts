@@ -260,12 +260,16 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
       .eq('user_id', userId)
       .is('embedding', null)
       .limit(10);
+    let embFails = 0;
     for (const o of orphans ?? []) {
       try {
         const emb = await embed(o.text, { apiKey, timeoutMs: 12_000 });
         await db.from('memory_cards_index').update({ embedding: emb }).eq('id', o.id);
       } catch {
-        break; // /embeddings instável agora — tenta de novo no próximo turno
+        // 1 falha NÃO abandona o lote (antes era `break` → um erro transitório
+        // deixava os outros órfãos invisíveis por horas). Só para se instável (3+).
+        embFails++;
+        if (embFails >= 3) break;
       }
     }
   } catch {}

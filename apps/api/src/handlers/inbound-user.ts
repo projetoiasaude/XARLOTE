@@ -274,9 +274,14 @@ export async function processInboundUser(
   // Embedda só com texto+key; falha é não-bloqueante (retrieval cai no last_seen_at).
   const retrieveMemory = async (): Promise<Awaited<ReturnType<typeof retrieveRelevantCards>>> => {
     let queryEmbedding: number[] | null = null;
-    if (inbound.text && inbound.text.length > 0 && llmKey) {
+    // Msg CURTA ("oi", "sim", "não") tem densidade semântica ~zero: o embedding
+    // dela filtra fora quase toda a memória relevante (similaridade nunca passa do
+    // piso). Nesses casos pulamos o semântico → retrieval cai no fallback por
+    // recência+confiança, que traz o perfil (alergias/medicamentos) mesmo assim.
+    const queryText = (inbound.text ?? '').trim();
+    if (queryText.length >= 12 && llmKey) {
       try {
-        queryEmbedding = await embed(inbound.text.slice(0, 1000), { apiKey: llmKey, timeoutMs: 6_000 });
+        queryEmbedding = await embed(queryText.slice(0, 1000), { apiKey: llmKey, timeoutMs: 6_000 });
       } catch (err) {
         await writeLog('warn', 'memory', `embed query falhou: ${String(err).slice(0, 120)}`, { traceId });
       }

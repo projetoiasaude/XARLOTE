@@ -714,14 +714,43 @@ async function handleCreateReminder(
   // next_run_at é o que o dispatcher olha. Recorrente sem scheduled_at calcula
   // o primeiro disparo pelo rrule (horário de Brasília) — antes ficava NULL e
   // o lembrete NUNCA disparava.
+  // Timezone do usuário (default Brasília): "8h30" tem que disparar 8h30 no fuso DELE.
+  const { data: uTz } = await db.from('users').select('timezone').eq('id', ctx.userId).maybeSingle();
+  const userTz = (uTz?.timezone as string | null) || undefined;
+
   const firstRun =
     args.scheduled_at ??
-    (args.rrule ? nextOccurrence(args.rrule)?.toISOString() ?? null : null);
+    (args.rrule ? nextOccurrence(args.rrule, new Date(), userTz)?.toISOString() ?? null : null);
 
   if (!firstRun) {
-    await writeLog('warn', 'tool', `create_reminder sem horário utilizável (scheduled_at=${args.scheduled_at ?? '∅'}, rrule=${args.rrule ?? '∅'}) — lembrete não agendado`, {
+    // Sem horário utilizável → NÃO cria lembrete morto (next_run_at NULL nunca dispara)
+    // e AVISA o usuário com franqueza — antes ele achava que estava agendado.
+    await writeLog('warn', 'tool', `create_reminder sem horário utilizável (scheduled_at=${args.scheduled_at ?? '∅'}, rrule=${args.rrule ?? '∅'}) — lembrete NÃO criado, usuário avisado`, {
       traceId: ctx.traceId, userId: ctx.userId,
     });
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      `Opa, não consegui entender o horário pro lembrete "${args.title}" 😅 Me fala de novo o horário certinho? Ex: "todo dia às 8h" ou "amanhã às 14h".`,
+      ctx.traceId);
+    return;
+  }
+
+  // GUARD DE DUPLICATA (caso real: LLM re-chamou create_reminder 3x → usuário ia
+  // receber o mesmo lembrete triplicado). Mesmo user + mesmo título + mesma
+  // recorrência/horário ainda pendente = idempotente, não duplica.
+  const dupQuery = db.from('reminders')
+    .select('id')
+    .eq('user_id', ctx.userId)
+    .eq('status', 'pending')
+    .ilike('title', args.title.trim());
+  const { data: dup } = await (args.rrule
+    ? dupQuery.eq('rrule', args.rrule)
+    : dupQuery.eq('scheduled_at', args.scheduled_at ?? ''))
+    .limit(1).maybeSingle();
+  if (dup?.id) {
+    await writeLog('info', 'tool', `create_reminder duplicado ("${args.title}") — já existe pendente, ignorando (idempotência)`, {
+      traceId: ctx.traceId, userId: ctx.userId, existingId: dup.id,
+    });
+    return;
   }
 
   await db.from('reminders').insert({

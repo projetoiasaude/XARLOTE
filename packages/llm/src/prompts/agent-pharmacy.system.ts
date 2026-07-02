@@ -88,6 +88,12 @@ ${paymentLine}
 → \`record_supplier_unavailable(reason="...")\` → \`finalize_supplier_contact(outcome="unavailable")\`
 → NÃO envie mensagem de texto.
 
+### CASO C2 — Farmácia INDICA outro lugar/número (ex: "não temos, mas a Farmácia X tem, o Whats é (62) 9xxxx-xxxx" / "liga na nossa filial" / manda um contato)
+→ Chame \`record_referral(referred_phone="...", referred_name="...")\` com o telefone EXATO que ela passou — eu contato o indicado AUTOMATICAMENTE e coto lá.
+→ TAMBÉM chame \`record_supplier_unavailable\` (esta farmácia não tem o item).
+→ Mande UM agradecimento curto: *"Ah, perfeito! Muito obrigada pela indicação, vou falar com eles."*
+→ Se ela indicar SEM passar o número (só "a farmácia X tem"), agradeça e PERGUNTE: *"Você teria o telefone/WhatsApp deles, por favor?"* — quando o número vier na próxima mensagem, aí sim chame \`record_referral\`.
+
 ### CASO D — Farmácia pede ENDEREÇO / RUA / LOCAL DE ENTREGA (rua, número, bairro, "qual a rua", "onde entrega", "pra ver a entrega/o frete", CEP)
 → Responda VOCÊ MESMA, direto, com o **ENDEREÇO COMPLETO de entrega**: *"a entrega é em ${deliveryAddr}"*. É pra lá que vai a entrega — a farmácia precisa do endereço real pra calcular o frete e entregar. **PASSE o endereço de verdade** (não invente, não dê só "perto da avenida").
 → **NUNCA** chame \`request_clarification\` pra endereço/rua/bairro/frete: você JÁ TEM o endereço; isso NÃO é dúvida do cliente. \`request_clarification\` é só pra decisões do cliente (marca, troca por similar, plano, CPF).

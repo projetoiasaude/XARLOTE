@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { db, findOrCreateConversation, getConversationMessages, writeLog } from '@iasaude/db';
+import { db, findOrCreateConversation, getConversationMessages, writeLog, writeAudit } from '@iasaude/db';
 import {
   chat,
   buildAgentPharmacySystemPrompt,
@@ -7,10 +7,11 @@ import {
   messagesToHistory,
   trimHistory,
 } from '@iasaude/llm';
-import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone } from '@iasaude/shared';
+import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone, toE164BR, brPhoneVariants } from '@iasaude/shared';
 import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier, sendTemplateOpeningToSupplier } from './outbound-agent.js';
+import { sendOutbound } from './outbound.js';
 import { consolidateQuotes, notifyUserQuoteArrived } from './quote-consolidation.js';
 import { relaySupplierQuestionToUser } from './clarification.js';
 import { templatesEnabled, pharmacyColdOpen } from '../config/template-registry.js';
@@ -136,6 +137,38 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     }
   }
 
+  // 🔁 REVIVE DE RESPOSTA TARDIA (recalibrado c/ 1º dia real): a farmácia respondeu
+  // DEPOIS do timeout — antes a msg caía em "Nenhuma cotação ativa" e era DESCARTADA
+  // em silêncio (farmácia falava e ninguém ouvia; a cotação era perdida). Agora:
+  // se há cotação 'timeout' desta conversa com pedido recente (<24h) e o pedido ainda
+  // faz sentido (quoting/failed/quoted), revivemos a negociação. Pedido 'failed'
+  // (usuário já ouviu "ninguém respondeu") volta pra 'quoting' — quando a cotação for
+  // registrada, a consolidação apresenta a boa notícia.
+  if (!quote) {
+    const { data: late } = await db
+      .from('quotes')
+      .select('*, orders(*), suppliers(*)')
+      .eq('conversation_id', conversationId)
+      .eq('status', 'timeout')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const lateOrder = late?.orders as { status?: string; created_at?: string } | null;
+    const orderAgeOk = lateOrder?.created_at
+      ? Date.now() - new Date(lateOrder.created_at).getTime() < 24 * 60 * 60 * 1000
+      : false;
+    if (late && lateOrder && orderAgeOk && ['quoting', 'failed', 'quoted'].includes(lateOrder.status ?? '')) {
+      await db.from('quotes').update({ status: 'negotiating', completed_at: null }).eq('id', late.id);
+      if (lateOrder.status === 'failed') {
+        await db.from('orders').update({ status: 'quoting' }).eq('id', late.order_id).eq('status', 'failed');
+      }
+      quote = { ...late, status: 'negotiating' };
+      await writeLog('info', 'supplier', `🔁 Resposta TARDIA da farmácia — cotação revivida (pedido estava '${lateOrder.status}')`, {
+        traceId, conversationId, quoteId: late.id, orderId: late.order_id,
+      });
+    }
+  }
+
   if (!quote) {
     await writeLog('warn', 'supplier', 'Nenhuma cotação ativa encontrada para este fornecedor', { traceId, conversationId });
     return;
@@ -214,6 +247,7 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   let outcome = '';
   let quoteRecorded = false;   // pra fallback determinístico quando o LLM não gera texto
   let recordedFrete = 0;
+  let referralRecorded = false; // indicação seguida → agradece mesmo com outcome unavailable
 
   for (const tc of llmResponse.toolCalls) {
     switch (tc.name) {
@@ -257,6 +291,103 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         await writeLog('info', 'quote', `❌ Farmácia indisponível: ${a.reason ?? 'sem motivo'}`, { traceId, quoteId: quote.id });
         shouldFinalize = true;
         outcome = 'unavailable';
+        break;
+      }
+      case 'record_referral': {
+        // 🔗 INDICAÇÃO AUTÔNOMA (pedido do fundador, 1º dia real): a farmácia passou
+        // OUTRO número ("fala com a Tamandaré, o Whats é X") → a Xarlote contata o
+        // indicado sozinha e cota lá. Guardas: telefone real (nunca placeholder),
+        // dedup contra fornecedores já cotados neste pedido, cap de 3 indicações por
+        // pedido (anti-loop de farmácias se indicando em círculo), pedido ainda vivo.
+        const a = tc.args as { referred_phone?: string; referred_name?: string; note?: string };
+        const refPhone = toE164BR(a.referred_phone);
+        if (!refPhone || isPlaceholderPhone(refPhone)) {
+          await writeLog('warn', 'referral', `Indicação com telefone inválido ("${a.referred_phone}") — ignorada`, { traceId, quoteId: quote.id });
+          break;
+        }
+        referralRecorded = true; // agradece a indicação mesmo com outcome unavailable
+        try {
+          const orderId = quote.order_id as string;
+          // Pedido ainda faz sentido? (revive já flipou failed→quoting se foi resposta tardia)
+          const { data: ordNow } = await db.from('orders').select('status, conversation_id, payment_method').eq('id', orderId).single();
+          if (!ordNow || ordNow.status !== 'quoting') {
+            await writeLog('info', 'referral', `Indicação recebida mas pedido está '${ordNow?.status}' — não vou contatar (registrado no log)`, { traceId, orderId });
+            break;
+          }
+          // Cap anti-loop: no máx 3 cotações por indicação neste pedido
+          const { count: refCount } = await db.from('quotes')
+            .select('id', { count: 'exact', head: true })
+            .eq('order_id', orderId).ilike('notes', 'indicação%');
+          if ((refCount ?? 0) >= 3) {
+            await writeLog('warn', 'referral', 'Cap de 3 indicações por pedido atingido — não vou contatar mais', { traceId, orderId });
+            break;
+          }
+          // Dedup: o indicado já está neste pedido? (casa variantes do 9º dígito)
+          const phoneVariants = brPhoneVariants(refPhone);
+          const { data: existingSup } = await db.from('suppliers')
+            .select('id, name').or(phoneVariants.map((p) => `whatsapp_e164.eq.${p}`).join(','))
+            .limit(1).maybeSingle();
+          let refSupplierId = existingSup?.id as string | undefined;
+          if (refSupplierId) {
+            const { data: dupQuote } = await db.from('quotes').select('id')
+              .eq('order_id', orderId).eq('supplier_id', refSupplierId).limit(1).maybeSingle();
+            if (dupQuote) {
+              await writeLog('info', 'referral', 'Indicado já está sendo cotado neste pedido — dedup', { traceId, orderId });
+              break;
+            }
+          } else {
+            const { data: newSup } = await db.from('suppliers').insert({
+              type: 'pharmacy',
+              name: (a.referred_name ?? '').trim() || 'Farmácia indicada',
+              whatsapp_e164: refPhone,
+              phone_e164: refPhone,
+              status: 'active',
+            }).select('id').single();
+            refSupplierId = newSup?.id;
+          }
+          if (!refSupplierId) break;
+          const supplierName = (quote.suppliers as { name?: string } | null)?.name ?? 'outra farmácia';
+          const { data: refQuote } = await db.from('quotes').insert({
+            order_id: orderId,
+            supplier_id: refSupplierId,
+            status: 'pending',
+            notes: `indicação de ${supplierName}${a.note ? ` — ${a.note}` : ''}`,
+          }).select('id').single();
+          if (!refQuote?.id) break;
+
+          // Contexto do usuário pra abertura (mesma assinatura do fluxo normal)
+          const { data: uconv } = await db.from('conversations').select('id, whatsapp_jid').eq('id', ordNow.conversation_id ?? '').maybeSingle();
+          const userPhone = uconv?.whatsapp_jid ? `+${uconv.whatsapp_jid.replace('@s.whatsapp.net', '')}` : '';
+          const itemsForRef = (order?.items ?? []) as OrderItem[];
+          const refQuoteId = refQuote.id as string;
+          setImmediate(() => {
+            initiatePharmacyNegotiation(
+              refQuoteId, orderId, itemsForRef, userNeighborhood,
+              (ordNow.payment_method as string | null) ?? null,
+              uconv?.id ?? '', userPhone, traceId,
+            ).catch((err) => writeLog('error', 'referral', `Negociação com indicado falhou: ${String(err).slice(0, 160)}`, { traceId, orderId }));
+          });
+          await writeAudit({
+            actorType: 'agent_pharmacy',
+            actorId: 'agent-pharmacy',
+            action: 'quote.referral_followed',
+            targetTable: 'quotes',
+            targetId: refQuoteId,
+            traceId,
+            metadata: { order_id: orderId, referred_by: supplierName, referred_phone: refPhone.slice(0, 6) + '***' },
+          });
+          await writeLog('info', 'referral', `🔗 Indicação seguida AUTONOMAMENTE: contatando ${a.referred_name ?? refPhone.slice(0, 6) + '***'} (indicado por ${supplierName})`, { traceId, orderId, refQuoteId });
+          // Avisa o USUÁRIO que a Xarlote está seguindo a pista sozinha (transparência
+          // do trabalho autônomo — ele vê que ela correu atrás em vez de desistir).
+          if (uconv?.id && userPhone) {
+            const refLabel = (a.referred_name ?? '').trim() || 'outra farmácia';
+            await sendOutbound(uconv.id, userPhone,
+              `A ${supplierName} não tinha, mas me indicou ${refLabel} — já estou falando com eles pra cotar pra você 🔎`,
+              traceId).catch(() => { /* aviso é cortesia, não bloqueia */ });
+          }
+        } catch (err) {
+          await writeLog('error', 'referral', `Falha ao seguir indicação: ${String(err).slice(0, 200)}`, { traceId, quoteId: quote.id });
+        }
         break;
       }
       case 'finalize_supplier_contact': {
@@ -306,9 +437,13 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   // outcomes silenciosos (unavailable/timeout — Caso C). Antes suprimia em QUALQUER
   // finalize, então a farmácia dava o preço e ouvia SILÊNCIO (a despedida "anotado,
   // vou confirmar com o cliente" do Caso A1 nunca saía).
-  const silentOutcome = outcome === 'unavailable' || outcome === 'timeout';
+  // Indicação seguida NÃO é silêncio: a farmácia ajudou — agradece (mesmo unavailable).
+  const silentOutcome = (outcome === 'unavailable' || outcome === 'timeout') && !referralRecorded;
   if (llmResponse.text.trim() && !silentOutcome) {
     await sendOutboundToSupplier(conversationId, supplierPhone, llmResponse.text.trim(), traceId);
+  } else if (!llmResponse.text.trim() && referralRecorded) {
+    // Fallback determinístico do agradecimento da indicação (turno só-tool).
+    await sendOutboundToSupplier(conversationId, supplierPhone, 'Ah, perfeito! Muito obrigada pela indicação, vou falar com eles. 🙏', traceId);
   } else if (!llmResponse.text.trim() && quoteRecorded && !silentOutcome) {
     // FALLBACK DETERMINÍSTICO: o gpt-4.1-mini às vezes registra a cotação via tool
     // SEM gerar texto → a farmácia ficava no vácuo. Aqui garantimos uma resposta:

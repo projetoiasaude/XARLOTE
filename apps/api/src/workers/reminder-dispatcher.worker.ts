@@ -35,7 +35,7 @@ export async function dispatchReminders(): Promise<void> {
 
   const { data: due, error } = await db
     .from('reminders')
-    .select('id, user_id, type, title, body, rrule, next_run_at, users(phone_e164, preferred_name)')
+    .select('id, user_id, type, title, body, rrule, next_run_at, users(phone_e164, preferred_name, timezone)')
     .eq('status', 'pending')
     .lte('next_run_at', now.toISOString())
     .limit(50);
@@ -53,7 +53,10 @@ export async function dispatchReminders(): Promise<void> {
     // 1. Claim: recorrente avança pro próximo disparo e CONTINUA pending;
     //    one-shot vira `sent`. Filtro por next_run_at = claim otimista
     //    (se outra réplica já avançou a row, 0 linhas mudam e pulamos).
-    const next = reminder.rrule ? nextOccurrence(reminder.rrule, now) : null;
+    // Recorrência calculada no FUSO DO USUÁRIO (default Brasília) — "8h30" tem
+    // que ser 8h30 onde a pessoa mora, não onde o servidor roda.
+    const userTz = (user as { timezone?: string | null }).timezone || undefined;
+    const next = reminder.rrule ? nextOccurrence(reminder.rrule, now, userTz) : null;
     const claim = next
       ? { next_run_at: next.toISOString(), last_run_at: now.toISOString() }
       : { status: 'sent', last_run_at: now.toISOString() };
