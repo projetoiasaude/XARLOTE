@@ -49,7 +49,14 @@ const defaults: PromptsConfig = {
   sara_suffix: '',
   agent_override: '',
   llm_api_key: '',
-  llm_model: 'openai/gpt-4.1-mini',
+  // Modelo conversacional/agêntico principal. z-ai/glm-5.2 (OpenRouter): mais
+  // inteligente que gpt-4.1-mini em raciocínio + uso de ferramentas, 1M de
+  // contexto, e faz PROMPT CACHING automático do prefixo (system prompt grande
+  // da Xarlote cacheia ~99% dos tokens de input a partir do 2º turno → paga
+  // menos). tools:true confirmado ao vivo. Trocável via env OPENROUTER_MODEL.
+  llm_model: 'z-ai/glm-5.2',
+  // Visão continua no gpt-4.1-mini (comprovado lendo receita/exame). glm-5.2
+  // não é vision-capable; os modelos glm-*v seriam o caminho se quisermos trocar.
   vision_model: 'openai/gpt-4.1-mini',
   audio_model: 'elevenlabs/scribe_v1',
   xarlote_enabled: true,
@@ -76,6 +83,9 @@ const defaults: PromptsConfig = {
 export function loadPrompts(): PromptsConfig {
   const envOverrides: Partial<PromptsConfig> = {};
   if (process.env['OPENROUTER_API_KEY']) envOverrides.llm_api_key = process.env['OPENROUTER_API_KEY'];
+  // Permite trocar o modelo conversacional só setando a env no Railway (sem redeploy
+  // de código). Precedência: defaults < env < prompts.json (dashboard).
+  if (process.env['OPENROUTER_MODEL']) envOverrides.llm_model = process.env['OPENROUTER_MODEL']!;
   if (process.env['ELEVENLABS_API_KEY']) envOverrides.tts_api_key = process.env['ELEVENLABS_API_KEY'];
   if (process.env['TTS_ENABLED']) envOverrides.tts_enabled = process.env['TTS_ENABLED'] === 'true' || process.env['TTS_ENABLED'] === '1';
   if (process.env['TTS_VOICE_ID']) envOverrides.tts_voice_id = process.env['TTS_VOICE_ID']!;

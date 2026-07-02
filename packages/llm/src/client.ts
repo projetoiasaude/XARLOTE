@@ -138,6 +138,11 @@ async function callOpenRouter(
     messages,
     temperature,
     max_tokens: maxTokens,
+    // F2.G3: pede o accounting de uso (inclui prompt_tokens_details.cached_tokens).
+    // O CACHE de prefixo é server-side/automático em modelos OpenAI-family e z-ai/GLM
+    // (o system prompt grande da Xarlote vem 1º e cacheia ~99% do input a partir do 2º
+    // turno) — este flag só garante que a economia apareça nas métricas de custo.
+    usage: { include: true },
   };
   if (tools?.length) {
     body['tools'] = tools;
