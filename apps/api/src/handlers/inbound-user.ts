@@ -571,8 +571,40 @@ export async function processInboundUser(
     }
   }
 
-  // 12. Send response — texto OU áudio (voice intro na primeira saudação)
-  if (llmResponse.text.trim()) {
+  // 12. Resolve o texto da resposta.
+  // 🛑 TURNO SÓ-TOOL (incidente Glauber 2026-07-01): o gpt-4.1-mini às vezes executa
+  // a(s) tool(s) SEM escrever texto (ex.: create_reminder criado, mas nenhuma
+  // confirmação) → o usuário ficava no VÁCUO e re-perguntava ("agendou?", "tá aí?"),
+  // e o LLM re-chamava a tool (criando duplicatas). Se NENHUMA mensagem saiu neste
+  // turno (a tool tb não respondeu — discovery/red-flag mandam a própria), fazemos UM
+  // follow-up (sem tools) pra NARRAR o que foi feito. Rede de segurança determinística.
+  let replyText = llmResponse.text.trim();
+  if (!replyText && llmResponse.toolCalls.length > 0) {
+    const { count: sentThisTurn } = await db
+      .from('messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('conversation_id', conversation.id)
+      .eq('direction', 'out')
+      .gt('created_at', new Date(llmStart).toISOString());
+    if (!sentThisTurn) {
+      const toolNames = llmResponse.toolCalls.map((t) => t.name).join(', ');
+      const lastUserText = typeof userMsgContent === 'string' ? userMsgContent : userMsgPreview;
+      try {
+        const followup = await chat(
+          `(Sistema: você acabou de executar com sucesso: ${toolNames}. O usuário havia dito: "${String(lastUserText).slice(0, 200)}". Escreva uma resposta CURTA, natural e humana confirmando pra ele o que foi feito. NÃO chame nenhuma tool.)`,
+          { model, apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'], systemInstruction: systemPrompt, history: geminiHistory, tools: [], temperature: 0.4, maxOutputTokens: 200, timeoutMs: 20_000 },
+        );
+        replyText = followup.text.trim();
+        await writeLog('info', 'agent', `Follow-up narrou turno só-tool (${toolNames})`, { traceId });
+      } catch (err) {
+        await writeLog('warn', 'agent', `Follow-up do turno só-tool falhou: ${String(err).slice(0, 120)}`, { traceId });
+      }
+      if (!replyText) replyText = 'Prontinho, já cuidei disso aqui! 💙 Precisa de mais alguma coisa?';
+    }
+  }
+
+  // 12b. Send response — texto OU áudio (voice intro na primeira saudação)
+  if (replyText) {
     const meta = (user.metadata as { audio_intro_sent?: boolean } | null | undefined) ?? {};
     const alreadyIntroed = meta.audio_intro_sent === true;
     // Voice intro só é possível se TTS ligado + ainda não rolou + user já consentiu.
@@ -597,7 +629,6 @@ export async function processInboundUser(
         shouldVoiceIntro = (outCount ?? 99) <= 2;
       }
     }
-    const replyText = llmResponse.text.trim();
     await writeLog('info', 'outbound', `Xarlote → usuário ${shouldVoiceIntro ? '[ÁUDIO intro]' : ''}: "${replyText.slice(0, 100)}${replyText.length > 100 ? '…' : ''}"`, { traceId, voiceIntro: shouldVoiceIntro });
 
     if (shouldVoiceIntro) {
