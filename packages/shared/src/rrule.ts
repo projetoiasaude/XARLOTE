@@ -187,3 +187,24 @@ export function nextOccurrence(rrule: string, from: Date = new Date(), tz: strin
   }
   return null;
 }
+
+/**
+ * Resolve o primeiro disparo (next_run_at) de um lembrete a partir do que a LLM
+ * mandou. Trata string vazia/whitespace como AUSENTE — a LLM costuma emitir
+ * `scheduled_at: ""` junto do rrule num lembrete recorrente, e `"" ?? x`
+ * devolve `""` (nullish coalescing NÃO trata string vazia como nulo). Esse
+ * bug fazia o `nextOccurrence` nunca ser chamado → lembrete recusado em loop
+ * (incidente Antônia Flávia). Sempre normalize os campos aqui.
+ */
+export function resolveReminderFirstRun(
+  scheduledAt: string | null | undefined,
+  rrule: string | null | undefined,
+  from: Date = new Date(),
+  tz: string = REMINDER_TZ,
+): string | null {
+  const sched = scheduledAt?.trim() ? scheduledAt.trim() : null;
+  const rule = rrule?.trim() ? rrule.trim() : null;
+  if (sched) return sched;
+  if (rule) return nextOccurrence(rule, from, tz)?.toISOString() ?? null;
+  return null;
+}

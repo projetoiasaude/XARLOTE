@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { nextOccurrence, parseRrule } from '../packages/shared/src/rrule.js';
+import { nextOccurrence, parseRrule, resolveReminderFirstRun } from '../packages/shared/src/rrule.js';
 
 // Brasília = UTC-3 (sem DST desde 2019): 8h BRT = 11h UTC.
 
@@ -77,6 +77,35 @@ describe('nextOccurrence — horário de Brasília', () => {
 
   it('retorna null pra rrule inválido', () => {
     expect(nextOccurrence('FREQ=YEARLY;BYHOUR=8')).toBeNull();
+  });
+});
+
+describe('resolveReminderFirstRun — footgun da string vazia (incidente Antônia Flávia)', () => {
+  const from = new Date('2026-07-02T11:00:15Z'); // 8h00m15s BRT
+
+  it('scheduled_at="" + rrule válido NÃO recusa — calcula pelo rrule', () => {
+    // O bug real: `"" ?? x` devolve `""`; nextOccurrence nunca era chamado.
+    const first = resolveReminderFirstRun('', 'FREQ=DAILY;BYHOUR=8;BYMINUTE=30', from);
+    expect(first).toBe('2026-07-02T11:30:00.000Z');
+  });
+
+  it('scheduled_at só-espaços é tratado como ausente', () => {
+    const first = resolveReminderFirstRun('   ', 'FREQ=DAILY;BYHOUR=20;BYMINUTE=0', from);
+    expect(first).toBe('2026-07-02T23:00:00.000Z');
+  });
+
+  it('scheduled_at real prevalece sobre o rrule', () => {
+    const first = resolveReminderFirstRun('2026-08-01T13:00:00.000Z', 'FREQ=DAILY;BYHOUR=8', from);
+    expect(first).toBe('2026-08-01T13:00:00.000Z');
+  });
+
+  it('rrule="" e scheduled_at="" → null (nada utilizável)', () => {
+    expect(resolveReminderFirstRun('', '', from)).toBeNull();
+    expect(resolveReminderFirstRun(undefined, undefined, from)).toBeNull();
+  });
+
+  it('rrule vazio mas scheduled_at válido → usa o scheduled_at', () => {
+    expect(resolveReminderFirstRun('2026-07-05T10:00:00.000Z', '', from)).toBe('2026-07-05T10:00:00.000Z');
   });
 
   it('resultado é sempre estritamente no futuro', () => {

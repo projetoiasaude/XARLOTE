@@ -3,7 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { nextOccurrence, isPlaceholderPhone, toE164BR } from '@iasaude/shared';
+import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -718,9 +718,14 @@ async function handleCreateReminder(
   const { data: uTz } = await db.from('users').select('timezone').eq('id', ctx.userId).maybeSingle();
   const userTz = (uTz?.timezone as string | null) || undefined;
 
-  const firstRun =
-    args.scheduled_at ??
-    (args.rrule ? nextOccurrence(args.rrule, new Date(), userTz)?.toISOString() ?? null : null);
+  // BUG CRÍTICO (Antônia Flávia): a LLM manda `scheduled_at: ""` (string vazia)
+  // junto com o rrule em lembrete recorrente. `"" ?? x` devolve `""` (nullish
+  // coalescing NÃO trata string vazia como nulo) → firstRun="" → cai no refuse e
+  // o nextOccurrence NUNCA era chamado. Normalizamos vazio/whitespace → null.
+  const scheduledAt = args.scheduled_at?.trim() ? args.scheduled_at.trim() : null;
+  const rrule = args.rrule?.trim() ? args.rrule.trim() : null;
+
+  const firstRun = resolveReminderFirstRun(scheduledAt, rrule, new Date(), userTz);
 
   if (!firstRun) {
     // Sem horário utilizável → NÃO cria lembrete morto (next_run_at NULL nunca dispara)
@@ -742,9 +747,9 @@ async function handleCreateReminder(
     .eq('user_id', ctx.userId)
     .eq('status', 'pending')
     .ilike('title', args.title.trim());
-  const { data: dup } = await (args.rrule
-    ? dupQuery.eq('rrule', args.rrule)
-    : dupQuery.eq('scheduled_at', args.scheduled_at ?? ''))
+  const { data: dup } = await (rrule
+    ? dupQuery.eq('rrule', rrule)
+    : dupQuery.eq('scheduled_at', scheduledAt ?? ''))
     .limit(1).maybeSingle();
   if (dup?.id) {
     await writeLog('info', 'tool', `create_reminder duplicado ("${args.title}") — já existe pendente, ignorando (idempotência)`, {
@@ -758,8 +763,8 @@ async function handleCreateReminder(
     type: args.type,
     title: args.title,
     body: args.body ?? null,
-    scheduled_at: args.scheduled_at ?? null,
-    rrule: args.rrule ?? null,
+    scheduled_at: scheduledAt,
+    rrule,
     next_run_at: firstRun,
     status: 'pending',
     payload: args.payload ?? {},
