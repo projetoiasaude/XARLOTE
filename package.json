@@ -12,6 +12,10 @@
     "test": "vitest run",
     "dev": "concurrently \"pnpm dev:api\" \"pnpm dev:web\"",
     "dev:app": "concurrently --names api,web --prefix-colors blue,magenta \"ROLE=api WHATSAPP_MODE=simulator pnpm --filter @iasaude/api dev\" \"NEXT_PUBLIC_API_URL=http://localhost:3001 pnpm --filter @iasaude/web dev\"",
+    "staging:db": "cd infra/supabase && npx supabase start",
+    "staging:db:reset": "cd infra/supabase && npx supabase db reset",
+    "staging:db:stop": "cd infra/supabase && npx supabase stop",
+    "staging": "concurrently --kill-others-on-fail --names api,worker,web --prefix-colors blue,green,magenta \"PORT=3001 ROLE=api pnpm --filter @iasaude/api dev:staging\" \"PORT=3010 ROLE=worker pnpm --filter @iasaude/api dev:staging\" \"NEXT_PUBLIC_API_URL=http://localhost:3001 pnpm --filter @iasaude/web dev\"",
     "start:prod": "concurrently --kill-others-on-fail --names api,worker --prefix-colors blue,green \"PORT=3001 ROLE=api pnpm --filter @iasaude/api start\" \"PORT=3010 ROLE=worker pnpm --filter @iasaude/api start\""
   },
   "devDependencies": {

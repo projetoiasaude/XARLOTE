@@ -39,6 +39,26 @@ function corsOrigins(): boolean | Array<string | RegExp> {
 async function main() {
   initSentry();
 
+  // 🛡️ TRAVA DE STAGING: quando APP_ENV=staging, o processo se RECUSA a subir se
+  // estiver apontando pro banco de PRODUÇÃO ou fora do modo simulador. Impossível
+  // um staging mal-configurado tocar dados reais ou disparar WhatsApp de verdade.
+  // (Só dispara com APP_ENV=staging — produção nunca seta isso, então nunca é afetada.)
+  if ((process.env['APP_ENV'] ?? '').toLowerCase() === 'staging') {
+    const PROD_DB_REF = 'niqmxiybiwrfkvdfojcq';
+    const supaUrl = process.env['SUPABASE_URL'] ?? '';
+    const mode = process.env['WHATSAPP_MODE'] ?? '';
+    const problems: string[] = [];
+    if (supaUrl.includes(PROD_DB_REF)) problems.push(`SUPABASE_URL aponta pro banco de PRODUÇÃO (${PROD_DB_REF})`);
+    if (mode !== 'simulator') problems.push(`WHATSAPP_MODE="${mode}" — staging DEVE usar "simulator" (nada de envio real)`);
+    if (problems.length) {
+      console.error('\n🛑 BOOT DE STAGING BLOQUEADO — proteção contra tocar produção:');
+      for (const p of problems) console.error(`   • ${p}`);
+      console.error('   Corrija o .env do staging (SUPABASE_URL de um banco isolado + WHATSAPP_MODE=simulator) e suba de novo.\n');
+      process.exit(1);
+    }
+    console.log('✅ Staging validado: banco isolado + modo simulador (sem envio real).');
+  }
+
   // ROLE define o que este processo roda (F1.A1 — separação api/worker):
   //   all (default) → HTTP + workers no mesmo processo (dev / single-box)
   //   api           → só HTTP (service "api" no Railway)

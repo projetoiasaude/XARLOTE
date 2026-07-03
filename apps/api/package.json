@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "tsx watch --env-file=../../.env src/server.ts",
+    "dev:staging": "tsx watch --env-file=../../.env.staging src/server.ts",
     "build": "tsc",
     "start": "tsx src/server.ts",
     "typecheck": "tsc --noEmit"

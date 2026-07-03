@@ -4,6 +4,8 @@ dist/
 .env
 .env.local
 .env.*.local
+.env.staging
+!.env.staging.example
 *.log
 .DS_Store
 .turbo/
