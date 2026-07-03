@@ -198,7 +198,7 @@ export const xarloteTools: ToolDefinition[] = [
     function: {
       name: 'create_reminder',
       description:
-        'Cria um lembrete/despertador. Quando chegar a hora, a Xarlote manda mensagem proativa no WhatsApp e no app. Use scheduled_at (único) OU rrule (recorrente) — pelo menos um dos dois.',
+        'Cria um lembrete/despertador. Quando chegar a hora, a Xarlote manda mensagem proativa no WhatsApp e no app. Use scheduled_at (único) OU rrule (recorrente) — pelo menos um dos dois. ⚠️ Se o usuário pedir pra MUDAR/REDIVIDIR um plano de lembretes que já existe (os ativos aparecem no seu contexto em LEMBRETES ATIVOS), chame cancel_reminders dos antigos ANTES de criar os novos — senão ele recebe os dois planos duplicados.',
       parameters: {
         type: 'object',
         properties: {
@@ -223,6 +223,37 @@ export const xarloteTools: ToolDefinition[] = [
         },
         required: ['type', 'title'],
       },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cancel_reminders',
+      description:
+        'Cancela lembretes ATIVOS do usuário. Use quando ele pedir pra parar/cancelar/mudar lembretes ("para de me lembrar da água", "cancela o lembrete do remédio") ou ANTES de criar um plano novo que substitui um antigo (veja LEMBRETES ATIVOS no contexto). title_query busca por parte do título (ex: "água" cancela todos os de água).',
+      parameters: {
+        type: 'object',
+        properties: {
+          title_query: {
+            type: 'string',
+            description: 'Parte do título dos lembretes a cancelar (case-insensitive). Ex: "água", "sobrancelha", "Losartana".',
+          },
+          all: {
+            type: 'boolean',
+            description: 'true = cancela TODOS os lembretes ativos do usuário. Só use se ele pedir explicitamente ("cancela todos os meus lembretes").',
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_reminders',
+      description:
+        'Envia ao usuário a lista dos lembretes ativos dele (título + horário). Use quando ele perguntar "quais lembretes eu tenho?", "o que você me lembra?". NÃO repita a lista no seu texto — a ferramenta já envia formatado.',
+      parameters: { type: 'object', properties: {}, required: [] },
     },
   },
   // NOTA: send_emergency_orientation foi REMOVIDA. Use red_flag_check no lugar

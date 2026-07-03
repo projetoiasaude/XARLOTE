@@ -15,7 +15,7 @@
  *     (deploy intermediário enquanto migrations 0003/0004 não rodaram)
  *   - Side-effects em transação quando possível
  */
-import { db, writeAudit, writeLog } from '@iasaude/db';
+import { db, writeAudit, writeLog, writeEvent } from '@iasaude/db';
 import { nextOccurrence } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { discoverClinics } from './clinic-discovery.js';
@@ -270,20 +270,61 @@ export async function handleStartTreatmentFromOrder(args: StartTreatmentArgs, ct
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function handleLogMedicationTaken(args: LogMedicationTakenArgs, ctx: BaseToolCtx): Promise<void> {
+  const likeSafe = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
   // Acha a medicação por nome (fuzzy)
-  const { data: med } = await db
+  let { data: med } = await db
     .from('user_medications')
     .select('id, treatment_id, medication_name, daily_consumption')
     .eq('user_id', ctx.userId)
-    .ilike('medication_name', `%${args.medication_name}%`)
+    .ilike('medication_name', `%${likeSafe(args.medication_name)}%`)
     .eq('active', true)
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
 
   if (!med?.id) {
-    await writeLog('warn', 'tool', `log_medication_taken: medicamento "${args.medication_name}" não encontrado pra user ${ctx.userId}`, { traceId: ctx.traceId });
-    return;
+    // HONESTIDADE (caso real: "água"/"loção da barba" só existiam como REMINDER,
+    // não em user_medications → no-op silencioso, mas a Xarlote dizia "vou
+    // registrar" — mentira estrutural). Agora SEMPRE persiste algo:
+    //   - hábito não-medicamentoso (água, exercício, sono) → evento analítico
+    //   - medicamento que só existe como lembrete → cria a row inferida e loga
+    const { data: rem } = await db
+      .from('reminders')
+      .select('id, type, title')
+      .eq('user_id', ctx.userId)
+      .in('status', ['pending', 'sent'])
+      .ilike('title', `%${likeSafe(args.medication_name)}%`)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const isHabit = rem?.type && rem.type !== 'medication';
+    if (isHabit) {
+      // Hábito (hidratação/exercício/sono/custom): registra evento — vira histórico
+      // consultável sem poluir o perfil de medicamentos.
+      await writeEvent({
+        eventName: 'habit.logged',
+        userId: ctx.userId,
+        conversationId: ctx.conversationId,
+        payload: { name: args.medication_name, status: args.status, reminder_type: rem.type, notes: args.notes ?? null },
+      });
+      await writeLog('info', 'tool', `habit.logged: "${args.medication_name}" (${args.status}) via lembrete ${rem.type}`, { traceId: ctx.traceId });
+      return;
+    }
+
+    // Medicamento real que nunca entrou no perfil (ex: veio só de um lembrete):
+    // cria inferido e segue o fluxo normal de log. Perfil se auto-completa.
+    const { data: created, error: createErr } = await db
+      .from('user_medications')
+      .insert({ user_id: ctx.userId, medication_name: args.medication_name, active: true, source: 'inferred' })
+      .select('id, treatment_id, medication_name, daily_consumption')
+      .single();
+    if (createErr || !created) {
+      await writeLog('warn', 'tool', `log_medication_taken: medicamento "${args.medication_name}" não encontrado e não foi possível criar inferido (${createErr?.message ?? 'sem retorno'})`, { traceId: ctx.traceId });
+      return;
+    }
+    await writeLog('info', 'tool', `log_medication_taken: "${args.medication_name}" criado como medicamento INFERIDO (só existia como lembrete)`, { traceId: ctx.traceId });
+    med = created;
   }
 
   await db.from('medication_log').insert({

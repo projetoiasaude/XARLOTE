@@ -134,6 +134,39 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     }
   }
 
+  // 🔁 REVIVE DE RESPOSTA TARDIA (paridade com a farmácia — inbound-supplier.ts):
+  // a clínica respondeu DEPOIS do timeout. Antes a msg caía no warn abaixo e era
+  // DESCARTADA (caso real: 4 ofertas de clínica perdidas às 08:14 de 02/07 — a
+  // consulta tinha morrido em 'failed' e as ofertas nunca chegaram ao paciente).
+  // Se há cotação 'timeout' desta conversa com consulta recente (<24h) e a consulta
+  // ainda faz sentido (searching/failed/quoted), revivemos: quote volta pra 'pending'
+  // (o passo 5 marca 'offered') e consulta 'failed' flipa atomicamente pra 'searching'
+  // — a consolidação/rescue apresenta a boa notícia quando a oferta for registrada.
+  if (!quote) {
+    const { data: late } = await db
+      .from('consultation_quotes')
+      .select('*, consultations!consultation_quotes_consultation_id_fkey(*), clinics(*)')
+      .eq('conversation_id', conversationId)
+      .eq('status', 'timeout')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const lateConsult = late?.consultations as { id?: string; status?: string; created_at?: string } | null;
+    const ageOk = lateConsult?.created_at
+      ? Date.now() - new Date(lateConsult.created_at).getTime() < 24 * 60 * 60 * 1000
+      : false;
+    if (late && lateConsult && ageOk && ['searching', 'failed', 'quoted'].includes(lateConsult.status ?? '')) {
+      await db.from('consultation_quotes').update({ status: 'pending' }).eq('id', late.id);
+      if (lateConsult.status === 'failed') {
+        await db.from('consultations').update({ status: 'searching' }).eq('id', late.consultation_id).eq('status', 'failed');
+      }
+      quote = { ...late, status: 'pending' };
+      await writeLog('info', 'clinic', `🔁 Resposta TARDIA da clínica — cotação revivida (consulta estava '${lateConsult.status}')`, {
+        traceId, conversationId, quoteId: late.id, consultationId: late.consultation_id,
+      });
+    }
+  }
+
   if (!quote) {
     await writeLog('warn', 'clinic', 'Nenhuma cotação ativa pra essa clínica', { traceId, conversationId });
     return;

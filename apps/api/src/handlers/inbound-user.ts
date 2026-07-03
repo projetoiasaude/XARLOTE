@@ -300,7 +300,7 @@ export async function processInboundUser(
     }
   };
 
-  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif] = await Promise.all([
+  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif, activeRemindersRes] = await Promise.all([
     getConversationMessages(conversation.id, 30),
     queryUser360(user.id),
     db.from('orders')
@@ -321,6 +321,15 @@ export async function processInboundUser(
       .limit(10),
     // Loop agêntico: pergunta pendente de farmácia/clínica aguardando o cliente.
     findPendingClarificationForUser(conversation.id),
+    // Lembretes ativos: a Xarlote precisa ENXERGAR o que já existe pra não criar
+    // plano duplicado (caso real: 2 planos de água sobrepostos = 15 pings/dia) e
+    // pra saber o que cancelar via cancel_reminders ao substituir um plano.
+    db.from('reminders')
+      .select('title, type, rrule, next_run_at')
+      .eq('user_id', user.id)
+      .eq('status', 'pending')
+      .order('next_run_at', { ascending: true })
+      .limit(20),
   ]);
 
   const geminiHistory = trimHistory(messagesToHistory(history.slice(0, -1)), 20);
@@ -392,6 +401,16 @@ export async function processInboundUser(
   // Skills emergentes (já carregadas em paralelo acima).
   if (skills.length > 0) {
     systemPrompt += `\n\n${formatSkillsForPrompt(skills)}`;
+  }
+
+  // Lembretes ativos — visibilidade pro gerenciamento (criar/cancelar/substituir).
+  const activeReminders = (activeRemindersRes.data ?? []) as Array<{ title: string; type: string; rrule: string | null; next_run_at: string }>;
+  if (activeReminders.length > 0) {
+    const fmtHora = (iso: string) => new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
+    const fmtData = (iso: string) => new Date(iso).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', timeZone: 'America/Sao_Paulo' });
+    const linhas = activeReminders.map((r) =>
+      `- "${r.title}" (${r.type}) — ${r.rrule ? `recorrente, próximo às ${fmtHora(r.next_run_at)}` : `único em ${fmtData(r.next_run_at)} às ${fmtHora(r.next_run_at)}`}`);
+    systemPrompt += `\n\n## ⏰ LEMBRETES ATIVOS DESTE USUÁRIO (${activeReminders.length})\n${linhas.join('\n')}\n\nSe ele pedir pra MUDAR/REDIVIDIR um plano acima, chame cancel_reminders (title_query) ANTES de criar os novos — nunca deixe dois planos do mesmo assunto coexistirem. Se pedir pra parar, cancel_reminders resolve sozinho.`;
   }
 
   if (promptsConfig.sara_suffix.trim()) {

@@ -19,6 +19,13 @@ describe('isPlaceholderPhone (trava anti-número-fake)', () => {
     expect(isPlaceholderPhone('+556291592150')).toBe(false);  // 12 díg
     expect(isPlaceholderPhone('+556232223344')).toBe(false);  // fixo 12 díg
   });
+  it('barra os números DEMO do simulador (caso Marina: envio real diário pra teste)', () => {
+    for (const demo of ['+5511999990001', '+5511999990002', '+5511999990003', '5511999990001']) {
+      expect(isPlaceholderPhone(demo)).toBe(true);
+    }
+    // vizinho REAL fora da faixa demo passa
+    expect(isPlaceholderPhone('+5511999991001')).toBe(false);
+  });
 });
 
 describe('brPhoneVariants (9º dígito BR)', () => {

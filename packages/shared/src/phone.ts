@@ -20,7 +20,11 @@ export function isPlaceholderPhone(phone: string | null | undefined): boolean {
   if (!phone) return true;
   const digits = phone.replace(/\D/g, '');
   if (digits.length < 12) return true; // BR real = 12 (sem 9) ou 13 (com 9) dígitos
-  return digits.startsWith('555500000');
+  if (digits.startsWith('555500000')) return true;
+  // Números DEMO do simulador (+5511999990001..3, WhatsAppSim.tsx) — usuários de
+  // teste criados via simulador ANTES do gate de prod ficaram no banco e recebiam
+  // envio REAL diário (caso Marina, 10/06→02/07). Nunca enviar pra essa faixa.
+  return digits.startsWith('551199999000');
 }
 
 /** Converte telefone BR cru ("(62) 3333-4444" / "6233334444") em E.164 (+55...). */

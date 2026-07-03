@@ -28,6 +28,7 @@ import { startSkillExtractorWorker } from './skill-extractor.worker.js';
 import { startAnomalyDetectorWorker } from './anomaly-detector.worker.js';
 import { startMetricsAggregatorWorker } from './metrics-aggregator.worker.js';
 import { startRedFlagEscalatorWorker } from './red-flag-escalator.worker.js';
+import { startNudgeWorker, stopNudgeWorker } from './nudge-stalled-flows.worker.js';
 import { startOutboundWorkers } from '../queues/outbound.queue.js';
 import { onShutdown } from '../lifecycle.js';
 import { withCronLock } from '../middleware/cron-lock.js';
@@ -80,6 +81,7 @@ export function startAllWorkers(log: WorkerLogger): void {
   startAnomalyDetectorWorker();
   startMetricsAggregatorWorker();
   startRedFlagEscalatorWorker();
+  startNudgeWorker(); // re-engaja fluxos parados (quoted sem escolha, clarificação sem resposta)
 
   // ── Consumidores das filas outbound (rate-limit de envio WhatsApp, F0.7) ──
   startOutboundWorkers();
@@ -88,6 +90,7 @@ export function startAllWorkers(log: WorkerLogger): void {
   onShutdown('cron intervals', () => {
     clearInterval(reminderTimer);
     clearInterval(compactorTimer);
+    stopNudgeWorker();
   });
   onShutdown('profile-enricher worker', () => enricherWorker.close());
 

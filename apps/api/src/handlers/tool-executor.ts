@@ -92,6 +92,12 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
       case 'create_reminder':
         await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown> }, ctx);
         break;
+      case 'cancel_reminders':
+        await handleCancelReminders(tc.args as { title_query?: string; all?: boolean }, ctx);
+        break;
+      case 'list_reminders':
+        await handleListReminders(ctx);
+        break;
       case 'send_emergency_orientation':
         // DEPRECATED — redireciona pra red_flag_check (que envia botões).
         // Mantido como fallback compat enquanto modelos antigos do LLM ainda usam.
@@ -707,8 +713,13 @@ async function handleGetOrderStatus(ctx: ToolContext) {
   await sendCurrentOrderStatus(order.id, ctx.conversationId, ctx.phoneE164, ctx.traceId);
 }
 
+/** Escapa curingas de LIKE/ILIKE (% e _) num valor vindo da LLM/usuário. */
+function escapeLike(s: string): string {
+  return s.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
 async function handleCreateReminder(
-  args: { type: string; title: string; body?: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown> },
+  args: { type: string; title?: string; body?: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown> },
   ctx: ToolContext
 ) {
   // next_run_at é o que o dispatcher olha. Recorrente sem scheduled_at calcula
@@ -718,6 +729,11 @@ async function handleCreateReminder(
   const { data: uTz } = await db.from('users').select('timezone').eq('id', ctx.userId).maybeSingle();
   const userTz = (uTz?.timezone as string | null) || undefined;
 
+  // CASO REAL (Glauber): a LLM chamou create_reminder sem title → a mensagem de
+  // refuse interpolava `args.title` e o usuário leu literalmente "undefined".
+  const title = (args.title ?? '').trim();
+  const titleForMsg = title || 'esse lembrete';
+
   // BUG CRÍTICO (Antônia Flávia): a LLM manda `scheduled_at: ""` (string vazia)
   // junto com o rrule em lembrete recorrente. `"" ?? x` devolve `""` (nullish
   // coalescing NÃO trata string vazia como nulo) → firstRun="" → cai no refuse e
@@ -725,16 +741,41 @@ async function handleCreateReminder(
   const scheduledAt = args.scheduled_at?.trim() ? args.scheduled_at.trim() : null;
   const rrule = args.rrule?.trim() ? args.rrule.trim() : null;
 
-  const firstRun = resolveReminderFirstRun(scheduledAt, rrule, new Date(), userTz);
+  let firstRun = resolveReminderFirstRun(scheduledAt, rrule, new Date(), userTz);
 
-  if (!firstRun) {
-    // Sem horário utilizável → NÃO cria lembrete morto (next_run_at NULL nunca dispara)
+  // CASO REAL (rajada das 10:50): a LLM manda scheduled_at de HOJE já passado
+  // ("começa às 8h" dito às 10:50) junto do rrule → next_run_at no passado →
+  // o dispatcher dispara TUDO de uma vez no próximo tick. Clamp pro futuro:
+  // recorrente recalcula pelo rrule; one-shot no passado é recusado com franqueza.
+  const GRACE_MS = 2 * 60_000;
+  if (firstRun) {
+    const t = new Date(firstRun).getTime();
+    if (Number.isNaN(t)) {
+      // scheduled_at ilegível (a LLM inventou formato) — tenta o rrule, senão recusa.
+      firstRun = rrule ? resolveReminderFirstRun(null, rrule, new Date(), userTz) : null;
+    } else if (t < Date.now() - GRACE_MS) {
+      if (rrule) {
+        firstRun = resolveReminderFirstRun(null, rrule, new Date(), userTz);
+      } else {
+        await writeLog('warn', 'tool', `create_reminder one-shot no PASSADO (${firstRun}) — recusado, usuário avisado`, {
+          traceId: ctx.traceId, userId: ctx.userId,
+        });
+        await sendOutbound(ctx.conversationId, ctx.phoneE164,
+          `Hmm, esse horário pra "${titleForMsg}" já passou 😅 Me fala uma data/hora futura que eu agendo certinho!`,
+          ctx.traceId);
+        return;
+      }
+    }
+  }
+
+  if (!firstRun || !title) {
+    // Sem horário utilizável (ou sem título) → NÃO cria lembrete morto/anônimo
     // e AVISA o usuário com franqueza — antes ele achava que estava agendado.
-    await writeLog('warn', 'tool', `create_reminder sem horário utilizável (scheduled_at=${args.scheduled_at ?? '∅'}, rrule=${args.rrule ?? '∅'}) — lembrete NÃO criado, usuário avisado`, {
+    await writeLog('warn', 'tool', `create_reminder sem ${!title ? 'título' : 'horário'} utilizável (title=${args.title ?? '∅'}, scheduled_at=${args.scheduled_at ?? '∅'}, rrule=${args.rrule ?? '∅'}) — lembrete NÃO criado, usuário avisado`, {
       traceId: ctx.traceId, userId: ctx.userId,
     });
     await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      `Opa, não consegui entender o horário pro lembrete "${args.title}" 😅 Me fala de novo o horário certinho? Ex: "todo dia às 8h" ou "amanhã às 14h".`,
+      `Opa, não consegui entender o horário pro lembrete "${titleForMsg}" 😅 Me fala de novo o horário certinho? Ex: "todo dia às 8h" ou "amanhã às 14h".`,
       ctx.traceId);
     return;
   }
@@ -742,26 +783,28 @@ async function handleCreateReminder(
   // GUARD DE DUPLICATA (caso real: LLM re-chamou create_reminder 3x → usuário ia
   // receber o mesmo lembrete triplicado). Mesmo user + mesmo título + mesma
   // recorrência/horário ainda pendente = idempotente, não duplica.
+  // escapeLike: título com % ou _ virava padrão curinga e casava com QUALQUER
+  // lembrete → criação silenciosamente ignorada.
   const dupQuery = db.from('reminders')
     .select('id')
     .eq('user_id', ctx.userId)
     .eq('status', 'pending')
-    .ilike('title', args.title.trim());
+    .ilike('title', escapeLike(title));
   const { data: dup } = await (rrule
     ? dupQuery.eq('rrule', rrule)
     : dupQuery.eq('scheduled_at', scheduledAt ?? ''))
     .limit(1).maybeSingle();
   if (dup?.id) {
-    await writeLog('info', 'tool', `create_reminder duplicado ("${args.title}") — já existe pendente, ignorando (idempotência)`, {
+    await writeLog('info', 'tool', `create_reminder duplicado ("${title}") — já existe pendente, ignorando (idempotência)`, {
       traceId: ctx.traceId, userId: ctx.userId, existingId: dup.id,
     });
     return;
   }
 
-  await db.from('reminders').insert({
+  const { error: insErr } = await db.from('reminders').insert({
     user_id: ctx.userId,
     type: args.type,
-    title: args.title,
+    title,
     body: args.body ?? null,
     scheduled_at: scheduledAt,
     rrule,
@@ -769,6 +812,80 @@ async function handleCreateReminder(
     status: 'pending',
     payload: args.payload ?? {},
   });
+  if (insErr) {
+    // Insert falhou (ex: enum inválido) — o turno da LLM já pode ter dito "agendei".
+    // Ser honesto > ficar bonito: avisa que NÃO ficou agendado.
+    await writeLog('error', 'tool', `create_reminder INSERT falhou: ${insErr.message}`, {
+      traceId: ctx.traceId, userId: ctx.userId,
+    });
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      `Opa, deu um probleminha técnico ao salvar o lembrete "${titleForMsg}" 😔 Pode me pedir de novo? Prometo que registro certinho.`,
+      ctx.traceId);
+  }
+}
+
+/**
+ * Cancela lembretes pendentes por busca de título (E3 — caso real: usuária pediu
+ * pra REDIVIDIR o plano de água; a Xarlote criou o plano novo mas não tinha como
+ * apagar o antigo → 15 pings/dia). A LLM enxerga os lembretes ativos no contexto
+ * do system prompt e chama esta tool ANTES de criar um plano substituto.
+ */
+async function handleCancelReminders(args: { title_query?: string; all?: boolean }, ctx: ToolContext) {
+  const q = (args.title_query ?? '').trim();
+  if (!q && !args.all) {
+    await writeLog('warn', 'tool', 'cancel_reminders sem title_query e sem all — ignorado', { traceId: ctx.traceId, userId: ctx.userId });
+    return;
+  }
+  let query = db.from('reminders')
+    .update({ status: 'cancelled' })
+    .eq('user_id', ctx.userId)
+    .eq('status', 'pending');
+  if (!args.all) query = query.ilike('title', `%${escapeLike(q)}%`);
+  const { data: cancelled, error } = await query.select('id, title');
+
+  if (error) {
+    await writeLog('error', 'tool', `cancel_reminders falhou: ${error.message}`, { traceId: ctx.traceId, userId: ctx.userId });
+    return;
+  }
+  await writeLog('info', 'tool', `cancel_reminders: ${cancelled?.length ?? 0} lembrete(s) cancelado(s) (query="${args.all ? '*' : q}")`, {
+    traceId: ctx.traceId, userId: ctx.userId, ids: (cancelled ?? []).map((r) => r.id),
+  });
+  await writeAudit({
+    actorType: 'xarlote',
+    action: 'reminder.cancelled',
+    userId: ctx.userId,
+    targetTable: 'reminders',
+    conversationId: ctx.conversationId,
+    traceId: ctx.traceId,
+    metadata: { count: cancelled?.length ?? 0, query: args.all ? '*' : q },
+  });
+}
+
+/**
+ * Lista os lembretes pendentes DIRETO pro usuário (execução de tool é
+ * fire-and-forget — a LLM não vê o resultado, então o handler responde).
+ */
+async function handleListReminders(ctx: ToolContext) {
+  const { data: rows } = await db.from('reminders')
+    .select('title, rrule, scheduled_at, next_run_at')
+    .eq('user_id', ctx.userId)
+    .eq('status', 'pending')
+    .order('next_run_at', { ascending: true })
+    .limit(30);
+
+  if (!rows?.length) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      'Você não tem nenhum lembrete ativo no momento 💙 Quer criar algum?', ctx.traceId);
+    return;
+  }
+  const fmtHora = (iso: string) => new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
+  const fmtData = (iso: string) => new Date(iso).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', timeZone: 'America/Sao_Paulo' });
+  const lines = rows.map((r) => {
+    const quando = r.rrule ? `todo dia às ${fmtHora(r.next_run_at)}` : `${fmtData(r.next_run_at)} às ${fmtHora(r.next_run_at)}`;
+    return `• *${r.title}* — ${quando}`;
+  });
+  await sendOutbound(ctx.conversationId, ctx.phoneE164,
+    `Seus lembretes ativos 📋\n\n${lines.join('\n')}\n\nQuer mudar ou cancelar algum? É só falar!`, ctx.traceId);
 }
 
 async function handleConfirmOrder(args: { order_id: string; quote_id: string }, ctx: ToolContext) {
