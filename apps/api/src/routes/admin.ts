@@ -204,6 +204,10 @@ export async function adminRoute(app: FastifyInstance) {
       vision_model: typeof body['vision_model'] === 'string' ? (body['vision_model'] as string) : undefined,
       audio_model: typeof body['audio_model'] === 'string' ? (body['audio_model'] as string) : undefined,
       xarlote_enabled: typeof body['xarlote_enabled'] === 'boolean' ? (body['xarlote_enabled'] as boolean) : undefined,
+      reminders_enabled: typeof body['reminders_enabled'] === 'boolean' ? (body['reminders_enabled'] as boolean) : undefined,
+      nudges_enabled: typeof body['nudges_enabled'] === 'boolean' ? (body['nudges_enabled'] as boolean) : undefined,
+      pharmacy_outbound_enabled: typeof body['pharmacy_outbound_enabled'] === 'boolean' ? (body['pharmacy_outbound_enabled'] as boolean) : undefined,
+      clinic_outbound_enabled: typeof body['clinic_outbound_enabled'] === 'boolean' ? (body['clinic_outbound_enabled'] as boolean) : undefined,
       tts_enabled: typeof body['tts_enabled'] === 'boolean' ? (body['tts_enabled'] as boolean) : undefined,
       tts_api_key: typeof body['tts_api_key'] === 'string' ? (body['tts_api_key'] as string) : undefined,
       tts_voice_id: typeof body['tts_voice_id'] === 'string' ? (body['tts_voice_id'] as string) : undefined,
@@ -302,7 +306,18 @@ export async function adminRoute(app: FastifyInstance) {
   });
 
   // Reset all dev/test data — messages, conversations, orders, quotes, users, logs
-  app.post('/reset-dev', async (_req, reply) => {
+  app.post('/reset-dev', async (req, reply) => {
+    // 🛑 WIPE TOTAL — em PRODUÇÃO isso apaga dados clínicos reais sem volta (backup
+    // ainda é pendência). Trava tripla: (1) desligado em prod salvo ALLOW_RESET_DEV;
+    // (2) header de confirmação explícito (mesmo padrão dos endpoints de envio real);
+    // (3) trilha de auditoria antes de deletar.
+    if (process.env['NODE_ENV'] === 'production' && process.env['ALLOW_RESET_DEV'] !== 'true') {
+      return reply.code(403).send({ error: 'reset_dev_disabled_in_prod', message: 'Wipe total desativado em produção. Setar ALLOW_RESET_DEV=true no Railway pra habilitar (e remover depois).' });
+    }
+    if (req.headers['x-confirm-wipe'] !== 'true') {
+      return reply.code(428).send({ error: 'confirm_required', message: 'Isto APAGA TODA a base. Reenvie com o header x-confirm-wipe: true.' });
+    }
+    await writeAudit({ actorType: 'admin', action: 'admin.reset_dev.executed', targetTable: 'ALL', metadata: { ip: req.ip } });
     const uuidTables = ['assistant_tasks', 'consent_events', 'reminders', 'prescriptions', 'quotes', 'messages', 'orders', 'conversations', 'users'];
     const bigintTables = ['system_logs'];
     for (const table of bigintTables) {
@@ -314,6 +329,61 @@ export async function adminRoute(app: FastifyInstance) {
       if (error) return reply.code(500).send({ error: `Failed on ${table}: ${error.message}` });
     }
     return reply.send({ ok: true, cleared: [...bigintTables, ...uuidTables] });
+  });
+
+  // ─── CONTROLE: cancelar lembrete/pedido/consulta pelo painel ──────────────
+  // O "botão de emergência" que faltou nos incidentes (15 pings da Antônia, resgate
+  // do Ciro) — antes só dava pra corrigir via SQL direto no banco.
+  app.patch<{ Params: { id: string } }>('/reminders/:id/cancel', async (req, reply) => {
+    const { data, error } = await db.from('reminders')
+      .update({ status: 'cancelled' })
+      .eq('id', req.params.id)
+      .in('status', ['pending', 'snoozed'])
+      .select('id, title, status');
+    if (error) return reply.code(500).send({ error: error.message });
+    if (!data?.length) return reply.code(409).send({ error: 'not_cancellable', message: 'Lembrete não existe ou já não está pendente.' });
+    await writeAudit({ actorType: 'admin', action: 'admin.reminder.cancelled', targetTable: 'reminders', targetId: req.params.id });
+    return reply.send({ ok: true, reminder: data[0] });
+  });
+
+  app.patch<{ Params: { id: string } }>('/orders/:id/cancel', async (req, reply) => {
+    const { data, error } = await db.from('orders')
+      .update({ status: 'cancelled' })
+      .eq('id', req.params.id)
+      .not('status', 'in', '("completed","cancelled")')
+      .select('id, status');
+    if (error) return reply.code(500).send({ error: error.message });
+    if (!data?.length) return reply.code(409).send({ error: 'not_cancellable', message: 'Pedido não existe ou já finalizado.' });
+    await writeAudit({ actorType: 'admin', action: 'admin.order.cancelled', targetTable: 'orders', targetId: req.params.id });
+    return reply.send({ ok: true, order: data[0] });
+  });
+
+  app.patch<{ Params: { id: string } }>('/consultations/:id/cancel', async (req, reply) => {
+    const { data, error } = await db.from('consultations')
+      .update({ status: 'cancelled', cancelled_reason: 'cancelada pelo admin' })
+      .eq('id', req.params.id)
+      .not('status', 'in', '("completed","cancelled")')
+      .select('id, status');
+    if (error) return reply.code(500).send({ error: error.message });
+    if (!data?.length) return reply.code(409).send({ error: 'not_cancellable', message: 'Consulta não existe ou já finalizada.' });
+    // Cancela lembretes ligados à consulta.
+    await db.from('reminders').update({ status: 'cancelled' })
+      .eq('status', 'pending').filter('payload->>consultation_id', 'eq', req.params.id);
+    await writeAudit({ actorType: 'admin', action: 'admin.consultation.cancelled', targetTable: 'consultations', targetId: req.params.id });
+    return reply.send({ ok: true, consultation: data[0] });
+  });
+
+  // Visão GLOBAL de lembretes (próximos disparos cross-user) — antes só dava pra
+  // ver 1 usuário por vez, então lembretes-zumbi (caso Marina) passavam batido.
+  app.get('/reminders', async (req, reply) => {
+    const status = (req.query as { status?: string })?.status ?? 'pending';
+    const { data, error } = await db.from('reminders')
+      .select('id, user_id, type, title, rrule, next_run_at, status, users(preferred_name, phone_e164)')
+      .eq('status', status)
+      .order('next_run_at', { ascending: true })
+      .limit(200);
+    if (error) return reply.code(500).send({ error: error.message });
+    return reply.send(data ?? []);
   });
 
   // ─── TESTE DE LOOP REAL (Fase 6) ──────────────────────────────────────────

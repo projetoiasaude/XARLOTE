@@ -327,7 +327,7 @@ export async function handleLogMedicationTaken(args: LogMedicationTakenArgs, ctx
     med = created;
   }
 
-  await db.from('medication_log').insert({
+  const { error: logErr } = await db.from('medication_log').insert({
     user_id: ctx.userId,
     medication_id: med.id,
     treatment_id: med.treatment_id,
@@ -336,6 +336,12 @@ export async function handleLogMedicationTaken(args: LogMedicationTakenArgs, ctx
     responded_at: new Date().toISOString(),
     notes: args.notes,
   });
+  if (logErr) {
+    // Adesão que o usuário CONFIRMOU não pode se perder em silêncio (o
+    // adherence-scorer lê essa tabela). Log honesto em vez de fingir sucesso.
+    await writeLog('error', 'tool', `medication_log INSERT falhou ("${args.medication_name}"): ${logErr.message}`, { traceId: ctx.traceId, userId: ctx.userId });
+    return;
+  }
 
   // Se taken: decrementa inventário + update last_taken_at
   if (args.status === 'taken') {
@@ -824,10 +830,12 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
       const twoHoursBefore = new Date(consultDate.getTime() - 2 * 3600 * 1000);
       const now = new Date();
 
+      // type='appointment' (o enum reminder_type_t NÃO tem 'consultation' → o insert
+      // antigo falhava em silêncio e os lembretes NUNCA eram criados).
       if (oneDayBefore > now) {
-        await db.from('reminders').insert({
+        const { error: e1 } = await db.from('reminders').insert({
           user_id: ctx.userId,
-          type: 'consultation',
+          type: 'appointment',
           title: `Consulta de ${before.specialty} amanhã`,
           body: `Sua consulta com a clínica está marcada pra amanhã às ${consultDate.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' })}.`,
           scheduled_at: oneDayBefore.toISOString(),
@@ -835,11 +843,12 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
           status: 'pending',
           payload: { consultation_id: args.consultation_id, quote_id: args.quote_id, kind: '1d_before' },
         });
+        if (e1) await writeLog('error', 'consultation', `lembrete 1d_before falhou: ${e1.message}`, { traceId: ctx.traceId });
       }
       if (twoHoursBefore > now) {
-        await db.from('reminders').insert({
+        const { error: e2 } = await db.from('reminders').insert({
           user_id: ctx.userId,
-          type: 'consultation',
+          type: 'appointment',
           title: `Consulta em 2 horas`,
           body: `Sua consulta de ${before.specialty} é hoje em 2 horas. Não esquece! 💙`,
           scheduled_at: twoHoursBefore.toISOString(),
@@ -847,6 +856,7 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
           status: 'pending',
           payload: { consultation_id: args.consultation_id, quote_id: args.quote_id, kind: '2h_before' },
         });
+        if (e2) await writeLog('error', 'consultation', `lembrete 2h_before falhou: ${e2.message}`, { traceId: ctx.traceId });
       }
     }
   }

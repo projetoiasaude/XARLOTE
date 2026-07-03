@@ -110,9 +110,16 @@ async function rawSend(job: OutboundJob): Promise<void> {
       await writeLog('error', 'outbound', `Abertura por template FALHOU (template=${job.templateName}) — estabelecimento pode não ter recebido: ${String(err).slice(0, 300)}`, {
         traceId: job.traceId, instance: job.instance, template: job.templateName,
       });
+      // Se por acaso houver janela de 24h aberta, o texto livre entrega. Se ele
+      // também falhar, RELANÇA o erro do template pra o BullMQ retentar (attempts:5
+      // + backoff) — antes o `.catch(()=>{})` + return engolia a falha e o job
+      // "completava" sem nunca entregar (uma queda transitória do zpro = abertura
+      // fria perdida em silêncio).
       if (job.text) {
-        await sendText(job.instance, job.phoneE164, job.text).catch(() => { /* texto frio também pode falhar; já logamos o erro */ });
-        return;
+        try {
+          await sendText(job.instance, job.phoneE164, job.text);
+          return;
+        } catch { /* texto frio também falhou — cai no throw abaixo pra retentar */ }
       }
       throw err;
     }
@@ -191,7 +198,11 @@ export function startOutboundWorkers(): void {
       { connection, concurrency: 1, limiter: { max, duration } },
     );
     worker.on('failed', (job, err) => {
-      void writeLog('error', 'outbound', `Job ${name} falhou (tentativa ${job?.attemptsMade ?? '?'}): ${String(err).slice(0, 500)}`, {
+      // BullMQ emite 'failed' em CADA tentativa. Só a TERMINAL conta como 'error'
+      // (e alimenta o alerta de "possível ban"); tentativas intermediárias viram
+      // 'warn' — senão UM número morto gera 5 erros e dispara alarme falso.
+      const terminal = (job?.attemptsMade ?? 0) >= (job?.opts?.attempts ?? 1);
+      void writeLog(terminal ? 'error' : 'warn', 'outbound', `Job ${name} ${terminal ? 'FALHOU (final)' : 'falhou'} (tentativa ${job?.attemptsMade ?? '?'}/${job?.opts?.attempts ?? '?'}): ${String(err).slice(0, 500)}`, {
         traceId: (job?.data as OutboundJob | undefined)?.traceId,
       });
     });

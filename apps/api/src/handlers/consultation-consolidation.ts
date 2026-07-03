@@ -61,8 +61,69 @@ export async function rescueStalledConsultations(): Promise<void> {
         await writeLog('error', 'consultation', `rescue de consulta falhou: ${String(err).slice(0, 160)}`, { consultationId: c.id });
       }
     }
+
+    await rescueStuckConfirming();
   } catch (err) {
     await writeLog('error', 'consultation', `rescueStalledConsultations falhou: ${String(err).slice(0, 160)}`, {});
+  }
+}
+
+/**
+ * Destrava consultas presas em 'confirming' (paciente escolheu, clínica nunca
+ * reconfirmou). Sem isto, a consulta fica 'confirming' PARA SEMPRE: a guarda de
+ * idempotência de start_consultation_search bloqueia qualquer nova busca do
+ * paciente ("você já tem uma busca em andamento"). Dois estágios:
+ *   > 3h sem atividade → avisa o paciente UMA vez (honesto, dedup por flag).
+ *   > 12h → volta pra 'quoted' (destrava + reapresenta opções) e cancela os
+ *           lembretes pré-criados (que apontavam pra um horário NÃO confirmado).
+ */
+async function rescueStuckConfirming(): Promise<void> {
+  const cutoff3h = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+  const { data: rows, error } = await db
+    .from('consultations')
+    .select('id, conversation_id, specialty, preferences, updated_at')
+    .eq('status', 'confirming')
+    .lt('updated_at', cutoff3h)
+    .limit(30);
+  if (error || !rows?.length) return;
+
+  const now = Date.now();
+  for (const c of rows) {
+    try {
+      if (!c.conversation_id) continue;
+      const { data: conv } = await db.from('conversations').select('whatsapp_jid').eq('id', c.conversation_id).single();
+      const phone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
+      if (!phone) continue;
+      const phoneE164 = `+${phone}`;
+      const prefs = (c.preferences as Record<string, unknown> | null) ?? {};
+      const ageMs = now - new Date(c.updated_at as string).getTime();
+      const traceId = `rescue-confirming-${c.id}`;
+
+      if (ageMs > 12 * 60 * 60 * 1000) {
+        // Destrava: volta pra 'quoted' (opções ainda no _consolidated_summary) e
+        // cancela os lembretes que apontavam pro horário não confirmado.
+        const { data: flipped } = await db.from('consultations')
+          .update({ status: 'quoted' }).eq('id', c.id).eq('status', 'confirming').select('id');
+        if (!flipped?.length) continue; // outro processo já mexeu
+        await db.from('reminders').update({ status: 'cancelled' })
+          .eq('status', 'pending').filter('payload->>consultation_id', 'eq', c.id);
+        await sendOutbound(c.conversation_id, phoneE164,
+          `Sobre sua consulta de ${c.specialty}: a clínica ainda não confirmou a reserva 😕 Liberei de novo as opções — quer tentar outra clínica ou horário? (Se preferir, ligue direto na clínica pra confirmar.)`,
+          traceId);
+        await writeLog('warn', 'consultation', `Consulta 'confirming' >12h sem reconfirmação → revertida pra 'quoted'`, { traceId, consultationId: c.id });
+      } else if (!prefs['confirming_nudged']) {
+        // 3-12h: avisa UMA vez (honesto) sem mexer no estado.
+        await db.from('consultations').update({
+          preferences: { ...prefs, confirming_nudged: true },
+        }).eq('id', c.id);
+        await sendOutbound(c.conversation_id, phoneE164,
+          `Oi! Ainda estou aguardando a clínica confirmar sua consulta de ${c.specialty} 🙏 Assim que tiver retorno eu te aviso. Se quiser, posso buscar outra opção em paralelo — é só falar!`,
+          traceId);
+        await writeLog('info', 'consultation', `Consulta 'confirming' >3h — paciente avisado (aguardando clínica)`, { traceId, consultationId: c.id });
+      }
+    } catch (err) {
+      await writeLog('error', 'consultation', `rescueStuckConfirming falhou p/ ${c.id}: ${String(err).slice(0, 140)}`, {});
+    }
   }
 }
 

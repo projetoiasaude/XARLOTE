@@ -174,11 +174,15 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     return;
   }
 
-  // 4. Guard: turn limit (12 turns = 24 messages)
+  // 4. Guard: turn limit (12 turns = 24 messages) — CONTA SÓ ESTA NEGOCIAÇÃO.
+  // A conversa de fornecedor é COMPARTILHADA por telefone e reusada entre pedidos;
+  // contar a vida inteira fazia a 2ª cotação com a mesma farmácia bater o limite já
+  // na 1ª resposta e morrer como 'timeout'. Conta a partir da criação da quote atual.
   const { count: msgCount } = await db
     .from('messages')
     .select('*', { count: 'exact', head: true })
-    .eq('conversation_id', conversationId);
+    .eq('conversation_id', conversationId)
+    .gte('created_at', quote.created_at);
 
   if ((msgCount ?? 0) > 24) {
     await finalizeQuote(quote.id, quote.order_id, 'timeout', traceId);
@@ -521,6 +525,12 @@ export async function initiatePharmacyNegotiation(
   userPhoneE164: string,
   traceId: string,
 ): Promise<void> {
+  // Kill-switch de disparo pra farmácia (hot-reload via /prompts) — freio de
+  // emergência pra parar de contatar estabelecimentos sem desligar a Xarlote.
+  if (!loadPrompts().pharmacy_outbound_enabled) {
+    await writeLog('warn', 'supplier', 'Disparo pra farmácia DESLIGADO (pharmacy_outbound_enabled=false) — negociação não iniciada', { traceId, quoteId });
+    return;
+  }
   // Load quote + supplier
   const { data: quote } = await db
     .from('quotes')

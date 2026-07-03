@@ -244,6 +244,43 @@ async function detectSendFailureSpike(): Promise<void> {
   } catch {}
 }
 
+/**
+ * Detecta CONTEÚDO quebrado saindo pro usuário — os incidentes reais desta semana
+ * foram de QUALIDADE de resposta (a msg literal "undefined" do caso Glauber), não
+ * de infra, e nenhum detector olhava o texto. Pega interpolação quebrada no minuto,
+ * não no print do usuário.
+ */
+async function detectBrokenOutboundContent(): Promise<void> {
+  try {
+    const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
+    const { data, count } = await db
+      .from('messages')
+      .select('id, conversation_id, content', { count: 'exact' })
+      .eq('direction', 'out')
+      .gte('created_at', cutoff)
+      // Só padrões DISTINTIVOS (ilike é substring: "%NaN%" casaria "Renan"/"banana",
+      // "%null%" casaria "anular" — falso-positivo). "undefined" e "[object Object]"
+      // não aparecem em texto PT-BR legítimo.
+      .or('content.ilike.%undefined%,content.ilike.%[object Object]%')
+      .limit(5);
+    const n = count ?? 0;
+    if (n > 0) {
+      const sample = (data ?? [])[0]?.content?.slice(0, 120) ?? '';
+      await sendTelegramAlert({
+        title: '🐛 Mensagem QUEBRADA enviada a usuário',
+        body: `${n} mensagem(ns) com "undefined"/"[object Object]"/"NaN"/"null" nos últimos 10min. Ex: "${sample}". Interpolação/tool quebrada — investigar já.`,
+        severity: 'critical',
+        throttleKey: 'broken_outbound_content',
+      });
+      await writeEvent({
+        eventName: 'anomaly.broken_outbound_content',
+        severity: 'critical',
+        payload: { count: n, sample },
+      });
+    }
+  } catch {}
+}
+
 async function runOnce(): Promise<void> {
   try {
     await Promise.all([
@@ -254,6 +291,7 @@ async function runOnce(): Promise<void> {
       detectOrderFailureRate(),
       detectCostBudget(),
       detectSendFailureSpike(),
+      detectBrokenOutboundContent(),
     ]);
   } catch (err) {
     await writeLog('error', 'anomaly', `worker crashed: ${String(err).slice(0, 200)}`, {});

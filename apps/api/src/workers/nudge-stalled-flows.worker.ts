@@ -20,6 +20,7 @@
 import { db, writeLog, writeEvent } from '@iasaude/db';
 import { sendOutbound } from '../handlers/outbound.js';
 import { withCronLock } from '../middleware/cron-lock.js';
+import { loadPrompts } from '../config/prompts.js';
 
 const POLL_MS = 15 * 60 * 1000;
 const MIN_AGE_MS = 3 * 60 * 60 * 1000;   // não afoba: 3h de silêncio antes do nudge
@@ -128,11 +129,40 @@ async function collectTargets(): Promise<NudgeTarget[]> {
     if (convId) targets.push({ kind: 'clarification', entityId: q.id, conversationId: convId, entityTs: q.clarification_asked_at });
   }
 
+  // d) STALL PRÉ-TOOL (os casos E7/E8 que motivaram este worker): a Xarlote fez uma
+  //    PERGUNTA de triagem ("é em Goiânia? plano ou particular?", "confirma a
+  //    novalgina?") ANTES de chamar start_pharmacy_order/start_consultation_search
+  //    — não existe order/consultation no banco, então (a)/(b)/(c) nunca veem. Aqui
+  //    olhamos a própria conversa: última mensagem é OUT terminando em '?' e o
+  //    usuário sumiu. É onde a conversão mais morre (maior intenção).
+  const { data: convs } = await db
+    .from('conversations')
+    .select('id, last_message_at')
+    .eq('party_type', 'user')
+    .not('user_id', 'is', null)
+    .gt('last_message_at', oldest)
+    .lt('last_message_at', newest)
+    .order('last_message_at', { ascending: false })
+    .limit(40);
+  for (const c of convs ?? []) {
+    const { data: last } = await db
+      .from('messages')
+      .select('direction, content, created_at')
+      .eq('conversation_id', c.id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (last?.direction === 'out' && (last.content ?? '').trim().endsWith('?')) {
+      targets.push({ kind: 'clarification', entityId: c.id, conversationId: c.id, entityTs: last.created_at });
+    }
+  }
+
   return targets;
 }
 
 export async function nudgeStalledFlows(): Promise<void> {
-  if (process.env['NUDGE_ENABLED'] === 'false') return; // kill-switch
+  if (process.env['NUDGE_ENABLED'] === 'false') return; // kill-switch (env, legado)
+  if (!loadPrompts().nudges_enabled) return;            // kill-switch (hot-reload via /prompts)
 
   try {
     const targets = await collectTargets();

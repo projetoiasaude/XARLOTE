@@ -3,7 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR } from '@iasaude/shared';
+import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -805,7 +805,8 @@ async function handleCreateReminder(
     user_id: ctx.userId,
     type: args.type,
     title,
-    body: args.body ?? null,
+    // body:"" (string vazia da LLM) → null, senão o dispatcher mandaria msg vazia.
+    body: args.body?.trim() ? args.body.trim() : null,
     scheduled_at: scheduledAt,
     rrule,
     next_run_at: firstRun,
@@ -830,6 +831,28 @@ async function handleCreateReminder(
  * apagar o antigo → 15 pings/dia). A LLM enxerga os lembretes ativos no contexto
  * do system prompt e chama esta tool ANTES de criar um plano substituto.
  */
+/** Remove acentos + minúsculas — pra casar "água" com "agua" (ILIKE não dobra diacrítico). */
+function foldAccents(s: string): string {
+  return s.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+}
+
+/** Descreve um lembrete pro usuário SEM mentir a frequência (semanal ≠ "todo dia"). */
+function describeReminder(rrule: string | null, nextRunAtIso: string): string {
+  const hora = new Date(nextRunAtIso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
+  if (!rrule) {
+    const data = new Date(nextRunAtIso).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', timeZone: 'America/Sao_Paulo' });
+    return `${data} às ${hora}`;
+  }
+  const parsed = parseRrule(rrule);
+  if (parsed?.freq === 'WEEKLY' && parsed.byDays?.length) {
+    const nomes = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'];
+    const dias = [...parsed.byDays].sort((a, b) => a - b).map((d) => nomes[d]).join('/');
+    return `${dias} às ${hora}`;
+  }
+  if (parsed?.freq === 'DAILY') return `todo dia às ${hora}`;
+  return `recorrente, próximo às ${hora}`;
+}
+
 async function handleCancelReminders(args: { title_query?: string; all?: boolean }, ctx: ToolContext) {
   const q = (args.title_query ?? '').trim();
   if (!q && !args.all) {
@@ -847,8 +870,37 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
     await writeLog('error', 'tool', `cancel_reminders falhou: ${error.message}`, { traceId: ctx.traceId, userId: ctx.userId });
     return;
   }
-  await writeLog('info', 'tool', `cancel_reminders: ${cancelled?.length ?? 0} lembrete(s) cancelado(s) (query="${args.all ? '*' : q}")`, {
-    traceId: ctx.traceId, userId: ctx.userId, ids: (cancelled ?? []).map((r) => r.id),
+  let count = cancelled?.length ?? 0;
+
+  // FALLBACK ACENTO-INSENSÍVEL: ILIKE do Postgres não dobra diacríticos — a LLM
+  // manda "agua" (sem acento) ou sinônimo e casava 0 rows EM SILÊNCIO, reabrindo o
+  // E3 (planos duplicados) com falsa sensação de resolvido. Refaz o match em JS.
+  if (count === 0 && !args.all && q) {
+    const { data: pend } = await db.from('reminders')
+      .select('id, title').eq('user_id', ctx.userId).eq('status', 'pending').limit(50);
+    const qn = foldAccents(q);
+    const ids = (pend ?? []).filter((r) => foldAccents(r.title ?? '').includes(qn)).map((r) => r.id);
+    if (ids.length) {
+      const { data: c2 } = await db.from('reminders').update({ status: 'cancelled' }).in('id', ids).select('id');
+      count = c2?.length ?? 0;
+    }
+  }
+
+  // AINDA 0: NÃO fica em silêncio (a LLM já pode ter dito "cancelei"). Fala a verdade.
+  if (count === 0 && !args.all) {
+    const { data: ativos } = await db.from('reminders')
+      .select('title').eq('user_id', ctx.userId).eq('status', 'pending').limit(15);
+    if (ativos?.length) {
+      const lista = ativos.map((r) => `• ${r.title}`).join('\n');
+      await sendOutbound(ctx.conversationId, ctx.phoneE164,
+        `Não achei lembrete com "${q}" 🤔 Seus ativos são:\n\n${lista}\n\nQual desses você quer cancelar?`, ctx.traceId);
+    } else {
+      await sendOutbound(ctx.conversationId, ctx.phoneE164, 'Você não tem lembretes ativos pra cancelar 💙', ctx.traceId);
+    }
+  }
+
+  await writeLog('info', 'tool', `cancel_reminders: ${count} lembrete(s) cancelado(s) (query="${args.all ? '*' : q}")`, {
+    traceId: ctx.traceId, userId: ctx.userId,
   });
   await writeAudit({
     actorType: 'xarlote',
@@ -857,7 +909,7 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
     targetTable: 'reminders',
     conversationId: ctx.conversationId,
     traceId: ctx.traceId,
-    metadata: { count: cancelled?.length ?? 0, query: args.all ? '*' : q },
+    metadata: { count, query: args.all ? '*' : q },
   });
 }
 
@@ -878,12 +930,7 @@ async function handleListReminders(ctx: ToolContext) {
       'Você não tem nenhum lembrete ativo no momento 💙 Quer criar algum?', ctx.traceId);
     return;
   }
-  const fmtHora = (iso: string) => new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
-  const fmtData = (iso: string) => new Date(iso).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', timeZone: 'America/Sao_Paulo' });
-  const lines = rows.map((r) => {
-    const quando = r.rrule ? `todo dia às ${fmtHora(r.next_run_at)}` : `${fmtData(r.next_run_at)} às ${fmtHora(r.next_run_at)}`;
-    return `• *${r.title}* — ${quando}`;
-  });
+  const lines = rows.map((r) => `• *${r.title}* — ${describeReminder(r.rrule, r.next_run_at)}`);
   await sendOutbound(ctx.conversationId, ctx.phoneE164,
     `Seus lembretes ativos 📋\n\n${lines.join('\n')}\n\nQuer mudar ou cancelar algum? É só falar!`, ctx.traceId);
 }

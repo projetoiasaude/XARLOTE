@@ -15,7 +15,8 @@
  */
 import { db, writeEvent, writeLog, listDeviceTokens, deleteDeviceTokens } from '@iasaude/db';
 import { isSimulatorMode } from '@iasaude/whatsapp';
-import { SARA_INSTANCE, nextOccurrence } from '@iasaude/shared';
+import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone } from '@iasaude/shared';
+import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
 
@@ -31,6 +32,10 @@ interface DueReminder {
 }
 
 export async function dispatchReminders(): Promise<void> {
+  // Kill-switch por fluxo (hot-reload via /prompts) — freio de emergência sem
+  // desligar a Xarlote inteira nem redeploy.
+  if (!loadPrompts().reminders_enabled) return;
+
   const now = new Date();
 
   const { data: due, error } = await db
@@ -38,6 +43,7 @@ export async function dispatchReminders(): Promise<void> {
     .select('id, user_id, type, title, body, rrule, next_run_at, users(phone_e164, preferred_name, timezone)')
     .eq('status', 'pending')
     .lte('next_run_at', now.toISOString())
+    .order('next_run_at', { ascending: true }) // backlog processa em ordem, sem starvation
     .limit(50);
 
   if (error) {
@@ -46,9 +52,20 @@ export async function dispatchReminders(): Promise<void> {
   }
   if (!due?.length) return;
 
+  const STALE_MS = 45 * 60_000; // recorrente atrasado > 45min = pula (espera a próxima)
+
   for (const reminder of due as unknown as DueReminder[]) {
     const user = reminder.users;
     if (!user?.phone_e164) continue;
+
+    // Número de TESTE/placeholder (ex: usuária Marina do simulador): auto-cancela
+    // o lembrete-zumbi na 1ª passada — senão claim+mirror+envio-bloqueado se
+    // repetem TODO dia pra sempre, poluindo o alerta de "possível ban".
+    if (isPlaceholderPhone(user.phone_e164)) {
+      await db.from('reminders').update({ status: 'cancelled' }).eq('id', reminder.id);
+      await writeLog('warn', 'reminder', `lembrete cancelado — telefone placeholder/teste (${user.phone_e164})`, {});
+      continue;
+    }
 
     // 1. Claim: recorrente avança pro próximo disparo e CONTINUA pending;
     //    one-shot vira `sent`. Filtro por next_run_at = claim otimista
@@ -70,8 +87,20 @@ export async function dispatchReminders(): Promise<void> {
       .select('id');
     if (!claimed?.length) continue;
 
+    // STALENESS: após downtime longo, um recorrente MUITO atrasado ("remédio das
+    // 8h" chegando 14h) é pior que não chegar (dose fora de hora). Claim já avançou
+    // pro próximo disparo; aqui só pulamos o ENVIO desta ocorrência velha. One-shot
+    // atrasado ainda envia (é a única chance dele).
+    const lateMs = now.getTime() - new Date(reminder.next_run_at).getTime();
+    if (reminder.rrule && lateMs > STALE_MS) {
+      await writeLog('warn', 'reminder', `lembrete recorrente pulado — atrasado ${Math.round(lateMs / 60000)}min (aguarda próxima ocorrência)`, {});
+      continue;
+    }
+
     const name = user.preferred_name ?? 'você';
-    const msg = reminder.body ?? `Ei ${name}, lembrete: ${reminder.title} 💊`;
+    // body:"" (string vazia que a LLM às vezes manda) NÃO é null → `?? fallback`
+    // não pega e o WhatsApp recebia mensagem VAZIA (rejeitada). Trata vazio.
+    const msg = reminder.body?.trim() ? reminder.body : `Ei ${name}, lembrete: ${reminder.title} 💊`;
 
     // 2. Espelha na conversa canônica (mesma do WhatsApp) → app vê via realtime.
     const { data: conv } = await db

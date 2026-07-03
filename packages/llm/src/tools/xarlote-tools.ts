@@ -213,7 +213,7 @@ export const xarloteTools: ToolDefinition[] = [
           },
           scheduled_at: {
             type: 'string',
-            description: 'Lembrete ÚNICO: ISO datetime em UTC (Brasília = UTC-3, então 15h de Brasília = 18:00Z)',
+            description: 'Lembrete ÚNICO: ISO datetime com offset de Brasília -03:00 (copie a hora local, sem converter). Ex: "2026-07-04T15:00:00-03:00".',
           },
           rrule: {
             type: 'string',

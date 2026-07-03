@@ -172,11 +172,14 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     return;
   }
 
-  // 4. Turn limit (12 turnos = 24 msgs)
+  // 4. Turn limit (12 turnos = 24 msgs) — CONTA SÓ ESTA NEGOCIAÇÃO. A conversa de
+  // clínica é compartilhada por telefone e reusada entre consultas; contar a vida
+  // inteira matava a 2ª negociação com a mesma clínica logo na 1ª resposta.
   const { count: msgCount } = await db
     .from('messages')
     .select('*', { count: 'exact', head: true })
-    .eq('conversation_id', conversationId);
+    .eq('conversation_id', conversationId)
+    .gte('created_at', (quote as { created_at: string }).created_at);
 
   if ((msgCount ?? 0) > 24) {
     await finalizeConsultationQuote(quote.id, quote.consultation_id, 'timeout', traceId);
@@ -543,6 +546,13 @@ export async function initiateClinicNegotiation(opts: {
   traceId: string;
 }): Promise<void> {
   const { quoteId, consultationId, clinicId, clinicName, clinicWhatsApp, ctx, userConversationId, userPhoneE164, traceId } = opts;
+
+  // Kill-switch de disparo pra clínica (hot-reload via /prompts) — complementa o
+  // CLINIC_OUTBOUND_MODE (env). Freio de emergência sem redeploy.
+  if (!loadPrompts().clinic_outbound_enabled) {
+    await writeLog('warn', 'clinic', 'Disparo pra clínica DESLIGADO (clinic_outbound_enabled=false) — negociação não iniciada', { traceId, quoteId });
+    return;
+  }
 
   const clinicJid = `${clinicWhatsApp.replace(/\D/g, '')}@s.whatsapp.net`;
 

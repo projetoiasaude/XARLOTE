@@ -27,6 +27,16 @@ export interface PromptsConfig {
   xarlote_enabled: boolean;
 
   /**
+   * Kill-switches POR FLUXO (hot-reload via /prompts, sem redeploy). Cada um
+   * desliga só o seu fluxo — diferente de xarlote_enabled, que muda TUDO. Servem
+   * de freio de emergência (ex: rajada de lembretes, disparo indevido a farmácia).
+   */
+  reminders_enabled: boolean;
+  nudges_enabled: boolean;
+  pharmacy_outbound_enabled: boolean;
+  clinic_outbound_enabled: boolean;
+
+  /**
    * TTS — Xarlote responde em ÁUDIO em momentos raros.
    * Hoje: dispara só na primeira saudação chamando o nome do usuário,
    * controlado por `users.metadata.audio_intro_sent`.
@@ -60,6 +70,10 @@ const defaults: PromptsConfig = {
   vision_model: 'openai/gpt-4.1-mini',
   audio_model: 'elevenlabs/scribe_v1',
   xarlote_enabled: true,
+  reminders_enabled: true,
+  nudges_enabled: true,
+  pharmacy_outbound_enabled: true,
+  clinic_outbound_enabled: true,
   tts_enabled: false,
   tts_api_key: '',
   // Carla — Inviting, Warm and Helpful (BR-nativa, shared library).
