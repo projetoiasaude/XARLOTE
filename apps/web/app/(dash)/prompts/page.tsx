@@ -16,6 +16,7 @@ import { cn } from '@/lib/utils';
 const API = process.env['NEXT_PUBLIC_API_URL'] ?? 'http://localhost:3001';
 
 const MODELS = [
+  { value: 'z-ai/glm-5.2', label: 'GLM-5.2 — inteligente + cache (atual)' },
   { value: 'openai/gpt-4.1-mini', label: 'GPT-4.1 Mini — rápido e barato' },
   { value: 'openai/gpt-4.1', label: 'GPT-4.1 — melhor qualidade' },
   { value: 'openai/gpt-4o-mini', label: 'GPT-4o Mini' },
@@ -62,6 +63,10 @@ interface PromptsConfig {
   vision_model: string;
   audio_model: string;
   xarlote_enabled: boolean;
+  reminders_enabled: boolean;
+  nudges_enabled: boolean;
+  pharmacy_outbound_enabled: boolean;
+  clinic_outbound_enabled: boolean;
   tts_enabled: boolean;
   tts_api_key: string;
   tts_voice_id: string;
@@ -89,10 +94,20 @@ const DEFAULT_CFG: PromptsConfig = {
   sara_suffix: '', agent_override: '', llm_api_key: '',
   llm_model: 'openai/gpt-4.1-mini', vision_model: 'openai/gpt-4.1-mini',
   audio_model: 'openai/gpt-4o-audio-preview', xarlote_enabled: true,
+  reminders_enabled: true, nudges_enabled: true,
+  pharmacy_outbound_enabled: true, clinic_outbound_enabled: true,
   tts_enabled: false, tts_api_key: '',
   tts_voice_id: XARLOTE_VOICE_ID, tts_model: 'eleven_multilingual_v2',
   tts_speed: 1.10,
 };
+
+// Interruptores de fluxo (kill-switches por fluxo) — salvam na hora, como o mestre.
+const FLOW_SWITCHES: { key: keyof PromptsConfig; label: string; desc: string }[] = [
+  { key: 'reminders_enabled', label: 'Lembretes', desc: 'Disparo de lembretes/despertadores proativos.' },
+  { key: 'nudges_enabled', label: 'Follow-ups (nudges)', desc: 'Re-engaja fluxos que o usuário deixou parados.' },
+  { key: 'pharmacy_outbound_enabled', label: 'Disparo a farmácias', desc: 'Contatar farmácias pra cotar pedidos.' },
+  { key: 'clinic_outbound_enabled', label: 'Disparo a clínicas', desc: 'Contatar clínicas pra buscar consultas.' },
+];
 
 export default function PromptsPage() {
   const [config, setConfig] = useState<PromptsConfig>(DEFAULT_CFG);
@@ -235,6 +250,31 @@ export default function PromptsPage() {
     }
   }
 
+  const [flowBusy, setFlowBusy] = useState<string | null>(null);
+  async function handleFlowToggle(key: keyof PromptsConfig) {
+    if (flowBusy) return;
+    const next = !config[key];
+    setFlowBusy(key);
+    setConfig((c) => ({ ...c, [key]: next }));
+    try {
+      const res = await fetch(`${API}/admin/prompts`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [key]: next }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const saved: PromptsConfig = await res.json();
+      setOriginal((o) => ({ ...o, [key]: saved[key] }));
+      setConfig((c) => ({ ...c, [key]: saved[key] }));
+    } catch (err) {
+      setConfig((c) => ({ ...c, [key]: !next })); // rollback
+      setErrorMsg(`Falha ao alternar ${key}: ${String(err)}`);
+      setStatus('error');
+    } finally {
+      setFlowBusy(null);
+    }
+  }
+
   async function handleSave() {
     setStatus('saving');
     setErrorMsg('');
@@ -358,6 +398,58 @@ export default function PromptsPage() {
           </div>
         </GlassCard>
       </motion.div>
+
+      {/* Interruptores de fluxo (kill-switches) */}
+      <GlassCard className="p-5">
+        <SectionHeader
+          icon={Power}
+          title="Interruptores de fluxo"
+          subtitle="Freio de emergência por função — sem desligar a Xarlote inteira. Entra em vigor na hora."
+        />
+        <div className="mt-4 grid gap-2.5 sm:grid-cols-2">
+          {FLOW_SWITCHES.map((sw) => {
+            const on = Boolean(config[sw.key]);
+            return (
+              <div
+                key={sw.key}
+                className={cn(
+                  'flex items-center justify-between gap-3 rounded-xl border px-3.5 py-3 transition-colors',
+                  on ? 'border-emerald-400/25 bg-emerald-400/[0.04]' : 'border-rose-400/25 bg-rose-400/[0.04]',
+                )}
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-white">{sw.label}</span>
+                    <GlassBadge tone={on ? 'live' : 'danger'} dot>{on ? 'Ligado' : 'Desligado'}</GlassBadge>
+                  </div>
+                  <p className="text-[11px] text-white/50 mt-0.5">{sw.desc}</p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={on}
+                  aria-label={sw.label}
+                  disabled={flowBusy === sw.key}
+                  onClick={() => handleFlowToggle(sw.key)}
+                  className={cn(
+                    'relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full transition-colors',
+                    'focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+                    'disabled:opacity-50 disabled:cursor-not-allowed',
+                    on ? 'bg-emerald-500 shadow-glow-success' : 'bg-white/10 border border-white/15',
+                  )}
+                >
+                  <motion.span
+                    aria-hidden
+                    animate={{ x: on ? 22 : 4 }}
+                    transition={{ type: 'spring', stiffness: 500, damping: 30 }}
+                    className="absolute top-1 inline-block h-5 w-5 rounded-full bg-white shadow-lg"
+                  />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      </GlassCard>
 
       {/* LLM config */}
       <GlassCard className="p-5">
