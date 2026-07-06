@@ -278,12 +278,21 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   // 6. Build context
   const history = await getConversationMessages(conversationId, 24);
   const order = quote.orders as {
+    user_id?: string;
     items: OrderItem[];
     delivery_address?: string | null;
     delivery_lat?: number;
     delivery_lng?: number;
     payment_method?: string | null;
   } | null;
+
+  // CPF do cliente (política do fundador: responder o CPF na hora e continuar). Fica no
+  // contexto do agente pra ele responder direto quando a farmácia pedir — sem re-perguntar.
+  let clientCpf: string | null = null;
+  if (order?.user_id) {
+    const { data: cpfRow } = await db.from('users').select('document_cpf').eq('id', order.user_id).maybeSingle();
+    clientCpf = (cpfRow?.document_cpf as string | null) ?? null;
+  }
 
   // Setor/bairro do usuário (vindo de delivery_address). Cai pra cidade da farmácia se não tiver.
   const supplier = quote.suppliers as { city?: string; state?: string } | null;
@@ -300,6 +309,7 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         neighborhoodCity: userNeighborhood,
         deliveryAddress: order?.delivery_address ?? null, // endereço real p/ a farmácia (Caso D/frete)
         paymentMethod: order?.payment_method ?? null,
+        cpf: clientCpf, // responde direto se a farmácia pedir CPF (Caso F)
         isOrderConfirmation,
       });
 

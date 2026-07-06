@@ -7,7 +7,15 @@ interface AgentContext {
   deliveryAddress?: string | null;
   cepPrefix?: string;
   paymentMethod?: string | null;
+  /** CPF do cliente (só dígitos) — responder direto quando a farmácia pedir (o cliente já consentiu no pedido). */
+  cpf?: string | null;
   isOrderConfirmation?: boolean;
+}
+
+/** Formata CPF de 11 dígitos como 000.000.000-00; devolve o cru se não tiver 11. */
+function fmtCpf(cpf: string): string {
+  const d = cpf.replace(/\D/g, '');
+  return d.length === 11 ? `${d.slice(0, 3)}.${d.slice(3, 6)}.${d.slice(6, 9)}-${d.slice(9)}` : cpf;
 }
 
 export function buildAgentPharmacySystemPrompt(ctx: AgentContext): string {
@@ -57,6 +65,12 @@ O cliente já escolheu essa farmácia. Essa mensagem é a resposta deles depois 
     ? `## FORMA DE PAGAMENTO DO CLIENTE\nO cliente já indicou que vai pagar via **${ctx.paymentMethod}**. Você pode mencionar isso de leve na abertura, e ao fechar a cotação confirmar se a farmácia aceita.`
     : `## FORMA DE PAGAMENTO\nO cliente ainda não disse a preferência de pagamento. Não invente — só confirme com a farmácia se ela perguntar.`;
 
+  // CPF do cliente disponível → o agente RESPONDE direto quando a farmácia pedir
+  // (política do fundador: responder o CPF na hora e continuar, sem re-perguntar ao cliente).
+  const cpfLine = ctx.cpf && ctx.cpf.replace(/\D/g, '').length === 11
+    ? `\n\n## DADOS DO CLIENTE (use SÓ se a farmácia pedir)\nCPF do cliente: **${fmtCpf(ctx.cpf)}**. Se a farmácia pedir o CPF pra cadastrar/cotar/fechar, **responda com esse CPF direto** e continue a conversa (o cliente já autorizou). NÃO peça o CPF de novo ao cliente.`
+    : '';
+
   return `Você é a *Xarlote*, falando direto pelo WhatsApp com o atendente de uma farmácia, em nome de um cliente que precisa de medicamento. Estilo: humana, simpática, brasileira, intimista (PT-BR), mensagens curtas como WhatsApp normal. **NUNCA** se identifique como "IA", "bot", "agente", "assistente automático" ou "sistema". Você é só a Xarlote, ajudando alguém a comprar remédio.
 
 ## ITENS PRA COTAR
@@ -67,7 +81,7 @@ ${itemsList}
 - **Endereço completo de entrega** (PASSE à farmácia quando ela pedir a rua/o local ou precisar pra calcular o frete): **${deliveryAddr}**
 É pra ESSE endereço que a entrega vai — a farmácia precisa dele pra calcular o frete e entregar de verdade.
 
-${paymentLine}
+${paymentLine}${cpfLine}
 
 ---
 
@@ -108,9 +122,10 @@ ${paymentLine}
 → Chame \`record_quote_price\` com o preço informado (Caso A) — e no \`notes\` diga a apresentação real (ex.: \`notes="apresentação de 20 comprimidos"\`). Assim o cliente vê a opção e decide.
 → Se a diferença for grande e você achar que o cliente precisa decidir, PODE também chamar \`request_clarification(question="a farmácia só tem a de 20 comprimidos por R$X, serve pra você?")\` — mas SEMPRE registre o preço primeiro pra não perder a cotação.
 
-### CASO F — Farmácia pede CPF ou dados pessoais do paciente
-→ \`request_clarification(question="...")\`
-→ NÃO forneça CPF ou nome completo do paciente.
+### CASO F — Farmácia pede CPF do cliente
+→ **Se você TEM o CPF** (aparece em "DADOS DO CLIENTE" acima): **responda com o CPF direto** e continue (ex.: *"Claro! O CPF é 000.000.000-00. Consegue me passar o valor e o prazo?"*). NÃO chame \`request_clarification\` e NÃO peça o CPF de novo ao cliente — ele já autorizou.
+→ **Se você NÃO tem o CPF** (não há "DADOS DO CLIENTE"): aí sim \`request_clarification(question="A farmácia pediu seu CPF pra cadastrar o pedido. Pode me passar?")\`.
+→ Se a farmácia pedir NOME COMPLETO ou outros dados sensíveis que você não tem, \`request_clarification\`. Nunca invente dados do paciente.
 
 ### CASO G — Resposta ambígua
 → UMA pergunta curta e direta pedindo a informação que falta.

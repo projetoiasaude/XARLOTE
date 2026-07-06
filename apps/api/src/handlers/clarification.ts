@@ -277,6 +277,19 @@ export async function relayUserAnswerToEstablishment(
     await db.from('quotes').update(answeredPatch).eq('id', pending.quoteId);
   }
 
+  // REUSO DO CPF (política do fundador): se o cliente respondeu um CPF a uma pergunta de
+  // CPF, salva no perfil pra a Xarlote responder as OUTRAS farmácias sozinha (sem re-perguntar
+  // nem deixar a farmácia no vácuo). NUNCA loga o CPF (PII — CLAUDE.md #3).
+  const cpfDigits = (answer ?? '').replace(/\D/g, '');
+  if (cpfDigits.length === 11 && /\bcpf\b/i.test(pending.question ?? '')) {
+    const { data: convRow } = await db.from('conversations').select('user_id').eq('id', userConversationId).maybeSingle();
+    const uid = convRow?.user_id as string | null;
+    if (uid) {
+      await db.from('users').update({ document_cpf: cpfDigits }).eq('id', uid);
+      await writeLog('info', 'clarification', 'CPF do cliente salvo no perfil (reuso automático nas próximas farmácias)', { traceId });
+    }
+  }
+
   if (pending.supplierConversationId && pending.supplierPhone) {
     const text = `Sobre o que você perguntou: ${answer}`;
     if (pending.kind === 'clinic') {
