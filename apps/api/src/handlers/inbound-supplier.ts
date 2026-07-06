@@ -169,6 +169,60 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     }
   }
 
+  // 📨 ATUALIZAÇÃO PÓS-COTAÇÃO (incidente Hiago 06/07): a farmácia mandou algo DEPOIS
+  // de já ter cotado (a cotação está 'quoted' e o pedido já foi consolidado/apresentado),
+  // mas ANTES do cliente confirmar — tipicamente o FRETE ("cobramos taxa de 7,90") ou
+  // um aviso ("pode demorar"). Antes isso caía em "Nenhuma cotação ativa" e era
+  // DESCARTADO em silêncio: o cliente nunca soube e o pedido travava com a farmácia
+  // esperando. Agora: atualiza o frete se vier valor, e LEVA a novidade ao cliente
+  // (via clarificação → o "pode seguir/sim" dele fecha pelo backstop). NÃO responde à
+  // farmácia (ela já deu a info; quem decide agora é o cliente).
+  if (!quote) {
+    const { data: posted } = await db
+      .from('quotes')
+      .select('*, orders(*), suppliers(*)')
+      .eq('conversation_id', conversationId)
+      .eq('status', 'quoted')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const pOrder = posted?.orders as { status?: string; selected_quote_id?: string | null } | null;
+    if (posted && pOrder && ['quoted', 'quoting'].includes(pOrder.status ?? '') && !pOrder.selected_quote_id) {
+      // Frete/taxa com valor → atualiza a cotação. GUARD (review): só grava se o valor
+      // for PLAUSÍVEL como frete (menor que o total da cotação) — senão "o total com
+      // frete fica 62,36" gravaria o TOTAL como frete. Fluxo de dinheiro: na dúvida, não grava.
+      if (/\b(taxa|frete|entrega|cobram)/i.test(text)) {
+        const fee = extractPriceBRL(text);
+        const total = posted.total != null ? Number(posted.total) : null;
+        if (fee != null && total != null && fee < total) {
+          await db.from('quotes').update({ delivery_fee: fee }).eq('id', posted.id);
+          await writeLog('info', 'quote', `Frete atualizado pós-cotação: R$${fee}`, { traceId, quoteId: posted.id });
+        }
+      }
+      // Dedup do relay (review): se o cliente já foi avisado há pouco (quote já
+      // awaiting_user recente), não re-pergunta a cada nota da farmácia — só atualiza o
+      // frete acima. Evita spam quando a farmácia manda 3 mensagens seguidas.
+      const askedAt = posted.clarification_asked_at ? new Date(posted.clarification_asked_at).getTime() : 0;
+      const alreadyWaiting = posted.clarification_status === 'awaiting_user' && (Date.now() - askedAt) < 10 * 60_000;
+      if (!alreadyWaiting) {
+        const supName = (posted.suppliers as { name?: string } | null)?.name ?? 'a farmácia';
+        try {
+          await relaySupplierQuestionToUser(
+            { id: posted.id, order_id: posted.order_id, conversation_id: posted.conversation_id, suppliers: { name: supName } },
+            `a farmácia retornou: "${text.slice(0, 180)}". Quer seguir com ela assim mesmo, ou prefere que eu veja outra opção?`,
+            traceId,
+          );
+          await writeLog('info', 'supplier', `📨 Atualização pós-cotação da farmácia levada ao cliente`, { traceId, conversationId, quoteId: posted.id });
+        } catch (err) {
+          await writeLog('error', 'supplier', `Falha ao relayar atualização pós-cotação: ${String(err).slice(0, 160)}`, { traceId, quoteId: posted.id });
+        }
+      } else {
+        await writeLog('info', 'supplier', `Atualização pós-cotação: cliente já avisado há pouco — só atualizei o frete (sem re-perguntar)`, { traceId, conversationId, quoteId: posted.id });
+      }
+      return;
+    }
+  }
+
   if (!quote) {
     await writeLog('warn', 'supplier', 'Nenhuma cotação ativa encontrada para este fornecedor', { traceId, conversationId });
     return;

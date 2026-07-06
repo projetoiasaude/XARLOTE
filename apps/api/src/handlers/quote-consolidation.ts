@@ -361,7 +361,9 @@ export async function consolidateQuotes(
     const q = sorted[i] as QuoteRow;
     const name = supplierMap.get(q.supplier_id) ?? 'Farmácia';
     const total = q.total?.toFixed(2);
-    const frete = q.delivery_fee != null ? (q.delivery_fee === 0 ? 'frete grátis' : `frete R$${q.delivery_fee.toFixed(2)}`) : '';
+    // frete: null = ainda não informado ("a confirmar") — NÃO mostrar "grátis" (mentira,
+    // caso Hiago 06/07). 0 = grátis confirmado. >0 = valor real.
+    const frete = q.delivery_fee == null ? 'frete a confirmar' : (q.delivery_fee === 0 ? 'frete grátis' : `frete R$${q.delivery_fee.toFixed(2)}`);
     const eta = q.eta_minutes ? `~${q.eta_minutes}min` : '';
     const payment = (q.payment_methods ?? []).join('/') || 'consulte';
     const pix = q.pix_key ? ` · Pix: ${q.pix_key}` : '';

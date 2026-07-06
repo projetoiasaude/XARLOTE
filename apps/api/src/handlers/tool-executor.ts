@@ -994,10 +994,12 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     .eq('order_id', args.order_id)
     .neq('id', args.quote_id)
     .in('status', ['pending', 'contacting', 'negotiating']);
+  // Fecha clarificação pendente em TODAS as cotações do pedido — INCLUSIVE a escolhida
+  // (review): senão a quote escolhida fica 'awaiting_user' e o nudge-worker re-cutuca o
+  // cliente sobre um pedido JÁ FECHADO. Sem .neq de propósito.
   await db.from('quotes')
     .update({ clarification_status: 'closed' })
     .eq('order_id', args.order_id)
-    .neq('id', args.quote_id)
     .eq('clarification_status', 'awaiting_user');
 
   // 4. Load order items + delivery address + payment method

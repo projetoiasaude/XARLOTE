@@ -115,7 +115,7 @@ describe('isOrderAcceptance (Fix #1 — aceite VERBAL vs resposta a dado/negaç�
     }
   });
   it('aceites legítimos continuam funcionando após o endurecimento', () => {
-    for (const t of ['aceito', 'pode fechar', 'quero a 1', 'prefiro a Droga Raia', 'pode ser', 'fechou', 'confirmo', 'a mais barata']) {
+    for (const t of ['aceito', 'pode fechar', 'pode entregar', 'quero a 1', 'prefiro a Droga Raia', 'pode ser', 'fechou', 'confirmo', 'a mais barata']) {
       expect(isOrderAcceptance(t), t).toBe(true);
     }
   });
@@ -134,6 +134,11 @@ describe('resolveQuotePick (Fix #1 — resolve escolha → quote_id)', () => {
     expect(resolveQuotePick(OPTS, 'opção 3')).toBe('q-sete');
     expect(resolveQuotePick(OPTS, 'a primeira')).toBe('q-facil');
     expect(resolveQuotePick(OPTS, '3')).toBe('q-sete');
+  });
+  it('por "farmácia N" (incidente Hiago 06/07 — "pode entregar então, farmácia 1")', () => {
+    expect(resolveQuotePick(OPTS, 'farmácia 1')).toBe('q-facil');
+    expect(resolveQuotePick(OPTS, 'Pode entregar então, farmácia 1')).toBe('q-facil');
+    expect(resolveQuotePick(OPTS, 'pode ser a drogaria 2')).toBe('q-raia');
   });
   it('número fora do range → null (não fecha errado)', () => {
     expect(resolveQuotePick(OPTS, 'quero a 9')).toBe(null);
@@ -200,5 +205,21 @@ describe('resolveQuotePick (Fix #1 — resolve escolha → quote_id)', () => {
     // mas um aceite real com 1 opção AINDA fecha:
     expect(resolveQuotePick(one, 'aceito')).toBe('q-only');
     expect(resolveQuotePick(one, 'pode fechar')).toBe('q-only');
+    expect(resolveQuotePick(one, 'pode entregar')).toBe('q-only');
+  });
+  it('"pode entregar 2 caixas" com 1 opção NÃO fecha (guarda de quantidade no caminho de 1 opção)', () => {
+    const one: QuoteOption[] = [{ option: 1, quote_id: 'q-only', supplier_name: 'Droga Fácil', total: 67.5 }];
+    expect(resolveQuotePick(one, 'pode entregar 2 caixas')).toBe(null);
+    expect(resolveQuotePick(one, 'manda 3 caixas')).toBe(null);
+  });
+});
+
+describe('extractPriceBRL — frete pós-cotação (incidente Hiago 06/07)', () => {
+  it('captura o valor do frete/taxa', () => {
+    expect(extractPriceBRL('aceitamos sim cobramos taxa de 7,90')).toBe(7.9);
+    expect(extractPriceBRL('o frete fica 12,00')).toBe(12);
+  });
+  it('aviso sem valor → null (só relaya o texto, não mexe no frete)', () => {
+    expect(extractPriceBRL('mas pode demorar para entregar')).toBe(null);
   });
 });

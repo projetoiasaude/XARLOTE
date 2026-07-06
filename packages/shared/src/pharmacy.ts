@@ -197,7 +197,7 @@ export function isOrderAcceptance(text: string | null | undefined): boolean {
   // ficam FORA — "aceita cartão?"/"confirma o endereço" não são aceites. "quero"/"prefiro"
   // com lookahead pra não casar consideração.
   const acceptRe =
-    /\b(aceito|quero(?!\s+(saber|pensar|ver|olhar|esperar|aguardar))|pode ser|pode seguir|pode fechar|fecha|fechar|fechou|fechado|manda ver|confirmo|prefiro(?!\s+(esperar|aguardar|pensar|ver|nao|não))|essa mesma?|esse mesmo)\b/;
+    /\b(aceito|quero(?!\s+(saber|pensar|ver|olhar|esperar|aguardar))|pode ser|pode seguir|pode fechar|pode entregar|fecha|fechar|fechou|fechado|manda ver|confirmo|prefiro(?!\s+(esperar|aguardar|pensar|ver|nao|não))|essa mesma?|esse mesmo)\b/;
   const superlative = /\b(a mais barata|mais barat|mais em conta|a mais rapida|mais rapid|a primeira|a segunda|a terceira)\b/;
   const shortYes = /^(sim|ok|okay|isso|isso mesmo|blz|beleza|show|perfeito|bora|pode|pode sim|quero sim|fechou|👍|✅)[\s!.]*$/;
   return acceptRe.test(t) || superlative.test(t) || shortYes.test(t);
@@ -237,7 +237,7 @@ export function resolveQuotePick(options: QuoteOption[], text: string | null | u
     const ordinal: Record<string, number> = { primeira: 1, segunda: 2, terceira: 3, primeiro: 1, segundo: 2, terceiro: 3 };
     let num: number | null = null;
     const iso = t.match(/^\s*(?:a\s+|op[çc][aã]o\s*|n[uú]mero\s*|n[°º]\s*)?([1-9])\s*$/);
-    const explicit = t.match(/\b(?:op[çc][aã]o|n[uú]mero|n[°º])\s*([1-9])\b/);
+    const explicit = t.match(/\b(?:op[çc][aã]o|n[uú]mero|n[°º]|farm[aá]cia|drogaria)\s*([1-9])\b/);
     const verbNum = t.match(/\b(?:quero|prefiro|escolho|fico com|vou de|pode ser)\s+(?:a\s+)?([1-9])\b/);
     if (iso) num = parseInt(iso[1] as string, 10);
     else if (explicit) num = parseInt(explicit[1] as string, 10);
@@ -271,8 +271,9 @@ export function resolveQuotePick(options: QuoteOption[], text: string | null | u
     if (withEta.length) return withEta.reduce((a, b) => ((a.eta_minutes as number) <= (b.eta_minutes as number) ? a : b)).quote_id;
   }
 
-  // 4) ACEITE VERBAL ("aceito", "pode ser", "sim") com UMA opção só → ela.
-  if (options.length === 1 && isOrderAcceptance(text)) return (options[0] as QuoteOption).quote_id;
+  // 4) ACEITE VERBAL ("aceito", "pode ser", "sim") com UMA opção só → ela. `!hasQtyNoun`
+  // barra "pode entregar 2 caixas" e afins (número de quantidade não é escolha).
+  if (options.length === 1 && !hasQtyNoun && isOrderAcceptance(text)) return (options[0] as QuoteOption).quote_id;
 
   return null;
 }

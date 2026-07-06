@@ -33,7 +33,9 @@ export function buildConsolidationMessage(quotes: Quote[], supplierNames: Record
   const lines = completed.map((q, i) => {
     const name = supplierNames[q.supplier_id] ?? 'Farmácia';
     const total = q.total?.toFixed(2).replace('.', ',');
-    const frete = q.delivery_fee ? ` (frete R$ ${q.delivery_fee.toFixed(2).replace('.', ',')})` : ' (frete grátis)';
+    // null = frete não informado ("a confirmar"); 0 = grátis; >0 = valor. NUNCA dizer
+    // "grátis" pra null (seria mentira). Alinhado com quote-consolidation.ts.
+    const frete = q.delivery_fee == null ? ' (frete a confirmar)' : (q.delivery_fee === 0 ? ' (frete grátis)' : ` (frete R$ ${q.delivery_fee.toFixed(2).replace('.', ',')})`);
     const eta = q.eta_minutes ? ` · entrega ~${q.eta_minutes}min` : '';
     const payment = q.payment_methods?.join('/') ?? 'Pix';
     return `${emojis[i]} *${name}* — R$ ${total}${frete}${eta} · ${payment}`;
