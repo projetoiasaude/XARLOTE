@@ -49,17 +49,15 @@ export async function sendOutbound(
   text: string,
   traceId: string,
   llmMeta: LlmMeta = {},
-  opts: { dedup?: boolean } = {},
+  opts: { dedup?: boolean; dedupWindowMs?: number } = {},
 ): Promise<void> {
-  // Anti double-send OPT-IN (Fix #4): SÓ a resposta conversacional da Xarlote deduplica
-  // (dois turnos concorrentes com texto idêntico — ex.: "Prontinho, já cuidei!" ×2).
-  // Workers/lembretes/notificações NÃO passam dedup (senão suprimiam uma notificação
-  // legítima e ainda marcavam "enviado" sem enviar — review: inventory-tracker/reminders).
-  // Janela CURTA (12s): a corrida de turnos concorrentes termina em <5s (observado 2-5s);
-  // 12s cobre com margem sem engolir duas perguntas sequenciais legítimas que o LLM
-  // respondeu com o mesmo texto genérico ("precisa de mais alguma coisa?") — review LOW.
-  if (opts.dedup && await isDuplicateRecentOutbound(conversationId, text, 12_000)) {
-    await writeLog('warn', 'outbound', `Mensagem duplicada suprimida (idêntica há <12s): "${(text ?? '').slice(0, 60)}"`, { traceId, conversationId });
+  // Anti double-send OPT-IN (Fix #4): SÓ os call-sites que passam dedup:true deduplicam
+  // (resposta conversacional da Xarlote e relays estabelecimento→usuário). Workers/lembretes
+  // NÃO passam dedup (senão suprimiam notificação legítima). Janela default 12s (corrida de
+  // turnos termina em <5s); relays de estabelecimento usam janela maior (mesma pergunta não
+  // deve repetir em ~1min).
+  if (opts.dedup && await isDuplicateRecentOutbound(conversationId, text, opts.dedupWindowMs ?? 12_000)) {
+    await writeLog('warn', 'outbound', `Mensagem duplicada suprimida: "${(text ?? '').slice(0, 60)}"`, { traceId, conversationId });
     return;
   }
 

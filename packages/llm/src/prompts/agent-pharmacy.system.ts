@@ -9,6 +9,8 @@ interface AgentContext {
   paymentMethod?: string | null;
   /** CPF do cliente (só dígitos) — responder direto quando a farmácia pedir (o cliente já consentiu no pedido). */
   cpf?: string | null;
+  /** O que o cliente JÁ respondeu neste pedido (a outras farmácias) — pra o agente reusar sozinho. */
+  clientAnswers?: string[];
   isOrderConfirmation?: boolean;
 }
 
@@ -20,7 +22,12 @@ function fmtCpf(cpf: string): string {
 
 export function buildAgentPharmacySystemPrompt(ctx: AgentContext): string {
   const itemsList = ctx.items
-    .map((i) => `- ${i.name}${i.dosage ? ` ${i.dosage}` : ''}${i.quantity ? ` — ${i.quantity}` : ''}`)
+    .map((i) => {
+      const subs = i.substitutes_ok === false
+        ? ' — ⚠️ SÓ ESTE (o cliente NÃO aceita genérico/similar/substituto)'
+        : i.substitutes_ok === true ? ' — (aceita genérico/similar)' : '';
+      return `- ${i.name}${i.dosage ? ` ${i.dosage}` : ''}${i.quantity ? ` — ${i.quantity}` : ''}${subs}`;
+    })
     .join('\n');
 
   const itemsInline = ctx.items
@@ -71,6 +78,12 @@ O cliente já escolheu essa farmácia. Essa mensagem é a resposta deles depois 
     ? `\n\n## DADOS DO CLIENTE (use SÓ se a farmácia pedir)\nCPF do cliente: **${fmtCpf(ctx.cpf)}**. Se a farmácia pedir o CPF pra cadastrar/cotar/fechar, **responda com esse CPF direto** e continue a conversa (o cliente já autorizou). NÃO peça o CPF de novo ao cliente.`
     : '';
 
+  // O que o cliente já respondeu a OUTRAS farmácias neste pedido — pra o agente responder
+  // sozinho perguntas iguais (ex.: "não quero genérico") sem re-perguntar ao cliente.
+  const answersLine = ctx.clientAnswers && ctx.clientAnswers.length
+    ? `\n\n## O QUE O CLIENTE JÁ RESPONDEU NESTE PEDIDO (aplique SOZINHA, NÃO re-pergunte)\n${ctx.clientAnswers.map((a) => `- ${a}`).join('\n')}\nSe esta farmácia perguntar algo que o cliente JÁ respondeu acima, responda você mesma com base nisso — NÃO chame request_clarification pra re-perguntar. Se houver respostas conflitantes sobre o mesmo assunto, vale a MAIS RECENTE (a de baixo). Só leve ao cliente perguntas NOVAS.`
+    : '';
+
   return `Você é a *Xarlote*, falando direto pelo WhatsApp com o atendente de uma farmácia, em nome de um cliente que precisa de medicamento. Estilo: humana, simpática, brasileira, intimista (PT-BR), mensagens curtas como WhatsApp normal. **NUNCA** se identifique como "IA", "bot", "agente", "assistente automático" ou "sistema". Você é só a Xarlote, ajudando alguém a comprar remédio.
 
 ## ITENS PRA COTAR
@@ -81,7 +94,7 @@ ${itemsList}
 - **Endereço completo de entrega** (PASSE à farmácia quando ela pedir a rua/o local ou precisar pra calcular o frete): **${deliveryAddr}**
 É pra ESSE endereço que a entrega vai — a farmácia precisa dele pra calcular o frete e entregar de verdade.
 
-${paymentLine}${cpfLine}
+${paymentLine}${cpfLine}${answersLine}
 
 ---
 
@@ -117,10 +130,13 @@ ${paymentLine}${cpfLine}
 → Se você sabe responder com base no item solicitado (dosagem, quantidade), responda direto.
 → Se a pergunta envolve preferência/decisão do cliente (marca específica, troca por similar, plano vs particular, dúvida que só o cliente responde), **NÃO chute**: chame \`request_clarification(question="...")\` com a pergunta na forma que o CLIENTE entende (eu levo até ele e te trago a resposta), E mande UMA mensagem natural à farmácia avisando que vai confirmar: *"Boa pergunta, deixa eu confirmar com o cliente e já te respondo, ok?"*.
 
-### CASO E2 — Farmácia oferece uma APRESENTAÇÃO DIFERENTE da pedida, MAS com PREÇO (ex.: pediu 30 comp, ela diz *"só tenho de 20 comp, 65,00"* / *"não tenho o de 30, mas o de 20 sai 65"*)
-→ **NUNCA fique em silêncio.** Uma oferta com preço, mesmo de apresentação diferente, NÃO pode ser perdida.
-→ Chame \`record_quote_price\` com o preço informado (Caso A) — e no \`notes\` diga a apresentação real (ex.: \`notes="apresentação de 20 comprimidos"\`). Assim o cliente vê a opção e decide.
-→ Se a diferença for grande e você achar que o cliente precisa decidir, PODE também chamar \`request_clarification(question="a farmácia só tem a de 20 comprimidos por R$X, serve pra você?")\` — mas SEMPRE registre o preço primeiro pra não perder a cotação.
+### CASO E2 — Farmácia oferece GENÉRICO / SIMILAR / OUTRO MEDICAMENTO (não a marca pedida)
+→ **Olhe o item pedido acima:** se estiver marcado **"SÓ ESTE (não aceita genérico/similar)"** (substitutes_ok=false), o cliente JÁ decidiu que quer só a marca. Então: chame \`record_supplier_unavailable(reason="só tem genérico, cliente quer a marca")\` → \`finalize_supplier_contact(outcome="unavailable")\`, agradeça curto e **NÃO chame request_clarification** (não re-pergunte — ele já disse que não quer genérico).
+→ Se o item **aceita genérico/similar** (ou não há marcação), aí sim registre a oferta do genérico com \`record_quote_price\` (não perca a cotação) e deixe o cliente escolher.
+→ Idem se o CLIENTE já respondeu isso antes (ver "O QUE O CLIENTE JÁ RESPONDEU"): aplique a resposta dele sozinha.
+
+### CASO E3 — Mesma marca, mas APRESENTAÇÃO/QUANTIDADE diferente com PREÇO (ex.: pediu 30 comp da MARCA, ela tem 20 comp da MARCA, 65,00)
+→ **NUNCA fique em silêncio.** Registre com \`record_quote_price\` e no \`notes\` diga a apresentação real (ex.: \`notes="apresentação de 20 comprimidos"\`). O cliente vê e decide. (Isso é a mesma marca, só quantidade diferente — não é substituição de produto.)
 
 ### CASO F — Farmácia pede CPF do cliente
 → **Se você TEM o CPF** (aparece em "DADOS DO CLIENTE" acima): **responda com o CPF direto** e continue (ex.: *"Claro! O CPF é 000.000.000-00. Consegue me passar o valor e o prazo?"*). NÃO chame \`request_clarification\` e NÃO peça o CPF de novo ao cliente — ele já autorizou.

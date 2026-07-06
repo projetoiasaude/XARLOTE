@@ -574,7 +574,9 @@ export async function processInboundUser(
       history: geminiHistory,
       tools: xarloteTools,
       temperature: 0.4,
-      maxOutputTokens: 1024,
+      // 1500 (era 1024): contexto de pedido fica grande e o glm-5.2 às vezes truncava a
+      // resposta no meio → turno vazio (incidente Cefaliv). Mais folga + o fallback acima.
+      maxOutputTokens: 1500,
       timeoutMs: 60_000,
     });
   } catch (err) {
@@ -696,7 +698,7 @@ export async function processInboundUser(
   const onlyAcceptTurn = !llmResponse.toolCalls.some((t) => t.name !== 'relay_answer_to_establishment' && t.name !== 'confirm_order_selection');
   const suppressReply = backstopConfirmed && onlyAcceptTurn;
   let replyText = suppressReply ? '' : llmResponse.text.trim();
-  if (!replyText && !suppressReply && llmResponse.toolCalls.length > 0) {
+  if (!replyText && !suppressReply) {
     const { count: sentThisTurn } = await db
       .from('messages')
       .select('id', { count: 'exact', head: true })
@@ -704,19 +706,29 @@ export async function processInboundUser(
       .eq('direction', 'out')
       .gt('created_at', new Date(llmStart).toISOString());
     if (!sentThisTurn) {
-      const toolNames = llmResponse.toolCalls.map((t) => t.name).join(', ');
-      const lastUserText = typeof userMsgContent === 'string' ? userMsgContent : userMsgPreview;
-      try {
-        const followup = await chat(
-          `(Sistema: você acabou de executar com sucesso: ${toolNames}. O usuário havia dito: "${String(lastUserText).slice(0, 200)}". Escreva uma resposta CURTA, natural e humana confirmando pra ele o que foi feito. NÃO chame nenhuma tool.)`,
-          { model, apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'], systemInstruction: systemPrompt, history: geminiHistory, tools: [], temperature: 0.4, maxOutputTokens: 200, timeoutMs: 20_000 },
-        );
-        replyText = followup.text.trim();
-        await writeLog('info', 'agent', `Follow-up narrou turno só-tool (${toolNames})`, { traceId });
-      } catch (err) {
-        await writeLog('warn', 'agent', `Follow-up do turno só-tool falhou: ${String(err).slice(0, 120)}`, { traceId });
+      if (llmResponse.toolCalls.length > 0) {
+        // Turno só-tool: narra o que foi feito.
+        const toolNames = llmResponse.toolCalls.map((t) => t.name).join(', ');
+        const lastUserText = typeof userMsgContent === 'string' ? userMsgContent : userMsgPreview;
+        try {
+          const followup = await chat(
+            `(Sistema: você acabou de executar com sucesso: ${toolNames}. O usuário havia dito: "${String(lastUserText).slice(0, 200)}". Escreva uma resposta CURTA, natural e humana confirmando pra ele o que foi feito. NÃO chame nenhuma tool.)`,
+            { model, apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'], systemInstruction: systemPrompt, history: geminiHistory, tools: [], temperature: 0.4, maxOutputTokens: 200, timeoutMs: 20_000 },
+          );
+          replyText = followup.text.trim();
+          await writeLog('info', 'agent', `Follow-up narrou turno só-tool (${toolNames})`, { traceId });
+        } catch (err) {
+          await writeLog('warn', 'agent', `Follow-up do turno só-tool falhou: ${String(err).slice(0, 120)}`, { traceId });
+        }
+        if (!replyText) replyText = 'Prontinho, já cuidei disso aqui! 💙 Precisa de mais alguma coisa?';
+      } else {
+        // 🛡️ TURNO VAZIO: o LLM não gerou texto NEM tool (ex.: estourou o limite de tokens
+        // numa resposta truncada / contexto gigante). NUNCA ficar muda — incidente Cefaliv
+        // 06/07 (ela ficou muda 2 turnos seguidos, 1024/1024 tokens de saída). Fallback honesto
+        // que reengata a conversa.
+        replyText = 'Opa, me atrapalhei aqui por um instante 🙈 Pode me falar de novo o que você precisa? Já cuido pra você 💙';
+        await writeLog('warn', 'llm', `Turno vazio (sem texto e sem tool — LLM truncado?) — fallback gracioso`, { traceId, tokensOut: llmResponse.tokensOut });
       }
-      if (!replyText) replyText = 'Prontinho, já cuidei disso aqui! 💙 Precisa de mais alguma coisa?';
     }
   }
 

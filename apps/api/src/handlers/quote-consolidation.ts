@@ -31,7 +31,10 @@ export function scheduleQuoteTimeout(
   userConversationId: string,
   userPhoneE164: string,
   traceId: string,
+  force = false,
 ): void {
+  // force (expand): re-arma os timers pro pedido reaberto mesmo que já tenham rodado antes.
+  if (force) scheduledTimeouts.delete(orderId);
   if (scheduledTimeouts.has(orderId)) return;
   scheduledTimeouts.add(orderId);
 
@@ -290,9 +293,10 @@ export async function consolidateQuotes(
   userPhoneE164: string,
   traceId: string,
 ): Promise<void> {
-  // Guard: only consolidate once per order
+  // Guard: only consolidate once per order. Inclui 'failed' (review Cefaliv): um pedido
+  // já 'failed' era re-consolidado e re-mandava "não consegui cotação" várias vezes.
   const { data: order } = await db.from('orders').select('status').eq('id', orderId).single();
-  if (!order || ['quoted', 'confirming', 'handed_off', 'cancelled'].includes(order.status)) return;
+  if (!order || ['quoted', 'confirming', 'handed_off', 'cancelled', 'failed'].includes(order.status)) return;
 
   // Loop agêntico: não fecha as opções enquanto uma farmácia espera um dado do
   // cliente (clarificação). Auto-libera após a janela (hasPendingClarification só

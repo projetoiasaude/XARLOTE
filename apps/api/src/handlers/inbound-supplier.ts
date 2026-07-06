@@ -160,7 +160,9 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     if (late && lateOrder && orderAgeOk && ['quoting', 'failed', 'quoted'].includes(lateOrder.status ?? '')) {
       await db.from('quotes').update({ status: 'negotiating', completed_at: null }).eq('id', late.id);
       if (lateOrder.status === 'failed') {
-        await db.from('orders').update({ status: 'quoting' }).eq('id', late.order_id).eq('status', 'failed');
+        // created_at=now reinicia o relógio do rescue-worker (review H1: pedido 'failed' é
+        // antigo; sem isso o rescue de 45min consolidaria/mataria na hora o que acabou de reviver).
+        await db.from('orders').update({ status: 'quoting', created_at: new Date().toISOString() }).eq('id', late.order_id).eq('status', 'failed');
       }
       quote = { ...late, status: 'negotiating' };
       await writeLog('info', 'supplier', `🔁 Resposta TARDIA da farmácia — cotação revivida (pedido estava '${lateOrder.status}')`, {
@@ -294,6 +296,27 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     clientCpf = (cpfRow?.document_cpf as string | null) ?? null;
   }
 
+  // O que o cliente JÁ respondeu a OUTRAS farmácias deste pedido (reuso — o agente
+  // responde perguntas iguais sozinho, sem re-perguntar; incidente Cefaliv: "não quero genérico" ×N).
+  let clientAnswers: string[] = [];
+  if (quote.order_id) {
+    const { data: answered } = await db.from('quotes')
+      .select('clarification_question, clarification_answer, clarification_answered_at')
+      .eq('order_id', quote.order_id)
+      .not('clarification_answer', 'is', null)
+      .order('clarification_answered_at', { ascending: true })
+      .limit(10);
+    const seen = new Set<string>();
+    for (const r of answered ?? []) {
+      const a = (r.clarification_answer as string | null)?.trim();
+      if (!a) continue;
+      const line = r.clarification_question
+        ? `Perguntaram "${(r.clarification_question as string).slice(0, 90)}" → cliente: "${a.slice(0, 90)}"`
+        : `Cliente disse: "${a.slice(0, 90)}"`;
+      if (!seen.has(line)) { seen.add(line); clientAnswers.push(line); }
+    }
+  }
+
   // Setor/bairro do usuário (vindo de delivery_address). Cai pra cidade da farmácia se não tiver.
   const supplier = quote.suppliers as { city?: string; state?: string } | null;
   const userNeighborhood =
@@ -310,6 +333,7 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         deliveryAddress: order?.delivery_address ?? null, // endereço real p/ a farmácia (Caso D/frete)
         paymentMethod: order?.payment_method ?? null,
         cpf: clientCpf, // responde direto se a farmácia pedir CPF (Caso F)
+        clientAnswers, // reusa respostas do cliente (não re-pergunta o que ele já disse)
         isOrderConfirmation,
       });
 

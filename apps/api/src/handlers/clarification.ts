@@ -85,7 +85,9 @@ export async function relaySupplierQuestionToUser(
 
   const supplierName = quote.suppliers?.name ?? 'a farmácia';
   const msg = `Oi! Pra fechar seu pedido com ${supplierName}, preciso confirmar uma coisinha: ${question}`;
-  await sendOutbound(order.conversation_id, `+${digits}`, msg, traceId);
+  // dedup 90s: a mesma pergunta da mesma farmácia não deve chegar duplicada ao cliente
+  // (incidente: "só tem genérico, serve?" saiu 2× em 16s).
+  await sendOutbound(order.conversation_id, `+${digits}`, msg, traceId, {}, { dedup: true, dedupWindowMs: 90_000 });
   await writeLog('info', 'clarification', `❓ Pergunta da farmácia levada ao cliente: "${question.slice(0, 80)}"`, { traceId, quoteId: quote.id });
 }
 
@@ -118,7 +120,7 @@ export async function relayClinicQuestionToUser(
 
   const clinicName = quote.clinics?.name ?? 'a clínica';
   const msg = `Oi! Pra marcar sua consulta com ${clinicName}, preciso confirmar uma coisinha: ${question}`;
-  await sendOutbound(consultation.conversation_id, `+${digits}`, msg, traceId);
+  await sendOutbound(consultation.conversation_id, `+${digits}`, msg, traceId, {}, { dedup: true, dedupWindowMs: 90_000 });
   await writeLog('info', 'clarification', `❓ Pergunta da clínica levada ao cliente: "${question.slice(0, 80)}"`, { traceId, quoteId: quote.id });
 }
 

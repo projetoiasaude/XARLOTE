@@ -152,6 +152,15 @@ export const xarloteTools: ToolDefinition[] = [
   {
     type: 'function',
     function: {
+      name: 'expand_pharmacy_search',
+      description:
+        'Amplia a busca do pedido de medicamento ATIVO: procura farmácias num raio MAIOR e contata SÓ as farmácias NOVAS (que ainda não foram cotadas neste pedido), adicionando ao mesmo pedido. Use quando o usuário pedir pra "buscar em mais farmácias", "ampliar o raio", "procurar mais longe", ou quando as cotadas não têm o que ele quer. NÃO reinicia o pedido e NÃO re-contata as mesmas farmácias.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'confirm_order_selection',
       description:
         'FECHA o pedido escolhendo UMA das farmácias já cotadas (avisa a farmácia E manda o pagamento pro cliente — é o passo que efetiva a compra). Chame SEMPRE que houver PEDIDO ATIVO com opções cotadas e o usuário aceitar/escolher uma: "aceito", "pode ser", "fechou", "quero a 1", "prefiro a Droga Raia", "a mais barata", "essa mesma". ⚠️ Isso TEM PRIORIDADE sobre relay_answer_to_establishment quando o pedido já está cotado — NÃO use relay pra fechar um pedido.',

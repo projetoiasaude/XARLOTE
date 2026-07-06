@@ -7,6 +7,7 @@ import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPh
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
+import { loadPrompts } from '../config/prompts.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
 import { relayUserAnswerToEstablishment } from './clarification.js';
@@ -110,6 +111,9 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         break;
       case 'get_order_status':
         await handleGetOrderStatus(ctx);
+        break;
+      case 'expand_pharmacy_search':
+        await handleExpandPharmacySearch(ctx);
         break;
       case 'confirm_order_selection':
         await handleConfirmOrder(tc.args as { order_id: string; quote_id: string }, ctx);
@@ -725,6 +729,116 @@ async function handleGetOrderStatus(ctx: ToolContext) {
   }
 
   await sendCurrentOrderStatus(order.id, ctx.conversationId, ctx.phoneE164, ctx.traceId);
+}
+
+/**
+ * AMPLIA a busca de um pedido ativo (incidente Cefaliv 06/07 — o usuário pediu pra
+ * buscar mais longe e a Xarlote não sabia). Re-descobre farmácias num raio MAIOR,
+ * EXCLUI as já contatadas neste pedido (por google_place_id) e contata só as NOVAS,
+ * adicionando ao mesmo pedido. Reabre o pedido pra 'quoting' (modo eager) pra as novas
+ * cotações serem apresentadas conforme chegam.
+ */
+async function handleExpandPharmacySearch(ctx: ToolContext) {
+  if (!loadPrompts().pharmacy_outbound_enabled) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164, 'O disparo pra farmácias está pausado no momento 💙 Já já volto a buscar pra você.', ctx.traceId);
+    return;
+  }
+  const { data: order } = await db
+    .from('orders')
+    .select('id, status, delivery_lat, delivery_lng, delivery_address, items, payment_method')
+    .eq('user_id', ctx.userId)
+    .in('status', ['quoting', 'quoted', 'failed'])
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!order?.id || order.delivery_lat == null || order.delivery_lng == null) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      'Não achei um pedido ativo pra ampliar a busca 💙 Me fala o medicamento e o endereço que eu começo uma busca nova.', ctx.traceId);
+    return;
+  }
+  const lat = Number(order.delivery_lat);
+  const lng = Number(order.delivery_lng);
+
+  // Farmácias JÁ contatadas neste pedido — nunca repetir. Exclui por place_id E por
+  // telefone (review L1: fornecedor de indicação não tem place_id; e a mesma loja pode
+  // aparecer com place_ids diferentes no Google).
+  const { data: existing } = await db.from('quotes').select('suppliers(google_place_id, whatsapp_e164, phone_e164)').eq('order_id', order.id);
+  const contacted = new Set(
+    (existing ?? []).map((q) => (q.suppliers as { google_place_id?: string } | null)?.google_place_id).filter(Boolean),
+  );
+  const contactedPhones = new Set(
+    (existing ?? [])
+      .flatMap((q) => { const s = q.suppliers as { whatsapp_e164?: string; phone_e164?: string } | null; return [s?.whatsapp_e164, s?.phone_e164]; })
+      .filter((p): p is string => !!p).map((p) => p.replace(/\D/g, '')),
+  );
+
+  // Raio MAIOR (10km).
+  let pharmacies: Awaited<ReturnType<typeof findNearbyPharmacies>> = [];
+  try {
+    pharmacies = await findNearbyPharmacies(lat, lng, 10000);
+  } catch (err) {
+    await writeLog('error', 'places', `expand: Google Places falhou: ${String(err).slice(0, 120)}`, { traceId: ctx.traceId, orderId: order.id });
+  }
+  const novas = pharmacies.filter((p) => !contacted.has(p.placeId));
+  const byDist = (a: (typeof novas)[number], b: (typeof novas)[number]) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999);
+  const top = [
+    ...novas.filter((p) => !isPharmacyChain(p.name)).sort(byDist),
+    ...novas.filter((p) => isPharmacyChain(p.name)).sort(byDist),
+  ].slice(0, 5);
+
+  if (top.length === 0) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      'Procurei num raio maior mas não achei farmácias NOVAS além das que já falei por aqui 😕 Se quiser, me manda outro endereço que eu busco numa região diferente.', ctx.traceId);
+    return;
+  }
+
+  // Reabre o pedido pra 'quoting'. created_at=now reinicia o relógio do rescue-worker
+  // (review H1: senão o rescue de 45min mataria o pedido reaberto na hora, já que
+  // created_at é imutável e o pedido é antigo). status_5min_done=false (review M1: NÃO
+  // eager — deixa os 3/5min juntarem um LOTE das novas, senão a 1ª que responder mata as outras).
+  await db.from('orders').update({ status: 'quoting', status_5min_done: false, created_at: new Date().toISOString() }).eq('id', order.id);
+
+  const items = (order.items ?? []) as OrderItem[];
+  const userNeighborhood = extractDeliverySector((order.delivery_address as string | null) ?? null) || `lat ${lat.toFixed(4)}, lng ${lng.toFixed(4)}`;
+  const quoteIds: string[] = [];
+  for (const pharmacy of top) {
+    let phoneE164: string | null = null;
+    try { phoneE164 = toE164BR(await getPlacePhone(pharmacy.placeId)); } catch { /* sem telefone → pula */ }
+    // Dedup por telefone (review L1): a mesma loja pode reaparecer com place_id diferente
+    // ou já ter sido contatada por indicação (sem place_id).
+    if (phoneE164 && contactedPhones.has(phoneE164.replace(/\D/g, ''))) continue;
+    const upsertData: Record<string, unknown> = {
+      type: 'pharmacy', name: pharmacy.name, google_place_id: pharmacy.placeId,
+      address: pharmacy.address, city: pharmacy.city, state: pharmacy.state,
+      latitude: pharmacy.lat, longitude: pharmacy.lng, rating: pharmacy.rating,
+      reviews: pharmacy.userRatingCount, status: 'active',
+    };
+    if (phoneE164) { upsertData['phone_e164'] = phoneE164; upsertData['whatsapp_e164'] = phoneE164; }
+    const { data: supplier } = await db.from('suppliers').upsert(upsertData, { onConflict: 'google_place_id' }).select('id, whatsapp_e164, phone_e164').single();
+    if (!supplier?.id) continue;
+    const reachable = supplier.whatsapp_e164 || supplier.phone_e164;
+    if (!reachable || isPlaceholderPhone(reachable)) continue;
+    const { data: quote } = await db.from('quotes').insert({ order_id: order.id, supplier_id: supplier.id, status: 'pending', distance_km: pharmacy.distanceKm }).select('id').single();
+    if (quote?.id) quoteIds.push(quote.id);
+  }
+
+  if (quoteIds.length === 0) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164, 'Achei farmácias novas mais longe, mas nenhuma com WhatsApp pra eu cotar agora 😕', ctx.traceId);
+    return;
+  }
+
+  await writeLog('info', 'order', `Busca ampliada: +${quoteIds.length} farmácias novas (raio 10km)`, { traceId: ctx.traceId, orderId: order.id });
+  await sendOutbound(ctx.conversationId, ctx.phoneE164,
+    `Ampliei a busca! 🔎 Contatei mais ${quoteIds.length} farmácia${quoteIds.length > 1 ? 's' : ''} nova${quoteIds.length > 1 ? 's' : ''} num raio maior. Assim que responderem, te aviso na hora 💙`, ctx.traceId);
+
+  for (let i = 0; i < quoteIds.length; i++) {
+    const quoteId = quoteIds[i] as string;
+    setTimeout(() => {
+      initiatePharmacyNegotiation(quoteId, order.id, items, userNeighborhood, (order.payment_method as string | null) ?? null, ctx.conversationId, ctx.phoneE164, ctx.traceId).catch(console.error);
+    }, i * 2000);
+  }
+  scheduleQuoteTimeout(order.id, ctx.conversationId, ctx.phoneE164, ctx.traceId, true); // force: re-arma os timers do lote novo
 }
 
 /** Escapa curingas de LIKE/ILIKE (% e _) num valor vindo da LLM/usuário. */
