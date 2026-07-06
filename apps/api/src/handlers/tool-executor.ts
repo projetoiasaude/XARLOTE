@@ -3,7 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule } from '@iasaude/shared';
+import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -587,7 +587,21 @@ async function startPharmacyDiscovery(
     return;
   }
 
-  const top = pharmacies.slice(0, 5);
+  // Fix #6: redes grandes (Drogasil/Raia/Pague Menos…) quase só mandam auto-resposta
+  // e nunca engajam um humano no WhatsApp; independentes conversam de verdade. Então
+  // priorizamos INDEPENDENTES (por distância), deixando as redes pro fim. Fallback
+  // garantido: se sobrarem <5 independentes, as redes preenchem o resto (o concat
+  // nunca deixa de contatar — só REORDENA). A ordem do Google (prominência) favorecia
+  // redes; aqui trocamos por relevância real de engajamento + proximidade.
+  const byDist = (a: (typeof pharmacies)[number], b: (typeof pharmacies)[number]) =>
+    (a.distanceKm ?? 999) - (b.distanceKm ?? 999);
+  const independentes = pharmacies.filter((p) => !isPharmacyChain(p.name)).sort(byDist);
+  const redes = pharmacies.filter((p) => isPharmacyChain(p.name)).sort(byDist);
+  const top = [...independentes, ...redes].slice(0, 5);
+  await writeLog('info', 'places', `Seleção Top-${top.length}: ${independentes.length} independente(s) priorizada(s), ${redes.length} rede(s) ao fim`, {
+    traceId: ctx.traceId, orderId,
+    selecionadas: top.map((p) => `${p.name}${isPharmacyChain(p.name) ? ' [rede]' : ''}`),
+  });
   const quoteIds: string[] = [];
   let semTelefone = 0;
 
@@ -936,10 +950,22 @@ async function handleListReminders(ctx: ToolContext) {
 }
 
 async function handleConfirmOrder(args: { order_id: string; quote_id: string }, ctx: ToolContext) {
-  // 1. Update order to confirming
-  await db.from('orders').update({ status: 'confirming', selected_quote_id: args.quote_id }).eq('id', args.order_id);
+  // 0. IDEMPOTÊNCIA: se o pedido já saiu de 'quoted' (já foi confirmado por outro
+  // turno concorrente / backstop), NÃO re-executa — senão manda 2ª msg à farmácia +
+  // 2ª msg de pagamento ao usuário. Só segue se a transição quoted/quoting→confirming
+  // pegar de fato (ou se já é este mesmo quote sendo re-tentado no mesmo estado).
+  const { data: ord0 } = await db.from('orders').select('status, selected_quote_id').eq('id', args.order_id).maybeSingle();
+  if (ord0 && ['confirming', 'handed_off', 'cancelled'].includes(ord0.status)) {
+    await writeLog('info', 'order', `confirm_order_selection ignorado — pedido já '${ord0.status}' (idempotência)`, {
+      traceId: ctx.traceId, orderId: args.order_id, quoteId: args.quote_id,
+    });
+    return;
+  }
 
-  // 2. Load quote + supplier
+  // 1. CARREGA + VALIDA a quote ANTES de qualquer transição/freeze (review HIGH): um
+  // quote_id ALUCINADO pelo LLM (ou de outro pedido) não pode transicionar o pedido pra
+  // 'confirming' e matar TODAS as cotações irmãs pra só depois descobrir que a quote não
+  // existe — isso bricava o pedido sem recuperação. Aqui nada é alterado até validar.
   const { data: quote } = await db
     .from('quotes')
     .select('*, suppliers(id, name, whatsapp_e164, phone_e164)')
@@ -947,11 +973,34 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     .single();
 
   if (!quote) {
-    await writeLog('error', 'order', `Quote ${args.quote_id} not found for confirmation`, { traceId: ctx.traceId });
+    await writeLog('error', 'order', `Quote ${args.quote_id} not found for confirmation — pedido intacto`, { traceId: ctx.traceId, orderId: args.order_id });
+    return;
+  }
+  if (quote.order_id !== args.order_id) {
+    await writeLog('error', 'order', `Quote ${args.quote_id} não pertence ao pedido ${args.order_id} — confirmação abortada (pedido intacto)`, { traceId: ctx.traceId, quoteOrderId: quote.order_id });
     return;
   }
 
-  // 3. Load order items + delivery address + payment method
+  // 2. Só AGORA transiciona o pedido pra 'confirming' + registra a escolha.
+  await db.from('orders').update({ status: 'confirming', selected_quote_id: args.quote_id }).eq('id', args.order_id);
+
+  // 3. CONGELA as cotações IRMÃS (Fix #2 — freeze): o usuário escolheu; as outras
+  // farmácias do MESMO pedido param de negociar (senão uma retardatária reabre a
+  // decisão com "aceita 20 em vez de 30?" ou registra preço e polui o estado).
+  // Fecha por order_id (não conversation_id — telefone compartilhado pode ter outro
+  // pedido) e só as que ainda estão vivas; limpa clarificação pendente das irmãs.
+  await db.from('quotes')
+    .update({ status: 'timeout', completed_at: new Date().toISOString() })
+    .eq('order_id', args.order_id)
+    .neq('id', args.quote_id)
+    .in('status', ['pending', 'contacting', 'negotiating']);
+  await db.from('quotes')
+    .update({ clarification_status: 'closed' })
+    .eq('order_id', args.order_id)
+    .neq('id', args.quote_id)
+    .eq('clarification_status', 'awaiting_user');
+
+  // 4. Load order items + delivery address + payment method
   const { data: order } = await db
     .from('orders')
     .select('items, delivery_address, delivery_lat, delivery_lng, payment_method')

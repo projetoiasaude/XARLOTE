@@ -24,6 +24,9 @@ export async function sendOutboundToSupplier(
   text: string,
   traceId: string,
 ): Promise<void> {
+  // SEM dedup aqui (review): a conversa de fornecedor é COMPARTILHADA por telefone entre
+  // pedidos concorrentes; uma msg idêntica (ex.: pergunta de frete determinística) de
+  // OUTRO pedido seria suprimida por engano. Dedup só no canal do usuário.
   await db.from('messages').insert({
     conversation_id: conversationId,
     direction: 'out',
@@ -70,6 +73,8 @@ export async function sendOutboundToClinic(
   text: string,
   traceId: string,
 ): Promise<void> {
+  // SEM dedup aqui (review): mesma razão do fornecedor — conversa de estabelecimento
+  // compartilhada; dedup só no canal do usuário.
   await db.from('messages').insert({
     conversation_id: conversationId,
     direction: 'out',

@@ -7,7 +7,7 @@ import {
   messagesToHistory,
   trimHistory,
 } from '@iasaude/llm';
-import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone, toE164BR, brPhoneVariants } from '@iasaude/shared';
+import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone, toE164BR, brPhoneVariants, extractPriceBRL, parseUnitCount } from '@iasaude/shared';
 import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier, sendTemplateOpeningToSupplier } from './outbound-agent.js';
@@ -172,6 +172,32 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   if (!quote) {
     await writeLog('warn', 'supplier', 'Nenhuma cotação ativa encontrada para este fornecedor', { traceId, conversationId });
     return;
+  }
+
+  // 3b. FREEZE (Fix #2): pedido já DECIDIDO e esta NÃO é a cotação escolhida →
+  // retardatária de pedido fechado. Não negocia (não grava preço, não relaya
+  // pergunta ao usuário); só encerra a cotação. A ESCOLHIDA segue normalmente pelo
+  // ramo isOrderConfirmation (logística pós-venda). Cobre a corrida em que a resposta
+  // chega no exato instante do aceite (o handleConfirmOrder já congela as irmãs, mas
+  // uma mensagem em voo pode escapar).
+  {
+    const ordSt = quote.orders as { status?: string; selected_quote_id?: string | null } | null;
+    // Só a cotação ESCOLHIDA (selected_quote_id === quote.id) segue num pedido já
+    // decidido — ela cai no ramo isOrderConfirmation (logística pós-venda). Qualquer
+    // OUTRA cotação (mesmo que tenha ficado 'quoted' e o ramo isOrderConfirmation a
+    // tenha marcado) é retardatária de pedido fechado → encerra sem negociar.
+    if (
+      ordSt &&
+      ['confirming', 'handed_off', 'cancelled'].includes(ordSt.status ?? '') &&
+      ordSt.selected_quote_id !== quote.id
+    ) {
+      await writeLog('info', 'supplier', `Farmácia retardatária de pedido já '${ordSt.status}' — ignorada (não é a escolhida)`, { traceId, conversationId, quoteId: quote.id });
+      await db.from('quotes')
+        .update({ status: 'timeout', completed_at: new Date().toISOString() })
+        .eq('id', quote.id)
+        .in('status', ['pending', 'contacting', 'negotiating']);
+      return;
+    }
   }
 
   // 4. Guard: turn limit (12 turns = 24 messages) — CONTA SÓ ESTA NEGOCIAÇÃO.
@@ -460,8 +486,50 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     await sendOutboundToSupplier(conversationId, supplierPhone, fallbackMsg, traceId);
     await writeLog('info', 'agent', 'Resposta determinística à farmácia (LLM não gerou texto)', { traceId, conversationId, freteConhecido: recordedFrete > 0 });
   } else if (!llmResponse.text.trim() && !shouldFinalize && llmResponse.toolCalls.length === 0) {
-    // LLM returned nothing — log it
-    await writeLog('warn', 'agent', 'Agente retornou resposta vazia sem tools — nenhuma ação tomada', { traceId, conversationId });
+    // FALLBACK DETERMINÍSTICO DE PREÇO (Fix #3 — lost-offer). O agente devolveu turno
+    // VAZIO (sem tool, sem texto) — mas a farmácia pode ter mandado um preço real (caso
+    // SeteFarma: "só tenho 20 comp, 65,00"). Antes virava timeout e a oferta VÁLIDA (a
+    // mais barata!) era perdida em silêncio. Agora extraímos o preço do texto cru e
+    // registramos a cotação. Conservador: se não houver preço confiável, extractPriceBRL
+    // devolve null e caímos no log de "resposta vazia" de sempre.
+    const price = extractPriceBRL(text);
+    if (price != null && quote.status !== 'quoted') {
+      const offered = parseUnitCount(text);
+      const requested = parseUnitCount(
+        (order?.items ?? []).map((i) => `${i.dosage ?? ''} ${i.quantity ?? ''}`).join(' '),
+      );
+      // Substituição de apresentação (ex.: pediu 30 comp, farmácia só tem 20): registra
+      // mesmo assim (não perde a oferta) MAS anota a diferença — a consolidação mostra a
+      // nota pro usuário decidir informado (ele ainda confirma antes de comprar).
+      // Marcador CANÔNICO "subst:só tem N comp" (a consolidação só exibe esse formato —
+      // nunca texto livre do LLM, pra não vazar nota interna ao usuário).
+      const substNote = offered && requested && offered !== requested ? ` | subst:só tem ${offered} comp` : '';
+      const { error: qErr } = await db.from('quotes').update({
+        status: 'quoted',
+        total: price,
+        // frete A CONFIRMAR (null, NÃO 0): 0 vira "frete grátis" na consolidação — mentira
+        // sobre o custo, já que a resposta tardia do frete é descartada (review HIGH).
+        delivery_fee: null,
+        payment_methods: ['pix'],
+        notes: `auto-capturado${substNote}`,
+        completed_at: new Date().toISOString(),
+      }).eq('id', quote.id).in('status', ['pending', 'contacting', 'negotiating']);
+      if (qErr) {
+        await writeLog('error', 'quote', `Fix#3: erro ao gravar cotação capturada: ${qErr.message}`, { traceId, quoteId: quote.id });
+      } else {
+        quoteRecorded = true;
+        shouldFinalize = true;
+        outcome = 'quoted';
+        await writeLog('info', 'quote', `💰 Fix#3: preço R$${price} capturado do texto (agente ficou mudo)${substNote}`, { traceId, quoteId: quote.id, price });
+        const supplierName = (quote.suppliers as { name?: string } | null)?.name ?? 'farmácia';
+        await notifyUserQuoteArrived(quote.order_id, supplierName, traceId).catch(() => { /* aviso é cortesia */ });
+        const addr = order?.delivery_address || userNeighborhood;
+        await sendOutboundToSupplier(conversationId, supplierPhone, `Show, anotei! A entrega é em ${addr}. Quanto fica o frete pra esse endereço?`, traceId);
+      }
+    } else {
+      // Turno genuinamente vazio (sem preço) — log de sempre.
+      await writeLog('warn', 'agent', 'Agente retornou resposta vazia sem tools — nenhuma ação tomada', { traceId, conversationId });
+    }
   }
 
   // 11. If negotiation ended, finalize and maybe consolidate (skip in confirmation mode)

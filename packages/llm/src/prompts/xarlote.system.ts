@@ -67,7 +67,7 @@ export function buildXarloteSystemPrompt(ctx: XarloteContext = {}): string {
     : 'Nenhum histórico relevante ainda.';
 
   const activeOrderSection = ctx.activeOrderSummary
-    ? `## PEDIDO ATIVO\n${ctx.activeOrderSummary}\n\n⚠️ IMPORTANTE: Quando o usuário escolher uma das opções de farmácia, chame IMEDIATAMENTE confirm_order_selection com o order_id e o quote_id correto da opção escolhida. Não peça confirmação adicional.`
+    ? `## PEDIDO ATIVO\n${ctx.activeOrderSummary}\n\n⚠️ IMPORTANTE: Quando o usuário aceitar/escolher uma das opções de farmácia (ex.: "aceito", "pode ser", "quero a 1", "prefiro a X", "a mais barata"), chame IMEDIATAMENTE **confirm_order_selection** com o order_id e o quote_id correto da opção escolhida. Não peça confirmação adicional.\n\n🔒 REGRA DE PRECEDÊNCIA: se existe PEDIDO ATIVO com opções cotadas E o usuário aceita/escolhe uma delas, **confirm_order_selection VENCE relay_answer_to_establishment**, mesmo que haja uma PERGUNTA PENDENTE no contexto. Fechar o pedido já avisa a farmácia — não relaye um aceite. Só use relay_answer_to_establishment quando o usuário responde um DADO que a farmácia perguntou (plano/particular, receita, marca), NÃO quando ele fecha negócio.`
     : '';
 
   return `Você é Xarlote, uma assistente de saúde especialista em medicamentos e farmácias, que conversa por WhatsApp em nome da IA da Saúde.

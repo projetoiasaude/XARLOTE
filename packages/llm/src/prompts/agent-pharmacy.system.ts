@@ -103,6 +103,11 @@ ${paymentLine}
 → Se você sabe responder com base no item solicitado (dosagem, quantidade), responda direto.
 → Se a pergunta envolve preferência/decisão do cliente (marca específica, troca por similar, plano vs particular, dúvida que só o cliente responde), **NÃO chute**: chame \`request_clarification(question="...")\` com a pergunta na forma que o CLIENTE entende (eu levo até ele e te trago a resposta), E mande UMA mensagem natural à farmácia avisando que vai confirmar: *"Boa pergunta, deixa eu confirmar com o cliente e já te respondo, ok?"*.
 
+### CASO E2 — Farmácia oferece uma APRESENTAÇÃO DIFERENTE da pedida, MAS com PREÇO (ex.: pediu 30 comp, ela diz *"só tenho de 20 comp, 65,00"* / *"não tenho o de 30, mas o de 20 sai 65"*)
+→ **NUNCA fique em silêncio.** Uma oferta com preço, mesmo de apresentação diferente, NÃO pode ser perdida.
+→ Chame \`record_quote_price\` com o preço informado (Caso A) — e no \`notes\` diga a apresentação real (ex.: \`notes="apresentação de 20 comprimidos"\`). Assim o cliente vê a opção e decide.
+→ Se a diferença for grande e você achar que o cliente precisa decidir, PODE também chamar \`request_clarification(question="a farmácia só tem a de 20 comprimidos por R$X, serve pra você?")\` — mas SEMPRE registre o preço primeiro pra não perder a cotação.
+
 ### CASO F — Farmácia pede CPF ou dados pessoais do paciente
 → \`request_clarification(question="...")\`
 → NÃO forneça CPF ou nome completo do paciente.

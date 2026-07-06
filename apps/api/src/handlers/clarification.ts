@@ -49,6 +49,21 @@ export async function relaySupplierQuestionToUser(
   question: string,
   traceId: string,
 ): Promise<void> {
+  // Fix #2 (freeze): pedido já DECIDIDO (usuário escolheu / confirmou) → NÃO reabre a
+  // decisão levando pergunta de uma farmácia retardatária ao usuário. Espelha o guard
+  // de record_referral (só age em 'quoting'/'quoted'). Também barra clarificação de
+  // uma quote que NÃO é a escolhida quando já há selected_quote_id.
+  const { data: ordStatus } = await db.from('orders').select('conversation_id, status, selected_quote_id').eq('id', quote.order_id).single();
+  if (!ordStatus?.conversation_id) {
+    await writeLog('warn', 'clarification', 'Pedido sem conversa do cliente — não dá pra levar a pergunta', { traceId, quoteId: quote.id });
+    return;
+  }
+  if (['confirming', 'handed_off', 'cancelled', 'failed'].includes(ordStatus.status) ||
+      (ordStatus.selected_quote_id && ordStatus.selected_quote_id !== quote.id)) {
+    await writeLog('info', 'clarification', `Pergunta da farmácia IGNORADA — pedido já decidido (status=${ordStatus.status})`, { traceId, quoteId: quote.id, orderId: quote.order_id });
+    return;
+  }
+
   await db.from('quotes').update({
     clarification_status: 'awaiting_user',
     clarification_question: question,
@@ -56,7 +71,7 @@ export async function relaySupplierQuestionToUser(
   }).eq('id', quote.id);
 
   // Conversa + telefone do CLIENTE (via order.conversation_id)
-  const { data: order } = await db.from('orders').select('conversation_id').eq('id', quote.order_id).single();
+  const order = ordStatus;
   if (!order?.conversation_id) {
     await writeLog('warn', 'clarification', 'Pedido sem conversa do cliente — não dá pra levar a pergunta', { traceId, quoteId: quote.id });
     return;
@@ -155,11 +170,13 @@ type PendingWithTime = PendingClarification & { _askedAt: string };
 
 /** Clarificação pendente de FARMÁCIA pro pedido ativo deste cliente. */
 async function findPendingPharmacyClarification(userConversationId: string): Promise<PendingWithTime | null> {
+  // Fix #2 (freeze): NÃO inclui 'confirming'/'handed_off' — pedido já decidido não
+  // deve reinjetar "PERGUNTA PENDENTE" e pedir relay (a escolha já foi feita).
   const { data: orders } = await db
     .from('orders')
     .select('id')
     .eq('conversation_id', userConversationId)
-    .in('status', ['quoting', 'quoted', 'confirming']);
+    .in('status', ['quoting', 'quoted']);
   const orderIds = (orders ?? []).map((o) => o.id);
   if (!orderIds.length) return null;
 

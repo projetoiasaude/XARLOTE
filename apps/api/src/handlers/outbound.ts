@@ -13,13 +13,56 @@ interface LlmMeta {
   latencyMs?: number;
 }
 
+/** Janela de deduplicação de saída idêntica na mesma conversa (anti double-send). */
+const DEDUP_WINDOW_MS = 30_000;
+
+/**
+ * A MESMA mensagem já saiu pra ESTA conversa nos últimos ~30s? (Fix #4)
+ *
+ * Causa real das duplicatas: NÃO há serialização por conversa — duas mensagens do
+ * usuário em poucos segundos geram dois turnos concorrentes, ambos caindo no mesmo
+ * fallback ("Prontinho, já cuidei!") ou repetindo a mesma pergunta. Como o 2º turno
+ * termina ~2s após o 1º, ele enxerga a inserção do 1º e é barrado aqui. Conteúdo
+ * idêntico na mesma conversa em <30s é praticamente sempre bug (nunca intenção).
+ */
+export async function isDuplicateRecentOutbound(
+  conversationId: string,
+  content: string,
+  windowMs: number = DEDUP_WINDOW_MS,
+): Promise<boolean> {
+  if (!content || !content.trim()) return false;
+  const cutoff = new Date(Date.now() - windowMs).toISOString();
+  const { data } = await db
+    .from('messages')
+    .select('id')
+    .eq('conversation_id', conversationId)
+    .eq('direction', 'out')
+    .eq('content', content)
+    .gt('created_at', cutoff)
+    .limit(1);
+  return (data?.length ?? 0) > 0;
+}
+
 export async function sendOutbound(
   conversationId: string,
   phoneE164: string,
   text: string,
   traceId: string,
-  llmMeta: LlmMeta = {}
+  llmMeta: LlmMeta = {},
+  opts: { dedup?: boolean } = {},
 ): Promise<void> {
+  // Anti double-send OPT-IN (Fix #4): SÓ a resposta conversacional da Xarlote deduplica
+  // (dois turnos concorrentes com texto idêntico — ex.: "Prontinho, já cuidei!" ×2).
+  // Workers/lembretes/notificações NÃO passam dedup (senão suprimiam uma notificação
+  // legítima e ainda marcavam "enviado" sem enviar — review: inventory-tracker/reminders).
+  // Janela CURTA (12s): a corrida de turnos concorrentes termina em <5s (observado 2-5s);
+  // 12s cobre com margem sem engolir duas perguntas sequenciais legítimas que o LLM
+  // respondeu com o mesmo texto genérico ("precisa de mais alguma coisa?") — review LOW.
+  if (opts.dedup && await isDuplicateRecentOutbound(conversationId, text, 12_000)) {
+    await writeLog('warn', 'outbound', `Mensagem duplicada suprimida (idêntica há <12s): "${(text ?? '').slice(0, 60)}"`, { traceId, conversationId });
+    return;
+  }
+
   // Persist outbound message first (realtime will push to dashboard)
   await db.from('messages').insert({
     conversation_id: conversationId,

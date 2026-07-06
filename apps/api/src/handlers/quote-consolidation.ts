@@ -367,7 +367,12 @@ export async function consolidateQuotes(
     const pix = q.pix_key ? ` · Pix: ${q.pix_key}` : '';
 
     const parts = [frete, eta, payment].filter(Boolean).join(' · ');
-    lines.push(`${NUMBERS[i] ?? `${i + 1}.`} *${name}* — R$${total}\n   ${parts}${pix}`);
+    // Substituição de apresentação (Fix #3): SÓ do marcador canônico "subst:só tem N comp"
+    // que o fallback determinístico grava — nunca de texto livre do LLM (que poderia
+    // vazar nota interna truncada tipo "só tem plano Unimed" ao usuário; review).
+    const substMatch = (q.notes ?? '').match(/subst:\s*(só tem \d+\s*comp)/i);
+    const subst = substMatch ? `\n   ⚠️ ${(substMatch[1] as string).trim()}` : '';
+    lines.push(`${NUMBERS[i] ?? `${i + 1}.`} *${name}* — R$${total}\n   ${parts}${pix}${subst}`);
   }
 
   const unavailableCount = (quotes ?? []).filter((q) => ['unavailable', 'timeout'].includes(q.status)).length;

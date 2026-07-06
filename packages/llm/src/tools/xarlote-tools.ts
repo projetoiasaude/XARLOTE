@@ -153,12 +153,13 @@ export const xarloteTools: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'confirm_order_selection',
-      description: 'Registra a escolha do usuário por uma das farmácias cotadas.',
+      description:
+        'FECHA o pedido escolhendo UMA das farmácias já cotadas (avisa a farmácia E manda o pagamento pro cliente — é o passo que efetiva a compra). Chame SEMPRE que houver PEDIDO ATIVO com opções cotadas e o usuário aceitar/escolher uma: "aceito", "pode ser", "fechou", "quero a 1", "prefiro a Droga Raia", "a mais barata", "essa mesma". ⚠️ Isso TEM PRIORIDADE sobre relay_answer_to_establishment quando o pedido já está cotado — NÃO use relay pra fechar um pedido.',
       parameters: {
         type: 'object',
         properties: {
-          order_id: { type: 'string' },
-          quote_id: { type: 'string' },
+          order_id: { type: 'string', description: 'order_id da opção escolhida (vem do PEDIDO ATIVO no contexto).' },
+          quote_id: { type: 'string', description: 'quote_id da opção que o usuário escolheu (vem de options[] no PEDIDO ATIVO).' },
         },
         required: ['order_id', 'quote_id'],
       },
@@ -168,7 +169,7 @@ export const xarloteTools: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'relay_answer_to_establishment',
-      description: 'Use quando há uma PERGUNTA PENDENTE de uma farmácia/clínica (você verá "PERGUNTA PENDENTE DE UM ESTABELECIMENTO" no contexto) e a mensagem do usuário responde a ela. Eu devolvo a resposta ao estabelecimento e a negociação continua de onde parou. NÃO use se o usuário estiver falando de outra coisa.',
+      description: 'Use quando há uma PERGUNTA PENDENTE de uma farmácia/clínica (você verá "PERGUNTA PENDENTE DE UM ESTABELECIMENTO" no contexto) e a mensagem do usuário responde a um DADO que ela pediu (plano vs particular, tem receita?, marca/similar, CPF). Eu devolvo a resposta ao estabelecimento e a negociação continua. ⚠️ NÃO use quando o usuário está ACEITANDO/ESCOLHENDO uma farmácia já cotada (isso é confirm_order_selection, mesmo que exista pergunta pendente). NÃO use se o usuário estiver falando de outra coisa.',
       parameters: {
         type: 'object',
         properties: {

@@ -1,8 +1,8 @@
 import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, buildConsentEvent } from '@iasaude/core';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES } from '@iasaude/shared';
-import type { NormalizedInbound, ProfileEnricherJob, MemoryCard } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, isOrderAcceptance } from '@iasaude/shared';
+import type { NormalizedInbound, ProfileEnricherJob, MemoryCard, QuoteOption } from '@iasaude/shared';
 import { chat, buildXarloteSystemPrompt, xarloteTools, messagesToHistory, trimHistory, embed, userContentWithImage, dataUrl, type ChatContent } from '@iasaude/llm';
 import { sendMenu, isSimulatorMode, fetchInboundMedia } from '@iasaude/whatsapp';
 import { transcribeAudio } from '@iasaude/integrations';
@@ -300,7 +300,7 @@ export async function processInboundUser(
     }
   };
 
-  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif, activeRemindersRes] = await Promise.all([
+  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif, activeRemindersRes, recentTasksRes] = await Promise.all([
     getConversationMessages(conversation.id, 30),
     queryUser360(user.id),
     db.from('orders')
@@ -330,6 +330,17 @@ export async function processInboundUser(
       .eq('status', 'pending')
       .order('next_run_at', { ascending: true })
       .limit(20),
+    // Fix #5: ações que a Xarlote JÁ executou no turno anterior (fire-and-forget não
+    // devolve resultado ao LLM → ela se contradizia "já cuidei" + "me diz qual prefere").
+    // Injeta o desfecho real das tools recentes pra ela NÃO afirmar o que não aconteceu.
+    db.from('assistant_tasks')
+      .select('tool_name, status, completed_at')
+      .eq('conversation_id', conversation.id)
+      .in('status', ['success', 'error'])
+      .not('completed_at', 'is', null)
+      .gte('completed_at', new Date(Date.now() - 10 * 60_000).toISOString())
+      .order('completed_at', { ascending: false })
+      .limit(6),
   ]);
 
   const geminiHistory = trimHistory(messagesToHistory(history.slice(0, -1)), 20);
@@ -413,6 +424,42 @@ export async function processInboundUser(
     systemPrompt += `\n\n## ⏰ LEMBRETES ATIVOS DESTE USUÁRIO (${activeReminders.length})\n${linhas.join('\n')}\n\nSe ele pedir pra MUDAR/REDIVIDIR um plano acima, chame cancel_reminders (title_query) ANTES de criar os novos — nunca deixe dois planos do mesmo assunto coexistirem. Se pedir pra parar, cancel_reminders resolve sozinho.`;
   }
 
+  // Fix #5 — desfecho REAL das tools do turno anterior (anti-contradição). O loop é
+  // fire-and-forget: o LLM não vê o retorno das tools e se contradizia ("já cuidei" +
+  // "me diz qual prefere"). Aqui ele passa a saber o que FECHOU vs o que está AGUARDANDO.
+  const recentTasks = (recentTasksRes.data ?? []) as Array<{ tool_name: string; status: string; completed_at: string }>;
+  if (recentTasks.length > 0) {
+    const OUTCOME: Record<string, string> = {
+      confirm_order_selection: 'pedido de medicamento FECHADO com a farmácia (aguardando pagamento/entrega)',
+      start_pharmacy_order: 'cotação de medicamento INICIADA — AGUARDANDO farmácias responderem (NÃO afirme que já tem preço; se ele perguntar, use get_order_status)',
+      confirm_consultation_selection: 'consulta CONFIRMADA com a clínica',
+      start_consultation_search: 'busca de consulta INICIADA — AGUARDANDO clínicas responderem',
+      create_reminder: 'lembrete criado',
+      cancel_reminders: 'lembrete(s) cancelado(s)',
+      log_medication_taken: 'dose registrada',
+      log_symptom: 'sintoma registrado',
+      set_emergency_contact: 'contato de emergência salvo',
+      save_exam_result: 'resultado de exame guardado no perfil',
+      red_flag_check: 'protocolo de emergência acionado (botões enviados)',
+    };
+    const seen = new Set<string>();
+    const linhas: string[] = [];
+    for (const tsk of recentTasks) {
+      if (seen.has(tsk.tool_name)) continue;
+      seen.add(tsk.tool_name);
+      const desc = OUTCOME[tsk.tool_name];
+      if (!desc) continue;
+      linhas.push(
+        tsk.status === 'error'
+          ? `- ❌ ${tsk.tool_name} FALHOU — NÃO diga que deu certo; se ele cobrar, peça pra tentar de novo.`
+          : `- ✅ ${desc}`,
+      );
+    }
+    if (linhas.length) {
+      systemPrompt += `\n\n## ✅ O QUE VOCÊ JÁ FEZ (último turno — use como CONTEXTO, não repita mecanicamente)\n${linhas.join('\n')}\n\nNão prometa nem re-execute o que já está aqui. Se o desfecho diz AGUARDANDO, não diga que já concluiu. Seja coerente com o estado real.`;
+    }
+  }
+
   if (promptsConfig.sara_suffix.trim()) {
     systemPrompt += `\n\n## INSTRUÇÕES ADICIONAIS (configuradas no dashboard)\n${promptsConfig.sara_suffix.trim()}`;
   }
@@ -421,7 +468,7 @@ export async function processInboundUser(
   // injeta a pergunta pendente pra Xarlote levar a resposta de volta.
   if (pendingClarif) {
     const oQue = pendingClarif.kind === 'clinic' ? 'a consulta' : 'o pedido';
-    systemPrompt += `\n\n## ⏳ PERGUNTA PENDENTE DE UM ESTABELECIMENTO\n${pendingClarif.supplierName} está aguardando uma resposta sua pra continuar ${oQue}:\n"${pendingClarif.question}"\n\nSe a mensagem do usuário responde isso (mesmo parcial), chame **relay_answer_to_establishment** com a resposta dele no campo \`answer\` — eu devolvo pro estabelecimento e a negociação segue. Se ele falar de OUTRA coisa, responda normal; a pergunta continua pendente.`;
+    systemPrompt += `\n\n## ⏳ PERGUNTA PENDENTE DE UM ESTABELECIMENTO\n${pendingClarif.supplierName} está aguardando uma resposta sua pra continuar ${oQue}:\n"${pendingClarif.question}"\n\nSe a mensagem do usuário responde um DADO desta pergunta (mesmo parcial), chame **relay_answer_to_establishment** com a resposta dele no campo \`answer\`. Se ele falar de OUTRA coisa, responda normal; a pergunta continua pendente.\n\n🔒 EXCEÇÃO IMPORTANTE: se a mensagem do usuário for um ACEITE/ESCOLHA de uma opção já cotada (ver PEDIDO ATIVO) — ex.: "aceito", "pode ser", "quero a X" — use **confirm_order_selection** (NÃO relay). Fechar já avisa a farmácia.`;
   }
 
   // 9. Build user message — texto, áudio (transcrito), imagem (multimodal vision), localização.
@@ -595,6 +642,46 @@ export async function processInboundUser(
     }
   }
 
+  // 11b. BACKSTOP DETERMINÍSTICO DE FECHAMENTO (Fix #1). O pedido do cliente parava
+  // em 'quoted' porque o LLM escolhia relay_answer_to_establishment em vez de
+  // confirm_order_selection no aceite (colisão com a PERGUNTA PENDENTE). Se há PEDIDO
+  // ATIVO 'quoted' com opções e o texto do usuário é um aceite/escolha RESOLVÍVEL
+  // (número, nome, "a mais barata", ou aceite genérico com 1 opção só), forçamos o
+  // confirm com o quote certo — independe do humor do LLM. Conservador: resolveQuotePick
+  // devolve null quando é ambíguo (não fecha errado).
+  let backstopConfirmed = false;
+  {
+    const activeOrder = activeOrderRes.data as { id: string; status: string; summary: string | null } | null;
+    const userTextForPick = typeof userMsgContent === 'string'
+      ? userMsgContent.replace(/^\[Áudio transcrito\]\s*/i, '').trim()
+      : '';
+    const alreadyConfirmed = llmResponse.toolCalls.some((t) => t.name === 'confirm_order_selection');
+    if (activeOrder && activeOrder.status === 'quoted' && activeOrder.summary && !alreadyConfirmed && userTextForPick) {
+      try {
+        const parsed = JSON.parse(activeOrder.summary) as { options?: QuoteOption[] };
+        const options = Array.isArray(parsed.options) ? parsed.options : [];
+        const pickedQuoteId = resolveQuotePick(options, userTextForPick);
+        // GUARDA CRÍTICA (review): só fecha se houver ACEITE VERBAL claro OU não houver
+        // pergunta pendente da farmácia. Sem isso, um "2" respondendo "quantas caixas?"
+        // (pendingClarif) fecharia a opção 2 por engano. resolveQuotePick já barra
+        // negação/quantidade/ambiguidade; aqui somamos o contexto de pergunta pendente.
+        const safeToConfirm = pickedQuoteId && (isOrderAcceptance(userTextForPick) || !pendingClarif);
+        if (safeToConfirm && pickedQuoteId) {
+          await writeLog('info', 'order', `🔒 Backstop: aceite detectado ("${userTextForPick.slice(0, 40)}") → forçando confirm_order_selection`, {
+            traceId, orderId: activeOrder.id, quoteId: pickedQuoteId, llmTools: llmResponse.toolCalls.map((t) => t.name), hadPendingClarif: !!pendingClarif,
+          });
+          await handleToolCall(
+            { id: randomUUID(), name: 'confirm_order_selection', args: { order_id: activeOrder.id, quote_id: pickedQuoteId } } as unknown as Parameters<typeof handleToolCall>[0],
+            { userId: user.id, conversationId: conversation.id, phoneE164, traceId, inboundMsg, inbound },
+          );
+          backstopConfirmed = true;
+        }
+      } catch (err) {
+        await writeLog('warn', 'order', `Backstop de confirm: parse/resolve falhou: ${String(err).slice(0, 120)}`, { traceId });
+      }
+    }
+  }
+
   // 12. Resolve o texto da resposta.
   // 🛑 TURNO SÓ-TOOL (incidente Glauber 2026-07-01): o gpt-4.1-mini às vezes executa
   // a(s) tool(s) SEM escrever texto (ex.: create_reminder criado, mas nenhuma
@@ -602,8 +689,14 @@ export async function processInboundUser(
   // e o LLM re-chamava a tool (criando duplicatas). Se NENHUMA mensagem saiu neste
   // turno (a tool tb não respondeu — discovery/red-flag mandam a própria), fazemos UM
   // follow-up (sem tools) pra NARRAR o que foi feito. Rede de segurança determinística.
-  let replyText = llmResponse.text.trim();
-  if (!replyText && llmResponse.toolCalls.length > 0) {
+  // Se o backstop fechou o pedido, handleConfirmOrder já mandou a msg de pagamento —
+  // suprime o texto do LLM (relay-style "vou avisar a farmácia"). MAS só quando o turno
+  // foi PURAMENTE o aceite: se o LLM também fez outra ação (ex.: create_reminder), o
+  // texto narra essa ação e NÃO pode ser engolido (review) — aí mantém.
+  const onlyAcceptTurn = !llmResponse.toolCalls.some((t) => t.name !== 'relay_answer_to_establishment' && t.name !== 'confirm_order_selection');
+  const suppressReply = backstopConfirmed && onlyAcceptTurn;
+  let replyText = suppressReply ? '' : llmResponse.text.trim();
+  if (!replyText && !suppressReply && llmResponse.toolCalls.length > 0) {
     const { count: sentThisTurn } = await db
       .from('messages')
       .select('id', { count: 'exact', head: true })
@@ -677,12 +770,14 @@ export async function processInboundUser(
         }).eq('id', user.id);
       }
     } else {
+      // dedup: true — só aqui (resposta conversacional) roda o anti double-send; dois
+      // turnos concorrentes com o mesmo texto param no 2º (Fix #4).
       await sendOutbound(conversation.id, phoneE164, replyText, traceId, {
         model: llmResponse.model,
         tokensIn: llmResponse.tokensIn,
         tokensOut: llmResponse.tokensOut,
         latencyMs: Date.now() - llmStart,
-      });
+      }, { dedup: true });
     }
   }
 
