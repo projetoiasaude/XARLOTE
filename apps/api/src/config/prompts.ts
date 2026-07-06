@@ -108,6 +108,19 @@ export function loadPrompts(): PromptsConfig {
     const n = parseFloat(process.env['TTS_SPEED']!);
     if (!isNaN(n) && n >= 0.7 && n <= 1.2) envOverrides.tts_speed = n;
   }
+  // Kill-switches por fluxo também via env (freio de emergência sem dashboard). Só
+  // desligam quando explicitamente "false"/"0"; ausente = mantém o default (ligado).
+  // Ex.: PHARMACY_OUTBOUND_ENABLED=false pausa o disparo a farmácias fora de horário.
+  // Precedência: default < env < prompts.json (dashboard tem a palavra final).
+  for (const [envName, key] of [
+    ['REMINDERS_ENABLED', 'reminders_enabled'],
+    ['NUDGES_ENABLED', 'nudges_enabled'],
+    ['PHARMACY_OUTBOUND_ENABLED', 'pharmacy_outbound_enabled'],
+    ['CLINIC_OUTBOUND_ENABLED', 'clinic_outbound_enabled'],
+  ] as const) {
+    const v = process.env[envName];
+    if (v !== undefined) envOverrides[key] = !(v === 'false' || v === '0');
+  }
 
   let fileOverrides: Partial<PromptsConfig> = {};
   try {
