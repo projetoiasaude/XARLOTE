@@ -7,7 +7,7 @@ import {
   messagesToHistory,
   trimHistory,
 } from '@iasaude/llm';
-import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone, toE164BR, brPhoneVariants, extractPriceBRL, parseUnitCount } from '@iasaude/shared';
+import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone, toE164BR, brPhoneVariants, extractPriceBRL, parseUnitCount, shortSupplierAddress, mentionsFreeShipping, itemDisplayName } from '@iasaude/shared';
 import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier, sendTemplateOpeningToSupplier } from './outbound-agent.js';
@@ -47,7 +47,11 @@ function extractDeliverySectorLocal(fullAddress: string | null): string | null {
     }
   }
 
-  const result = [street, sector].filter(Boolean).join(', ');
+  // Pra a ABERTURA (nível-região, antes de fechar): prefere o BAIRRO/SETOR sozinho
+  // ("Recanto das Emas") — mais natural e mais privado que "Rua Ema 5, Recanto das
+  // Emas". A rua completa só vai depois, quando a farmácia pede pra calcular o frete
+  // (Caso D, via delivery_address). Cai pra rua se não houver setor.
+  const result = sector || street || '';
   return result || null;
 }
 
@@ -365,6 +369,12 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   let outcome = '';
   let quoteRecorded = false;   // pra fallback determinístico quando o LLM não gera texto
   let recordedFrete = 0;
+  // Frete CONHECIDO (valor OU grátis) vs DESCONHECIDO — pra não re-perguntar o frete
+  // quando a farmácia já disse que é grátis (incidente Droga Mauge 07/07). A farmácia
+  // costuma dizer "entrega grátis" na ABERTURA e o preço só depois → varre TAMBÉM as
+  // mensagens ANTERIORES dela (direction 'in'), não só o texto atual (review F4).
+  let freteKnown = mentionsFreeShipping(text)
+    || (history ?? []).some((m) => m.direction === 'in' && mentionsFreeShipping(m.content ?? ''));
   let referralRecorded = false; // indicação seguida → agradece mesmo com outcome unavailable
 
   for (const tc of llmResponse.toolCalls) {
@@ -377,6 +387,8 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         };
         quoteRecorded = true;
         recordedFrete = a.delivery_fee ?? 0;
+        // frete conhecido se a farmácia deu um valor (inclui 0 = grátis explícito) OU disse grátis no texto
+        if (a.delivery_fee !== undefined) freteKnown = true;
         const { error: qErr } = await db.from('quotes').update({
           status: 'quoted',
           subtotal: a.subtotal ?? null,
@@ -567,12 +579,14 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     // SEM gerar texto → a farmácia ficava no vácuo. Aqui garantimos uma resposta:
     // se o frete ainda não veio, passamos o ENDEREÇO REAL e pedimos o frete; se já
     // veio, despedida. (Não depende do LLM produzir texto.)
-    const addr = order?.delivery_address || userNeighborhood;
-    const fallbackMsg = recordedFrete > 0
-      ? 'Show, anotado! Vou confirmar com o cliente e já volto pra fechar, obrigada!'
-      : `Show, anotei! A entrega é em ${addr}. Quanto fica o frete pra esse endereço?`;
+    const addr = shortSupplierAddress(order?.delivery_address) || userNeighborhood;
+    // Tom humano + frete-aware: se o frete JÁ é conhecido (valor ou grátis), NÃO
+    // re-pergunta — só confirma que vai fechar com o cliente. Sem "o cliente"/"volto".
+    const fallbackMsg = freteKnown
+      ? 'Perfeito, anotei aqui! Já confirmo e volto pra fechar com você, tá? 🙂'
+      : `Anotado! A entrega é aqui em ${addr} — quanto fica o frete pra esse endereço?`;
     await sendOutboundToSupplier(conversationId, supplierPhone, fallbackMsg, traceId);
-    await writeLog('info', 'agent', 'Resposta determinística à farmácia (LLM não gerou texto)', { traceId, conversationId, freteConhecido: recordedFrete > 0 });
+    await writeLog('info', 'agent', 'Resposta determinística à farmácia (LLM não gerou texto)', { traceId, conversationId, freteConhecido: freteKnown });
   } else if (!llmResponse.text.trim() && !shouldFinalize && llmResponse.toolCalls.length === 0) {
     // FALLBACK DETERMINÍSTICO DE PREÇO (Fix #3 — lost-offer). O agente devolveu turno
     // VAZIO (sem tool, sem texto) — mas a farmácia pode ter mandado um preço real (caso
@@ -611,8 +625,12 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         await writeLog('info', 'quote', `💰 Fix#3: preço R$${price} capturado do texto (agente ficou mudo)${substNote}`, { traceId, quoteId: quote.id, price });
         const supplierName = (quote.suppliers as { name?: string } | null)?.name ?? 'farmácia';
         await notifyUserQuoteArrived(quote.order_id, supplierName, traceId).catch(() => { /* aviso é cortesia */ });
-        const addr = order?.delivery_address || userNeighborhood;
-        await sendOutboundToSupplier(conversationId, supplierPhone, `Show, anotei! A entrega é em ${addr}. Quanto fica o frete pra esse endereço?`, traceId);
+        const addr = shortSupplierAddress(order?.delivery_address) || userNeighborhood;
+        // Se a farmácia já disse grátis na mesma mensagem do preço, não re-pergunta o frete.
+        const followUp = freteKnown
+          ? 'Perfeito, anotei! Já confirmo aqui e volto pra fechar, tá? 🙂'
+          : `Anotado! A entrega é aqui em ${addr} — quanto fica o frete pra esse endereço?`;
+        await sendOutboundToSupplier(conversationId, supplierPhone, followUp, traceId);
       }
     } else {
       // Turno genuinamente vazio (sem preço) — log de sempre.
@@ -751,7 +769,7 @@ export async function initiatePharmacyNegotiation(
 
   // Default defensivo: lista vazia/nomes em branco não pode gerar template com
   // variável vazia (a Meta rejeita) — cai pra um texto genérico válido.
-  const itemsText = items.map((i) => `${i.name}${i.dosage ? ` ${i.dosage}` : ''}${i.quantity ? ` (${i.quantity})` : ''}`).join(', ').trim() || 'os itens do pedido';
+  const itemsText = items.map((i) => `${itemDisplayName(i.name, i.dosage)}${i.quantity ? ` (${i.quantity})` : ''}`).join(', ').trim() || 'os itens do pedido';
   const paymentClause = paymentMethod ? ` O pagamento vai ser via ${paymentMethod}.` : '';
   const fallbackOpening = `Oi, tudo bem? Aqui é a Xarlote, você teria ${itemsText}? Para entregar no ${userNeighborhood}, queria saber o preço e prazo de entrega, por favor.${paymentClause}`;
 

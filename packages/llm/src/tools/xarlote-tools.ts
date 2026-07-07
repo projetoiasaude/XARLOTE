@@ -182,7 +182,7 @@ export const xarloteTools: ToolDefinition[] = [
       parameters: {
         type: 'object',
         properties: {
-          answer: { type: 'string', description: 'Resposta do usuário à pergunta do estabelecimento, curta e direta.' },
+          answer: { type: 'string', description: 'A resposta que vai DIRETO pra farmácia/clínica — escreva em 1ª pessoa, curta e natural, como se VOCÊ estivesse respondendo no WhatsApp (a farmácia não sabe que existe um cliente por trás). NÃO escreva "o cliente quer/prefere/não quer" (3ª pessoa = cara de robô); escreva "quero…", "pode ser…", "prefiro…". Seja auto-contida (não cite o que outra farmácia falou). Ex.: "Pode ser o genérico sim, quanto fica?" / "Prefiro só a marca mesmo (Pietra 2mg), tem?" / "Meu CPF é 000.000.000-00".' },
         },
         required: ['answer'],
       },

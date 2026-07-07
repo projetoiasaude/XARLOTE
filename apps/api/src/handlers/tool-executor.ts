@@ -3,7 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication } from '@iasaude/shared';
+import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -1275,7 +1275,7 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
   const supplierPhone = supplier?.whatsapp_e164 || supplier?.phone_e164 || null;
   if (supplier && quote.conversation_id && supplierPhone && !isPlaceholderPhone(supplierPhone)) {
     const itemsList = items
-      .map((i: OrderItem) => `- ${i.name}${i.dosage ? ` ${i.dosage}` : ''}${i.quantity ? ` (${i.quantity})` : ''}`)
+      .map((i: OrderItem) => `- ${itemDisplayName(i.name, i.dosage)}${i.quantity ? ` (${i.quantity})` : ''}`)
       .join('\n');
     const paymentLabel = (userPaymentMethod || ((quote.payment_methods ?? ['pix']) as string[])[0] || 'pix').toString();
     // Aqui já vai TUDO: endereço completo + link do Google Maps com a localização exata
@@ -1286,11 +1286,13 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
         : null;
     const addressParts: string[] = [];
     if (deliveryAddress && !/Localização compartilhada|^lat\s/i.test(deliveryAddress)) {
-      addressParts.push(`Endereço de entrega: ${deliveryAddress}`);
+      addressParts.push(`Endereço de entrega: ${shortSupplierAddress(deliveryAddress)}`);
     }
     if (mapsLink) addressParts.push(`Localização no mapa: ${mapsLink}`);
     const addressLine = addressParts.length ? `\n${addressParts.join('\n')}` : '';
-    const confirmToPharmacy = `Oi, voltando aqui, o cliente fechou com vocês. Pode preparar pra entrega, por favor:\n${itemsList}${addressLine}\nForma de pagamento: ${paymentLabel}.\nMe avisa quando o pedido estiver pronto ou saindo, por favor. Obrigada!`;
+    // Tom humano: 1ª pessoa, sem "voltando aqui" (pra farmácia é UMA conversa contínua,
+    // não existe ida-e-volta) e sem "o cliente" em 3ª pessoa (cara de intermediário/robô).
+    const confirmToPharmacy = `Fechou então! 🙌 Pode preparar pra entrega, por favor:\n${itemsList}${addressLine}\nPagamento: ${paymentLabel}.\nSe puder me dar um toque quando estiver saindo, agradeço demais!`;
     await sendOutboundToSupplier(quote.conversation_id as string, supplierPhone, confirmToPharmacy, ctx.traceId);
     await writeLog('info', 'order', `Confirmação enviada para ${supplier.name}`, {
       traceId: ctx.traceId,

@@ -45,9 +45,9 @@ export function pickClinicFallbackMessage(flags: {
   appointmentConfirmed: boolean;
   clarificationRequested: boolean;
 }): string {
-  if (flags.appointmentConfirmed) return 'Perfeito, muito obrigada! Já passo as instruções pro paciente.';
-  if (flags.clarificationRequested) return 'Deixa eu confirmar isso com o paciente e já te respondo, tá? Obrigada!';
-  return 'Show, anotei o horário! Vou confirmar com o paciente e já volto pra fechar, obrigada!';
+  if (flags.appointmentConfirmed) return 'Perfeito, muito obrigada! Tá tudo certo então 🙂';
+  if (flags.clarificationRequested) return 'Deixa eu confirmar isso aqui rapidinho e já te respondo, tá? Obrigada!';
+  return 'Anotei o horário! Deixa eu confirmar aqui e já te retorno pra fechar, tá? 🙂';
 }
 
 export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void> {

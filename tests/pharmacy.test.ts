@@ -6,6 +6,9 @@ import {
   isOrderAcceptance,
   resolveQuotePick,
   sameMedication,
+  shortSupplierAddress,
+  mentionsFreeShipping,
+  itemDisplayName,
   type QuoteOption,
 } from '../packages/shared/src/pharmacy.js';
 
@@ -212,6 +215,63 @@ describe('resolveQuotePick (Fix #1 — resolve escolha → quote_id)', () => {
     const one: QuoteOption[] = [{ option: 1, quote_id: 'q-only', supplier_name: 'Droga Fácil', total: 67.5 }];
     expect(resolveQuotePick(one, 'pode entregar 2 caixas')).toBe(null);
     expect(resolveQuotePick(one, 'manda 3 caixas')).toBe(null);
+  });
+});
+
+describe('shortSupplierAddress — endereço humano pra farmácia (07/07)', () => {
+  it('tira "Região X" e "Brasil", mantém rua/bairro/cidade/UF/CEP', () => {
+    expect(shortSupplierAddress('Rua EMA 5, Residencial Recanto das Emas, Goiânia, Goiás, Região Centro-Oeste, 74393-376, Brasil'))
+      .toBe('Rua EMA 5, Residencial Recanto das Emas, Goiânia, Goiás, 74393-376');
+    expect(shortSupplierAddress('Rua 14, Setor Oeste, Goiânia, Goiás, Região Centro-Oeste, 74115-060, Brasil'))
+      .toBe('Rua 14, Setor Oeste, Goiânia, Goiás, 74115-060');
+  });
+  it('endereço já limpo passa intacto; vazio → ""', () => {
+    expect(shortSupplierAddress('Rua 14, Setor Oeste, Goiânia')).toBe('Rua 14, Setor Oeste, Goiânia');
+    expect(shortSupplierAddress('')).toBe('');
+    expect(shortSupplierAddress(null)).toBe('');
+  });
+});
+
+describe('mentionsFreeShipping — não re-perguntar frete quando já é grátis', () => {
+  it('detecta grátis/cortesia/não cobramos/sem taxa/de graça/por nossa conta/incluso', () => {
+    expect(mentionsFreeShipping('nossa entrega é Grátis 😄')).toBe(true);
+    expect(mentionsFreeShipping('Não cobramos frete')).toBe(true);
+    expect(mentionsFreeShipping('entrega é cortesia')).toBe(true);
+    expect(mentionsFreeShipping('sem taxa de entrega')).toBe(true);
+    expect(mentionsFreeShipping('a entrega sai de graça')).toBe(true);
+    expect(mentionsFreeShipping('a entrega fica por nossa conta')).toBe(true);
+    expect(mentionsFreeShipping('o frete tá incluso')).toBe(true);
+    expect(mentionsFreeShipping('não paga nada de entrega')).toBe(true);
+  });
+  it('taxa COM valor NÃO é grátis', () => {
+    expect(mentionsFreeShipping('cobramos taxa de 7,90')).toBe(false);
+    expect(mentionsFreeShipping('o frete fica 12,00')).toBe(false);
+    expect(mentionsFreeShipping('23,00')).toBe(false);
+  });
+  it('NEGAÇÃO de grátis (antes ou depois) NÃO conta como grátis', () => {
+    expect(mentionsFreeShipping('não temos frete grátis')).toBe(false);
+    expect(mentionsFreeShipping('não é grátis não')).toBe(false);
+    expect(mentionsFreeShipping('infelizmente não é gratuito')).toBe(false);
+    expect(mentionsFreeShipping('Frete grátis? Não temos, viu')).toBe(false);
+    expect(mentionsFreeShipping('sem frete grátis')).toBe(false);
+    expect(mentionsFreeShipping('frete não incluso')).toBe(false);
+  });
+  it('frete grátis CONDICIONAL (acima de X / só pra CEP) → NÃO é grátis pro pedido', () => {
+    expect(mentionsFreeShipping('Custa 45. Frete grátis acima de 100 reais')).toBe(false);
+    expect(mentionsFreeShipping('frete grátis nas compras a partir de R$ 150')).toBe(false);
+    expect(mentionsFreeShipping('grátis só pra CEP do centro')).toBe(false);
+  });
+  it('"por conta do cliente" NÃO é grátis (o cliente paga)', () => {
+    expect(mentionsFreeShipping('a entrega fica por conta do cliente')).toBe(false);
+  });
+});
+
+describe('itemDisplayName — sem dosagem duplicada ("2mg 2mg")', () => {
+  it('não repete a dosagem quando já está no nome', () => {
+    expect(itemDisplayName('Pietra ED 2mg', '2mg')).toBe('Pietra ED 2mg');
+    expect(itemDisplayName('Pietra ED', '2mg')).toBe('Pietra ED 2mg');
+    expect(itemDisplayName('Dorflex', null)).toBe('Dorflex');
+    expect(itemDisplayName('Cefaliv', '')).toBe('Cefaliv');
   });
 });
 

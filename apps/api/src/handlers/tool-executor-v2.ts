@@ -817,7 +817,7 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
       const planLine = q.plan_accepted && q.plan_accepted.toLowerCase() !== 'particular'
         ? ` Plano: ${q.plan_accepted}.`
         : ` (Particular.)`;
-      const msg = `Oi! O paciente${patientFirst ? ` ${patientFirst}` : ''} confirmou — quer marcar pra ${dt}.${planLine} Vocês conseguem reservar esse horário? Obrigada!`;
+      const msg = `Oi! Fechei aqui${patientFirst ? ` com o ${patientFirst}` : ''} — pode marcar pra ${dt}?${planLine} Consegue reservar esse horário pra mim? Obrigada! 🙂`;
       await sendOutboundToClinic(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId);
     }
   }
@@ -895,7 +895,7 @@ export async function handleCancelConsultation(args: { consultation_id: string; 
       const { data: conv } = await db.from('conversations').select('whatsapp_jid').eq('id', q.conversation_id).single();
       const clinicPhone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
       if (clinicPhone) {
-        const msg = `Oi! Infelizmente o paciente precisou cancelar a consulta marcada. Desculpa o transtorno e obrigada pela disponibilidade!`;
+        const msg = `Oi! Infelizmente vou precisar cancelar essa consulta que marquei 😕 Desculpa o transtorno e obrigada pela atenção!`;
         await sendOutboundToClinic(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId);
       }
     }

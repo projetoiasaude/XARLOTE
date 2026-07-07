@@ -129,6 +129,71 @@ export function sameMedication(
   return false;
 }
 
+// ─── Tom humano com a farmácia (polimento 07/07) ─────────────────────────────
+
+/**
+ * Encurta o endereço geocodado pra mandar à farmácia. O geocoder devolve coisas
+ * como "Rua Ema 5, Recanto das Emas, Goiânia, Goiás, Região Centro-Oeste, 74393-376,
+ * Brasil" — ninguém escreve "Região Centro-Oeste, Brasil". Tira o nível de
+ * macro-região e o país, mantendo rua/bairro/cidade/UF/CEP (o que a farmácia usa
+ * pra calcular frete e entregar).
+ */
+export function shortSupplierAddress(addr: string | null | undefined): string {
+  if (!addr) return '';
+  return addr
+    .replace(/,?\s*Regi[ãa]o\s+(Norte|Nordeste|Centro-Oeste|Sudeste|Sul)\b/gi, '')
+    .replace(/,?\s*Brasil\b/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/(?:,\s*){2,}/g, ', ')
+    .replace(/,\s*$/, '')
+    .trim();
+}
+
+/**
+ * A farmácia disse que a entrega é GRÁTIS/cortesia? (pra não re-perguntar o frete
+ * quando ela já avisou — incidente Droga Mauge 07/07). Acento-insensível.
+ * Cuidado: "cobramos taxa de 7,90" NÃO é grátis (não casa "nao cobr" nem "gratis").
+ */
+export function mentionsFreeShipping(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const t = fold(text);
+
+  // Sinais POSITIVOS de entrega sem custo. "por conta" só conta com "nossa"/"da casa"
+  // ("por conta do cliente" = o cliente paga, NÃO é grátis). "incluso" só p/ frete/entrega.
+  const freePos = /\b(gratis|gratuit\w*|cortesia|free)\b|\bsem\s+(frete|taxa|custo)\b|\bde\s+gra[çc]a\b|\bpor\s+nossa\s+conta\b|\bpor\s+conta\s+da\s+(casa|loja|farmacia)\b|\b(frete|entrega)\b[^.!?\n]{0,12}\binclus[oa]\b|\bnao\s+cobr\w*\s+(o\s+|a\s+)?(frete|taxa|entrega|nada)\b|\bnao\s+paga\s+nada\b/;
+  if (!freePos.test(t)) return false;
+
+  // "sem frete grátis" = literalmente NÃO tem grátis (inversão semântica). (F1)
+  if (/\bsem\s+frete\s+gratis\b/.test(t)) return false;
+
+  // NEGAÇÃO perto do termo (antes OU depois): "não temos frete grátis", "frete
+  // grátis? não temos", "não é grátis", "frete não incluso". (F2) — a janela cruza
+  // "?" (mesma frase) mas NÃO "." ou "!" (frase nova).
+  const term = '(gratis|gratuit|cortesia|free|de\\s+gra[çc]a|inclus)';
+  if (new RegExp(`\\bnao\\b[^.!\\n]{0,25}${term}`).test(t)) return false;
+  if (new RegExp(`${term}[^.!\\n]{0,20}\\bnao\\b`).test(t)) return false;
+
+  // Frete grátis CONDICIONAL ("grátis acima de 100", "a partir de", "só pra CEP X",
+  // "mínimo de") → NÃO é grátis pro pedido; trata como desconhecido (confirma o valor). (F1)
+  const cond = '(acima|a partir|compras?\\s+de|apenas|somente|\\bso\\b|minim\\w+|pra\\s+cep|para\\s+cep)';
+  if (new RegExp(`(gratis|gratuit|free)[^.!?\\n]{0,30}${cond}`).test(t)) return false;
+  if (new RegExp(`${cond}[^.!?\\n]{0,30}(gratis|gratuit|free)`).test(t)) return false;
+
+  return true;
+}
+
+/**
+ * Nome do item pra exibição SEM repetir a dosagem quando ela já está no nome
+ * (ex.: name="Pietra ED 2mg" + dosage="2mg" → "Pietra ED 2mg", não "Pietra ED 2mg 2mg").
+ */
+export function itemDisplayName(name: string | null | undefined, dosage?: string | null): string {
+  const n = (name ?? '').trim();
+  const d = (dosage ?? '').trim();
+  if (!d) return n;
+  if (fold(n).includes(fold(d))) return n;
+  return `${n} ${d}`.trim();
+}
+
 // ─── Extração de preço (Fix #3, lost-offer) ──────────────────────────────────
 
 /** Converte "1.250,00" / "65,00" / "65.00" / "65" → número. null se inválido. */

@@ -293,7 +293,12 @@ export async function relayUserAnswerToEstablishment(
   }
 
   if (pending.supplierConversationId && pending.supplierPhone) {
-    const text = `Sobre o que você perguntou: ${answer}`;
+    // Manda a resposta DIRETA, sem prefixo — "Sobre o que você perguntou:" é cara de
+    // robô/call-center (a farmácia perguntou, isto é a resposta; humano não prefixa).
+    // O texto já vem no tom certo (o agente/relay formula em 1ª pessoa, sem "o cliente").
+    // Se por acaso a resposta vier vazia, NÃO deixa o estabelecimento no vácuo (ele
+    // acabou de perguntar) — manda um ack curto pra segurar a conversa (review LOW).
+    const text = (answer ?? '').trim() || 'Deixa eu confirmar aqui rapidinho e já te falo, tá? 🙂';
     if (pending.kind === 'clinic') {
       await sendOutboundToClinic(pending.supplierConversationId, pending.supplierPhone, text, traceId);
     } else {
