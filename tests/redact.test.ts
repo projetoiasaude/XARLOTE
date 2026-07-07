@@ -35,6 +35,13 @@ describe('redactPII — redige por chave sensível, preserva operacional', () =>
     expect(out.lat).toBe('[redacted]');
     expect(out.lng).toBe('[redacted]');
   });
+  it('redige detalhes de endereço (complement/quadra/lote/bairro) — save_address LGPD', () => {
+    const out = redactPII({ label: 'casa', complement: 'Qd 19 Lt 28', bairro: 'Recanto das Emas', full_address: 'Rua Ema 5' });
+    expect(out.complement).toBe('[redacted]');
+    expect(out.bairro).toBe('[redacted]');
+    expect(out.full_address).toBe('[redacted]');
+    expect(out.label).toBe('casa'); // o RÓTULO não é PII — preserva
+  });
   it('preserva chaves operacionais (debug não quebra)', () => {
     const out = redactPII({ trace_id: 'abc', conversation_id: 'c1', category: 'webhook', count: 3 });
     expect(out).toEqual({ trace_id: 'abc', conversation_id: 'c1', category: 'webhook', count: 3 });

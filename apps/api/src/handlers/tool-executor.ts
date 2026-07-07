@@ -96,7 +96,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         await handleSaveExamResult(tc.args as unknown as SaveExamArgs, ctx);
         break;
       case 'start_pharmacy_order':
-        await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string }, ctx);
+        await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string }, ctx);
         break;
       case 'create_reminder':
         await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown> }, ctx);
@@ -154,6 +154,9 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         break;
       case 'set_default_address':
         await handleSetDefaultAddress(tc.args as unknown as { address_label: string }, ctx);
+        break;
+      case 'save_address':
+        await handleSaveAddress(tc.args as unknown as { label: string; full_address?: string; complement?: string; notes?: string; set_default?: boolean }, ctx);
         break;
       case 'start_consultation_search':
         await handleStartConsultationSearch(tc.args as unknown as StartConsultationArgs, ctx);
@@ -489,8 +492,107 @@ async function handleCancelOrder(args: { order_id?: string; reason?: string }, c
   await cancelActiveOrder(targetId, args.reason ?? 'cancelado pelo usuário', ctx.traceId);
 }
 
+/**
+ * Salva/atualiza um endereço ROTULADO do usuário (casa/trabalho/outro) pra reusar
+ * depois via start_pharmacy_order(saved_address_label). Fonte da localização:
+ * (1) full_address se geocodifica PRECISO; senão (2) a localização EXATA do último
+ * pedido (caso 📍/salvar-o-que-acabei-de-usar); senão pede o endereço.
+ * NUNCA loga o endereço (PII — CLAUDE.md #3): só o label + id.
+ */
+async function handleSaveAddress(
+  args: { label: string; full_address?: string; complement?: string; notes?: string; set_default?: boolean },
+  ctx: ToolContext,
+): Promise<void> {
+  const label = (args.label ?? '').trim() || 'principal';
+  let lat: number | null = null;
+  let lng: number | null = null;
+  let addrText: string | null = (args.full_address ?? '').trim() || null;
+  const hadText = !!addrText;
+
+  // 1. Texto PRECISO tem prioridade (salvar proativo "meu trabalho é Av X 100").
+  if (addrText) {
+    const geo = await geocodeAddress(addrText);
+    if (geo && geo.confidence === 'precise') {
+      lat = geo.lat; lng = geo.lng;
+      addrText = geo.formattedAddress || addrText;
+    }
+  }
+  // 2. SEM texto (caso 📍 / "salva o que acabei de usar") → localização EXATA do último
+  //    pedido. ⚠️ NÃO cai aqui se o usuário DEU um texto que só geocodificou impreciso —
+  //    salvar a localização de OUTRO pedido sob esse rótulo mandaria a entrega pro lugar
+  //    errado. Nesse caso pede o CEP (abaixo).
+  if ((lat == null || lng == null) && !hadText) {
+    const { data: ord } = await db.from('orders')
+      .select('delivery_lat, delivery_lng, delivery_address')
+      .eq('user_id', ctx.userId)
+      .not('delivery_lat', 'is', null)
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (ord?.delivery_lat != null && ord?.delivery_lng != null) {
+      lat = ord.delivery_lat as number;
+      lng = ord.delivery_lng as number;
+      addrText = (ord.delivery_address as string | null);
+    }
+  }
+  if (lat == null || lng == null) {
+    const pedido = hadText
+      ? `Não consegui localizar esse endereço com precisão 🙈 Me confirma com o CEP que eu salvo certinho.`
+      : `Pra guardar esse endereço eu preciso dele completo 🙂 Me manda com o CEP, ou compartilha sua localização 📍 que eu salvo.`;
+    await sendOutbound(ctx.conversationId, ctx.phoneE164, pedido, ctx.traceId);
+    return;
+  }
+
+  // 3. Componentes estruturados (best-effort) pra exibir bonitinho depois.
+  let street: string | null = null, number: string | null = null, neighborhood: string | null = null;
+  let city: string | null = null, state: string | null = null, cep: string | null = null;
+  try {
+    const nomi = await reverseGeocodeNominatim(lat, lng);
+    if (nomi) {
+      street = nomi.road ?? null; number = nomi.houseNumber ?? null;
+      neighborhood = nomi.neighborhood ?? null; city = nomi.city ?? null;
+      state = nomi.state ?? null; cep = nomi.postcode ?? null;
+    }
+  } catch { /* best-effort — coords bastam */ }
+  // Se o geocode não trouxe rua mas temos o texto do usuário, guarda o texto como rua.
+  if (!street && addrText) street = addrText.slice(0, 180);
+
+  // 4. Upsert por (user, label) — atualiza se já existe esse rótulo.
+  const { data: existing } = await db.from('user_addresses')
+    .select('id').eq('user_id', ctx.userId).ilike('label', escapeLike(label)).limit(1).maybeSingle();
+  const row: Record<string, unknown> = {
+    user_id: ctx.userId, label,
+    street, number, complement: (args.complement ?? '').trim() || null,
+    neighborhood, city, state, cep,
+    latitude: lat, longitude: lng,
+    notes: (args.notes ?? '').trim() || null,
+  };
+  let addrId: string | null = null;
+  if (existing?.id) {
+    await db.from('user_addresses').update(row).eq('id', existing.id);
+    addrId = existing.id as string;
+  } else {
+    const { data: ins } = await db.from('user_addresses').insert(row).select('id').single();
+    addrId = (ins?.id as string | undefined) ?? null;
+  }
+
+  // 5. Default: se pedido explicitamente OU se é o ÚNICO endereço do usuário.
+  if (addrId) {
+    const { count } = await db.from('user_addresses')
+      .select('id', { count: 'exact', head: true }).eq('user_id', ctx.userId);
+    if (args.set_default === true || (count ?? 0) <= 1) {
+      await db.from('user_addresses').update({ is_default: false }).eq('user_id', ctx.userId);
+      await db.from('user_addresses').update({ is_default: true }).eq('id', addrId);
+    }
+  }
+  await writeLog('info', 'address', `Endereço "${label}" salvo/atualizado`, { traceId: ctx.traceId, userAddressId: addrId });
+  await writeAudit({
+    actorType: 'xarlote', action: 'user.address.save', userId: ctx.userId,
+    targetTable: 'user_addresses', targetId: addrId ?? undefined,
+    conversationId: ctx.conversationId, traceId: ctx.traceId, metadata: { label },
+  });
+}
+
 async function handleStartPharmacyOrder(
-  args: { items: OrderItem[]; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string },
+  args: { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string },
   ctx: ToolContext
 ) {
   // ─── IDEMPOTÊNCIA + TROCA DE PRODUTO ───────────────────────────────────────
@@ -558,10 +660,48 @@ async function handleStartPharmacyOrder(
   let lng: number | null = null;
   let deliveryAddress: string | null = null;
   let locationSource = 'unknown';
+  let userAddressId: string | null = null;
 
-  // Prioridade: endereço de texto > localização do WhatsApp > lat/lng dos args do LLM.
-  // (LLM costuma reaproveitar coords antigas do histórico — texto fresco é mais confiável.)
-  if (args.location?.address) {
+  // Prioridade: ENDEREÇO SALVO (label) > endereço de texto > localização do WhatsApp > lat/lng do LLM.
+  // (LLM costuma reaproveitar coords antigas do histórico — texto fresco é mais confiável;
+  //  mas endereço SALVO explicitamente escolhido é a localização exata guardada — reusa direto.)
+  if (args.saved_address_label) {
+    const { data: saved } = await db
+      .from('user_addresses')
+      .select('id, label, street, number, complement, neighborhood, city, state, cep, latitude, longitude, usage_count')
+      .eq('user_id', ctx.userId)
+      .ilike('label', escapeLike(args.saved_address_label.trim()))
+      .order('is_default', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (saved?.latitude != null && saved?.longitude != null) {
+      lat = saved.latitude as number;
+      lng = saved.longitude as number;
+      userAddressId = saved.id as string;
+      const parts = [
+        [saved.street, saved.number].filter(Boolean).join(', '),
+        saved.complement, saved.neighborhood,
+        [saved.city, saved.state].filter(Boolean).join(' - '),
+        saved.cep,
+      ].filter((p) => p && String(p).trim());
+      deliveryAddress = parts.join(', ') || (saved.label as string);
+      locationSource = `saved_address:${saved.label}`;
+      // Marca uso (pra sugerir default depois e ordenar por frequência). Read-then-write
+      // simples — 1 usuário por vez, sem concorrência real aqui.
+      await db.from('user_addresses')
+        .update({ usage_count: ((saved.usage_count as number | null) ?? 0) + 1, last_used_at: new Date().toISOString() })
+        .eq('id', saved.id);
+      await writeLog('info', 'order', `start_pharmacy_order — usando endereço salvo "${saved.label}"`, {
+        traceId: ctx.traceId, userAddressId, lat, lng,
+      });
+    } else {
+      // Label não encontrado / sem coords → pede o endereço (não inventa localização).
+      await sendOutbound(ctx.conversationId, ctx.phoneE164,
+        `Hmm, não achei esse endereço salvo aqui 🙈 Me manda o endereço (com o CEP fica perfeito) ou compartilha sua localização 📍 que eu já coto.`,
+        ctx.traceId);
+      return;
+    }
+  } else if (args.location?.address) {
     await writeLog('info', 'geocoding', `Geocodificando endereço: ${args.location.address}`, { traceId: ctx.traceId });
     const geo = await geocodeAddress(args.location.address);
     if (geo && geo.confidence === 'precise') {
@@ -671,6 +811,7 @@ async function handleStartPharmacyOrder(
     delivery_lat: lat,
     delivery_lng: lng,
     delivery_address: deliveryAddress,
+    user_address_id: userAddressId,
     payment_method: args.payment_method ?? null,
   }).select('id').single();
 

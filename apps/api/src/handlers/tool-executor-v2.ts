@@ -503,12 +503,14 @@ export async function handleLogSymptom(args: LogSymptomArgs, ctx: BaseToolCtx): 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export async function handleSetDefaultAddress(args: { address_label: string }, ctx: BaseToolCtx): Promise<void> {
-  // Acha endereço pelo label (case-insensitive)
+  // Acha endereço pelo label (case-insensitive). Escapa %/_ do ILIKE — senão um label
+  // com wildcard casaria QUALQUER endereço (mesma lição do escapeLike de tool-executor).
+  const labelPattern = (args.address_label ?? '').replace(/[\\%_]/g, (c) => `\\${c}`);
   const { data: addr } = await db
     .from('user_addresses')
     .select('id, label, is_default')
     .eq('user_id', ctx.userId)
-    .ilike('label', args.address_label)
+    .ilike('label', labelPattern)
     .limit(1)
     .maybeSingle();
 

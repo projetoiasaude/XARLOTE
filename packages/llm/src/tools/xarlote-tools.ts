@@ -117,9 +117,13 @@ export const xarloteTools: ToolDefinition[] = [
               required: ['name', 'substitutes_ok'],
             },
           },
+          saved_address_label: {
+            type: 'string',
+            description: 'Se o usuário mandou entregar num endereço JÁ SALVO (ex.: disse "manda pra casa", "pro trabalho", ou você perguntou "casa/trabalho/novo?" e ele escolheu um salvo), passe o LABEL do endereço salvo aqui (ex.: "casa", "trabalho") — o backend usa a localização exata já guardada, sem re-geocodificar nem pedir de novo. Veja os "Endereços salvos" no contexto. NÃO use junto com location.',
+          },
           location: {
             type: 'object',
-            description: 'Localização do usuário (lat/lng ou endereço)',
+            description: 'Localização do usuário quando é um endereço NOVO/atual (lat/lng ou endereço de texto). Use isto OU saved_address_label, não os dois.',
             properties: {
               lat: { type: 'number' },
               lng: { type: 'number' },
@@ -355,13 +359,31 @@ export const xarloteTools: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'set_default_address',
-      description: 'Marca um endereço como padrão do paciente. Use quando ele explicitamente pedir ("deixa esse como padrão") ou após detectar uso repetido (≥3 vezes mesmo endereço).',
+      description: 'Marca um endereço JÁ SALVO como padrão do paciente. Use quando ele explicitamente pedir ("deixa esse como padrão") ou após detectar uso repetido (≥3 vezes mesmo endereço).',
       parameters: {
         type: 'object',
         properties: {
           address_label: { type: 'string', description: 'Label do endereço (ex: "casa", "trabalho")' },
         },
         required: ['address_label'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'save_address',
+      description: 'SALVA (ou atualiza) um endereço rotulado do paciente pra reusar nas próximas vezes. Use depois que o paciente confirmar um endereço novo e você perguntar de quem é ("é sua casa, trabalho ou outro?") + a quadra/lote (ou complemento). Assim, da próxima vez você só pergunta "casa, trabalho ou novo?" e reusa via start_pharmacy_order(saved_address_label). Se o paciente compartilhou localização 📍, o backend já tem a rua/setor — você só confirma a quadra/lote e o rótulo e salva.',
+      parameters: {
+        type: 'object',
+        properties: {
+          label: { type: 'string', description: 'Rótulo do endereço: "casa", "trabalho", ou outro nome curto que o paciente deu ("casa da minha mãe").' },
+          full_address: { type: 'string', description: 'Endereço COMPLETO como o paciente confirmou, incluindo quadra/lote/número/complemento se houver (ex.: "Rua Ema 5, Qd 19 Lt 28, Recanto das Emas, Goiânia"). Se o paciente compartilhou localização 📍 e não houver texto, deixe vazio — o backend usa a localização do último pedido/mensagem.' },
+          complement: { type: 'string', description: 'Complemento/quadra/lote/ponto de referência, se o paciente informou separado (ex.: "Qd 19 Lt 28", "apto 302", "casa azul do portão branco"). Opcional.' },
+          notes: { type: 'string', description: 'Instrução de entrega, se houver (ex.: "deixar com o porteiro"). Opcional.' },
+          set_default: { type: 'boolean', description: 'true se esse deve virar o endereço padrão (ex.: é o primeiro, ou o paciente pediu). Opcional.' },
+        },
+        required: ['label'],
       },
     },
   },

@@ -15,6 +15,7 @@ const SENSITIVE_KEY = new RegExp(
   [
     'phone', 'telefone', 'whatsapp', 'jid', 'cpf', 'rg', 'email', 'e_mail',
     'address', 'endereco', 'endereço', 'street', 'rua', 'logradouro', 'cep',
+    'complement', 'complemento', 'bairro', 'neighborhood', 'numero', 'quadra', 'lote',
     'lat', 'lng', 'latitude', 'longitude', 'geo', 'coord',
     'pix', 'card', 'cartao', 'cartão',
     'full_name', 'preferred_name', 'patient_name', 'contact_name',
