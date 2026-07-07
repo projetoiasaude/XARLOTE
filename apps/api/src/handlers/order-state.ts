@@ -205,6 +205,9 @@ export function buildOrderStateBlock(state: OrderState): string {
   lines.push(
     `- Você pode **falar de novo com UMA farmácia específica** deste pedido com a tool **message_supplier** (passe \`supplier_hint\` = o nome/dica dela e \`message\` = o que dizer, em 1ª pessoa, tom humano). Use quando o usuário pedir algo dirigido: "fala pra São Benedito que topo o Uber", "pergunta pra Drogalobo se tem o genérico", "vê com a que respondeu se entrega hoje".`,
   );
+  lines.push(
+    `- 🚫 **REGRA ABSOLUTA DE HONESTIDADE:** falar com uma farmácia SÓ acontece se você CHAMAR a tool **message_supplier** neste turno. **NUNCA** escreva "já falei com a farmácia", "mandei mensagem", "entrei em contato" ou "avisei a farmácia" sem ter chamado a tool — isso é MENTIR pro usuário (a mensagem NÃO sai sozinha). Se o usuário pede pra contatar/voltar numa farmácia: **CHAME message_supplier** (não descreva o que faria). A própria tool confirma pro usuário que enviou.`,
+  );
   if (conditionals.length) {
     const names = conditionals.map((s) => s.supplierName).join(', ');
     lines.push(

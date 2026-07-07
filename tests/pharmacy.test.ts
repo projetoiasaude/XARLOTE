@@ -368,6 +368,12 @@ describe('resolveSupplierByHint — casa a farmácia-alvo por nome/dica', () => 
     expect(resolveSupplierByHint(cands, 'a do uber')).toBe('q1');
   });
 
+  it('frase REAL do incidente 07/07 (backstop de re-contato) → resolve o único respondente', () => {
+    // O glm-5.2 narrou "já falei" sem chamar a tool; o backstop usa a frase crua do user.
+    expect(resolveSupplierByHint(cands,
+      'Xarlote pode entrar em contato com uma das farmácias que você já havia conversado, que disse que teria entregador somente após as 15h, a que tem o número')).toBe('q1');
+  });
+
   it('dica semântica com >1 respondente → null (ambíguo, não adivinha)', () => {
     const two = cands.map((c) => ({ ...c, responded: true }));
     expect(resolveSupplierByHint(two, 'a que respondeu')).toBeNull();

@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, buildConsentEvent } from '@iasaude/core';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, isOrderAcceptance } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName } from '@iasaude/shared';
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard, QuoteOption } from '@iasaude/shared';
 import { chat, buildXarloteSystemPrompt, xarloteTools, messagesToHistory, trimHistory, embed, userContentWithImage, dataUrl, type ChatContent } from '@iasaude/llm';
 import { sendMenu, isSimulatorMode, fetchInboundMedia } from '@iasaude/whatsapp';
@@ -716,6 +716,43 @@ export async function processInboundUser(
     }
   }
 
+  // 11c. BACKSTOP DETERMINÍSTICO DE RE-CONTATO (incidente 07/07 ao vivo): o glm-5.2
+  // NARROU "já falei com a farmácia! mandei mensagem…" SEM chamar message_supplier —
+  // mentira: nada saiu pra farmácia. Se o usuário claramente pede pra CONTATAR/VOLTAR
+  // numa farmácia do pedido (verbo de re-contato em forma de PEDIDO, não pergunta-passado)
+  // e resolvemos UMA farmácia-alvo pela dica (conservador, null em ambiguidade), forçamos
+  // message_supplier — o handler faz todos os guards (janela 24h, freeze, revive). Mensagem
+  // sintetizada limpa e humana; a farmácia responde e o loop normal segue.
+  let backstopReContacted = false;
+  {
+    const alreadyContacted = llmResponse.toolCalls.some((t) =>
+      ['message_supplier', 'contact_establishment', 'relay_answer_to_establishment', 'confirm_order_selection', 'expand_pharmacy_search', 'start_pharmacy_order'].includes(t.name));
+    const userText = typeof userMsgContent === 'string' ? userMsgContent.replace(/^\[Áudio transcrito\]\s*/i, '').trim() : '';
+    // Verbos de PEDIDO (presente/infinitivo/imperativo) — NÃO passado ("falou?"/"mandou?"
+    // são perguntas sobre o passado, não comandos → não disparam).
+    const reContactVerb =
+      /\b(fala|fale|falar|pergunt[ae]|perguntar|volt[ae]|voltar|entra(r)? em contato|manda|mande|mandar|contata|contatar|contate|pede|pe[çc]a|pedir|chama|chame|chamar|v[êe] com|confirma com|verifica com)\b/i.test(userText);
+    if (!alreadyContacted && reContactVerb && orderState && orderState.suppliers.length && userText) {
+      const targetQuoteId = resolveSupplierByHint(
+        orderState.suppliers.map((s) => ({ quote_id: s.quoteId, supplier_name: s.supplierName, status: s.status, responded: s.responded })),
+        userText,
+      );
+      const target = targetQuoteId ? orderState.suppliers.find((s) => s.quoteId === targetQuoteId) : null;
+      if (target) {
+        const itemName = orderState.items.map((i) => itemDisplayName(i.name, i.dosage)).join(', ') || 'o pedido';
+        const msg = `Oi! 🙂 Sobre o ${itemName} que perguntei mais cedo — vocês conseguem me atender agora? Se puder me passar o valor e como fica a entrega, agradeço!`;
+        await writeLog('warn', 'order', `🔒 Backstop de re-contato: LLM narrou sem chamar message_supplier → forçando contato com ${target.supplierName}`, {
+          traceId, orderId: orderState.orderId, quoteId: target.quoteId, llmTools: llmResponse.toolCalls.map((t) => t.name),
+        });
+        await handleToolCall(
+          { id: randomUUID(), name: 'message_supplier', args: { supplier_hint: target.supplierName, message: msg } } as unknown as Parameters<typeof handleToolCall>[0],
+          turnToolCtx,
+        );
+        backstopReContacted = true;
+      }
+    }
+  }
+
   // 12. Resolve o texto da resposta.
   // 🛑 TURNO SÓ-TOOL (incidente Glauber 2026-07-01): o gpt-4.1-mini às vezes executa
   // a(s) tool(s) SEM escrever texto (ex.: create_reminder criado, mas nenhuma
@@ -728,8 +765,28 @@ export async function processInboundUser(
   // foi PURAMENTE o aceite: se o LLM também fez outra ação (ex.: create_reminder), o
   // texto narra essa ação e NÃO pode ser engolido (review) — aí mantém.
   const onlyAcceptTurn = !llmResponse.toolCalls.some((t) => t.name !== 'relay_answer_to_establishment' && t.name !== 'confirm_order_selection');
-  const suppressReply = backstopConfirmed && onlyAcceptTurn;
+  // Suprime o texto do LLM quando um backstop assumiu: confirm (aceite) OU re-contato (a
+  // narração "já falei com a farmácia" era MENTIRA — o message_supplier real já mandou a
+  // confirmação verdadeira). Sem isso o usuário veria a mentira + a confirmação real.
+  const suppressReply = (backstopConfirmed && onlyAcceptTurn) || backstopReContacted;
   let replyText = suppressReply ? '' : llmResponse.text.trim();
+
+  // 🚫 GUARDA ANTI-MENTIRA RESIDUAL (incidente 07/07): o LLM afirma ter contatado a
+  // farmácia ("já falei com a farmácia", "mandei mensagem", "entrei em contato") mas
+  // NENHUM contato real ocorreu (nem tool nem backstop — alvo ambíguo/sem pedido). Não
+  // deixa a mentira sair: troca por uma resposta HONESTA que pede o nome da farmácia.
+  if (replyText && !backstopReContacted) {
+    const reallyContacted = llmResponse.toolCalls.some((t) =>
+      ['message_supplier', 'contact_establishment', 'relay_answer_to_establishment', 'confirm_order_selection'].includes(t.name));
+    const claimsContact = /(mandei\s+(uma\s+)?(mensagem|msg|recado)|entrei\s+em\s+contato|acabei de falar com (a|as|o) ?(farm|drog)|j[áa]\s+(falei|avisei|mandei|entrei em contato)\s+(com\s+)?(a\s+|as\s+|na\s+|pra\s+|para\s+|o\s+)?(farm[aá]cia|drog|eles\b|a loja))/i.test(replyText);
+    if (claimsContact && !reallyContacted) {
+      await writeLog('warn', 'agent', `🚫 Anti-mentira: LLM afirmou contato com farmácia sem chamar tool → resposta honesta`, { traceId, textPreview: replyText.slice(0, 60) });
+      replyText = orderState && orderState.suppliers.length
+        ? 'Deixa eu acertar direitinho: com qual farmácia do seu pedido você quer que eu fale? Me diz o nome que eu mando a mensagem na hora 💙'
+        : 'Pra eu falar com uma farmácia eu preciso de um pedido ativo — me fala o remédio e o endereço que eu começo a busca 💙';
+    }
+  }
+
   if (!replyText && !suppressReply) {
     const { count: sentThisTurn } = await db
       .from('messages')
