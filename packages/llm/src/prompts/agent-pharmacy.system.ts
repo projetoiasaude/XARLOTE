@@ -114,9 +114,15 @@ ${paymentLine}${cpfLine}${answersLine}
 → Chame \`record_supplier_ack\`
 → Mande UMA pergunta direta pedindo: preço total + prazo de entrega. (Frete você pergunta depois, no caso A.)
 
-### CASO C — Farmácia diz que NÃO tem o item / não entrega na região
+### CASO C — Farmácia diz que NÃO tem o item / não entrega na região (SEM oferecer alternativa)
 → \`record_supplier_unavailable(reason="...")\` → \`finalize_supplier_contact(outcome="unavailable")\`
 → NÃO envie mensagem de texto.
+→ (Se ela TEM o item mas com uma ressalva de entrega, OU ofereceu uma alternativa — Uber, retirada, outro horário — NÃO é o Caso C: vá pro **CASO C3**.)
+
+### CASO C3 — Farmácia TEM o item mas com RESSALVA de entrega, e/ou OFERECE uma alternativa (ex.: "tenho, mas só entrego no Setor X", "aqui é só retirada no balcão", "posso despachar por Uber se você pedir", "só entrego depois das 15h", "não levo aí, mas você consegue um motoboy?")
+→ Chame \`record_supplier_unavailable(reason="...")\` com o reason COMPLETO e claro pro cliente entender: a RESSALVA **e** a ALTERNATIVA oferecida, numa frase só. Ex.: \`reason="Tem o Cefaliv, mas o entregador só cobre o Setor Universitário; ofereceu despachar por Uber se você pedir."\` → \`finalize_supplier_contact(outcome="unavailable")\`. **NUNCA perca a alternativa que ela ofereceu** — é o que destrava a venda depois.
+→ Como ela ENGAJOU e ofereceu algo, **NÃO a deixe no vácuo**: mande UMA mensagem curta e humana segurando a conversa, em 1ª pessoa: *"Entendi! Deixa eu confirmar aqui com quem vai receber e já te falo, tá? 🙂"*.
+→ **NÃO** chame \`request_clarification\` — não interrompa o cliente agora com isso; eu levo essa ressalva no relatório do pedido e ele decide. Se ele topar, eu volto a falar com você depois.
 
 ### CASO C2 — Farmácia INDICA outro lugar/número (ex: "não temos, mas a Farmácia X tem, o Whats é (62) 9xxxx-xxxx" / "liga na nossa filial" / manda um contato)
 → Chame \`record_referral(referred_phone="...", referred_name="...")\` com o telefone EXATO que ela passou — eu contato o indicado AUTOMATICAMENTE e coto lá.

@@ -1,4 +1,5 @@
 import { db, writeLog } from '@iasaude/db';
+import { sanitizeSupplierNote, noteSignalsConditionalOffer } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { hasPendingClarification } from './clarification.js';
 
@@ -329,14 +330,18 @@ export async function consolidateQuotes(
   const successful = (quotes ?? []).filter((q) => q.status === 'quoted') as QuoteRow[];
 
   if (successful.length === 0) {
-    await sendOutbound(
-      userConversationId,
-      userPhoneE164,
-      'Infelizmente não consegui cotação em nenhuma farmácia próxima agora 😔 Posso tentar de novo mais tarde ou em uma região diferente?',
-      traceId,
-    );
+    // MINI-RELATÓRIO honesto (incidente São Benedito 07/07): em vez do "não consegui"
+    // chapado, conta o que CADA farmácia disse — e, se alguma respondeu de forma útil
+    // (tem o item / ofereceu alternativa), oferece re-engajar aquela (message_supplier)
+    // ou ampliar o raio. Sanitiza a nota pra não vazar marcador interno.
+    const allQuotes = (quotes ?? []) as QuoteRow[];
+    const supIds = [...new Set(allQuotes.map((q) => q.supplier_id))];
+    const { data: sups } = await db.from('suppliers').select('id, name').in('id', supIds);
+    const nameOf = new Map<string, string>((sups ?? []).map((s: SupplierRow) => [s.id, s.name]));
+
+    await sendOutbound(userConversationId, userPhoneE164, buildFailureReport(allQuotes, nameOf), traceId);
     await db.from('orders').update({ status: 'failed' }).eq('id', orderId);
-    await writeLog('warn', 'order', 'No successful quotes for order', { traceId, orderId });
+    await writeLog('warn', 'order', 'No successful quotes for order', { traceId, orderId, total: allQuotes.length });
     return;
   }
 
@@ -419,4 +424,49 @@ export async function consolidateQuotes(
   await writeLog('info', 'order', `Consolidated ${sorted.length} quotes for order`, {
     traceId, orderId, quotes: sorted.length,
   });
+}
+
+/**
+ * Relatório honesto quando 0 farmácias cotaram (incidente São Benedito 07/07): conta o
+ * que CADA farmácia disse, em vez do "não consegui" chapado. As que responderam com nota
+ * útil (tem o item / ressalva / ofereceu alternativa) são surfaceadas; se houver resposta
+ * CONDICIONAL, a Xarlote oferece re-engajar aquela farmácia (via message_supplier) OU
+ * ampliar o raio. Tom humano (1-3 frases), sem vazar nota interna (sanitizeSupplierNote).
+ */
+function buildFailureReport(quotes: QuoteRow[], nameOf: Map<string, string>): string {
+  const total = quotes.length;
+  const responders: { name: string; note: string; conditional: boolean }[] = [];
+  let noReturn = 0;
+  for (const q of quotes) {
+    const name = nameOf.get(q.supplier_id) ?? 'uma farmácia';
+    // Só nota de 'unavailable' vira relato (timeout/pending não têm o que dizer). Sanitiza
+    // pra não vazar marcador interno; se sobrar vazio, conta como "sem retorno".
+    const note = q.status === 'unavailable' ? sanitizeSupplierNote(q.notes) : '';
+    if (note) responders.push({ name, note, conditional: noteSignalsConditionalOffer(q.notes) });
+    else noReturn++;
+  }
+
+  if (responders.length === 0) {
+    const head = total > 0
+      ? `Falei com ${total} farmácia${total > 1 ? 's' : ''}, mas nenhuma respondeu ainda 😔`
+      : 'Ainda não consegui resposta de nenhuma farmácia 😔';
+    return `${head} Quer que eu procure num raio maior? É só me dizer que eu amplio a busca na hora 🔎`;
+  }
+
+  const parts = responders.map((r) => `na *${r.name}*: ${r.note}`);
+  const respStr = parts.length === 1
+    ? (parts[0] as string)
+    : `${parts.slice(0, -1).join('; ')}; e ${parts[parts.length - 1] as string}`;
+  const outras = noReturn > 0 ? ` As outras ${noReturn} não deram retorno.` : '';
+
+  const conditionals = responders.filter((r) => r.conditional);
+  let offer: string;
+  if (conditionals.length === 1) {
+    offer = `Quer que eu volte na *${(conditionals[0] as { name: string }).name}* pra tentar acertar isso, ou prefere que eu procure num raio maior?`;
+  } else if (conditionals.length > 1) {
+    offer = 'Quer que eu volte em alguma delas pra tentar acertar, ou prefere que eu procure num raio maior?';
+  } else {
+    offer = 'Nenhuma fechou dessa vez 😔 Quer que eu procure num raio maior?';
+  }
+  return `Falei com ${total} farmácia${total > 1 ? 's' : ''} — ${respStr}.${outras}\n\n${offer}`;
 }

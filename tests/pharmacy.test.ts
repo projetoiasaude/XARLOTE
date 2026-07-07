@@ -9,7 +9,11 @@ import {
   shortSupplierAddress,
   mentionsFreeShipping,
   itemDisplayName,
+  resolveSupplierByHint,
+  sanitizeSupplierNote,
+  noteSignalsConditionalOffer,
   type QuoteOption,
+  type SupplierCandidate,
 } from '../packages/shared/src/pharmacy.js';
 
 describe('isPharmacyChain (Fix #6 — deprioriza redes)', () => {
@@ -335,5 +339,143 @@ describe('sameMedication — troca de produto (incidente Cefaliv/delírio 06/07)
   it('LIMITAÇÃO CONHECIDA — marca vs molécula da MESMA droga → false (trata como troca; re-cota, recuperável)', () => {
     // Sem dicionário de sinônimos não dá pra saber que Tylenol≡Paracetamol. Documentado.
     expect(sameMedication(mk('Tylenol'), mk('Paracetamol'))).toBe(false);
+  });
+});
+
+// ─── Re-engajamento dirigido (feature São Benedito 07/07) ────────────────────
+
+describe('resolveSupplierByHint — casa a farmácia-alvo por nome/dica', () => {
+  const cands: SupplierCandidate[] = [
+    { quote_id: 'q1', supplier_name: 'Drogaria São Benedito', status: 'unavailable', responded: true },
+    { quote_id: 'q2', supplier_name: 'DROGALOBO - NOSSA REDE', status: 'timeout', responded: false },
+    { quote_id: 'q3', supplier_name: 'Drogaria Santa Lúcia', status: 'timeout', responded: false },
+  ];
+
+  it('nome distintivo casa exatamente 1 → devolve o quote_id', () => {
+    expect(resolveSupplierByHint(cands, 'volta na São Benedito e diz que topo o Uber')).toBe('q1');
+    expect(resolveSupplierByHint(cands, 'pergunta pra Drogalobo se tem o genérico')).toBe('q2');
+    expect(resolveSupplierByHint(cands, 'fala com a Santa Lúcia')).toBe('q3');
+  });
+
+  it('acento não atrapalha (São ≡ sao, Lúcia ≡ lucia)', () => {
+    expect(resolveSupplierByHint(cands, 'a sao benedito')).toBe('q1');
+    expect(resolveSupplierByHint(cands, 'santa lucia')).toBe('q3');
+  });
+
+  it('dica semântica "a que respondeu/tem" + 1 respondente → esse respondente', () => {
+    expect(resolveSupplierByHint(cands, 'fala com a que respondeu')).toBe('q1');
+    expect(resolveSupplierByHint(cands, 'a farmácia que tem o remédio')).toBe('q1');
+    expect(resolveSupplierByHint(cands, 'a do uber')).toBe('q1');
+  });
+
+  it('dica semântica com >1 respondente → null (ambíguo, não adivinha)', () => {
+    const two = cands.map((c) => ({ ...c, responded: true }));
+    expect(resolveSupplierByHint(two, 'a que respondeu')).toBeNull();
+  });
+
+  it('nome que casa >1 → null (ambíguo)', () => {
+    // "drogaria" é genérica (descartada); mas se a dica casar 2 nomes distintos → null
+    const amb: SupplierCandidate[] = [
+      { quote_id: 'a', supplier_name: 'Farmácia Central', responded: true },
+      { quote_id: 'b', supplier_name: 'Central Popular', responded: true },
+    ];
+    expect(resolveSupplierByHint(amb, 'a central')).toBeNull();
+  });
+
+  it('dica genérica sem match → null (pede desambiguação no caller)', () => {
+    expect(resolveSupplierByHint(cands, 'aquela farmácia lá')).toBeNull();
+    expect(resolveSupplierByHint(cands, 'sei lá')).toBeNull();
+    expect(resolveSupplierByHint([], 'São Benedito')).toBeNull();
+  });
+
+  it('MATCH POR PALAVRA INTEIRA — token curto NÃO casa dentro de outra palavra (review MEDIUM)', () => {
+    const c: SupplierCandidate[] = [
+      { quote_id: 'sol', supplier_name: 'Drogaria Sol', responded: false },
+      { quote_id: 'est', supplier_name: 'Farmácia Estrela', responded: false },
+    ];
+    // "sol" está dentro de "re[sol]ve"/"con[sol]ida" — NÃO pode mirar a Drogaria Sol.
+    expect(resolveSupplierByHint(c, 'resolve isso pra mim')).toBeNull();
+    expect(resolveSupplierByHint(c, 'pode consolidar o pedido')).toBeNull();
+    // mas o nome REAL casa:
+    expect(resolveSupplierByHint(c, 'fala com a Drogaria Sol')).toBe('sol');
+  });
+
+  it('NEGAÇÃO → null (não mira a farmácia que o user pediu pra EVITAR — review LOW)', () => {
+    expect(resolveSupplierByHint(cands, 'não fala com a São Benedito')).toBeNull();
+    expect(resolveSupplierByHint(cands, 'qualquer uma menos a São Benedito')).toBeNull();
+  });
+
+  it('nome 100% GENÉRICO casa por frase inteira (review MEDIUM — antes era intargetável)', () => {
+    const c: SupplierCandidate[] = [
+      { quote_id: 'pop', supplier_name: 'Farmácia Popular', responded: true },
+      { quote_id: 'sb', supplier_name: 'Drogaria São Benedito', responded: true },
+    ];
+    expect(resolveSupplierByHint(c, 'fala com a Farmácia Popular')).toBe('pop');
+    expect(resolveSupplierByHint(c, 'a São Benedito')).toBe('sb');
+  });
+});
+
+describe('sanitizeSupplierNote — não vaza marcador interno ao usuário', () => {
+  it('remove marcador subst: e auto-capturado', () => {
+    expect(sanitizeSupplierNote('auto-capturado| subst:só tem 20 comp')).toBe('só tem 20 comp');
+  });
+  it('remove prefixo "indicação de ..."', () => {
+    expect(sanitizeSupplierNote('indicação de Droga Raia — tem o item')).toBe('tem o item');
+  });
+  it('remove nota interna de ops "fornecedor sem telefone real"', () => {
+    expect(sanitizeSupplierNote('fornecedor sem telefone real')).toBe('');
+  });
+  it('tira URL (não vaza link/pix)', () => {
+    expect(sanitizeSupplierNote('paga aqui https://pix.example/abc please')).toBe('paga aqui please');
+  });
+  it('mascara telefone/CPF que o LLM copiou da fala da farmácia (review LOW — defense-in-depth)', () => {
+    expect(sanitizeSupplierNote('Tem o item; se quiser ligue (62) 99999-8888 pra combinar')).toBe('Tem o item; se quiser ligue [contato] pra combinar');
+    expect(sanitizeSupplierNote('meu pix é 111.222.333-44')).toBe('meu pix é [contato]');
+    // preço NÃO é mascarado (não é telefone de 10-11 dígitos)
+    expect(sanitizeSupplierNote('fica R$ 65,00 no total')).toBe('fica R$ 65,00 no total');
+  });
+  it('preserva nota útil de verdade (caso São Benedito)', () => {
+    const n = 'Tem o Cefaliv, mas o entregador só cobre o Setor Universitário; ofereceu despachar por Uber.';
+    expect(sanitizeSupplierNote(n)).toBe(n);
+  });
+  it('corta em ~180 chars', () => {
+    expect(sanitizeSupplierNote('x'.repeat(300)).length).toBeLessThanOrEqual(181);
+  });
+  it('vazio/null → string vazia', () => {
+    expect(sanitizeSupplierNote('')).toBe('');
+    expect(sanitizeSupplierNote(null)).toBe('');
+    expect(sanitizeSupplierNote(undefined)).toBe('');
+  });
+});
+
+describe('noteSignalsConditionalOffer — detecta "tem mas com ressalva/oferta"', () => {
+  it('caso São Benedito (tem + só entrega + Uber) → true', () => {
+    expect(noteSignalsConditionalOffer('Tem o Cefaliv, mas o entregador só cobre o Setor Universitário; ofereceu Uber.')).toBe(true);
+  });
+  it('retirada no balcão / horário / motoboy → true', () => {
+    expect(noteSignalsConditionalOffer('só retirada no balcão')).toBe(true);
+    expect(noteSignalsConditionalOffer('só entrego depois das 15h')).toBe(true);
+    expect(noteSignalsConditionalOffer('não levo aí, mas você consegue um motoboy')).toBe(true);
+  });
+  it('indicação de outro lugar → true', () => {
+    expect(noteSignalsConditionalOffer('não tenho, mas indico a Farmácia X')).toBe(true);
+  });
+  it('sem estoque puro (sem oferta) → false', () => {
+    expect(noteSignalsConditionalOffer('não tem em estoque')).toBe(false);
+    expect(noteSignalsConditionalOffer('só tem genérico, cliente quer a marca')).toBe(false);
+    expect(noteSignalsConditionalOffer('')).toBe(false);
+    expect(noteSignalsConditionalOffer(null)).toBe(false);
+  });
+  it('NEGAÇÃO de disponibilidade (Caso C puro) → false (review 07/07: "não temos" era falso-positivo)', () => {
+    expect(noteSignalsConditionalOffer('Não temos esse remédio')).toBe(false);
+    expect(noteSignalsConditionalOffer('não tenho o Cefaliv')).toBe(false);
+    expect(noteSignalsConditionalOffer('infelizmente não tenho')).toBe(false);
+    expect(noteSignalsConditionalOffer('não temos previsão')).toBe(false);
+    expect(noteSignalsConditionalOffer('sem disponível no momento')).toBe(false);
+  });
+  it('negação MAS com alternativa oferecida → true (referral / ressalva vence)', () => {
+    expect(noteSignalsConditionalOffer('não tenho, mas indico a Farmácia X')).toBe(true);
+    expect(noteSignalsConditionalOffer('não entrego aí, mas você consegue um motoboy')).toBe(true);
+    expect(noteSignalsConditionalOffer('tenho sim, só que entrego a partir das 15h')).toBe(true);
   });
 });

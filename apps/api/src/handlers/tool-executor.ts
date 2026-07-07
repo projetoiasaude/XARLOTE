@@ -12,6 +12,7 @@ import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
 import { relayUserAnswerToEstablishment } from './clarification.js';
 import { handleFindByName, handleContactEstablishment } from './reach-out.js';
+import { loadLatestOrderState, resolveTargetSupplier } from './order-state.js';
 import {
   handleStartTreatmentFromOrder, handleLogMedicationTaken, handleUpdateTreatmentStatus,
   handleLogSymptom, handleSetDefaultAddress,
@@ -123,6 +124,9 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         break;
       case 'expand_pharmacy_search':
         await handleExpandPharmacySearch(ctx);
+        break;
+      case 'message_supplier':
+        await handleMessageSupplier(tc.args as { supplier_hint?: string; message?: string }, ctx);
         break;
       case 'confirm_order_selection':
         await handleConfirmOrder(tc.args as { order_id: string; quote_id: string }, ctx);
@@ -994,12 +998,17 @@ async function startPharmacyDiscovery(
 }
 
 async function handleGetOrderStatus(ctx: ToolContext) {
-  // Pega o pedido ativo mais recente do usuário (qualquer status não-terminal).
+  // Pega o pedido MAIS RECENTE do usuário nas últimas 24h — INCLUI 'failed' (guarda
+  // anti-alucinação, incidente 07/07): antes 'failed' ficava de fora e a Xarlote pegava
+  // um pedido 'handed_off' ANTIGO e dizia "seu pedido já foi confirmado" pra um pedido que
+  // na verdade FALHOU hoje. A janela de 24h evita reportar um pedido velho.
+  const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const { data: order } = await db
     .from('orders')
     .select('id, status')
     .eq('user_id', ctx.userId)
-    .in('status', ['quoting', 'quoted', 'confirming', 'handed_off'])
+    .in('status', ['quoting', 'quoted', 'confirming', 'handed_off', 'failed'])
+    .gte('created_at', sinceIso)
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -1009,6 +1018,18 @@ async function handleGetOrderStatus(ctx: ToolContext) {
       ctx.conversationId,
       ctx.phoneE164,
       'No momento não tem nenhum pedido em andamento aqui 💙 É só me falar o medicamento e o endereço que eu cuido pra você.',
+      ctx.traceId,
+    );
+    return;
+  }
+
+  // Pedido que FALHOU: seja honesta (nunca "confirmado"). O mini-relatório detalhado já
+  // saiu na consolidação; aqui ofereço os caminhos de retomada (re-engajar / ampliar).
+  if (order.status === 'failed') {
+    await sendOutbound(
+      ctx.conversationId,
+      ctx.phoneE164,
+      'Esse pedido não fechou — nenhuma farmácia deu certo dessa vez 😔 Quer que eu volte em alguma que respondeu ou procure num raio maior?',
       ctx.traceId,
     );
     return;
@@ -1125,6 +1146,97 @@ async function handleExpandPharmacySearch(ctx: ToolContext) {
     }, i * 2000);
   }
   scheduleQuoteTimeout(order.id, ctx.conversationId, ctx.phoneE164, ctx.traceId, true); // force: re-arma os timers do lote novo
+}
+
+/**
+ * RE-ENGAJAMENTO DIRIGIDO (pedido do fundador — incidente São Benedito 07/07): manda uma
+ * mensagem PERSONALIZADA a UMA farmácia específica de um pedido ativo OU recente (mesmo
+ * 'failed'), retomando a conversa dentro da janela de 24h. Ex.: a São Benedito tinha o
+ * Cefaliv e ofereceu despachar por Uber → o usuário pede "fala que topo o Uber" → aqui a
+ * Xarlote volta na conversa daquela farmácia, manda o recado e reabre a negociação.
+ *
+ * Fecha os gaps do incidente: a Xarlote não sabia "voltar" numa farmácia; o pedido 'failed'
+ * nem aparecia como ativo; e a conversa da farmácia seguia viva (dentro das 24h).
+ */
+async function handleMessageSupplier(args: { supplier_hint?: string; message?: string }, ctx: ToolContext) {
+  // Kill-switch de disparo (a msg vai pra uma farmácia) — freio de emergência.
+  if (!loadPrompts().pharmacy_outbound_enabled) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164, 'O contato com farmácias está pausado no momento 💙 Já já volto a falar com elas pra você.', ctx.traceId);
+    return;
+  }
+  const hint = (args.supplier_hint ?? '').trim();
+  const message = (args.message ?? '').trim();
+  if (!message) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164, 'Me diz o que você quer que eu fale pra farmácia que eu mando na hora 💙', ctx.traceId);
+    return;
+  }
+
+  const state = await loadLatestOrderState(ctx.userId);
+  if (!state || !state.suppliers.length) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      'Não achei um pedido recente com farmácias pra eu falar 💙 Se quiser, me fala o remédio e o endereço que eu começo uma busca nova.', ctx.traceId);
+    return;
+  }
+
+  const target = resolveTargetSupplier(state, hint);
+  if (!target) {
+    const nomes = state.suppliers.map((s) => s.supplierName).slice(0, 6).join(', ');
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      `Não tenho certeza de qual farmácia você quer que eu fale 🤔 As do seu pedido são: ${nomes}. Me diz o nome que eu mando na hora.`, ctx.traceId);
+    return;
+  }
+
+  if (!target.conversationId || !target.phoneE164 || isPlaceholderPhone(target.phoneE164)) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      `Não tenho um WhatsApp válido da ${target.supplierName} pra falar direto com ela 😕 Quer que eu procure em outras farmácias?`, ctx.traceId);
+    return;
+  }
+
+  // Janela de 24h (WABA/zpro): fora dela, texto livre não é entregue — seja honesta.
+  if (!target.contactableFreeText) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      `Faz mais de 24h que a ${target.supplierName} não me responde, então não consigo reabrir a conversa direto com ela 😕 Quer que eu procure em outras farmácias num raio maior?`, ctx.traceId);
+    return;
+  }
+
+  // TOCTOU (review HIGH): entre o loadLatestOrderState e agora, um confirm_order_selection
+  // concorrente pode ter DECIDIDO o pedido (sem serialização por-usuário ainda). Re-lê o
+  // status FRESCO do banco ANTES de qualquer side-effect. Se o pedido já foi decidido e o
+  // alvo NÃO é a farmácia escolhida, aborta (não reabre conversa com irmã congelada — Fix
+  // #2 freeze). A janela restante (re-fetch → send) é mínima.
+  const { data: freshOrder } = await db.from('orders').select('status, selected_quote_id').eq('id', state.orderId).maybeSingle();
+  const freshStatus = freshOrder?.status;
+  const isChosen = !!freshOrder?.selected_quote_id && freshOrder.selected_quote_id === target.quoteId;
+  if (!freshStatus || (['confirming', 'handed_off', 'cancelled'].includes(freshStatus) && !isChosen)) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      'Esse pedido já foi fechado 💙 Se quiser falar com outra farmácia, me fala que eu começo um pedido novo.', ctx.traceId);
+    return;
+  }
+
+  // Revive dirigido: cotação terminal (timeout/unavailable) → 'negotiating' pra reatar o
+  // loop. Reabre o pedido em modo EAGER (status_5min_done=true) + created_at=now: assim,
+  // quando a farmácia responder, notifyUserQuoteArrived apresenta na hora — e NÃO re-armo os
+  // timers curtos de 3/5min (que consolidariam cedo e MATARIAM a revivida antes de ela
+  // responder; espelha o revive de resposta tardia em inbound-supplier, que confia no eager
+  // + rescue de 45min). Guards de status tornam idempotente sob concorrência.
+  const revivedTerminal = ['timeout', 'unavailable'].includes(target.status);
+  if (revivedTerminal) {
+    await db.from('quotes').update({ status: 'negotiating', completed_at: null })
+      .eq('id', target.quoteId).in('status', ['timeout', 'unavailable']);
+    // Reabre 'failed' OU 'quoted' (não só failed): se ficasse 'quoted', notifyUserQuoteArrived
+    // dá no-op e a cotação da revivida NUNCA apareceria. Guardado no status fresco não-decidido.
+    await db.from('orders').update({ status: 'quoting', status_5min_done: true, created_at: new Date().toISOString() })
+      .eq('id', state.orderId).in('status', ['failed', 'quoted', 'quoting']);
+  }
+
+  // Envia pela FILA do agente (ban-safe). A `message` pode conter PII (endereço) → NÃO logar.
+  await sendOutboundToSupplier(target.conversationId, target.phoneE164, message, ctx.traceId);
+
+  await writeLog('info', 'order', `message_supplier → ${target.supplierName} (re-engajamento dirigido)`, {
+    traceId: ctx.traceId, orderId: state.orderId, quoteId: target.quoteId, revived: revivedTerminal,
+  });
+  await sendOutbound(ctx.conversationId, ctx.phoneE164,
+    `Prontinho, mandei pra ${target.supplierName} 💬 Assim que responderem eu te aviso aqui!`, ctx.traceId);
 }
 
 /** Escapa curingas de LIKE/ILIKE (% e _) num valor vindo da LLM/usuário. */

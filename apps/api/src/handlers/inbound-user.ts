@@ -12,6 +12,7 @@ import { sendOutbound, sendOutboundAudio } from './outbound.js';
 import { handleToolCall } from './tool-executor.js';
 import { saveContactsToMemory } from './reach-out.js';
 import { findPendingClarificationForUser } from './clarification.js';
+import { loadLatestOrderState, buildOrderStateBlock } from './order-state.js';
 
 // Queue pra disparar enricher async — instância única por processo
 const enricherQueue = new Queue(QUEUE_NAMES.PROFILE_ENRICHER, {
@@ -301,7 +302,7 @@ export async function processInboundUser(
     }
   };
 
-  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif, activeRemindersRes, recentTasksRes] = await Promise.all([
+  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif, activeRemindersRes, recentTasksRes, orderState] = await Promise.all([
     getConversationMessages(conversation.id, 30),
     queryUser360(user.id),
     db.from('orders')
@@ -342,6 +343,10 @@ export async function processInboundUser(
       .gte('completed_at', new Date(Date.now() - 10 * 60_000).toISOString())
       .order('completed_at', { ascending: false })
       .limit(6),
+    // Estado COMPLETO do pedido de farmácia mais recente (todas as farmácias, cada uma
+    // num ponto) — pra Xarlote entender o pedido inteiro, re-contatar uma específica
+    // (message_supplier) e nunca alucinar "confirmado" num pedido que falhou.
+    loadLatestOrderState(user.id).catch(() => null),
   ]);
 
   const geminiHistory = trimHistory(messagesToHistory(history.slice(0, -1)), 20);
@@ -470,6 +475,13 @@ export async function processInboundUser(
   if (pendingClarif) {
     const oQue = pendingClarif.kind === 'clinic' ? 'a consulta' : 'o pedido';
     systemPrompt += `\n\n## ⏳ PERGUNTA PENDENTE DE UM ESTABELECIMENTO\n${pendingClarif.supplierName} está aguardando uma resposta sua pra continuar ${oQue}:\n"${pendingClarif.question}"\n\nSe a mensagem do usuário responde um DADO desta pergunta (mesmo parcial), chame **relay_answer_to_establishment** com a resposta dele no campo \`answer\`. Se ele falar de OUTRA coisa, responda normal; a pergunta continua pendente.\n\n🔒 EXCEÇÃO IMPORTANTE: se a mensagem do usuário for um ACEITE/ESCOLHA de uma opção já cotada (ver PEDIDO ATIVO) — ex.: "aceito", "pode ser", "quero a X" — use **confirm_order_selection** (NÃO relay). Fechar já avisa a farmácia.`;
+  }
+
+  // Estado COMPLETO do pedido (todas as farmácias + o que cada uma disse + quais dá pra
+  // re-contatar na janela de 24h). Dá à Xarlote a compreensão do pedido inteiro — pra
+  // voltar numa farmácia específica (message_supplier), reportar honesto e não alucinar.
+  if (orderState) {
+    systemPrompt += `\n\n${buildOrderStateBlock(orderState)}`;
   }
 
   // 9. Build user message — texto, áudio (transcrito), imagem (multimodal vision), localização.

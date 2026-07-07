@@ -165,6 +165,28 @@ export const xarloteTools: ToolDefinition[] = [
   {
     type: 'function',
     function: {
+      name: 'message_supplier',
+      description:
+        'Manda uma mensagem PERSONALIZADA a UMA farmácia específica de um pedido em andamento OU recente (mesmo que já tenha "falhado" ou a farmácia já tenha respondido), pra RETOMAR/DESTRAVAR aquela conversa. Use quando o usuário pedir algo dirigido a uma farmácia que você já contatou: "volta na São Benedito e diz que topo o Uber", "pergunta pra Drogalobo se tem o genérico", "fala pra farmácia que respondeu que pode ser hoje à tarde". Eu identifico a farmácia pela dica (veja "ESTADO DO PEDIDO" no contexto), mando sua mensagem no WhatsApp dela e reabro a negociação — quando ela responder eu sigo o fluxo normal e você fecha com confirm_order_selection. ⚠️ NÃO use pra COMEÇAR um pedido novo (start_pharmacy_order) nem pra BUSCAR mais farmácias num raio maior (expand_pharmacy_search) nem pra responder uma PERGUNTA PENDENTE (relay_answer_to_establishment).',
+      parameters: {
+        type: 'object',
+        properties: {
+          supplier_hint: {
+            type: 'string',
+            description: 'Nome ou dica da farmácia-alvo, como o usuário se referiu ("São Benedito", "a que tem o remédio", "a que respondeu", "a do Uber"). Eu caso com as farmácias do pedido (ver ESTADO DO PEDIDO).',
+          },
+          message: {
+            type: 'string',
+            description: 'A mensagem que vai DIRETO pra farmácia — 1ª pessoa, curta e natural, como se VOCÊ estivesse no WhatsApp (a farmácia não sabe que há um cliente por trás). NÃO escreva "o cliente quer/topa" (3ª pessoa = robô); escreva "topo pedir o Uber sim, quanto fica no total?", "consigo retirar no balcão?", "pode ser hoje à tarde mesmo". Auto-contida.',
+          },
+        },
+        required: ['supplier_hint', 'message'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'confirm_order_selection',
       description:
         'FECHA o pedido escolhendo UMA das farmácias já cotadas (avisa a farmácia E manda o pagamento pro cliente — é o passo que efetiva a compra). Chame SEMPRE que houver PEDIDO ATIVO com opções cotadas e o usuário aceitar/escolher uma: "aceito", "pode ser", "fechou", "quero a 1", "prefiro a Droga Raia", "a mais barata", "essa mesma". ⚠️ Isso TEM PRIORIDADE sobre relay_answer_to_establishment quando o pedido já está cotado — NÃO use relay pra fechar um pedido.',

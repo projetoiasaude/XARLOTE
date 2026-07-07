@@ -7,7 +7,7 @@ import {
   messagesToHistory,
   trimHistory,
 } from '@iasaude/llm';
-import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone, toE164BR, brPhoneVariants, extractPriceBRL, parseUnitCount, shortSupplierAddress, mentionsFreeShipping, itemDisplayName } from '@iasaude/shared';
+import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone, toE164BR, brPhoneVariants, extractPriceBRL, parseUnitCount, shortSupplierAddress, mentionsFreeShipping, itemDisplayName, noteSignalsConditionalOffer } from '@iasaude/shared';
 import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier, sendTemplateOpeningToSupplier } from './outbound-agent.js';
@@ -376,6 +376,10 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   let freteKnown = mentionsFreeShipping(text)
     || (history ?? []).some((m) => m.direction === 'in' && mentionsFreeShipping(m.content ?? ''));
   let referralRecorded = false; // indicação seguida → agradece mesmo com outcome unavailable
+  // Resposta CONDICIONAL (tem o item mas com ressalva / ofereceu Uber, retirada, etc. —
+  // CASO C3): a farmácia engajou, então NÃO fica no vácuo (silêncio) como um unavailable
+  // seco — manda um ack humano segurando a conversa (incidente São Benedito 07/07).
+  let conditionalOfferRecorded = false;
 
   for (const tc of llmResponse.toolCalls) {
     switch (tc.name) {
@@ -418,7 +422,10 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
       case 'record_supplier_unavailable': {
         const a = tc.args as { reason?: string };
         await db.from('quotes').update({ status: 'unavailable', completed_at: new Date().toISOString(), notes: a.reason ?? null }).eq('id', quote.id);
-        await writeLog('info', 'quote', `❌ Farmácia indisponível: ${a.reason ?? 'sem motivo'}`, { traceId, quoteId: quote.id });
+        // CASO C3: tem o item mas com ressalva / ofereceu alternativa (Uber, retirada…) →
+        // a farmácia engajou, não deixa no vácuo (o ack humano do LLM vai sair na etapa 10).
+        if (noteSignalsConditionalOffer(a.reason)) conditionalOfferRecorded = true;
+        await writeLog('info', 'quote', `❌ Farmácia indisponível: ${a.reason ?? 'sem motivo'}${conditionalOfferRecorded ? ' (condicional/ofereceu alternativa)' : ''}`, { traceId, quoteId: quote.id });
         shouldFinalize = true;
         outcome = 'unavailable';
         break;
@@ -568,12 +575,18 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   // finalize, então a farmácia dava o preço e ouvia SILÊNCIO (a despedida "anotado,
   // vou confirmar com o cliente" do Caso A1 nunca saía).
   // Indicação seguida NÃO é silêncio: a farmácia ajudou — agradece (mesmo unavailable).
-  const silentOutcome = (outcome === 'unavailable' || outcome === 'timeout') && !referralRecorded;
+  // Resposta CONDICIONAL (CASO C3) também NÃO é silêncio: a farmácia ofereceu algo (Uber,
+  // retirada) e ficaria no vácuo — manda um ack humano segurando a conversa.
+  const silentOutcome = (outcome === 'unavailable' || outcome === 'timeout') && !referralRecorded && !conditionalOfferRecorded;
   if (llmResponse.text.trim() && !silentOutcome) {
     await sendOutboundToSupplier(conversationId, supplierPhone, llmResponse.text.trim(), traceId);
   } else if (!llmResponse.text.trim() && referralRecorded) {
     // Fallback determinístico do agradecimento da indicação (turno só-tool).
     await sendOutboundToSupplier(conversationId, supplierPhone, 'Ah, perfeito! Muito obrigada pela indicação, vou falar com eles. 🙏', traceId);
+  } else if (!llmResponse.text.trim() && conditionalOfferRecorded) {
+    // Fallback determinístico do ack condicional (CASO C3, turno só-tool): não deixa a
+    // farmácia que ofereceu alternativa no vácuo (era o buraco do incidente São Benedito).
+    await sendOutboundToSupplier(conversationId, supplierPhone, 'Entendi! Deixa eu confirmar aqui com quem vai receber e já te falo, tá? 🙂', traceId);
   } else if (!llmResponse.text.trim() && quoteRecorded && !silentOutcome) {
     // FALLBACK DETERMINÍSTICO: o gpt-4.1-mini às vezes registra a cotação via tool
     // SEM gerar texto → a farmácia ficava no vácuo. Aqui garantimos uma resposta:

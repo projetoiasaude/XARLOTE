@@ -424,3 +424,114 @@ export function resolveQuotePick(options: QuoteOption[], text: string | null | u
 
   return null;
 }
+
+// ─── Re-engajamento dirigido: resolver farmácia por dica + sanitizar nota ─────
+
+/** Candidato de farmácia dentro de um pedido, pra re-contato dirigido (message_supplier). */
+export interface SupplierCandidate {
+  quote_id: string;
+  supplier_name?: string | null;
+  /** pending|contacting|negotiating|quoted|unavailable|timeout */
+  status?: string | null;
+  /** Deu qualquer resposta substantiva (cotou um preço OU disse algo registrado em notes). */
+  responded?: boolean;
+}
+
+/**
+ * Resolve QUAL farmácia de um pedido o usuário quer re-contatar, a partir de uma dica
+ * em texto ("volta na São Benedito", "fala com a que tem o remédio", "a que respondeu").
+ * Conservador — devolve null em ambiguidade (é um envio real a um fornecedor):
+ *   - nome distintivo casando EXATAMENTE 1 → ela;
+ *   - >1 nome casando → null (ambíguo);
+ *   - 0 nome + dica semântica ("a que tem/respondeu", "a única", "aquela") + EXATAMENTE
+ *     1 respondente → ela.
+ */
+export function resolveSupplierByHint(
+  candidates: SupplierCandidate[],
+  hint: string | null | undefined,
+): string | null {
+  if (!candidates?.length || !hint) return null;
+  const t = fold(hint);
+  // Negação/exclusão → não mira ninguém (paridade com resolveQuotePick/isOrderAcceptance):
+  // "não fala com a X", "qualquer uma menos a X" não podem virar um envio À X (review LOW).
+  // NEGATION_RE cobre não/nunca/nem/cancela; "menos/exceto/tirando" são exclusão local.
+  if (NEGATION_RE.test(t) || /\b(menos|exceto|tirando|sem ser)\b/.test(t)) return null;
+
+  // 1) NOME da farmácia. Casa por PALAVRA INTEIRA (\b), não substring — senão um token
+  //    curto ('sol','vida','rio') casaria dentro de palavras comuns ("re[sol]ve") e
+  //    miraria a farmácia ERRADA (review MEDIUM). Nome 100% genérico (sem palavra
+  //    distintiva, ex.: "Farmácia Popular") cai no fallback de FRASE inteira.
+  const nameMatches = candidates.filter((c) => {
+    const nm = c.supplier_name ?? '';
+    const words = distinctiveWords(nm);
+    if (words.length) return words.some((w) => new RegExp(`\\b${w}\\b`).test(t));
+    const full = fold(nm).replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+    return full.length >= 5 && t.includes(full);
+  });
+  if (nameMatches.length === 1) return (nameMatches[0] as SupplierCandidate).quote_id;
+  if (nameMatches.length > 1) return null;
+
+  // 2) DICA SEMÂNTICA ("a que tem/respondeu", "a única", "aquela", "do uber") →
+  //    se houver EXATAMENTE 1 respondente, é ela; senão null (não adivinha).
+  // Cues ESPECÍFICOS de "aquela que respondeu/tem" — de propósito SEM "aquela"/"a que"
+  // soltos (vagos demais; "aquela farmácia lá" não deve mirar ninguém).
+  const semantic =
+    /\b(que tem|que responde|respondeu|que tinha|dispon[ií]vel|a [uú]nica|[uú]nica que|a farm[aá]cia que|que ofereceu|do uber|o uber|essa farm[aá]cia)\b/.test(t);
+  if (semantic) {
+    const responders = candidates.filter((c) => c.responded);
+    if (responders.length === 1) return (responders[0] as SupplierCandidate).quote_id;
+  }
+  return null;
+}
+
+/**
+ * Limpa a nota interna de uma cotação (`quotes.notes`) pra apresentar ao usuário SEM
+ * vazar marcadores internos nem links/chaves. Remove marcadores canônicos (subst:,
+ * auto-capturado, "indicação de …"), tira URLs, colapsa espaço e corta em ~180 chars.
+ * Devolve '' se não sobrar conteúdo útil (o caller então omite a linha).
+ */
+export function sanitizeSupplierNote(note: string | null | undefined): string {
+  if (!note) return '';
+  let s = String(note);
+  s = s
+    .replace(/\bsubst:\s*/gi, ' ') // tira o marcador "subst:", mantém o valor ("só tem N comp")
+    .replace(/\bauto-capturado\b/gi, ' ')
+    .replace(/^\s*indica[çc][aã]o de[^—\-|]*[—\-|]?/i, ' ')
+    .replace(/fornecedor sem telefone real/gi, ' ') // nota interna de ops (sem número)
+    .replace(/https?:\/\/\S+/gi, ' ')
+    // Defense-in-depth: a nota vai por sendOutbound ao usuário — mascara telefone/CPF que
+    // o LLM possa ter copiado da fala da farmácia (não vazar número/chave cru). CPF ANTES
+    // do telefone (11 dígitos com pontuação de CPF não devem virar telefone).
+    .replace(/\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g, '[contato]') // CPF formatado
+    .replace(/\(?\d{2}\)?[\s.-]?9?\d{4}[\s.-]?\d{4}\b/g, '[contato]') // telefone BR (10-11 díg)
+    .replace(/[|]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (s.length > 180) s = s.slice(0, 177).trimEnd() + '…';
+  return s;
+}
+
+/**
+ * Heurística: a nota de uma cotação `unavailable`/`timeout` indica que a farmácia TEM
+ * o item ou OFERECEU uma alternativa (entrega condicional, retirada, Uber, indicação)?
+ * Usado pra (a) marcar a cotação como "respondeu de forma útil" no relatório e (b)
+ * sugerir re-engajar aquela farmácia. Conservador: só true com sinal claro.
+ */
+export function noteSignalsConditionalOffer(note: string | null | undefined): boolean {
+  if (!note) return false;
+  const t = fold(note);
+  // 1) Alternativa OFERECIDA (Uber, retirada, balcão, horário, indicação) vale SEMPRE —
+  //    inclusive junto de "não tenho, MAS indico X" (referral) ou "só entrego no Setor Y".
+  //    PREFIXO (sem \b final) pra casar flexões: indic→indico/indica, retir→retirada,
+  //    despach→despachar, s[óo] entreg→só entrega/entrego. uber/balcão são palavra inteira.
+  const hasAlternative =
+    /\bs[óo]\s+entreg|\bretir|\bbalc[aã]o|\buber\b|\bmotoboy|\bbuscar|\bdespach|\ba partir das|\bdepois das|\bindic|\bencaminh/.test(t);
+  if (hasAlternative) return true;
+  // 2) Disponibilidade positiva — mas BARRANDO negação ("não tenho", "não temos", "sem
+  //    disponível"). "em estoque" fica de fora (casaria "não tem em estoque"). Sem o guard,
+  //    "Não temos esse remédio" (Caso C puro) virava falso-positivo (review 07/07).
+  const hasAvailability = /\b(tenho|temos|tem o |tem sim|tem aqui|dispon[ií]vel)\b/.test(t);
+  if (!hasAvailability) return false;
+  const negatedHave = /\b(nao|nem|sem)\b[^.;!?]{0,12}\b(tenho|temos|tem|dispon[ií]vel)/.test(t);
+  return !negatedHave;
+}
