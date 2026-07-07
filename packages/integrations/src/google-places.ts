@@ -3,6 +3,7 @@ import axios from 'axios';
 // Uses the Legacy Places API (Nearby Search) which is enabled on this project.
 // Places API (New) requires separate activation at console.developers.google.com.
 const NEARBY_SEARCH = 'https://maps.googleapis.com/maps/api/place/nearbysearch/json';
+const TEXT_SEARCH = 'https://maps.googleapis.com/maps/api/place/textsearch/json';
 const GEOCODING_BASE = 'https://maps.googleapis.com/maps/api/geocode/json';
 const PLACE_DETAILS = 'https://maps.googleapis.com/maps/api/place/details/json';
 
@@ -208,6 +209,48 @@ export async function reverseGeocode(lat: number, lng: number): Promise<string |
     timeout: 8_000,
   });
   return res.data?.results?.[0]?.formatted_address ?? null;
+}
+
+/**
+ * Busca lugares por TEXTO (nome + cidade), não por lat/lng+raio. Usado quando o
+ * usuário dá o NOME de um médico ou de uma clínica ("Dr. Fulano cardiologista
+ * Goiânia", "Clínica Vida Goiânia") — o discovery normal só acha por proximidade.
+ * Places Text Search (mesma chave/legacy API). Retorna candidatos SEM telefone
+ * (chame getPlacePhone(placeId) nos escolhidos, como no discovery por proximidade).
+ */
+export async function findPlacesByTextSearch(query: string, limit = 5): Promise<PlaceResult[]> {
+  const q = (query ?? '').trim();
+  if (!q) return [];
+  const res = await axios.get(TEXT_SEARCH, {
+    params: { query: q, key: getKey(), language: 'pt-BR', region: 'br' },
+    timeout: 10_000,
+  });
+  if (res.data?.status !== 'OK' && res.data?.status !== 'ZERO_RESULTS') {
+    throw new Error(`Places Text Search error: ${res.data?.status} — ${res.data?.error_message ?? ''}`);
+  }
+  const places: unknown[] = res.data?.results ?? [];
+  return places.slice(0, limit).map((p: any) => {
+    const addr: string = p.formatted_address ?? '';
+    const parts = addr.split(',').map((s: string) => s.trim()).filter(Boolean);
+    // formatted_address BR ~ "Rua X, 100 - Bairro, Cidade - UF, CEP, Brasil"
+    const cityState = parts.find((s: string) => / - [A-Z]{2}\b/.test(s)) ?? '';
+    const [city, state] = cityState.split(' - ').map((s: string) => s.trim());
+    return {
+      placeId: p.place_id as string,
+      name: (p.name ?? '') as string,
+      address: addr,
+      city: city ?? '',
+      state: state ?? '',
+      lat: p.geometry?.location?.lat as number,
+      lng: p.geometry?.location?.lng as number,
+      phone: undefined,
+      website: undefined,
+      rating: p.rating as number | undefined,
+      userRatingCount: (p.user_ratings_total as number) ?? undefined,
+      distanceKm: undefined,
+      isOpen: p.opening_hours?.open_now as boolean | undefined,
+    } as PlaceResult;
+  });
 }
 
 /** Fetch phone number for a place (requires an extra Detail call). */

@@ -9,6 +9,7 @@
 // Devolve `null` para: echo (fromMe), grupo, status/ack, ou shape irreconhecível.
 import { parsePhoneNumber } from 'libphonenumber-js';
 import type { NormalizedInbound } from '@iasaude/shared';
+import { extractSharedContacts } from './contacts.js';
 
 // ── helpers de extração tolerante ────────────────────────────────────────────
 
@@ -211,6 +212,30 @@ export function normalizeZproWebhook(
   ) {
     const text = btnTitle || pickStr(payload, P.text) || btnId || '';
     return { ...base, contentType: 'text', text };
+  }
+
+  // 1.5) Contato(s) compartilhado(s) (vCard) — msg.type='contacts', msg.contacts[].
+  //      Um envio pode trazer VÁRIOS cards. Trata como TEXTO (pra fluir no pipeline e
+  //      persistir) + anexa sharedContacts pra Xarlote poder falar com o número.
+  if (typeStr.includes('contact')) {
+    const msgObj = (payload as { msg?: unknown })?.msg ?? payload;
+    const contacts = extractSharedContacts(msgObj);
+    if (contacts.length) {
+      const names = contacts.map((c) => c.name).join(', ');
+      return {
+        ...base,
+        contentType: 'text',
+        text: `[Compartilhou ${contacts.length > 1 ? 'os contatos' : 'o contato'}: ${names}]`,
+        sharedContacts: contacts,
+      };
+    }
+    // Contato sem telefone legível → NÃO dropa a mensagem (senão vira dead air): devolve
+    // um texto pra Xarlote pedir o número digitado (review).
+    return {
+      ...base,
+      contentType: 'text',
+      text: '[O usuário compartilhou um contato, mas não consegui ler o número — peça pra ele digitar o WhatsApp com DDD]',
+    };
   }
 
   // 2) Localização

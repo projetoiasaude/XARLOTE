@@ -1,6 +1,7 @@
 import { parsePhoneNumber } from 'libphonenumber-js';
 import type { NormalizedInbound } from '@iasaude/shared';
 import type { UazapiWebhookPayload } from './types.js';
+import { extractSharedContacts } from './contacts.js';
 
 export function normalizeWebhookPayload(payload: UazapiWebhookPayload): NormalizedInbound | null {
   const msg = payload.message;
@@ -62,6 +63,28 @@ export function normalizeWebhookPayload(payload: UazapiWebhookPayload): Normaliz
       msg.text ||
       '';
     return { ...base, contentType: 'text', text };
+  }
+
+  // Contato(s) compartilhado(s) — best-effort (shape uazapi não capturado; tenta
+  // as chaves prováveis). Trata como texto + anexa sharedContacts.
+  if (type.includes('contact') || messageType.includes('contact')) {
+    const m = msg as unknown as Record<string, unknown>;
+    const contacts = extractSharedContacts(m['contacts'] ?? (m['content'] as Record<string, unknown>)?.['contacts'] ?? m);
+    if (contacts.length) {
+      const names = contacts.map((c) => c.name).join(', ');
+      return {
+        ...base,
+        contentType: 'text',
+        text: `[Compartilhou ${contacts.length > 1 ? 'os contatos' : 'o contato'}: ${names}]`,
+        sharedContacts: contacts,
+      };
+    }
+    // Contato sem número legível → não dropa (dead air): pede o número digitado.
+    return {
+      ...base,
+      contentType: 'text',
+      text: '[O usuário compartilhou um contato, mas não consegui ler o número — peça pra ele digitar o WhatsApp com DDD]',
+    };
   }
 
   // Texto

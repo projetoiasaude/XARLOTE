@@ -234,6 +234,10 @@ export interface NormalizedInbound {
   mediaMime?: string;
   mediaDurationMs?: number;
   location?: { lat: number; lng: number; name?: string; address?: string };
+  // Contato(s) do WhatsApp compartilhado(s) pelo usuário (vCard). Um único envio
+  // pode trazer VÁRIOS cards (msg.contacts é array). phoneE164 já normalizado; org
+  // presente = contato comercial (business). Usado pra Xarlote falar com esse número.
+  sharedContacts?: Array<{ name: string; phoneE164: string; org?: string }>;
   // Contexto do provedor (zpro/WABA): id do ticket aberto pra este contato, usado
   // pra enviar botões interativos (/sendButtonWABA exige ticketId). Opcional —
   // ausente no uazapi.

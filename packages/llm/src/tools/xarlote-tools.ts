@@ -210,6 +210,42 @@ export const xarloteTools: ToolDefinition[] = [
   {
     type: 'function',
     function: {
+      name: 'find_clinic_by_name',
+      description: 'Procura um MÉDICO ou CLÍNICA pelo NOME no Google (quando o paciente dá só o nome, ex.: "quero marcar com o Dr. Fulano", "acha a Clínica Vida"). Eu busco na internet, pego o telefone e APRESENTO pro paciente confirmar se é aquele mesmo — só depois que ele confirmar é que eu chamo contact_establishment pra falar com eles. NÃO use pra farmácia (essa é discovery por localização).',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Nome do médico ou da clínica que o paciente falou.' },
+          city: { type: 'string', description: 'Cidade pra refinar a busca. Se o paciente não disse, omita (uso a cidade do perfil).' },
+          specialty: { type: 'string', description: 'Especialidade, se souber (ex.: "cardiologista"). Opcional.' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'contact_establishment',
+      description: 'Entra em contato com um número ESPECÍFICO pra resolver algo — use em 2 situações: (1) o paciente CONFIRMOU a clínica/médico que você achou com find_clinic_by_name ("sim, é essa") → chame SEM phone (eu uso o contato pendente); (2) o paciente COMPARTILHOU um contato do WhatsApp ou DIGITOU um número e quer que você fale com ele → passe o phone. Diga o kind (clinic pra marcar consulta, pharmacy pra pedir remédio). Pra pharmacy, passe os items. Eu salvo o contato na memória automaticamente.',
+      parameters: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', enum: ['clinic', 'pharmacy'], description: 'clinic = marcar consulta; pharmacy = pedir/cotar remédio.' },
+          phone: { type: 'string', description: 'Telefone/WhatsApp do contato (com DDD), quando o paciente compartilhou/digitou. Omita se for confirmação de um find_clinic_by_name (uso o pendente).' },
+          name: { type: 'string', description: 'Nome do contato/estabelecimento, se souber.' },
+          specialty: { type: 'string', description: 'Especialidade da consulta (kind=clinic). Opcional.' },
+          items: {
+            type: 'array', description: 'Medicamentos a cotar (kind=pharmacy).',
+            items: { type: 'object', properties: { name: { type: 'string' }, dosage: { type: 'string' }, quantity: { type: 'string' }, substitutes_ok: { type: 'boolean' } }, required: ['name', 'substitutes_ok'] },
+          },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'create_reminder',
       description:
         'Cria um lembrete/despertador. Quando chegar a hora, a Xarlote manda mensagem proativa no WhatsApp e no app. Use scheduled_at (único) OU rrule (recorrente) — pelo menos um dos dois. ⚠️ Se o usuário pedir pra MUDAR/REDIVIDIR um plano de lembretes que já existe (os ativos aparecem no seu contexto em LEMBRETES ATIVOS), chame cancel_reminders dos antigos ANTES de criar os novos — senão ele recebe os dois planos duplicados.',

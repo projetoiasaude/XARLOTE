@@ -10,6 +10,7 @@ import { Queue } from 'bullmq';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutbound, sendOutboundAudio } from './outbound.js';
 import { handleToolCall } from './tool-executor.js';
+import { saveContactsToMemory } from './reach-out.js';
 import { findPendingClarificationForUser } from './clarification.js';
 
 // Queue pra disparar enricher async — instância única por processo
@@ -476,7 +477,21 @@ export async function processInboundUser(
   let userMsgContent: string | ChatContent[] = inbound.text ?? '';
   let userMsgPreview = '';
 
-  if (inbound.contentType === 'location' && inbound.location) {
+  if (inbound.sharedContacts?.length) {
+    // Contato(s) do WhatsApp compartilhado(s): mostra nome+telefone pro LLM (pra ele
+    // poder chamar contact_establishment) e SALVA na memória automaticamente. O telefone
+    // NÃO fica no content persistido (inbound.text é phone-free) — só no prompt do LLM.
+    const list = inbound.sharedContacts
+      .map((c) => `${c.name} (WhatsApp ${c.phoneE164}${c.org ? `, ${c.org}` : ''})`).join('; ');
+    const plural = inbound.sharedContacts.length > 1;
+    userMsgContent = `[O usuário compartilhou ${plural ? 'os contatos' : 'o contato'}: ${list}. Já salvei na sua memória. Se ele quiser que você FALE com esse número (pedir remédio, marcar consulta, etc.), chame contact_establishment com esse phone e o kind certo. Se ele não disse o que quer, pergunte.]`;
+    userMsgPreview = `[contato: ${inbound.sharedContacts.map((c) => c.name).join(', ')}]`;
+    await saveContactsToMemory(inbound.sharedContacts, { userId: user.id, conversationId: conversation.id, phoneE164, traceId })
+      .catch(() => { /* memória é best-effort */ });
+    // Chegou contato NOVO → invalida uma busca-por-nome pendente (senão um "sim" depois
+    // poderia contatar o candidato antigo em vez deste contato — review).
+    await db.from('conversations').update({ pending_lookup: null }).eq('id', conversation.id).then(() => {}, () => {});
+  } else if (inbound.contentType === 'location' && inbound.location) {
     userMsgContent = `[Localização compartilhada: lat ${inbound.location.lat}, lng ${inbound.location.lng}${inbound.location.name ? `, ${inbound.location.name}` : ''}]`;
     userMsgPreview = userMsgContent;
   } else if (inbound.contentType === 'audio') {
