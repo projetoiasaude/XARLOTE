@@ -47,6 +47,88 @@ export function isPharmacyChain(name: string | null | undefined): boolean {
   return PHARMACY_CHAIN_NAMES.some((c) => n.includes(c));
 }
 
+// ─── Troca de medicamento (product-switch) ───────────────────────────────────
+// Palavras que NÃO discriminam o medicamento (dosagem, apresentação, quantidade,
+// conectivos) — removidas antes de comparar dois pedidos. Ficam só os tokens
+// "cabeça" (o nome real da droga: pietra, cefaliv, dorflex…).
+const MED_NOISE = new Set<string>([
+  'mg', 'mcg', 'ml', 'g', 'ui', 'un', 'und', 'unid', 'unidade', 'unidades',
+  'caixa', 'caixas', 'cx', 'comp', 'comprimido', 'comprimidos', 'cp', 'cps',
+  'capsula', 'capsulas', 'caps', 'drageas', 'dragea', 'frasco', 'frascos',
+  'ampola', 'ampolas', 'sache', 'saches', 'gotas', 'spray', 'pomada', 'creme',
+  'xarope', 'solucao', 'suspensao', 'de', 'do', 'da', 'com', 'sem', 'e', 'ed',
+  'generico', 'generica', 'marca', 'ref', 'similar',
+]);
+
+// Palavras de CLASSE/veículo/sal/fabricante — genéricas demais pra discriminar UM
+// medicamento sozinhas. Dois produtos TOTALMENTE diferentes podem compartilhá-las
+// ("cloridrato de metformina" ≠ "cloridrato de sertralina"; "Vitamina D" ≠
+// "Vitamina C"). Removidas dos tokens-cabeça pra não gerar falso "mesmo" (review
+// Cefaliv: senão a troca entre vitaminas/ácidos/sais reabre o delírio). O
+// discriminador real (metformina, ferroso) sobrevive; pra vitamina, o designador
+// (C/D/D3/B12) é capturado à parte em medHeadTokens.
+const MED_CLASS = new Set<string>([
+  'vitamina', 'vitaminas', 'vit', 'acido', 'sulfato', 'cloridrato', 'maleato',
+  'besilato', 'mesilato', 'valerato', 'dipropionato', 'fosfato', 'nitrato',
+  'bromidrato', 'oleo', 'soro', 'colageno', 'complexo', 'composto', 'sais',
+  'sabonete', 'shampoo', 'xampu', 'oral', 'infantil', 'adulto', 'pediatrico',
+  'forte', 'plus', 'max', 'flex',
+  // fabricantes (aparecem no nome mas não discriminam a droga)
+  'neo', 'quimica', 'medley', 'eurofarma', 'cimed', 'germed', 'sandoz', 'ache',
+  'biosintetica', 'prati', 'donaduzzi', 'geolab', 'nova',
+]);
+
+/**
+ * Tokens "cabeça" (nome real da droga) de um item — sem acento, sem ruído, sem
+ * palavra de classe/veículo, sem números puros. Extra: captura o designador de
+ * vitamina ("Vitamina C" → `vit:c`, "Vitamina D3" → `vit:d3`, "Vitamina B12" →
+ * `vit:b12`) como token FORTE, pois "vitamina" vira classe e o designador (C/D)
+ * sozinho seria curto demais e cairia fora.
+ */
+function medHeadTokens(name: string | null | undefined): Set<string> {
+  const out = new Set<string>();
+  if (!name) return out;
+  const folded = fold(name);
+  // Designador de vitamina: "vitamina d", "vit c", "vitamina b12", "vitamina d3", "vitamina k2".
+  const vit = folded.match(/\bvit(?:amina)?\s*([a-k])\s?(\d{0,2})\b/);
+  if (vit) out.add(`vit:${vit[1]}${vit[2] ?? ''}`);
+  for (const raw of folded.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)) {
+    if (raw.length < 3) continue;        // "ed", designadores curtos (já capturados acima)
+    if (MED_NOISE.has(raw)) continue;
+    if (MED_CLASS.has(raw)) continue;    // classe/veículo/sal/fabricante — não discrimina
+    if (/^\d/.test(raw)) continue;       // "500", "30", "2mg", "1g" → dose/quantidade
+    out.add(raw);
+  }
+  return out;
+}
+
+/**
+ * Dois conjuntos de itens são o MESMO medicamento? (ex.: "Pietra 2mg" ≡ "Pietra ED").
+ *
+ * Usado pela trava de idempotência do start_pharmacy_order pra decidir entre
+ * "re-pedido do mesmo produto" (não reiniciar) vs "TROCA de produto" (cancelar o
+ * ativo e abrir o novo — incidente Cefaliv 06/07: usuário largou o Pietra e quis o
+ * Cefaliv, e a Xarlote ficava presa mostrando as cotações velhas).
+ *
+ * Regra: se os nomes compartilham QUALQUER token-cabeça discriminável → mesmo
+ * medicamento. Na dúvida (algum lado sem token discriminável) → devolve TRUE
+ * (mesmo) — nunca cancela um pedido ativo por engano; a troca explícita fica com
+ * cancel_order. Limitação conhecida: marca vs molécula da MESMA droga (Tylenol vs
+ * Paracetamol) dá tokens disjuntos → tratado como TROCA (re-cota; recuperável).
+ */
+export function sameMedication(
+  a: ReadonlyArray<{ name?: string | null }> | null | undefined,
+  b: ReadonlyArray<{ name?: string | null }> | null | undefined,
+): boolean {
+  const ta = new Set<string>();
+  for (const it of a ?? []) for (const t of medHeadTokens(it?.name)) ta.add(t);
+  const tb = new Set<string>();
+  for (const it of b ?? []) for (const t of medHeadTokens(it?.name)) tb.add(t);
+  if (ta.size === 0 || tb.size === 0) return true; // incerto → trata como MESMO (seguro)
+  for (const t of ta) if (tb.has(t)) return true;  // interseção → mesmo medicamento
+  return false;
+}
+
 // ─── Extração de preço (Fix #3, lost-offer) ──────────────────────────────────
 
 /** Converte "1.250,00" / "65,00" / "65.00" / "65" → número. null se inválido. */

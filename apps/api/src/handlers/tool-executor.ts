@@ -3,7 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain } from '@iasaude/shared';
+import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -67,6 +67,14 @@ interface ToolContext {
   traceId: string;
   inboundMsg: Message;
   inbound: NormalizedInbound;
+  /**
+   * IDs de pedidos CRIADOS neste turno (compartilhado entre as tools do mesmo turno).
+   * Blindagem contra a ordem não-determinística das tool calls (review HIGH-1): se o
+   * LLM emite `start_pharmacy_order` (que cria um pedido novo na troca) ANTES de
+   * `cancel_order`, o cancel NÃO pode cancelar o pedido recém-criado. cancel_order
+   * ignora qualquer id aqui.
+   */
+  ordersCreatedThisTurn?: Set<string>;
 }
 
 export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<void> {
@@ -117,6 +125,9 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         break;
       case 'confirm_order_selection':
         await handleConfirmOrder(tc.args as { order_id: string; quote_id: string }, ctx);
+        break;
+      case 'cancel_order':
+        await handleCancelOrder(tc.args as { order_id?: string; reason?: string }, ctx);
         break;
       case 'relay_answer_to_establishment':
         // Loop agêntico: o cliente respondeu a uma pergunta de farmácia/clínica.
@@ -393,17 +404,109 @@ async function handleSaveExamResult(args: SaveExamArgs, ctx: ToolContext) {
   });
 }
 
+const ACTIVE_ORDER_STATUSES = ['drafting', 'quoting', 'quoted', 'confirming'];
+
+/**
+ * Cancela um pedido de medicamento: marca 'cancelled', congela as cotações vivas
+ * e fecha clarificações pendentes — assim os workers (nudge/rescue) não re-cutucam
+ * um pedido morto. Idempotente: cancelar um pedido já terminal é no-op benigno (o
+ * filtro `.in(status, ACTIVE)` não casa nada). NÃO avisa as farmácias (evita spam;
+ * respostas tardias caem no guard de status do inbound-supplier). Mesmo status
+ * terminal 'timeout' usado no freeze de cotações irmãs do confirm_order_selection.
+ */
+async function cancelActiveOrder(orderId: string, reason: string, traceId: string): Promise<boolean> {
+  // Checa o erro do update do PEDIDO (review hardening): se falhar (DB transiente), o
+  // caller da TROCA aborta em vez de criar um 2º pedido vivo com o antigo ainda ativo.
+  const { error: ordErr } = await db.from('orders')
+    .update({ status: 'cancelled', cancelled_reason: reason.slice(0, 500) })
+    .eq('id', orderId)
+    .in('status', ACTIVE_ORDER_STATUSES);
+  if (ordErr) {
+    await writeLog('error', 'order', `Falha ao cancelar pedido ${orderId}: ${String(ordErr.message ?? ordErr).slice(0, 160)}`, { traceId, orderId });
+    return false;
+  }
+  await db.from('quotes')
+    .update({ status: 'timeout', completed_at: new Date().toISOString() })
+    .eq('order_id', orderId)
+    .in('status', ['pending', 'contacting', 'negotiating', 'quoted']);
+  await db.from('quotes')
+    .update({ clarification_status: 'closed' })
+    .eq('order_id', orderId)
+    .eq('clarification_status', 'awaiting_user');
+  await writeLog('info', 'order', `Pedido cancelado — ${reason}`, { traceId, orderId });
+  return true;
+}
+
+/**
+ * Tool `cancel_order` — ANTES não tinha `case` no dispatch: caía no `default: break`
+ * e era marcada 'success' sem cancelar NADA (incidente Cefaliv 06/07 — o usuário
+ * mandava "cancela o Pietra e pede Cefaliv", a Xarlote dizia "cancelei!" mas o
+ * pedido seguia 'quoted', travando o novo pedido na trava de idempotência e fazendo
+ * ela repetir "suas cotações já estão prontas, olha acima" — o delírio).
+ * O `order_id` vem do LLM e pode estar errado/alucinado → a fonte de verdade é o
+ * pedido ATIVO do usuário; só honra o order_id se ele pertencer a ESSE usuário.
+ */
+async function handleCancelOrder(args: { order_id?: string; reason?: string }, ctx: ToolContext): Promise<void> {
+  const createdThisTurn = ctx.ordersCreatedThisTurn;
+  let targetId: string | null = null;
+
+  if (args.order_id) {
+    // order_id FOI passado (o schema exige) → é O pedido nomeado. Só cancela se ele
+    // pertencer a ESTE usuário, estiver ATIVO e NÃO tiver sido criado neste turno.
+    // Se foi passado mas não resolve pra ativo (já terminal / de outro usuário /
+    // alucinado / recém-criado) → NO-OP. NUNCA cai no "cancela o mais recente" — era
+    // o HIGH-1: na ordem start→cancel, o fallback cancelava o pedido NOVO recém-criado.
+    if (!createdThisTurn?.has(args.order_id)) {
+      const { data: byId } = await db
+        .from('orders')
+        .select('id, status, user_id')
+        .eq('id', args.order_id)
+        .maybeSingle();
+      if (byId && byId.user_id === ctx.userId && ACTIVE_ORDER_STATUSES.includes(byId.status as string)) {
+        targetId = byId.id as string;
+      }
+    }
+  } else {
+    // order_id AUSENTE (raro — schema exige) → aí sim o pedido ativo mais recente do
+    // próprio usuário, EXCLUINDO qualquer um criado neste turno (blindagem HIGH-1).
+    const { data: actives } = await db
+      .from('orders')
+      .select('id')
+      .eq('user_id', ctx.userId)
+      .in('status', ACTIVE_ORDER_STATUSES)
+      .order('created_at', { ascending: false })
+      .limit(5);
+    targetId = (actives ?? []).map((o) => o.id as string).find((id) => !createdThisTurn?.has(id)) ?? null;
+  }
+
+  if (!targetId) {
+    await writeLog('info', 'order', 'cancel_order — nenhum pedido ativo elegível pra cancelar (no-op)', {
+      traceId: ctx.traceId, orderIdArg: args.order_id ?? null,
+    });
+    return;
+  }
+
+  await cancelActiveOrder(targetId, args.reason ?? 'cancelado pelo usuário', ctx.traceId);
+}
+
 async function handleStartPharmacyOrder(
   args: { items: OrderItem[]; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string },
   ctx: ToolContext
 ) {
-  // ─── IDEMPOTÊNCIA ──────────────────────────────────────────────────────────
-  // Se já existe uma order ativa (quoting/quoted/confirming) pra esse usuário,
-  // NÃO cria outra e NÃO reinicia contato com farmácias. Apenas atualiza status.
-  // (Xarlote costuma re-chamar essa tool quando usuário pressiona — proteção essencial.)
+  // ─── IDEMPOTÊNCIA + TROCA DE PRODUTO ───────────────────────────────────────
+  // Se já existe uma order ativa (quoting/quoted/confirming) pra esse usuário:
+  //   • MESMO medicamento → NÃO cria outra e NÃO reinicia contato (proteção
+  //     essencial: a Xarlote re-chama essa tool quando o usuário pressiona
+  //     "e aí, achou?"). Só devolve o status atual.
+  //   • Medicamento DIFERENTE + pedido ainda em cotação (quoting/quoted) →
+  //     é uma TROCA (incidente Cefaliv 06/07: largou o Pietra, quer o Cefaliv).
+  //     Cancela o antigo e SEGUE criando o novo — em vez de ficar preso
+  //     repetindo "suas cotações já estão prontas, olha acima".
+  //     'confirming' (já escolheu farmácia, handoff em curso) NÃO auto-troca —
+  //     conservador; nesse caso mostra status e o usuário/`cancel_order` decide.
   const { data: existingActive } = await db
     .from('orders')
-    .select('id, status')
+    .select('id, status, items')
     .eq('user_id', ctx.userId)
     .in('status', ['quoting', 'quoted', 'confirming'])
     .order('created_at', { ascending: false })
@@ -411,11 +514,44 @@ async function handleStartPharmacyOrder(
     .maybeSingle();
 
   if (existingActive) {
-    await writeLog('warn', 'order', `start_pharmacy_order ignorado — já há pedido ativo (${existingActive.status})`, {
-      traceId: ctx.traceId, existingOrderId: existingActive.id,
-    });
-    await sendCurrentOrderStatus(existingActive.id, ctx.conversationId, ctx.phoneE164, ctx.traceId);
-    return;
+    const activeItems = (existingActive.items ?? []) as OrderItem[];
+    const status = existingActive.status as string;
+    const differentProduct = !sameMedication(args.items, activeItems);
+
+    if (differentProduct && ['quoting', 'quoted'].includes(status)) {
+      // TROCA em cotação: cancela o antigo e SEGUE criando o novo.
+      await writeLog('info', 'order', `start_pharmacy_order — TROCA de medicamento; cancelando pedido ativo ${existingActive.id} e abrindo o novo`, {
+        traceId: ctx.traceId, existingOrderId: existingActive.id,
+        from: activeItems.map((i) => i.name).join(', '), to: (args.items ?? []).map((i) => i.name).join(', '),
+      });
+      const ok = await cancelActiveOrder(existingActive.id, 'usuário trocou de medicamento', ctx.traceId);
+      if (!ok) {
+        // Cancel do antigo falhou (DB transiente) → NÃO cria o novo (senão ficam 2 vivos).
+        await sendOutbound(ctx.conversationId, ctx.phoneE164,
+          'Tive um probleminha aqui pra trocar seu pedido 🙈 Pode me mandar de novo qual medicamento você quer agora?', ctx.traceId);
+        return;
+      }
+      // NÃO retorna — cai no fluxo normal de criação do novo pedido abaixo.
+    } else if (differentProduct && status === 'confirming') {
+      // Pedido já em FECHAMENTO com a farmácia (confirmação possivelmente já enviada) —
+      // não cancela sozinha (farmácia comprometida; golden rule). Não mente "olha acima";
+      // pergunta de forma honesta e deixa o usuário/`cancel_order` decidir (MEDIUM-1).
+      const novo = (args.items ?? []).map((i) => i.name).filter(Boolean).join(', ') || 'o novo medicamento';
+      await writeLog('info', 'order', `start_pharmacy_order — troca pedida com pedido em 'confirming'; pedindo confirmação`, {
+        traceId: ctx.traceId, existingOrderId: existingActive.id,
+      });
+      await sendOutbound(ctx.conversationId, ctx.phoneE164,
+        `Seu pedido anterior já está sendo fechado com a farmácia 💙 Quer que eu cancele ele pra buscar ${novo}? Se sim, é só confirmar que eu começo na hora.`,
+        ctx.traceId);
+      return;
+    } else {
+      // MESMO medicamento → protege contra reinício (anti-restart). Só devolve status.
+      await writeLog('warn', 'order', `start_pharmacy_order ignorado — já há pedido ativo do mesmo medicamento (${status})`, {
+        traceId: ctx.traceId, existingOrderId: existingActive.id,
+      });
+      await sendCurrentOrderStatus(existingActive.id, ctx.conversationId, ctx.phoneE164, ctx.traceId);
+      return;
+    }
   }
 
   let lat: number | null = null;
@@ -539,6 +675,8 @@ async function handleStartPharmacyOrder(
   }).select('id').single();
 
   if (!order?.id) return;
+  // Marca o pedido como criado NESTE turno → cancel_order não pode cancelá-lo (HIGH-1).
+  ctx.ordersCreatedThisTurn?.add(order.id as string);
 
   await startPharmacyDiscovery(order.id, lat, lng, args.items, deliveryAddress, args.payment_method ?? null, ctx);
 }

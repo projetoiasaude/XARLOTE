@@ -5,6 +5,7 @@ import {
   parseUnitCount,
   isOrderAcceptance,
   resolveQuotePick,
+  sameMedication,
   type QuoteOption,
 } from '../packages/shared/src/pharmacy.js';
 
@@ -221,5 +222,58 @@ describe('extractPriceBRL — frete pós-cotação (incidente Hiago 06/07)', () 
   });
   it('aviso sem valor → null (só relaya o texto, não mexe no frete)', () => {
     expect(extractPriceBRL('mas pode demorar para entregar')).toBe(null);
+  });
+});
+
+describe('sameMedication — troca de produto (incidente Cefaliv/delírio 06/07)', () => {
+  const mk = (name: string) => [{ name }];
+  it('medicamentos DIFERENTES → false (é troca; cancela o antigo e abre o novo)', () => {
+    expect(sameMedication(mk('Pietra 2mg'), mk('Cefaliv'))).toBe(false);
+    expect(sameMedication(mk('Cefaliv 1 caixa'), mk('Pietra ED 2mg'))).toBe(false);
+    expect(sameMedication(mk('Dorflex'), mk('Dipirona 500mg'))).toBe(false);
+    expect(sameMedication(mk('Losartana 50mg'), mk('Rivotril 2mg'))).toBe(false);
+  });
+  it('MESMO medicamento (variações de dose/apresentação/marca) → true (não reinicia)', () => {
+    expect(sameMedication(mk('Pietra 2mg'), mk('Pietra ED'))).toBe(true);
+    expect(sameMedication(mk('Pietra ED 2mg 30 comprimidos'), mk('pietra'))).toBe(true);
+    expect(sameMedication(mk('Dorflex'), mk('Dorflex 300mg 1 caixa'))).toBe(true);
+    expect(sameMedication(mk('Cefaliv'), mk('CEFALIV genérico'))).toBe(true);
+    expect(sameMedication(mk('Dipirona 500mg'), mk('dipirona sódica 1g'))).toBe(true);
+  });
+  it('multi-item: interseção em qualquer token → mesmo (não troca por engano)', () => {
+    expect(sameMedication(
+      [{ name: 'Pietra 2mg' }, { name: 'Ácido fólico' }],
+      [{ name: 'Pietra ED' }],
+    )).toBe(true);
+  });
+  it('incerto (nome vazio/só ruído) → true (NUNCA cancela pedido ativo por engano)', () => {
+    expect(sameMedication(mk(''), mk('Cefaliv'))).toBe(true);
+    expect(sameMedication(mk('1 caixa'), mk('Pietra'))).toBe(true);
+    expect(sameMedication([], mk('Cefaliv'))).toBe(true);
+    expect(sameMedication(null, mk('Cefaliv'))).toBe(true);
+  });
+
+  // ─── Review Cefaliv Finding 2: palavra de CLASSE compartilhada NÃO pode dar falso "mesmo" ───
+  it('vitaminas diferentes → false (troca — "vitamina" é classe, o designador discrimina)', () => {
+    expect(sameMedication(mk('Vitamina D'), mk('Vitamina C'))).toBe(false);
+    expect(sameMedication(mk('Vitamina D3 2000UI'), mk('Vitamina B12'))).toBe(false);
+    expect(sameMedication(mk('Vitamina C'), mk('Vitamina K2'))).toBe(false);
+    expect(sameMedication(mk('vit D'), mk('vit C efervescente'))).toBe(false);
+  });
+  it('MESMA vitamina (dose/forma diferentes) → true (não reinicia)', () => {
+    expect(sameMedication(mk('Vitamina D'), mk('Vitamina D 5000UI'))).toBe(true);
+    expect(sameMedication(mk('Vitamina C 1g'), mk('vit C efervescente'))).toBe(true);
+  });
+  it('sais/ácidos/cloridratos diferentes → false (o sal é classe, a molécula discrimina)', () => {
+    expect(sameMedication(mk('Cloridrato de metformina'), mk('Cloridrato de sertralina'))).toBe(false);
+    expect(sameMedication(mk('Sulfato ferroso'), mk('Sulfato de magnésio'))).toBe(false);
+    expect(sameMedication(mk('Ácido fólico'), mk('Ácido acetilsalicílico'))).toBe(false);
+  });
+  it('mesmo fabricante no nome NÃO cola produtos diferentes → false', () => {
+    expect(sameMedication(mk('Paracetamol Neo Química'), mk('Ibuprofeno Neo Química'))).toBe(false);
+  });
+  it('LIMITAÇÃO CONHECIDA — marca vs molécula da MESMA droga → false (trata como troca; re-cota, recuperável)', () => {
+    // Sem dicionário de sinônimos não dá pra saber que Tylenol≡Paracetamol. Documentado.
+    expect(sameMedication(mk('Tylenol'), mk('Paracetamol'))).toBe(false);
   });
 });

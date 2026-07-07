@@ -630,17 +630,22 @@ export async function processInboundUser(
   });
 
   // 11. Execute tool calls
+  // ctx ÚNICO do turno: o Set ordersCreatedThisTurn é COMPARTILHADO entre todas as
+  // tools (e o backstop) → cancel_order não cancela um pedido criado por um
+  // start_pharmacy_order do mesmo turno, independente da ordem que o LLM emitiu (HIGH-1).
+  const turnToolCtx = {
+    userId: user.id,
+    conversationId: conversation.id,
+    phoneE164,
+    traceId,
+    inboundMsg,
+    inbound,
+    ordersCreatedThisTurn: new Set<string>(),
+  };
   if (llmResponse.toolCalls.length > 0) {
     for (const tc of llmResponse.toolCalls) {
       await writeLog('info', 'tool', `Tool call: ${tc.name}`, { traceId, args: tc.args });
-      await handleToolCall(tc, {
-        userId: user.id,
-        conversationId: conversation.id,
-        phoneE164,
-        traceId,
-        inboundMsg,
-        inbound,
-      });
+      await handleToolCall(tc, turnToolCtx);
     }
   }
 
@@ -674,7 +679,7 @@ export async function processInboundUser(
           });
           await handleToolCall(
             { id: randomUUID(), name: 'confirm_order_selection', args: { order_id: activeOrder.id, quote_id: pickedQuoteId } } as unknown as Parameters<typeof handleToolCall>[0],
-            { userId: user.id, conversationId: conversation.id, phoneE164, traceId, inboundMsg, inbound },
+            turnToolCtx,
           );
           backstopConfirmed = true;
         }

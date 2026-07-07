@@ -172,6 +172,10 @@ export async function sendCurrentOrderStatus(
         ? 'Suas cotações já estão prontas! 💙 Olha as opções na nossa última mensagem aí em cima — me diz qual prefere.'
         : 'Seu pedido já foi confirmado com a farmácia escolhida 💙 Se precisar de qualquer coisa é só falar.',
       traceId,
+      {},
+      // Dedup: se o usuário pressiona ("e aí?") várias vezes seguidas, não repete a
+      // MESMA frase "olha acima" a cada 5s (era parte do delírio no incidente Cefaliv).
+      { dedup: true, dedupWindowMs: 20_000 },
     );
     return;
   }
