@@ -101,11 +101,18 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
       .in('status', ['pending', 'contacting', 'negotiating'])
       .order('created_at', { ascending: false });
     if (openQuotes && openQuotes.length > 1) {
+      // Cotações de PEDIDOS DISTINTOS na mesma conversa = cross-client (não deveria mais
+      // acontecer com a trava de exclusividade em initiatePharmacyNegotiation). Se ocorrer
+      // (TOCTOU de 2 pedidos iniciando no mesmo instante), é ERRO grave — a resposta pode ir
+      // pro cliente errado. Cotações do MESMO pedido = só ambiguidade leve (warn).
+      const distinctOrders = new Set((openQuotes as Array<{ order_id?: string }>).map((q) => q.order_id));
       await writeLog(
-        'warn',
+        distinctOrders.size > 1 ? 'error' : 'warn',
         'supplier',
-        `⚠️ ${openQuotes.length} cotações abertas na mesma conversa de farmácia — resposta atribuída à mais recente (possível mistura; resolve 100% com código de referência)`,
-        { traceId, conversationId, openQuoteIds: (openQuotes as Array<{ id: string }>).map((q) => q.id) },
+        distinctOrders.size > 1
+          ? `🚨 ${openQuotes.length} cotações de ${distinctOrders.size} PEDIDOS DIFERENTES na mesma conversa — risco de misturar clientes; resposta atribuída à mais recente (isolamento falhou — investigar TOCTOU)`
+          : `⚠️ ${openQuotes.length} cotações do MESMO pedido na mesma conversa — resposta atribuída à mais recente`,
+        { traceId, conversationId, openQuoteIds: (openQuotes as Array<{ id: string }>).map((q) => q.id), distinctOrders: distinctOrders.size },
       );
     }
     quote = openQuotes?.[0] ?? null;
@@ -957,6 +964,41 @@ export async function initiatePharmacyNegotiation(
   // Create (or find) supplier conversation
   const conv = await findOrCreateConversation(AGENT_INSTANCE, supplierJid, 'supplier', null, supplier.id);
 
+  // 🔒 ISOLAMENTO DE CLIENTE (incidente 08/07 — a conversa da farmácia é UMA por telefone):
+  // a farmácia `2fd35e36` acumulou cotações de 3 clientes diferentes; um pedido de Pietra
+  // (Setor Sul) entrou no thread de um Multigrip (Jardim América) de OUTRO cliente. Duas
+  // consequências: (1) a farmácia vê 2 pedidos misturados no mesmo thread; (2) quando ela
+  // responde, o roteamento pega a cotação MAIS RECENTE (openQuotes[0]) → resposta podia ir
+  // pro cliente ERRADO. Regra: uma farmácia só negocia UM pedido por vez nesta conversa.
+  const otherCutoffIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const { data: otherQuotesRaw } = await db.from('quotes')
+    .select('id, order_id, status, created_at, orders(status)')
+    .eq('conversation_id', conv.id)
+    .neq('order_id', orderId);
+  const otherQuotes = (otherQuotesRaw ?? []) as Array<{ order_id: string; status: string; created_at: string; orders?: { status?: string } | null }>;
+  // "Ocupada" = a cotação DESTA farmácia pra outro pedido ainda está VIVA (pending/contacting/
+  // negotiating/quoted) E o outro pedido AINDA não fechou. Pedido fechado/cancelado/falho =
+  // farmácia livre (não sobre-bloqueia por causa de um pedido antigo que já foi entregue).
+  const otherActive = otherQuotes.filter((q) =>
+    ['pending', 'contacting', 'negotiating', 'quoted'].includes(q.status)
+    && !['handed_off', 'cancelled', 'failed'].includes(q.orders?.status ?? ''));
+  if (otherActive.length) {
+    // Farmácia OCUPADA com pedido ATIVO de outro cliente → NÃO contata (este pedido usa as
+    // outras farmácias do Top-N). Evita mistura de clientes e cross-routing da resposta.
+    await writeLog('warn', 'pharmacy', `Farmácia ${supplier.name} já negocia pedido ATIVO de outro cliente nesta conversa — PULADA pra este pedido (isolamento de cliente)`, {
+      traceId, quoteId, conversationId: conv.id, otherOrderIds: [...new Set(otherActive.map((q) => q.order_id))],
+    });
+    await db.from('quotes').update({ notes: 'farmácia ocupada com pedido de outro cliente (isolamento)' }).eq('id', quoteId);
+    // finalizeQuote (não update+return seco): conta como terminal e roda a consolidação —
+    // se TODAS as Top-N forem puladas, o pedido falha rápido com relatório honesto, em vez
+    // de o cliente ouvir "as farmácias ainda não responderam" (mentira) e esperar 45min.
+    await finalizeQuote(quoteId, orderId, 'unavailable', traceId);
+    return;
+  }
+  // Thread teve OUTRO cliente nas últimas 24h (mesmo já finalizado) → abertura FRESCA, não
+  // "eu de novo por aqui" (que herdaria o contexto do outro cliente e misturaria os pedidos).
+  const threadHadOtherClientRecently = otherQuotes.some((q) => q.created_at > otherCutoffIso);
+
   // Link quote to this conversation
   await db.from('quotes')
     .update({ conversation_id: conv.id, status: 'contacting', started_at: new Date().toISOString() })
@@ -991,7 +1033,11 @@ export async function initiatePharmacyNegotiation(
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
-  const isWarm = !!lastIn?.created_at && Date.now() - new Date(lastIn.created_at).getTime() < 24 * 60 * 60 * 1000;
+  // Continuação quente SÓ quando o thread recente é do MESMO cliente — se teve outro
+  // cliente nas últimas 24h, abre FRESCO (senão "eu de novo" cai no pedido do outro).
+  const isWarm = !!lastIn?.created_at
+    && Date.now() - new Date(lastIn.created_at).getTime() < 24 * 60 * 60 * 1000
+    && !threadHadOtherClientRecently;
 
   // Build opening message via Agent LLM. Repassamos o setor REAL do usuário (não a cidade da farmácia).
   const { data: ordAddr } = await db.from('orders').select('delivery_address').eq('id', orderId).single();
