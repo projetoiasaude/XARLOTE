@@ -15,6 +15,7 @@ import {
   extractAcceptConditions,
   isServiceNumber,
   humanizePaymentLabel,
+  humanizeSupplierText,
   type QuoteOption,
   type SupplierCandidate,
 } from '../packages/shared/src/pharmacy.js';
@@ -559,5 +560,28 @@ describe('humanizePaymentLabel', () => {
     expect(humanizePaymentLabel('cartão de crédito')).toBe('cartão de crédito');
     expect(humanizePaymentLabel('pix')).toBe('Pix');
     expect(humanizePaymentLabel('dinheiro')).toBe('dinheiro');
+  });
+});
+
+describe('humanizeSupplierText — sem emoji, sem travessão (farmácia não pode achar que é robô)', () => {
+  it('troca travessão por vírgula e tira emoji (fechamento real)', () => {
+    const out = humanizeSupplierText('o endereço é Rua Ema 5, Qd 19 Lt 28 — pagamento no cartão, tá? me avisa quando sair 🙏');
+    expect(out).toBe('o endereço é Rua Ema 5, Qd 19 Lt 28, pagamento no cartão, tá? me avisa quando sair');
+    expect(out).not.toMatch(/[—–]/);
+    expect(out).not.toMatch(/\p{Extended_Pictographic}/u);
+  });
+  it('tira TODO emoji (vários tipos)', () => {
+    expect(humanizeSupplierText('Sou a Xarlote! 😃 fechou 🙌 pode preparar 💙')).toBe('Sou a Xarlote! fechou pode preparar');
+    expect(humanizeSupplierText('perfeito 🙂✅')).toBe('perfeito');
+  });
+  it('meia-risca (–) também vira vírgula', () => {
+    expect(humanizeSupplierText('fechou – pode separar')).toBe('fechou, pode separar');
+  });
+  it('não estraga texto normal (sem emoji/travessão)', () => {
+    expect(humanizeSupplierText('oi, vocês têm cefaliv 500mg? é pra entregar no setor oeste')).toBe('oi, vocês têm cefaliv 500mg? é pra entregar no setor oeste');
+  });
+  it('limpa vírgula/espaço sobrando quando o emoji estava no fim', () => {
+    expect(humanizeSupplierText('anotado, valeu 🙏')).toBe('anotado, valeu');
+    expect(humanizeSupplierText('  ')).toBe('');
   });
 });

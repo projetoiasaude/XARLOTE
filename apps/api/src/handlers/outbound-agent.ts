@@ -1,6 +1,6 @@
 import { db, writeLog } from '@iasaude/db';
 import { isSimulatorMode, zproConfigured } from '@iasaude/whatsapp';
-import { AGENT_INSTANCE } from '@iasaude/shared';
+import { AGENT_INSTANCE, humanizeSupplierText } from '@iasaude/shared';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
 import { buildTemplatePayload, humanizeTemplate, type TemplateKey } from '../config/template-registry.js';
 
@@ -24,6 +24,10 @@ export async function sendOutboundToSupplier(
   text: string,
   traceId: string,
 ): Promise<void> {
+  // HIGIENE HUMANA no ponto ÚNICO de saída pra farmácia (incidente Santa Lúcia 07/07:
+  // farmácia real achou que era robô e não entregou): tira TODO emoji e troca travessão
+  // por vírgula — vale pro texto do LLM E pros determinísticos, sem caçar cada string.
+  text = humanizeSupplierText(text);
   // SEM dedup aqui (review): a conversa de fornecedor é COMPARTILHADA por telefone entre
   // pedidos concorrentes; uma msg idêntica (ex.: pergunta de frete determinística) de
   // OUTRO pedido seria suprimida por engano. Dedup só no canal do usuário.
@@ -73,6 +77,7 @@ export async function sendOutboundToClinic(
   text: string,
   traceId: string,
 ): Promise<void> {
+  text = humanizeSupplierText(text); // paridade com a farmácia: sem emoji, sem travessão
   // SEM dedup aqui (review): mesma razão do fornecedor — conversa de estabelecimento
   // compartilhada; dedup só no canal do usuário.
   await db.from('messages').insert({

@@ -628,6 +628,33 @@ export function isServiceNumber(phone: string | null | undefined): boolean {
   return /^(4002|4004|4020|3003)\d{4}$/.test(subscriber);
 }
 
+/**
+ * Higieniza texto ENVIADO a um estabelecimento (farmácia/clínica) pra soar HUMANO
+ * (incidente Santa Lúcia 07/07: a farmácia achou que era robô e não entregou):
+ *   - tira TODO emoji/pictograma (uma pessoa texta a farmácia sem emoji);
+ *   - troca travessão "—"/meia-risca "–" por vírgula (ninguém usa travessão no zap);
+ *   - limpa espaço duplo, espaço antes de pontuação e vírgula sobrando.
+ * Aplicado no ÚNICO ponto de saída (sendOutboundToSupplier), então vale pro texto do
+ * LLM E pros determinísticos — não precisa caçar cada string.
+ */
+export function humanizeSupplierText(text: string | null | undefined): string {
+  if (!text) return '';
+  let s = String(text);
+  // travessão/meia-risca (com espaços ao redor) → ", "
+  s = s.replace(/\s*[—–]\s*/g, ', ');
+  // emoji/pictogramas + seletores de variação + ZWJ
+  s = s.replace(/\p{Extended_Pictographic}/gu, '').replace(/[\u{FE00}-\u{FE0F}\u{200D}\u{20E3}]/gu, '');
+  // limpezas
+  s = s
+    .replace(/ {2,}/g, ' ')
+    .replace(/\s+([,.!?;:])/g, '$1')  // espaço antes de pontuação
+    .replace(/,\s*,/g, ',')            // vírgula dupla
+    .replace(/,\s*([.!?])/g, '$1')     // ", ." → "."
+    .replace(/[,\s]+$/g, '')           // vírgula/espaço no fim
+    .trim();
+  return s;
+}
+
 /** "cartao"/"pix" do banco → forma legível pro cliente ("cartão", "Pix"). */
 export function humanizePaymentLabel(method: string | null | undefined): string {
   if (!method) return '';
