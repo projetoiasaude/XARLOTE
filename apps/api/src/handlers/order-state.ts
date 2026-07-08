@@ -16,8 +16,13 @@ import { providerFor } from '@iasaude/whatsapp';
  */
 
 const WINDOW_MS = 24 * 60 * 60 * 1000;
-/** Pedidos recentes que ainda fazem sentido re-engajar/reportar (inclui failed <24h). */
-const RELEVANT_STATUSES = ['quoting', 'quoted', 'confirming', 'failed'] as const;
+/**
+ * Pedidos recentes que ainda fazem sentido re-engajar/reportar (inclui failed <24h e
+ * handed_off — incidente Santa Lúcia 07/07: sem handed_off, a Xarlote ficava CEGA
+ * depois de fechar: o aviso do prazo das 19h morreu com "Não achei um pedido recente"
+ * e ela não sabia responder "cadê meu pedido?").
+ */
+const RELEVANT_STATUSES = ['quoting', 'quoted', 'confirming', 'handed_off', 'failed'] as const;
 
 export interface OrderSupplierState {
   quoteId: string;
@@ -48,6 +53,14 @@ export interface OrderState {
   createdAt: string;
   selectedQuoteId: string | null;
   suppliers: OrderSupplierState[];
+  /** Quando fechou (handed_off). null se ainda não fechou. */
+  closedAt: string | null;
+  /** Prazo prometido de entrega (do aceite do cliente). */
+  deliveryDeadline: string | null;
+  /** Condições ditas no aceite ("entregar antes das 19h"). */
+  closeConditions: string | null;
+  /** A farmácia ESCOLHIDA respondeu algo DEPOIS do fechamento? (confirmação de preparo) */
+  supplierAckAfterClose: boolean;
 }
 
 interface QuoteJoinRow {
@@ -70,7 +83,7 @@ export async function loadLatestOrderState(userId: string): Promise<OrderState |
   const sinceIso = new Date(Date.now() - WINDOW_MS).toISOString();
   const { data: order } = await db
     .from('orders')
-    .select('id, status, items, created_at, selected_quote_id')
+    .select('id, status, items, created_at, selected_quote_id, closed_at, delivery_deadline, close_conditions')
     .eq('user_id', userId)
     .in('status', RELEVANT_STATUSES as unknown as string[])
     .gte('created_at', sinceIso)
@@ -131,6 +144,13 @@ export async function loadLatestOrderState(userId: string): Promise<OrderState |
     };
   });
 
+  // A escolhida respondeu algo DEPOIS do fechamento? (= confirmação de preparo/logística)
+  const closedAt = (order.closed_at as string | null) ?? null;
+  const chosen = suppliers.find((s) => s.quoteId === order.selected_quote_id);
+  const supplierAckAfterClose = !!(
+    closedAt && chosen?.lastSupplierInboundAt && new Date(chosen.lastSupplierInboundAt) > new Date(closedAt)
+  );
+
   return {
     orderId: order.id,
     status: order.status,
@@ -138,6 +158,10 @@ export async function loadLatestOrderState(userId: string): Promise<OrderState |
     createdAt: order.created_at,
     selectedQuoteId: (order.selected_quote_id as string | null) ?? null,
     suppliers,
+    closedAt,
+    deliveryDeadline: (order.delivery_deadline as string | null) ?? null,
+    closeConditions: (order.close_conditions as string | null) ?? null,
+    supplierAckAfterClose,
   };
 }
 
@@ -162,13 +186,27 @@ function supplierStateLabel(s: OrderSupplierState): string {
   }
 }
 
+/** "19:30" em Brasília, a partir de um ISO. */
+function hourBRT(iso: string): string {
+  return new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
+}
+
 /** Rótulo humano do estado do PEDIDO como um todo. */
 function orderStatusLabel(state: OrderState): string {
   switch (state.status) {
     case 'quoting': return 'buscando/negociando com as farmácias';
     case 'quoted': return 'com cotações prontas (veja PEDIDO ATIVO pra fechar)';
     case 'confirming':
-    case 'handed_off': return 'FECHADO com a farmácia escolhida';
+    case 'handed_off': {
+      const chosen = state.suppliers.find((s) => s.quoteId === state.selectedQuoteId);
+      const quando = state.closedAt ? ` às ${hourBRT(state.closedAt)}` : '';
+      const ack = state.supplierAckAfterClose
+        ? 'a farmácia já respondeu depois do fechamento'
+        : 'a farmácia AINDA NÃO confirmou o preparo/saída';
+      const prazo = state.deliveryDeadline ? `; prazo prometido: até ${hourBRT(state.deliveryDeadline)}` : '';
+      const cond = state.closeConditions && !state.deliveryDeadline ? `; condição do cliente: "${state.closeConditions}"` : '';
+      return `FECHADO com ${chosen?.supplierName ?? 'a farmácia escolhida'}${quando} — ${ack}${prazo}${cond}`;
+    }
     case 'failed': return 'NÃO fechou — nenhuma opção viável ainda';
     default: return state.status;
   }
@@ -217,6 +255,11 @@ export function buildOrderStateBlock(state: OrderState): string {
   if (state.status === 'failed' || state.status === 'quoting') {
     lines.push(`- Se quiser procurar MAIS farmácias num raio maior, use **expand_pharmacy_search**.`);
   }
+  if (['confirming', 'handed_off'].includes(state.status)) {
+    lines.push(
+      `- Pedido FECHADO: pra qualquer logística com a farmácia escolhida (cobrar status da entrega, passar número/complemento do endereço, ajustar horário), use **message_supplier** com o nome dela — a conversa segue aberta. Se o usuário perguntar "cadê meu pedido", responda com o estado REAL acima (fechado + a farmácia confirmou ou não) e, se fizer sentido, cobre a farmácia via message_supplier.`,
+    );
+  }
   if (!anyContactable && state.suppliers.length) {
     lines.push(`- Nenhuma farmácia deste pedido está na janela de conversa agora; pra retomar, o caminho é começar um pedido novo (start_pharmacy_order) ou ampliar a busca.`);
   }
@@ -230,9 +273,14 @@ export function buildOrderStateBlock(state: OrderState): string {
 /** Resolve a farmácia-alvo dentro do estado do pedido, a partir da dica do usuário. */
 export function resolveTargetSupplier(state: OrderState, hint: string | null | undefined): OrderSupplierState | null {
   const quoteId = resolveSupplierByHint(
-    state.suppliers.map((s) => ({ quote_id: s.quoteId, supplier_name: s.supplierName, status: s.status, responded: s.responded })),
+    state.suppliers.map((s) => ({
+      quote_id: s.quoteId, supplier_name: s.supplierName, status: s.status,
+      responded: s.responded, phoneE164: s.phoneE164, // caso 07/07: usuário manda o NÚMERO da farmácia
+    })),
     hint,
   );
   if (!quoteId) return null;
+  // Pedido FECHADO: dica vaga ("a farmácia", "eles") deve mirar a ESCOLHIDA — é a única
+  // conversa viva que importa. Se o hint não resolveu e há escolhida, o caller decide.
   return state.suppliers.find((s) => s.quoteId === quoteId) ?? null;
 }

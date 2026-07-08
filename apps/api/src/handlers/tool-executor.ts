@@ -3,7 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName } from '@iasaude/shared';
+import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -77,6 +77,13 @@ interface ToolContext {
    * ignora qualquer id aqui.
    */
   ordersCreatedThisTurn?: Set<string>;
+  /**
+   * UMA VOZ POR TURNO (incidente 07/07): quando um handler manda uma resposta
+   * auto-contida ao usuário (ex.: message_supplier "Prontinho, mandei…" ou a
+   * desambiguação "qual farmácia?"), ele seta suppressLlmText=true — senão o texto do
+   * LLM sai JUNTO e contradiz ("Não tenho certeza…" + "Deixa eu mandar mensagem 💙").
+   */
+  turnFlags?: { suppressLlmText: boolean };
 }
 
 export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<void> {
@@ -927,7 +934,9 @@ async function startPharmacyDiscovery(
     // Só cria cotação (= só CONTATA) farmácia com telefone REAL. Sem número → fica no
     // diretório mas NÃO é contatada. NUNCA fabricar número (ver isPlaceholderPhone).
     const reachable = supplier.whatsapp_e164 || supplier.phone_e164;
-    if (!reachable || isPlaceholderPhone(reachable)) { semTelefone++; continue; }
+    // isServiceNumber: 4002/0800/3003 é call-center (caso Pague Menos 4002-8282) — não é
+    // WhatsApp de loja; cotar ali é jogar mensagem no void.
+    if (!reachable || isPlaceholderPhone(reachable) || isServiceNumber(reachable)) { semTelefone++; continue; }
 
     const { data: quote } = await db.from('quotes').insert({
       order_id: orderId,
@@ -1125,7 +1134,7 @@ async function handleExpandPharmacySearch(ctx: ToolContext) {
     const { data: supplier } = await db.from('suppliers').upsert(upsertData, { onConflict: 'google_place_id' }).select('id, whatsapp_e164, phone_e164').single();
     if (!supplier?.id) continue;
     const reachable = supplier.whatsapp_e164 || supplier.phone_e164;
-    if (!reachable || isPlaceholderPhone(reachable)) continue;
+    if (!reachable || isPlaceholderPhone(reachable) || isServiceNumber(reachable)) continue;
     const { data: quote } = await db.from('quotes').insert({ order_id: order.id, supplier_id: supplier.id, status: 'pending', distance_km: pharmacy.distanceKm }).select('id').single();
     if (quote?.id) quoteIds.push(quote.id);
   }
@@ -1159,43 +1168,51 @@ async function handleExpandPharmacySearch(ctx: ToolContext) {
  * nem aparecia como ativo; e a conversa da farmácia seguia viva (dentro das 24h).
  */
 async function handleMessageSupplier(args: { supplier_hint?: string; message?: string }, ctx: ToolContext) {
+  // Toda resposta deste handler é AUTO-CONTIDA → suprime o texto do LLM do turno
+  // (uma voz só; senão sai "Não tenho certeza…" + "Deixa eu mandar mensagem 💙" juntos).
+  const say = async (text: string) => {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164, text, ctx.traceId);
+    if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
+  };
   // Kill-switch de disparo (a msg vai pra uma farmácia) — freio de emergência.
   if (!loadPrompts().pharmacy_outbound_enabled) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164, 'O contato com farmácias está pausado no momento 💙 Já já volto a falar com elas pra você.', ctx.traceId);
+    await say('O contato com farmácias está pausado no momento 💙 Já já volto a falar com elas pra você.');
     return;
   }
   const hint = (args.supplier_hint ?? '').trim();
   const message = (args.message ?? '').trim();
   if (!message) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164, 'Me diz o que você quer que eu fale pra farmácia que eu mando na hora 💙', ctx.traceId);
+    await say('Me diz o que você quer que eu fale pra farmácia que eu mando na hora 💙');
     return;
   }
 
   const state = await loadLatestOrderState(ctx.userId);
   if (!state || !state.suppliers.length) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      'Não achei um pedido recente com farmácias pra eu falar 💙 Se quiser, me fala o remédio e o endereço que eu começo uma busca nova.', ctx.traceId);
+    await say('Não achei um pedido recente com farmácias pra eu falar 💙 Se quiser, me fala o remédio e o endereço que eu começo uma busca nova.');
     return;
   }
 
-  const target = resolveTargetSupplier(state, hint);
+  let target = resolveTargetSupplier(state, hint);
+  // Pedido FECHADO + dica que não resolveu ("a farmácia", "eles") → a ESCOLHIDA é a única
+  // conversa que importa; mira nela (sem negação no hint — negação nunca vira envio).
+  if (!target && ['confirming', 'handed_off'].includes(state.status) && state.selectedQuoteId
+      && !/\b(n[ãa]o|nunca|nem|menos|exceto)\b/i.test(hint)) {
+    target = state.suppliers.find((s) => s.quoteId === state.selectedQuoteId) ?? null;
+  }
   if (!target) {
     const nomes = state.suppliers.map((s) => s.supplierName).slice(0, 6).join(', ');
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      `Não tenho certeza de qual farmácia você quer que eu fale 🤔 As do seu pedido são: ${nomes}. Me diz o nome que eu mando na hora.`, ctx.traceId);
+    await say(`Não tenho certeza de qual farmácia você quer que eu fale 🤔 As do seu pedido são: ${nomes}. Me diz o nome que eu mando na hora.`);
     return;
   }
 
   if (!target.conversationId || !target.phoneE164 || isPlaceholderPhone(target.phoneE164)) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      `Não tenho um WhatsApp válido da ${target.supplierName} pra falar direto com ela 😕 Quer que eu procure em outras farmácias?`, ctx.traceId);
+    await say(`Não tenho um WhatsApp válido da ${target.supplierName} pra falar direto com ela 😕 Quer que eu procure em outras farmácias?`);
     return;
   }
 
   // Janela de 24h (WABA/zpro): fora dela, texto livre não é entregue — seja honesta.
   if (!target.contactableFreeText) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      `Faz mais de 24h que a ${target.supplierName} não me responde, então não consigo reabrir a conversa direto com ela 😕 Quer que eu procure em outras farmácias num raio maior?`, ctx.traceId);
+    await say(`Faz mais de 24h que a ${target.supplierName} não me responde, então não consigo reabrir a conversa direto com ela 😕 Quer que eu procure em outras farmácias num raio maior?`);
     return;
   }
 
@@ -1208,8 +1225,7 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
   const freshStatus = freshOrder?.status;
   const isChosen = !!freshOrder?.selected_quote_id && freshOrder.selected_quote_id === target.quoteId;
   if (!freshStatus || (['confirming', 'handed_off', 'cancelled'].includes(freshStatus) && !isChosen)) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      'Esse pedido já foi fechado 💙 Se quiser falar com outra farmácia, me fala que eu começo um pedido novo.', ctx.traceId);
+    await say('Esse pedido já foi fechado 💙 Se quiser falar com outra farmácia, me fala que eu começo um pedido novo.');
     return;
   }
 
@@ -1235,8 +1251,7 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
   await writeLog('info', 'order', `message_supplier → ${target.supplierName} (re-engajamento dirigido)`, {
     traceId: ctx.traceId, orderId: state.orderId, quoteId: target.quoteId, revived: revivedTerminal,
   });
-  await sendOutbound(ctx.conversationId, ctx.phoneE164,
-    `Prontinho, mandei pra ${target.supplierName} 💬 Assim que responderem eu te aviso aqui!`, ctx.traceId);
+  await say(`Prontinho, mandei pra ${target.supplierName} 💬 Assim que responderem eu te aviso aqui!`);
 }
 
 /** Escapa curingas de LIKE/ILIKE (% e _) num valor vindo da LLM/usuário. */
@@ -1514,10 +1529,10 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     .eq('order_id', args.order_id)
     .eq('clarification_status', 'awaiting_user');
 
-  // 4. Load order items + delivery address + payment method
+  // 4. Load order items + delivery address + payment method (+ endereço salvo com nº/complemento)
   const { data: order } = await db
     .from('orders')
-    .select('items, delivery_address, delivery_lat, delivery_lng, payment_method')
+    .select('items, delivery_address, delivery_lat, delivery_lng, payment_method, user_address_id')
     .eq('id', args.order_id)
     .single();
   const items = (order?.items ?? []) as OrderItem[];
@@ -1528,37 +1543,82 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
       : null);
   const userPaymentMethod = (order?.payment_method as string | null) ?? null;
 
-  // 4. Send confirmation message to pharmacy via agent (tom humano, sem emojis)
+  // CONDIÇÕES DO ACEITE (incidente Santa Lúcia 07/07): "só que tem que entregar antes das
+  // 19:00" era DESCARTADO — o fechamento ia sem o prazo e o aviso posterior morria. Agora a
+  // condição viaja NA mensagem de fechamento e o prazo fica no pedido (worker de follow-up).
+  const acceptText = ctx.inbound?.text ?? '';
+  const conditions = extractAcceptConditions(acceptText);
+  const deadlineIso = (() => {
+    if (conditions.deadlineHour == null) return null;
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date()); // YYYY-MM-DD
+    const hh = String(conditions.deadlineHour).padStart(2, '0');
+    const mm = String(conditions.deadlineMinute).padStart(2, '0');
+    return new Date(`${today}T${hh}:${mm}:00-03:00`).toISOString();
+  })();
+
+  // ENDEREÇO ENTREGÁVEL: prioriza o endereço SALVO (tem número/quadra/lote/complemento);
+  // senão usa o texto do pedido. "Rua 14, Setor Oeste" sem número NÃO entrega — se faltar,
+  // fecha mesmo assim (não perde a farmácia) mas pede o complemento ao cliente na sequência
+  // (o relay pós-fechamento leva; message_supplier agora funciona em handed_off).
+  let addrHuman: string | null = null;
+  let addrHasUnit = false;
+  if (order?.user_address_id) {
+    const { data: savedAddr } = await db
+      .from('user_addresses')
+      .select('street, number, complement, neighborhood')
+      .eq('id', order.user_address_id)
+      .maybeSingle();
+    if (savedAddr?.street) {
+      const parts = [
+        `${savedAddr.street}${savedAddr.number ? `, ${savedAddr.number}` : ''}`,
+        savedAddr.complement || null,
+        savedAddr.neighborhood || null,
+      ].filter(Boolean);
+      addrHuman = parts.join(', ');
+      addrHasUnit = !!(savedAddr.number || savedAddr.complement);
+    }
+  }
+  if (!addrHuman && deliveryAddress && !/Localização compartilhada|^lat\s/i.test(deliveryAddress)) {
+    addrHuman = shortSupplierAddress(deliveryAddress);
+    // Tem número/qd/lt no texto? (segmento só-número ou marcador qd/lt/nº/apto/casa)
+    addrHasUnit = /,\s*\d+[a-zA-Z]?\s*(,|$)/.test(deliveryAddress) || /\b(qd|quadra|lt|lote|n[ºo°]\s*\d|apto|apart|bloco|casa\s*\d)/i.test(deliveryAddress);
+  }
+
+  // 4b. Fechamento HUMANO (incidente Santa Lúcia: o formato-formulário com lista, rótulos e
+  // link do Maps fez a farmácia achar que era robô e NÃO ENTREGAR). Agora: 2 mensagens
+  // curtas de gente, sem bullets, sem "Endereço de entrega:", SEM link do Maps (humano não
+  // manda URL crua; se a farmácia pedir a localização, o agente manda na conversa).
   const supplier = quote.suppliers as { id: string; name: string; whatsapp_e164?: string; phone_e164?: string } | null;
   // 🛑 Só confirma com fornecedor de telefone REAL (nunca fabrica número fake — ver
   // incidente 2026-07-01). Sem telefone válido → pula (não há farmácia real pra avisar).
   const supplierPhone = supplier?.whatsapp_e164 || supplier?.phone_e164 || null;
   if (supplier && quote.conversation_id && supplierPhone && !isPlaceholderPhone(supplierPhone)) {
-    const itemsList = items
-      .map((i: OrderItem) => `- ${itemDisplayName(i.name, i.dosage)}${i.quantity ? ` (${i.quantity})` : ''}`)
-      .join('\n');
-    const paymentLabel = (userPaymentMethod || ((quote.payment_methods ?? ['pix']) as string[])[0] || 'pix').toString();
-    // Aqui já vai TUDO: endereço completo + link do Google Maps com a localização exata
-    // (no momento da cotação a gente passa só rua/setor pra não vazar info do cliente sem fechar pedido).
-    const mapsLink =
-      order?.delivery_lat != null && order?.delivery_lng != null
-        ? `https://www.google.com/maps?q=${Number(order.delivery_lat).toFixed(6)},${Number(order.delivery_lng).toFixed(6)}`
-        : null;
-    const addressParts: string[] = [];
-    if (deliveryAddress && !/Localização compartilhada|^lat\s/i.test(deliveryAddress)) {
-      addressParts.push(`Endereço de entrega: ${shortSupplierAddress(deliveryAddress)}`);
-    }
-    if (mapsLink) addressParts.push(`Localização no mapa: ${mapsLink}`);
-    const addressLine = addressParts.length ? `\n${addressParts.join('\n')}` : '';
-    // Tom humano: 1ª pessoa, sem "voltando aqui" (pra farmácia é UMA conversa contínua,
-    // não existe ida-e-volta) e sem "o cliente" em 3ª pessoa (cara de intermediário/robô).
-    const confirmToPharmacy = `Fechou então! 🙌 Pode preparar pra entrega, por favor:\n${itemsList}${addressLine}\nPagamento: ${paymentLabel}.\nSe puder me dar um toque quando estiver saindo, agradeço demais!`;
-    await sendOutboundToSupplier(quote.conversation_id as string, supplierPhone, confirmToPharmacy, ctx.traceId);
-    await writeLog('info', 'order', `Confirmação enviada para ${supplier.name}`, {
+    const itemsInline = items
+      .map((i: OrderItem) => `${i.quantity ? `${i.quantity} de ` : ''}${itemDisplayName(i.name, i.dosage)}`)
+      .join(' e ') || 'o pedido';
+    const paymentLabel = humanizePaymentLabel(userPaymentMethod || ((quote.payment_methods ?? ['pix']) as string[])[0] || 'pix');
+
+    // Variação leve pra não soar template (mesma pessoa não fala igual sempre).
+    const openings = ['fechou! pode preparar', 'show, fechado! pode separar', 'fechou então, pode preparar'];
+    const opening = openings[Math.abs(args.order_id.charCodeAt(0) + args.order_id.charCodeAt(3)) % openings.length] as string;
+    const msg1 = `${opening} ${itemsInline} pra mim`;
+
+    // Prazo em fala natural — SÓ quando extraímos uma HORA clara do aceite. Cláusula livre
+    // (ex.: "vai ser cartão", "obrigado") NÃO vai pra farmácia (review: mandaria ruído tipo
+    // "Só uma coisa: obrigado" — o exato tell de robô). A cláusula fica só no estado interno.
+    const deadlinePart = conditions.deadlineHour != null
+      ? ` ah, e preciso que chegue até as ${conditions.deadlineHour}${conditions.deadlineMinute ? `:${String(conditions.deadlineMinute).padStart(2, '0')}` : ''}h, consegue?`
+      : '';
+    const addrPart = addrHuman ? `o endereço é ${addrHuman}` : 'já te passo o endereço certinho';
+    const msg2 = `${addrPart} — pagamento no ${paymentLabel}, tá?${deadlinePart} me avisa quando sair pra entrega 🙏`;
+
+    await sendOutboundToSupplier(quote.conversation_id as string, supplierPhone, msg1, ctx.traceId);
+    await sendOutboundToSupplier(quote.conversation_id as string, supplierPhone, msg2, ctx.traceId);
+    await writeLog('info', 'order', `Confirmação (humanizada, 2 msgs) enviada para ${supplier.name}`, {
       traceId: ctx.traceId,
       quoteId: args.quote_id,
-      deliveryAddress,
-      paymentMethod: paymentLabel,
+      hasDeadline: conditions.deadlineHour != null,
+      addrHasUnit,
     });
   } else {
     await writeLog('warn', 'order', `Confirmação NÃO enviada — supplier ou conversation_id ausente`, {
@@ -1569,20 +1629,33 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     });
   }
 
-  // 5. Update order to handed_off
-  await db.from('orders').update({ status: 'handed_off' }).eq('id', args.order_id);
+  // 5. Update order to handed_off + memória do fechamento (worker de follow-up usa).
+  await db.from('orders').update({
+    status: 'handed_off',
+    closed_at: new Date().toISOString(),
+    close_conditions: conditions.clause ?? (conditions.deadlineHour != null ? `entregar até ${conditions.deadlineHour}h` : null),
+    delivery_deadline: deadlineIso,
+  }).eq('id', args.order_id);
 
   // 6. Send payment details to user
   const supplierName = supplier?.name ?? 'farmácia selecionada';
-  const paymentMsg = buildPaymentMessage(quote, supplierName);
+  const paymentMsg = buildPaymentMessage(quote, supplierName, conditions.deadlineHour);
   await sendOutbound(ctx.conversationId, ctx.phoneE164, paymentMsg, ctx.traceId);
+
+  // 6b. Endereço SEM número/complemento → pede ao cliente AGORA (a farmácia não entrega em
+  // "Rua 14" sem número; quando ele responder, a Xarlote repassa via message_supplier —
+  // que agora funciona pós-fechamento).
+  if (!addrHasUnit) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      'Só me confirma o número (ou quadra/lote e complemento) do endereço pra eu passar certinho pra entrega 💙', ctx.traceId);
+  }
 
   await writeLog('info', 'order', `Pedido finalizado — handed_off para ${supplierName}`, {
     traceId: ctx.traceId, orderId: args.order_id, quoteId: args.quote_id,
   });
 }
 
-function buildPaymentMessage(quote: Record<string, unknown>, supplierName: string): string {
+function buildPaymentMessage(quote: Record<string, unknown>, supplierName: string, deadlineHour?: number | null): string {
   const lines: string[] = [`✅ *Pedido confirmado com ${supplierName}!*\n`];
 
   if (quote['pix_key']) {
@@ -1592,7 +1665,7 @@ function buildPaymentMessage(quote: Record<string, unknown>, supplierName: strin
     lines.push(`🔗 *Link de pagamento:* ${quote['payment_link']}`);
   }
 
-  const methods = ((quote['payment_methods'] as string[]) ?? []).join('/');
+  const methods = ((quote['payment_methods'] as string[]) ?? []).map((m) => humanizePaymentLabel(m)).join('/');
   if (methods) {
     lines.push(`💳 *Pagamento:* ${methods}`);
   }
@@ -1607,6 +1680,9 @@ function buildPaymentMessage(quote: Record<string, unknown>, supplierName: strin
   const eta = quote['eta_minutes'] as number | null;
   if (eta) {
     lines.push(`⏱️ *Previsão de entrega:* ~${eta} minutos`);
+  }
+  if (deadlineHour != null) {
+    lines.push(`⏰ Já pedi pra chegar até as ${deadlineHour}h — fico de olho e te aviso.`);
   }
 
   lines.push('\nA farmácia foi notificada. Qualquer dúvida, é só me chamar! 💙');

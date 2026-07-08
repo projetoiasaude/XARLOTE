@@ -435,6 +435,26 @@ export interface SupplierCandidate {
   status?: string | null;
   /** Deu qualquer resposta substantiva (cotou um preço OU disse algo registrado em notes). */
   responded?: boolean;
+  /** Telefone E.164 — pra casar quando o usuário manda o NÚMERO da farmácia (caso 07/07). */
+  phoneE164?: string | null;
+}
+
+/**
+ * O hint contém o TELEFONE deste candidato? Tolerante ao 9º dígito BR (o usuário
+ * digitou "556298766733" e o cadastro tem "5562998766733" — mesmo número). Compara
+ * qualquer sequência de 10-13 dígitos do hint contra as variantes do candidato.
+ */
+function hintMatchesPhone(hintDigitsRuns: string[], candPhone: string | null | undefined): boolean {
+  if (!candPhone) return false;
+  const cand = candPhone.replace(/\D/g, '');
+  // Variantes do candidato: com/sem DDI 55, com/sem o 9º dígito.
+  const candVariants = new Set<string>([cand]);
+  const local = cand.startsWith('55') ? cand.slice(2) : cand; // DDD+numero
+  candVariants.add(local);
+  if (local.length === 11 && local[2] === '9') candVariants.add(local.slice(0, 2) + local.slice(3)); // tira o 9
+  if (local.length === 10) candVariants.add(local.slice(0, 2) + '9' + local.slice(2)); // põe o 9
+  for (const v of [...candVariants]) candVariants.add('55' + v);
+  return hintDigitsRuns.some((run) => candVariants.has(run));
 }
 
 /**
@@ -456,6 +476,18 @@ export function resolveSupplierByHint(
   // "não fala com a X", "qualquer uma menos a X" não podem virar um envio À X (review LOW).
   // NEGATION_RE cobre não/nunca/nem/cancela; "menos/exceto/tirando" são exclusão local.
   if (NEGATION_RE.test(t) || /\b(menos|exceto|tirando|sem ser)\b/.test(t)) return null;
+
+  // 0) TELEFONE no hint — a dica mais explícita que existe ("a que tem o número
+  //    556298766733"). Caso real 07/07: o usuário deu o número e a Xarlote não achou.
+  //    Tolerante ao 9º dígito. Casa exatamente 1 → ela.
+  const digitRuns = [...hint.matchAll(/\d[\d\s.\-()]{8,}\d/g)]
+    .map((m) => (m[0] as string).replace(/\D/g, ''))
+    .filter((d) => d.length >= 10 && d.length <= 13);
+  if (digitRuns.length) {
+    const phoneMatches = candidates.filter((c) => hintMatchesPhone(digitRuns, c.phoneE164));
+    if (phoneMatches.length === 1) return (phoneMatches[0] as SupplierCandidate).quote_id;
+    if (phoneMatches.length > 1) return null; // mesmo número em 2 candidatos → ambíguo
+  }
 
   // 1) NOME da farmácia. Casa por PALAVRA INTEIRA (\b), não substring — senão um token
   //    curto ('sol','vida','rio') casaria dentro de palavras comuns ("re[sol]ve") e
@@ -534,4 +566,78 @@ export function noteSignalsConditionalOffer(note: string | null | undefined): bo
   if (!hasAvailability) return false;
   const negatedHave = /\b(nao|nem|sem)\b[^.;!?]{0,12}\b(tenho|temos|tem|dispon[ií]vel)/.test(t);
   return !negatedHave;
+}
+
+// ─── Fechamento vivo: condições do aceite + prazo + números de serviço ────────
+
+export interface AcceptConditions {
+  /** Cláusula de condição extraída do aceite (ex.: "tem que entregar antes das 19:00"). */
+  clause: string | null;
+  /** Hora-limite prometida (0-23, horário local), se o aceite tem prazo ("antes das 19h"). */
+  deadlineHour: number | null;
+  deadlineMinute: number;
+}
+
+/**
+ * Extrai as CONDIÇÕES que o cliente colocou na mensagem de aceite (incidente Santa
+ * Lúcia 07/07: "Pode pedir da Santa Lúcia mesmo, só que tem que entregar antes das
+ * 19:00 porfavor" → o fechamento ignorava a condição e o prazo se perdia).
+ * Determinístico e conservador: só extrai o que casa padrão claro.
+ */
+export function extractAcceptConditions(text: string | null | undefined): AcceptConditions {
+  const none: AcceptConditions = { clause: null, deadlineHour: null, deadlineMinute: 0 };
+  if (!text) return none;
+  const raw = text.trim();
+  const t = fold(raw);
+
+  // Prazo: "antes das 19", "até as 19:30", "antes de 19h", "no máximo 18h".
+  const dm = t.match(/\b(antes d[ae]s?|at[ée]( [àa]s?)?|no m[áa]ximo( at[ée])?)\s*(?:[àa]s?\s*)?(\d{1,2})(?:[:h](\d{2}))?\b/);
+  let deadlineHour: number | null = null;
+  let deadlineMinute = 0;
+  if (dm) {
+    const h = parseInt(dm[4] as string, 10);
+    const m = dm[5] ? parseInt(dm[5] as string, 10) : 0;
+    if (h >= 0 && h <= 23 && m >= 0 && m <= 59) { deadlineHour = h; deadlineMinute = m; }
+  }
+
+  // Cláusula: o trecho depois de "só que / mas / desde que / tem que / precisa / porém".
+  // Limpa "por favor" e pontuação sobrando. Cap de 140 chars (vai numa msg de WhatsApp).
+  const cm = raw.match(/\b(?:s[óo] que|mas|por[ée]m|desde que|contanto que)\s+(.{5,140})/i)
+    ?? raw.match(/\b((?:tem que|precisa(?: de)?|preciso que|n[ãa]o pode)\s+.{3,120})/i);
+  let clause = cm ? (cm[1] as string).trim() : null;
+  if (clause) {
+    clause = clause.replace(/\b(por ?favor|pfv|pf)\b/gi, '').replace(/\s+/g, ' ').replace(/[.,;\s]+$/, '').trim();
+    if (clause.length < 5) clause = null;
+  }
+  if (!clause && deadlineHour == null) return none;
+  return { clause, deadlineHour, deadlineMinute };
+}
+
+/**
+ * Número de SERVIÇO/call-center (4002/4004/4020/3003/0800/0300) — não é WhatsApp de
+ * loja; disparar cotação pra ele é jogar msg no void (caso Pague Menos 4002-8282).
+ */
+export function isServiceNumber(phone: string | null | undefined): boolean {
+  if (!phone) return false;
+  const d = phone.replace(/\D/g, '');
+  const local = d.startsWith('55') ? d.slice(2) : d;
+  // 0800/0300 podem vir SEM DDD (8-11 dígitos começando com 0800/0300)
+  if (/^0(800|300)\d{6,8}$/.test(local) || /^0(800|300)\d{6,8}$/.test(d)) return true;
+  // Com DDD: assinante começando com 4002/4004/4020/3003 (números corporativos não-móveis)
+  const subscriber = local.length >= 10 ? local.slice(2) : local;
+  return /^(4002|4004|4020|3003)\d{4}$/.test(subscriber);
+}
+
+/** "cartao"/"pix" do banco → forma legível pro cliente ("cartão", "Pix"). */
+export function humanizePaymentLabel(method: string | null | undefined): string {
+  if (!method) return '';
+  const t = fold(String(method));
+  if (t.includes('pix')) return 'Pix';
+  if (t.includes('cartao') || t.includes('credito') || t.includes('debito')) {
+    if (t.includes('debito')) return 'cartão de débito';
+    if (t.includes('credito')) return 'cartão de crédito';
+    return 'cartão';
+  }
+  if (t.includes('dinheiro') || t.includes('especie')) return 'dinheiro';
+  return String(method);
 }

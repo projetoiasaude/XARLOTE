@@ -12,6 +12,9 @@ import {
   resolveSupplierByHint,
   sanitizeSupplierNote,
   noteSignalsConditionalOffer,
+  extractAcceptConditions,
+  isServiceNumber,
+  humanizePaymentLabel,
   type QuoteOption,
   type SupplierCandidate,
 } from '../packages/shared/src/pharmacy.js';
@@ -483,5 +486,78 @@ describe('noteSignalsConditionalOffer — detecta "tem mas com ressalva/oferta"'
     expect(noteSignalsConditionalOffer('não tenho, mas indico a Farmácia X')).toBe(true);
     expect(noteSignalsConditionalOffer('não entrego aí, mas você consegue um motoboy')).toBe(true);
     expect(noteSignalsConditionalOffer('tenho sim, só que entrego a partir das 15h')).toBe(true);
+  });
+});
+
+// ─── Fechamento vivo (incidente Santa Lúcia 07/07) ───────────────────────────
+
+describe('extractAcceptConditions — condições do aceite viajam com o fechamento', () => {
+  it('frase REAL do incidente: prazo "antes das 19:00" extraído', () => {
+    const c = extractAcceptConditions('Pode pedir da Santa Lúcia mesmo, só que tem que entregar antes das 19:00 porfavor, vai ser cartão');
+    expect(c.deadlineHour).toBe(19);
+    expect(c.deadlineMinute).toBe(0);
+    expect(c.clause).toMatch(/entregar antes das 19/i);
+    expect(c.clause).not.toMatch(/porfavor|por favor/i);
+  });
+  it('"até as 18:30" → 18:30', () => {
+    const c = extractAcceptConditions('fecha com a 1, mas até as 18:30 tá?');
+    expect(c.deadlineHour).toBe(18);
+    expect(c.deadlineMinute).toBe(30);
+  });
+  it('condição sem hora ("desde que seja o genérico") → clause sem deadline', () => {
+    const c = extractAcceptConditions('pode ser, desde que seja o genérico da EMS');
+    expect(c.deadlineHour).toBeNull();
+    expect(c.clause).toMatch(/gen[ée]rico/i);
+  });
+  it('aceite puro sem condição → nada', () => {
+    const c = extractAcceptConditions('pode fechar com a 2');
+    expect(c.clause).toBeNull();
+    expect(c.deadlineHour).toBeNull();
+  });
+  it('hora inválida (25h) não vira deadline', () => {
+    const c = extractAcceptConditions('entrega antes das 25 tá');
+    expect(c.deadlineHour).toBeNull();
+  });
+});
+
+describe('resolveSupplierByHint — casa por TELEFONE (caso real 07/07)', () => {
+  const cands: SupplierCandidate[] = [
+    { quote_id: 'sl', supplier_name: 'Drogaria Santa Lúcia', responded: true, phoneE164: '+5562998766733' },
+    { quote_id: 'sb', supplier_name: 'Drogaria São Benedito', responded: true, phoneE164: '+556232610628' },
+  ];
+  it('número digitado SEM o 9º dígito casa mesmo assim (frase real do Hiago)', () => {
+    expect(resolveSupplierByHint(cands, 'a que tem o número 556298766733')).toBe('sl');
+  });
+  it('número COM o 9º dígito também casa', () => {
+    expect(resolveSupplierByHint(cands, 'entra em contato com esse telefone 5562998766733')).toBe('sl');
+  });
+  it('número formatado "(62) 99876-6733" casa', () => {
+    expect(resolveSupplierByHint(cands, 'fala com a do (62) 99876-6733')).toBe('sl');
+  });
+  it('número que não é de nenhuma → cai pros outros caminhos (nome/semântica)', () => {
+    expect(resolveSupplierByHint(cands, 'fala com a 62911112222')).toBeNull();
+  });
+});
+
+describe('isServiceNumber — call-center não é WhatsApp de loja (caso Pague Menos)', () => {
+  it('4002-8282 (com DDD/DDI) → true', () => {
+    expect(isServiceNumber('+555540028282')).toBe(true);
+    expect(isServiceNumber('556240028282')).toBe(true);
+  });
+  it('0800 → true', () => {
+    expect(isServiceNumber('08007779999')).toBe(true);
+  });
+  it('celular normal de loja → false', () => {
+    expect(isServiceNumber('+5562998766733')).toBe(false);
+    expect(isServiceNumber('+556232610628')).toBe(false);
+  });
+});
+
+describe('humanizePaymentLabel', () => {
+  it('normaliza tokens do banco', () => {
+    expect(humanizePaymentLabel('cartao')).toBe('cartão');
+    expect(humanizePaymentLabel('cartão de crédito')).toBe('cartão de crédito');
+    expect(humanizePaymentLabel('pix')).toBe('Pix');
+    expect(humanizePaymentLabel('dinheiro')).toBe('dinheiro');
   });
 });

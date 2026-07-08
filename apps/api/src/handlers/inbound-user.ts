@@ -668,6 +668,9 @@ export async function processInboundUser(
     inboundMsg,
     inbound,
     ordersCreatedThisTurn: new Set<string>(),
+    // UMA VOZ: handlers auto-contidos (message_supplier) setam suppressLlmText — o texto
+    // do LLM não sai junto contradizendo a resposta real da tool (incidente 07/07 17:34).
+    turnFlags: { suppressLlmText: false },
   };
   if (llmResponse.toolCalls.length > 0) {
     for (const tc of llmResponse.toolCalls) {
@@ -740,7 +743,11 @@ export async function processInboundUser(
       const target = targetQuoteId ? orderState.suppliers.find((s) => s.quoteId === targetQuoteId) : null;
       if (target) {
         const itemName = orderState.items.map((i) => itemDisplayName(i.name, i.dosage)).join(', ') || 'o pedido';
-        const msg = `Oi! 🙂 Sobre o ${itemName} que perguntei mais cedo — vocês conseguem me atender agora? Se puder me passar o valor e como fica a entrega, agradeço!`;
+        // Mensagem ciente do estado: pedido FECHADO → cobra a entrega; senão → retoma a cotação.
+        const isClosed = ['confirming', 'handed_off'].includes(orderState.status) && target.quoteId === orderState.selectedQuoteId;
+        const msg = isClosed
+          ? `oi! tudo certo com o pedido do ${itemName}? consegue me confirmar se já saiu pra entrega?`
+          : `oi! sobre o ${itemName} que perguntei mais cedo — vocês conseguem me atender agora? se puder me passar o valor e como fica a entrega, agradeço`;
         await writeLog('warn', 'order', `🔒 Backstop de re-contato: LLM narrou sem chamar message_supplier → forçando contato com ${target.supplierName}`, {
           traceId, orderId: orderState.orderId, quoteId: target.quoteId, llmTools: llmResponse.toolCalls.map((t) => t.name),
         });
@@ -764,11 +771,13 @@ export async function processInboundUser(
   // suprime o texto do LLM (relay-style "vou avisar a farmácia"). MAS só quando o turno
   // foi PURAMENTE o aceite: se o LLM também fez outra ação (ex.: create_reminder), o
   // texto narra essa ação e NÃO pode ser engolido (review) — aí mantém.
-  const onlyAcceptTurn = !llmResponse.toolCalls.some((t) => t.name !== 'relay_answer_to_establishment' && t.name !== 'confirm_order_selection');
-  // Suprime o texto do LLM quando um backstop assumiu: confirm (aceite) OU re-contato (a
-  // narração "já falei com a farmácia" era MENTIRA — o message_supplier real já mandou a
-  // confirmação verdadeira). Sem isso o usuário veria a mentira + a confirmação real.
-  const suppressReply = (backstopConfirmed && onlyAcceptTurn) || backstopReContacted;
+  const onlyAcceptTurn = !llmResponse.toolCalls.some((t) => !['relay_answer_to_establishment', 'confirm_order_selection', 'message_supplier'].includes(t.name));
+  // Suprime o texto do LLM quando um backstop OU um handler auto-contido assumiu:
+  // confirm (aceite), re-contato do backstop, ou message_supplier que já respondeu
+  // ("Prontinho, mandei…" / desambiguação). Senão o usuário vê DUAS vozes contraditórias
+  // no mesmo turno (incidente 07/07 17:34). Só quando o turno não tem OUTRAS ações que o
+  // texto do LLM precise narrar.
+  const suppressReply = ((backstopConfirmed || turnToolCtx.turnFlags.suppressLlmText) && onlyAcceptTurn) || backstopReContacted;
   let replyText = suppressReply ? '' : llmResponse.text.trim();
 
   // 🚫 GUARDA ANTI-MENTIRA RESIDUAL (incidente 07/07): o LLM afirma ter contatado a

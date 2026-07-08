@@ -29,6 +29,7 @@ import { startAnomalyDetectorWorker } from './anomaly-detector.worker.js';
 import { startMetricsAggregatorWorker } from './metrics-aggregator.worker.js';
 import { startRedFlagEscalatorWorker } from './red-flag-escalator.worker.js';
 import { startNudgeWorker, stopNudgeWorker } from './nudge-stalled-flows.worker.js';
+import { startOrderFollowupWorker, stopOrderFollowupWorker } from './order-followup.worker.js';
 import { startOutboundWorkers } from '../queues/outbound.queue.js';
 import { onShutdown } from '../lifecycle.js';
 import { withCronLock } from '../middleware/cron-lock.js';
@@ -82,6 +83,7 @@ export function startAllWorkers(log: WorkerLogger): void {
   startMetricsAggregatorWorker();
   startRedFlagEscalatorWorker();
   startNudgeWorker(); // re-engaja fluxos parados (quoted sem escolha, clarificação sem resposta)
+  startOrderFollowupWorker(); // pós-fechamento: cobra farmácia muda + alerta prazo (incidente Santa Lúcia)
 
   // ── Consumidores das filas outbound (rate-limit de envio WhatsApp, F0.7) ──
   startOutboundWorkers();
@@ -91,6 +93,7 @@ export function startAllWorkers(log: WorkerLogger): void {
     clearInterval(reminderTimer);
     clearInterval(compactorTimer);
     stopNudgeWorker();
+    stopOrderFollowupWorker();
   });
   onShutdown('profile-enricher worker', () => enricherWorker.close());
 
@@ -98,6 +101,6 @@ export function startAllWorkers(log: WorkerLogger): void {
     'Workers ON: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h), ' +
       'inventory-tracker (6h), adherence-scorer (24h), consultation-feedback (1h), consultation-dispatcher (30s), ' +
       'kg-builder (6h), skill-extractor (24h), anomaly-detector (10min), metrics-aggregator (1h), ' +
-      'red-flag-escalator (10s), outbound-whatsapp (queue)',
+      'red-flag-escalator (10s), order-followup (2min), outbound-whatsapp (queue)',
   );
 }

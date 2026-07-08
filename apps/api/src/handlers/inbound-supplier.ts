@@ -6,7 +6,11 @@ import {
   agentPharmacyTools,
   messagesToHistory,
   trimHistory,
+  userContentWithImage,
+  dataUrl,
 } from '@iasaude/llm';
+import { fetchInboundMedia } from '@iasaude/whatsapp';
+import { transcribeAudio } from '@iasaude/integrations';
 import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone, toE164BR, brPhoneVariants, extractPriceBRL, parseUnitCount, shortSupplierAddress, mentionsFreeShipping, itemDisplayName, noteSignalsConditionalOffer } from '@iasaude/shared';
 import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
@@ -60,23 +64,17 @@ export interface SupplierInboundCtx {
   supplierPhone: string;
   text: string;
   traceId: string;
+  /** true quando a mensagem já foi persistida pelo debounce (enqueueSupplierTurn). */
+  skipPersist?: boolean;
 }
 
 export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<void> {
   const { conversationId, supplierPhone, text, traceId } = ctx;
 
-  // 1. Persist inbound message from supplier
-  await db.from('messages').insert({
-    conversation_id: conversationId,
-    direction: 'in',
-    sender_role: 'supplier',
-    content_type: 'text',
-    content: text,
-    trace_id: traceId,
-  });
-  await db.from('conversations')
-    .update({ last_message_at: new Date().toISOString() })
-    .eq('id', conversationId);
+  // 1. Persist inbound message from supplier (pulado quando o debounce já persistiu)
+  if (!ctx.skipPersist) {
+    await persistSupplierInbound(conversationId, text, traceId);
+  }
 
   // 2. Load conversation to get supplier_id (may be null in simulator mode)
   const { data: conv } = await db.from('conversations').select('*').eq('id', conversationId).single();
@@ -339,6 +337,11 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         cpf: clientCpf, // responde direto se a farmácia pedir CPF (Caso F)
         clientAnswers, // reusa respostas do cliente (não re-pergunta o que ele já disse)
         isOrderConfirmation,
+        // Link do Maps SÓ pra quando a farmácia pedir a localização (pedido fechado) —
+        // mandado casual em 1 linha, nunca no fechamento (humano não manda link com rótulo).
+        mapsUrl: order?.delivery_lat != null && order?.delivery_lng != null
+          ? `https://www.google.com/maps?q=${Number(order.delivery_lat).toFixed(6)},${Number(order.delivery_lng).toFixed(6)}`
+          : null,
       });
 
   // 7. Call LLM (Agent persona)
@@ -657,6 +660,103 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   }
 }
 
+// ─── Debounce de rajada + persistência imediata ──────────────────────────────
+// Incidente Santa Lúcia 07/07: a farmácia mandou "Olá" e "Boa noite" em 1s e a Xarlote
+// respondeu DUAS mensagens quase iguais em 3s (cada webhook virava um turno) — cara de
+// robô na hora. Agora: cada mensagem é PERSISTIDA na hora (fidelidade do transcript),
+// mas o TURNO espera alguns segundos; o que chegar na janela entra no MESMO turno e o
+// LLM responde UMA vez, vendo a rajada inteira.
+const supplierTurnBuffer = new Map<string, { texts: string[]; supplierPhone: string; traceId: string; timer: ReturnType<typeof setTimeout> }>();
+const SUPPLIER_DEBOUNCE_MS = Number(process.env['SUPPLIER_DEBOUNCE_MS'] ?? 8000);
+
+async function persistSupplierInbound(conversationId: string, text: string, traceId: string): Promise<void> {
+  await db.from('messages').insert({
+    conversation_id: conversationId,
+    direction: 'in',
+    sender_role: 'supplier',
+    content_type: 'text',
+    content: text,
+    trace_id: traceId,
+  });
+  await db.from('conversations')
+    .update({ last_message_at: new Date().toISOString() })
+    .eq('id', conversationId);
+}
+
+/** Enfileira uma mensagem do fornecedor: persiste JÁ, turno debounced (rajada = 1 turno). */
+export async function enqueueSupplierTurn(conversationId: string, supplierPhone: string, text: string, traceId: string): Promise<void> {
+  await persistSupplierInbound(conversationId, text, traceId);
+  const existing = supplierTurnBuffer.get(conversationId);
+  if (existing) {
+    clearTimeout(existing.timer);
+    existing.texts.push(text);
+    existing.traceId = traceId; // trace da última msg da rajada
+  }
+  const entry = existing ?? { texts: [text], supplierPhone, traceId, timer: setTimeout(() => {}, 0) };
+  entry.timer = setTimeout(() => {
+    supplierTurnBuffer.delete(conversationId);
+    const combined = entry.texts.map((t) => t.trim()).filter(Boolean).join('\n');
+    if (!combined) {
+      // Rajada só de mensagens vazias (mídia ilegível) → SEM turno (nada de "Fico no
+      // aguardo! 🙂" repetido a cada figurinha — silêncio é humano aqui).
+      void writeLog('info', 'supplier', 'Rajada sem texto útil (mídia ilegível) — sem resposta', { traceId: entry.traceId, conversationId });
+      return;
+    }
+    processInboundSupplier({ conversationId, supplierPhone: entry.supplierPhone, text: combined, traceId: entry.traceId, skipPersist: true })
+      .catch((err) => writeLog('error', 'supplier', `Turno debounced falhou: ${String(err).slice(0, 160)}`, { traceId: entry.traceId, conversationId }));
+  }, SUPPLIER_DEBOUNCE_MS);
+  if (!existing) supplierTurnBuffer.set(conversationId, entry);
+}
+
+/**
+ * Mídia do FORNECEDOR → texto (best-effort). A farmácia manda foto do produto com o
+ * preço na etiqueta, ou áudio — antes isso chegava como mensagem VAZIA e a Xarlote
+ * respondia filler repetido (10:53/10:54 de 07/07). Reusa a infra da perna do usuário:
+ * áudio → transcrição; imagem → visão (1 frase objetiva). Falha → null (silêncio).
+ */
+async function supplierMediaToText(inbound: NormalizedInbound, traceId: string): Promise<string | null> {
+  try {
+    if (inbound.contentType !== 'audio' && inbound.contentType !== 'image') return null;
+    const media = await fetchInboundMedia(inbound, AGENT_INSTANCE);
+    if (!media) return null;
+    const cfg = loadPrompts();
+    if (inbound.contentType === 'audio') {
+      const r = await transcribeAudio(media.buffer, media.mime, {
+        model: cfg.audio_model || 'elevenlabs/scribe_v1',
+        openRouterKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'],
+        geminiKey: process.env['GOOGLE_GENAI_API_KEY'],
+        elevenLabsKey: cfg.tts_api_key || process.env['ELEVENLABS_API_KEY'],
+        timeoutMs: 30_000,
+      });
+      const t = r.text?.trim();
+      return t ? `[áudio da farmácia]: ${t}` : null;
+    }
+    // imagem → visão: 1 frase objetiva (produto/preço/texto legível)
+    const du = dataUrl(media.buffer.toString('base64'), media.mime || 'image/jpeg');
+    const res = await chat(
+      userContentWithImage(
+        'Foto enviada por uma farmácia numa cotação de medicamento pelo WhatsApp. Descreva em UMA frase objetiva o que ela mostra — produto, preço/etiqueta e qualquer texto legível. Sem interpretação clínica.',
+        [du],
+      ),
+      {
+        model: cfg.vision_model || cfg.llm_model || 'openai/gpt-4.1-mini',
+        apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'],
+        systemInstruction: 'Você descreve fotos objetivamente em PT-BR, em 1 frase curta.',
+        history: [],
+        tools: [],
+        temperature: 0.1,
+        maxOutputTokens: 120,
+        timeoutMs: 25_000,
+      },
+    );
+    const desc = res.text?.trim();
+    return desc ? `[foto da farmácia: ${desc}]` : null;
+  } catch (err) {
+    await writeLog('warn', 'supplier', `Mídia do fornecedor ilegível: ${String(err).slice(0, 140)}`, { traceId });
+    return null;
+  }
+}
+
 // Called from webhook for real uazapi messages on the agent instance.
 // AGENT_INSTANCE serve tanto pra farmácia quanto pra clínica — diferenciamos
 // pelo `party_type` da conversa salva no DB.
@@ -679,6 +779,14 @@ export async function processInboundSupplierFromWebhook(inbound: NormalizedInbou
   const conv = rows?.[0];
   if (!conv) return;
 
+  // Mídia → texto (foto do produto com preço, áudio): antes chegava VAZIO e virava
+  // filler repetido. Best-effort; falha vira '' e o debounce silencia.
+  let text = inbound.text ?? '';
+  if (inbound.contentType === 'audio' || inbound.contentType === 'image') {
+    const mediaText = await supplierMediaToText(inbound, traceId);
+    if (mediaText) text = text ? `${text}\n${mediaText}` : mediaText;
+  }
+
   // Roteamento por party_type — clinic vai pro agent-clinic, supplier fica aqui
   if ((conv as { party_type?: string }).party_type === 'clinic') {
     // Lazy import pra evitar ciclo
@@ -686,18 +794,14 @@ export async function processInboundSupplierFromWebhook(inbound: NormalizedInbou
     await processInboundClinic({
       conversationId: conv.id,
       clinicPhone: inbound.from.phoneE164,
-      text: inbound.text ?? '',
+      text,
       traceId,
     });
     return;
   }
 
-  await processInboundSupplier({
-    conversationId: conv.id,
-    supplierPhone: inbound.from.phoneE164,
-    text: inbound.text ?? '',
-    traceId,
-  });
+  // Debounce de rajada: persiste JÁ, turno único depois da janela (mata o double-send).
+  await enqueueSupplierTurn(conv.id, inbound.from.phoneE164, text, traceId);
 }
 
 // ─── Initiate a new negotiation (called after pharmacy discovery) ────────────
@@ -784,17 +888,37 @@ export async function initiatePharmacyNegotiation(
   // variável vazia (a Meta rejeita) — cai pra um texto genérico válido.
   const itemsText = items.map((i) => `${itemDisplayName(i.name, i.dosage)}${i.quantity ? ` (${i.quantity})` : ''}`).join(', ').trim() || 'os itens do pedido';
   const paymentClause = paymentMethod ? ` O pagamento vai ser via ${paymentMethod}.` : '';
-  const fallbackOpening = `Oi, tudo bem? Aqui é a Xarlote, você teria ${itemsText}? Para entregar no ${userNeighborhood}, queria saber o preço e prazo de entrega, por favor.${paymentClause}`;
+
+  // CONVERSA QUENTE (incidente Santa Lúcia 07/07, 20:34): a farmácia tinha acabado de
+  // fechar um pedido e recebeu "Oi, tudo bem? Aqui é a Xarlote, assistente de saúde…"
+  // como se nunca tivessem falado — tell de robô na cara. Dentro da janela de 24h o
+  // Meta ACEITA texto livre: a abertura vira uma CONTINUAÇÃO natural da conversa (sem
+  // re-apresentação, ciente do que está pendente). Template só em conversa FRIA.
+  const { data: lastIn } = await db.from('messages')
+    .select('created_at')
+    .eq('conversation_id', conv.id)
+    .eq('direction', 'in')
+    .eq('sender_role', 'supplier')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const isWarm = !!lastIn?.created_at && Date.now() - new Date(lastIn.created_at).getTime() < 24 * 60 * 60 * 1000;
+
+  const fallbackOpening = isWarm
+    ? `oi, eu de novo por aqui 🙂 vocês teriam ${itemsText}? é pra entregar no ${userNeighborhood} — me passa o valor e o prazo?`
+    : `Oi, tudo bem? Aqui é a Xarlote, você teria ${itemsText}? Para entregar no ${userNeighborhood}, queria saber o preço e prazo de entrega, por favor.${paymentClause}`;
 
   let opening: string;
   try {
+    const warmHistory = isWarm ? trimHistory(messagesToHistory(await getConversationMessages(conv.id, 12) as Message[]), 10) : [];
+    const openingInstr = isWarm
+      ? '\n\nCONTINUAÇÃO DE CONVERSA: você JÁ conversou com esta farmácia (histórico acima) — ela te conhece. Escreva UMA mensagem curta e natural pedindo a cotação NOVA dos itens: SEM se re-apresentar (nada de "aqui é a Xarlote"/"assistente"), cumprimento leve no máximo; se houver assunto pendente com ela (ex.: entrega de um pedido anterior ainda não confirmada), reconheça em meia frase antes ("antes de mais nada, saiu aquela entrega?"). Tom de WhatsApp de gente: curto, sem formalidade, no máximo 1 emoji. Não use tools.'
+      : '\n\nEsta é a primeira mensagem. Escreva apenas a mensagem de abertura para a farmácia — apresentando-se como Xarlote e perguntando sobre os itens. Sem emojis. Sem mencionar IA/agente/sistema. Não use tools ainda.';
     const res = await chat('INICIAR_COTACAO', {
       model: cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
       apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'],
-      systemInstruction:
-        systemPrompt +
-        '\n\nEsta é a primeira mensagem. Escreva apenas a mensagem de abertura para a farmácia — apresentando-se como Xarlote e perguntando sobre os itens. Sem emojis. Sem mencionar IA/agente/sistema. Não use tools ainda.',
-      history: [],
+      systemInstruction: systemPrompt + openingInstr,
+      history: warmHistory,
       tools: [],
       temperature: 0.4,
       maxOutputTokens: 200,
@@ -805,15 +929,13 @@ export async function initiatePharmacyNegotiation(
     opening = fallbackOpening;
   }
 
-  await writeLog('info', 'pharmacy', `Initiating negotiation with ${supplier.name}`, {
-    traceId, quoteId, supplierId: supplier.id,
+  await writeLog('info', 'pharmacy', `Initiating negotiation with ${supplier.name}${isWarm ? ' (conversa quente — texto livre)' : ''}`, {
+    traceId, quoteId, supplierId: supplier.id, isWarm,
   });
 
-  // Fase 6: no número OFICIAL a abertura fria PRECISA ser template (Meta). Quando
-  // ligado (WHATSAPP_TEMPLATES_ENABLED=true), pharmacyColdOpen escolhe o template:
-  // cotacao_medicamento se já aprovado, senão o coringa contato_geral (aprovado).
-  // Desligado (default / agente ainda no uazapi), segue o texto livre de hoje.
-  if (templatesEnabled()) {
+  // Fase 6: no número OFICIAL a abertura FRIA precisa ser template (Meta). Conversa
+  // QUENTE (<24h) vai de texto livre humano — sem template, sem re-apresentação.
+  if (templatesEnabled() && !isWarm) {
     const t = pharmacyColdOpen(itemsText, userNeighborhood);
     await sendTemplateOpeningToSupplier(conv.id, supplierPhone, t.key, t.variables, traceId);
   } else {
