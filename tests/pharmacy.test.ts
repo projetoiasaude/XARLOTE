@@ -519,6 +519,31 @@ describe('extractAcceptConditions — condições do aceite viajam com o fechame
     const c = extractAcceptConditions('entrega antes das 25 tá');
     expect(c.deadlineHour).toBeNull();
   });
+  // Regressão do review 08/07: "19h" (hora + "h" SEM minutos) é a forma mais natural
+  // em PT-BR e o `\b` final da regex fazia ela não casar NADA → prazo dropado silencioso.
+  it('bare "antes das 19h" (sem minutos) → 19h', () => {
+    const c = extractAcceptConditions('Pode fechar, mas antes das 19h por favor');
+    expect(c.deadlineHour).toBe(19);
+    expect(c.deadlineMinute).toBe(0);
+  });
+  it('"antes de 19h" e "no máximo 18h" (formas do docstring) capturam a hora', () => {
+    expect(extractAcceptConditions('entrega antes de 19h').deadlineHour).toBe(19);
+    expect(extractAcceptConditions('no máximo 18h, tá?').deadlineHour).toBe(18);
+  });
+  it('"19h30" (h com minutos) ainda vira 19:30', () => {
+    const c = extractAcceptConditions('até as 19h30');
+    expect(c.deadlineHour).toBe(19);
+    expect(c.deadlineMinute).toBe(30);
+  });
+  it('grafias coladas "19hrs" / "19hs" / "19 horas" capturam a hora', () => {
+    expect(extractAcceptConditions('só que tem que entregar antes das 19hrs').deadlineHour).toBe(19);
+    expect(extractAcceptConditions('antes das 19hs').deadlineHour).toBe(19);
+    expect(extractAcceptConditions('no máximo 18 horas').deadlineHour).toBe(18);
+  });
+  it('número de 3+ dígitos após o prefixo não vira deadline falso (lookahead)', () => {
+    // "antes das 190" não deve extrair 19 (o lookahead (?![\d:]) barra o dígito seguinte).
+    expect(extractAcceptConditions('antes das 190 unidades').deadlineHour).toBeNull();
+  });
 });
 
 describe('resolveSupplierByHint — casa por TELEFONE (caso real 07/07)', () => {
@@ -583,5 +608,15 @@ describe('humanizeSupplierText — sem emoji, sem travessão (farmácia não pod
   it('limpa vírgula/espaço sobrando quando o emoji estava no fim', () => {
     expect(humanizeSupplierText('anotado, valeu 🙏')).toBe('anotado, valeu');
     expect(humanizeSupplierText('  ')).toBe('');
+  });
+  // Review 08/07: \p{Extended_Pictographic} não cobre bandeira nem tom de pele.
+  it('bandeira (Regional Indicator) e tom de pele também somem', () => {
+    expect(humanizeSupplierText('chegou do Brasil 🇧🇷 hoje')).toBe('chegou do Brasil hoje');
+    expect(humanizeSupplierText('beleza 👍🏽')).toBe('beleza');
+    expect(humanizeSupplierText('valeu 🇧🇷')).not.toMatch(/\p{Regional_Indicator}/u);
+  });
+  it('intervalo numérico com travessão vira "a" (não "," que viraria lista/decimal)', () => {
+    expect(humanizeSupplierText('entrega entre 10—15 minutos')).toBe('entrega entre 10 a 15 minutos');
+    expect(humanizeSupplierText('fica R$ 10–15')).toBe('fica R$ 10 a 15');
   });
 });

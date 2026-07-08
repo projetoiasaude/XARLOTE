@@ -590,8 +590,12 @@ export function extractAcceptConditions(text: string | null | undefined): Accept
   const raw = text.trim();
   const t = fold(raw);
 
-  // Prazo: "antes das 19", "até as 19:30", "antes de 19h", "no máximo 18h".
-  const dm = t.match(/\b(antes d[ae]s?|at[ée]( [àa]s?)?|no m[áa]ximo( at[ée])?)\s*(?:[àa]s?\s*)?(\d{1,2})(?:[:h](\d{2}))?\b/);
+  // Prazo: "antes das 19", "até as 19:30", "antes de 19h", "no máximo 18h", "19hrs",
+  // "19 horas". O sufixo de hora é tolerante (`h`, `hs`, `hrs`, `horas`, com/sem espaço)
+  // e o fim usa lookahead `(?![\d:])` no lugar de `\b`: o `\b` falhava entre o dígito e
+  // o "h" (ambos \w) e entre "h" e "s"/"r", dropando o prazo (formas naturais em PT-BR) —
+  // review 08/07. Hora inválida ainda é barrada pelo guard `h>=0 && h<=23` abaixo.
+  const dm = t.match(/\b(antes d[ae]s?|at[ée]( [àa]s?)?|no m[áa]ximo( at[ée])?)\s*(?:[àa]s?\s*)?(\d{1,2})(?:[:h](\d{2})|\s*h(?:r?s|oras?)?)?(?![\d:])/);
   let deadlineHour: number | null = null;
   let deadlineMinute = 0;
   if (dm) {
@@ -640,10 +644,20 @@ export function isServiceNumber(phone: string | null | undefined): boolean {
 export function humanizeSupplierText(text: string | null | undefined): string {
   if (!text) return '';
   let s = String(text);
-  // travessão/meia-risca (com espaços ao redor) → ", "
+  // Intervalo numérico com travessão ("10—15 min", "R$ 10–15") → "10 a 15": vira "a",
+  // não "," — senão a farmácia leria como lista/decimal ("10, 15") — review 08/07.
+  s = s.replace(/(\d)\s*[—–]\s*(\d)/g, '$1 a $2');
+  // travessão/meia-risca de FRASE (com espaços ao redor) → ", "
   s = s.replace(/\s*[—–]\s*/g, ', ');
-  // emoji/pictogramas + seletores de variação + ZWJ
-  s = s.replace(/\p{Extended_Pictographic}/gu, '').replace(/[\u{FE00}-\u{FE0F}\u{200D}\u{20E3}]/gu, '');
+  // emoji/pictogramas + bandeiras (Regional_Indicator) + modificador de tom de pele
+  // (Emoji_Modifier) + seletores de variação + ZWJ + keycap. \p{Extended_Pictographic}
+  // sozinho NÃO cobre bandeira nem tom de pele — são propriedades Unicode disjuntas
+  // (bandeira 🇧🇷 sobrevivia; tom de pele deixava o modificador solto) — review 08/07.
+  s = s
+    .replace(/\p{Extended_Pictographic}/gu, '')
+    .replace(/\p{Regional_Indicator}/gu, '')
+    .replace(/\p{Emoji_Modifier}/gu, '')
+    .replace(/[\u{FE00}-\u{FE0F}\u{200D}\u{20E3}]/gu, '');
   // limpezas
   s = s
     .replace(/ {2,}/g, ' ')

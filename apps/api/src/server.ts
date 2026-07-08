@@ -10,6 +10,7 @@ import { adminRoute } from './routes/admin.js';
 import { appRoute } from './routes/app.js';
 import { startAllWorkers } from './workers/start-all.js';
 import { closeOutbound } from './queues/outbound.queue.js';
+import { flushSupplierTurnBuffer } from './handlers/inbound-supplier.js';
 import { installShutdownHandlers, onShutdown } from './lifecycle.js';
 import { closeRedisClient } from './queue-config.js';
 import { initSentry, captureError, closeSentry } from './observability/sentry.js';
@@ -138,6 +139,14 @@ async function main() {
     // Ordem: HTTP primeiro (para de aceitar + drena in-flight) → workers (crons +
     // enricher, registrados dentro de startAllWorkers) → outbound → Redis → Sentry.
     onShutdown('http server (drena in-flight)', () => app.close());
+
+    // Flush do debounce de fornecedor: processa rajadas na janela de 8s que morreriam com o
+    // SIGTERM (msg persistida mas turno nunca rodado). Depois do http (sem webhook novo) e
+    // ANTES do outbound/redis fecharem (o flush envia msgs pela fila). Só faz sentido no
+    // processo que recebe webhooks (role api/all); no worker puro o buffer está sempre vazio.
+    if (runApi) {
+      onShutdown('flush debounce de fornecedor', () => flushSupplierTurnBuffer());
+    }
 
     // Workers: só neste processo se ROLE incluir worker. Registram seus próprios
     // disposers (cron intervals, enricher) via onShutdown, na ordem certa.

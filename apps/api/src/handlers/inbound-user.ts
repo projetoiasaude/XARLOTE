@@ -775,9 +775,15 @@ export async function processInboundUser(
   // Suprime o texto do LLM quando um backstop OU um handler auto-contido assumiu:
   // confirm (aceite), re-contato do backstop, ou message_supplier que já respondeu
   // ("Prontinho, mandei…" / desambiguação). Senão o usuário vê DUAS vozes contraditórias
-  // no mesmo turno (incidente 07/07 17:34). Só quando o turno não tem OUTRAS ações que o
-  // texto do LLM precise narrar.
-  const suppressReply = ((backstopConfirmed || turnToolCtx.turnFlags.suppressLlmText) && onlyAcceptTurn) || backstopReContacted;
+  // no mesmo turno (incidente 07/07 17:34).
+  //   • suppressLlmText (handler auto-contido JÁ mandou a resposta certa) suprime SEMPRE —
+  //     inclusive quando o LLM empacotou message_supplier com OUTRA tool legal (ex.:
+  //     create_reminder), caso em que onlyAcceptTurn virava false e a 2ª voz vazava
+  //     ("Não tenho certeza…" + "Deixa eu mandar 💙" juntos) — review 08/07. A ação
+  //     empacotada roda (o lembrete é criado); só a narração conflitante é engolida.
+  //   • backstopConfirmed é FORÇADO em silêncio (o LLM não sabia) → só suprime quando o
+  //     turno foi PURAMENTE o aceite; senão engoliria a narração de uma ação legítima.
+  const suppressReply = (backstopConfirmed && onlyAcceptTurn) || turnToolCtx.turnFlags.suppressLlmText || backstopReContacted;
   let replyText = suppressReply ? '' : llmResponse.text.trim();
 
   // 🚫 GUARDA ANTI-MENTIRA RESIDUAL (incidente 07/07): o LLM afirma ter contatado a

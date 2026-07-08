@@ -565,6 +565,13 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
           eta_minutes: a.estimated_delivery_minutes ?? quote.eta_minutes,
           notes: a.notes ?? quote.notes,
         }).eq('id', quote.id);
+        // Sinal REAL de confirmação (≠ "a farmácia mandou qualquer coisa"): o order-followup
+        // usa supplier_confirmed_at pra suprimir o alerta de prazo ao cliente. Antes ele
+        // suprimia com QUALQUER inbound da farmácia após o fechamento → um "blz" jogado
+        // desarmava o aviso e mascarava o incidente Santa Lúcia (review 08/07).
+        if (quote.order_id) {
+          await db.from('orders').update({ supplier_confirmed_at: new Date().toISOString() }).eq('id', quote.order_id);
+        }
         await writeLog('info', 'order', `✅ Farmácia confirmou preparo do pedido${a.estimated_delivery_minutes ? ` — ETA: ${a.estimated_delivery_minutes}min` : ''}`, { traceId, quoteId: quote.id });
         break;
       }
@@ -666,8 +673,26 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
 // robô na hora. Agora: cada mensagem é PERSISTIDA na hora (fidelidade do transcript),
 // mas o TURNO espera alguns segundos; o que chegar na janela entra no MESMO turno e o
 // LLM responde UMA vez, vendo a rajada inteira.
-const supplierTurnBuffer = new Map<string, { texts: string[]; supplierPhone: string; traceId: string; timer: ReturnType<typeof setTimeout> }>();
+// NOTA (single-instance): supplierTurnBuffer é estado LOCAL do processo. Hoje o service
+// `api` roda como instância ÚNICA no Railway; se algum dia escalar horizontalmente
+// (roadmap F2.F1), o debounce precisa migrar pra coordenação via Redis (como os crons já
+// fazem com withCronLock) — senão réplicas coalescem a mesma rajada isoladamente e o
+// double-send volta. Review 08/07.
+interface SupplierTurn {
+  texts: string[];
+  supplierPhone: string;
+  traceId: string;
+  timer: ReturnType<typeof setTimeout> | null;
+  pendingMedia: number;   // mensagens ainda transcrevendo (áudio/imagem) → seguram a janela
+  mediaDeadline: number;  // teto absoluto pra fechar mesmo com mídia pendente (anti-travamento)
+}
+const supplierTurnBuffer = new Map<string, SupplierTurn>();
 const SUPPLIER_DEBOUNCE_MS = Number(process.env['SUPPLIER_DEBOUNCE_MS'] ?? 8000);
+// Teto de espera pela mídia antes de fechar a rajada sem ela. Precisa cobrir o pior caso
+// REALISTA de download + transcrição (áudio timeout=30s + folga pro download): abaixo disso,
+// um áudio lento-mas-bem-sucedido chegaria depois do turno já ter fechado e viraria um 2º
+// turno = double-send (review 08/07). Mídia que FALHA vira '' → silêncio, sem 2º turno.
+const SUPPLIER_MEDIA_HOLD_MS = Number(process.env['SUPPLIER_MEDIA_HOLD_MS'] ?? 45_000);
 
 async function persistSupplierInbound(conversationId: string, text: string, traceId: string): Promise<void> {
   await db.from('messages').insert({
@@ -683,29 +708,97 @@ async function persistSupplierInbound(conversationId: string, text: string, trac
     .eq('id', conversationId);
 }
 
-/** Enfileira uma mensagem do fornecedor: persiste JÁ, turno debounced (rajada = 1 turno). */
-export async function enqueueSupplierTurn(conversationId: string, supplierPhone: string, text: string, traceId: string): Promise<void> {
-  await persistSupplierInbound(conversationId, text, traceId);
+/** (Re)arma o timer da janela de debounce da conversa. */
+function armSupplierTimer(conversationId: string): void {
+  const entry = supplierTurnBuffer.get(conversationId);
+  if (!entry) return;
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = setTimeout(() => fireSupplierTurn(conversationId), SUPPLIER_DEBOUNCE_MS);
+}
+
+/** Fecha a rajada: processa o turno único (ou silencia se vazio) e limpa o buffer. */
+function fireSupplierTurn(conversationId: string): void {
+  const entry = supplierTurnBuffer.get(conversationId);
+  if (!entry) return;
+  // Ainda esperando transcrição de mídia e dentro do teto → NÃO fecha a rajada sem ela
+  // (senão o áudio vira um 2º turno = double-send, o exato tell de robô); re-checa em 1s.
+  if (entry.pendingMedia > 0 && Date.now() < entry.mediaDeadline) {
+    entry.timer = setTimeout(() => fireSupplierTurn(conversationId), 1000);
+    return;
+  }
+  supplierTurnBuffer.delete(conversationId);
+  if (entry.timer) clearTimeout(entry.timer);
+  const combined = entry.texts.map((t) => t.trim()).filter(Boolean).join('\n');
+  if (!combined) {
+    // Rajada só de mensagens vazias (mídia ilegível) → SEM turno (nada de "Fico no
+    // aguardo! 🙂" repetido a cada figurinha — silêncio é humano aqui).
+    void writeLog('info', 'supplier', 'Rajada sem texto útil (mídia ilegível) — sem resposta', { traceId: entry.traceId, conversationId });
+    return;
+  }
+  void processInboundSupplier({ conversationId, supplierPhone: entry.supplierPhone, text: combined, traceId: entry.traceId, skipPersist: true })
+    .catch((err) => writeLog('error', 'supplier', `Turno debounced falhou: ${String(err).slice(0, 160)}`, { traceId: entry.traceId, conversationId }));
+}
+
+/**
+ * RESERVA um slot na rajada ANTES de processar mídia lenta. Transcrição de áudio/imagem
+ * pode levar mais que a janela de 8s — sem a reserva, o áudio entraria DEPOIS do turno já
+ * ter disparado e viraria um 2º turno/2ª resposta (double-send). Síncrono: incrementa
+ * pendingMedia (segura a janela) e arma/estende o timer. Review 08/07.
+ */
+export function reserveSupplierMedia(conversationId: string, supplierPhone: string, traceId: string): void {
   const existing = supplierTurnBuffer.get(conversationId);
   if (existing) {
-    clearTimeout(existing.timer);
-    existing.texts.push(text);
-    existing.traceId = traceId; // trace da última msg da rajada
+    existing.pendingMedia += 1;
+    existing.mediaDeadline = Date.now() + SUPPLIER_MEDIA_HOLD_MS;
+    existing.supplierPhone = supplierPhone;
+  } else {
+    supplierTurnBuffer.set(conversationId, {
+      texts: [], supplierPhone, traceId, timer: null,
+      pendingMedia: 1, mediaDeadline: Date.now() + SUPPLIER_MEDIA_HOLD_MS,
+    });
   }
-  const entry = existing ?? { texts: [text], supplierPhone, traceId, timer: setTimeout(() => {}, 0) };
-  entry.timer = setTimeout(() => {
-    supplierTurnBuffer.delete(conversationId);
-    const combined = entry.texts.map((t) => t.trim()).filter(Boolean).join('\n');
-    if (!combined) {
-      // Rajada só de mensagens vazias (mídia ilegível) → SEM turno (nada de "Fico no
-      // aguardo! 🙂" repetido a cada figurinha — silêncio é humano aqui).
-      void writeLog('info', 'supplier', 'Rajada sem texto útil (mídia ilegível) — sem resposta', { traceId: entry.traceId, conversationId });
-      return;
-    }
-    processInboundSupplier({ conversationId, supplierPhone: entry.supplierPhone, text: combined, traceId: entry.traceId, skipPersist: true })
-      .catch((err) => writeLog('error', 'supplier', `Turno debounced falhou: ${String(err).slice(0, 160)}`, { traceId: entry.traceId, conversationId }));
-  }, SUPPLIER_DEBOUNCE_MS);
+  armSupplierTimer(conversationId);
+}
+
+/**
+ * Enfileira uma mensagem do fornecedor: turno debounced (rajada = 1 turno). Persiste a msg
+ * (fidelidade do transcript) — mas o PUSH no buffer é síncrono ANTES do await do insert, pra
+ * a ordem seguir a CHEGADA e não a ordem em que os inserts do Supabase resolvem (jitter de
+ * rede podia inverter uma rajada e o LLM ler "não tem mais\ntem sim" invertido). Review 08/07.
+ * `fromReservation` = esta msg tinha um slot de mídia reservado (decrementa pendingMedia).
+ */
+export async function enqueueSupplierTurn(conversationId: string, supplierPhone: string, text: string, traceId: string, fromReservation = false): Promise<void> {
+  const existing = supplierTurnBuffer.get(conversationId);
+  const entry: SupplierTurn = existing ?? {
+    texts: [], supplierPhone, traceId, timer: null, pendingMedia: 0, mediaDeadline: 0,
+  };
+  entry.texts.push(text);
+  entry.traceId = traceId; // trace da última msg da rajada
+  entry.supplierPhone = supplierPhone;
+  if (fromReservation && entry.pendingMedia > 0) entry.pendingMedia -= 1;
   if (!existing) supplierTurnBuffer.set(conversationId, entry);
+  armSupplierTimer(conversationId);
+  // Persiste DEPOIS (a ordem no buffer já está travada). Não persiste vazio — msg de mídia
+  // ilegível não deve virar um row vazio (que ainda enganaria o ackAt do order-followup).
+  if (text.trim()) await persistSupplierInbound(conversationId, text, traceId);
+}
+
+/**
+ * Flush do buffer no shutdown. Railway manda SIGTERM em TODO redeploy: sem isto, uma rajada
+ * na janela de 8s some com o processo — a msg foi persistida mas o turno NUNCA roda (farmácia
+ * sem resposta) e o order-followup era enganado (row existe → parecia "acked"). Processa o
+ * que já tem agora (não espera transcrição pendente — mídia é best-effort). Review 08/07.
+ */
+export async function flushSupplierTurnBuffer(): Promise<void> {
+  const pending = [...supplierTurnBuffer.entries()];
+  supplierTurnBuffer.clear();
+  await Promise.allSettled(pending.map(async ([conversationId, entry]) => {
+    if (entry.timer) clearTimeout(entry.timer);
+    const combined = entry.texts.map((t) => t.trim()).filter(Boolean).join('\n');
+    if (!combined) return;
+    await processInboundSupplier({ conversationId, supplierPhone: entry.supplierPhone, text: combined, traceId: entry.traceId, skipPersist: true })
+      .catch((err) => writeLog('error', 'supplier', `Flush de rajada no shutdown falhou: ${String(err).slice(0, 160)}`, { traceId: entry.traceId, conversationId }));
+  }));
 }
 
 /**
@@ -779,16 +872,15 @@ export async function processInboundSupplierFromWebhook(inbound: NormalizedInbou
   const conv = rows?.[0];
   if (!conv) return;
 
-  // Mídia → texto (foto do produto com preço, áudio): antes chegava VAZIO e virava
-  // filler repetido. Best-effort; falha vira '' e o debounce silencia.
-  let text = inbound.text ?? '';
-  if (inbound.contentType === 'audio' || inbound.contentType === 'image') {
-    const mediaText = await supplierMediaToText(inbound, traceId);
-    if (mediaText) text = text ? `${text}\n${mediaText}` : mediaText;
-  }
+  const isMedia = inbound.contentType === 'audio' || inbound.contentType === 'image';
 
-  // Roteamento por party_type — clinic vai pro agent-clinic, supplier fica aqui
+  // Roteamento por party_type — clinic vai pro agent-clinic (fluxo próprio, SEM debounce).
   if ((conv as { party_type?: string }).party_type === 'clinic') {
+    let text = inbound.text ?? '';
+    if (isMedia) {
+      const mediaText = await supplierMediaToText(inbound, traceId);
+      if (mediaText) text = text ? `${text}\n${mediaText}` : mediaText;
+    }
     // Lazy import pra evitar ciclo
     const { processInboundClinic } = await import('./agent-clinic.js');
     await processInboundClinic({
@@ -800,8 +892,19 @@ export async function processInboundSupplierFromWebhook(inbound: NormalizedInbou
     return;
   }
 
-  // Debounce de rajada: persiste JÁ, turno único depois da janela (mata o double-send).
-  await enqueueSupplierTurn(conv.id, inbound.from.phoneE164, text, traceId);
+  // Supplier: debounce de rajada. Mídia → texto (foto do produto com preço, áudio): antes
+  // chegava VAZIO e virava filler repetido. Best-effort; falha vira '' e o debounce silencia.
+  let text = inbound.text ?? '';
+  if (isMedia) {
+    // RESERVA o slot ANTES da transcrição lenta (pode passar da janela de 8s): sem isto o
+    // áudio entraria depois do turno já ter disparado e viraria um 2º turno = double-send.
+    reserveSupplierMedia(conv.id, inbound.from.phoneE164, traceId);
+    const mediaText = await supplierMediaToText(inbound, traceId);
+    if (mediaText) text = text ? `${text}\n${mediaText}` : mediaText;
+    await enqueueSupplierTurn(conv.id, inbound.from.phoneE164, text, traceId, true);
+  } else {
+    await enqueueSupplierTurn(conv.id, inbound.from.phoneE164, text, traceId);
+  }
 }
 
 // ─── Initiate a new negotiation (called after pharmacy discovery) ────────────
@@ -872,6 +975,24 @@ export async function initiatePharmacyNegotiation(
     await db.from('conversations').update({ memory_cards: book }).eq('id', conv.id);
   }
 
+  // CONVERSA QUENTE (incidente Santa Lúcia 07/07, 20:34): a farmácia tinha acabado de
+  // fechar um pedido e recebeu "Oi, tudo bem? Aqui é a Xarlote, assistente de saúde…"
+  // como se nunca tivessem falado — tell de robô na cara. Dentro da janela de 24h o
+  // Meta ACEITA texto livre: a abertura vira uma CONTINUAÇÃO natural da conversa (sem
+  // re-apresentação, ciente do que está pendente). Template só em conversa FRIA.
+  // Calculado ANTES do systemPrompt pra a regra #7 do prompt já nascer ciente (senão o
+  // prompt-base mandava sempre "diga seu nome" e contradizia a nota de continuação —
+  // review 08/07: o modelo pode seguir a regra numerada e re-apresentar).
+  const { data: lastIn } = await db.from('messages')
+    .select('created_at')
+    .eq('conversation_id', conv.id)
+    .eq('direction', 'in')
+    .eq('sender_role', 'supplier')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const isWarm = !!lastIn?.created_at && Date.now() - new Date(lastIn.created_at).getTime() < 24 * 60 * 60 * 1000;
+
   // Build opening message via Agent LLM. Repassamos o setor REAL do usuário (não a cidade da farmácia).
   const { data: ordAddr } = await db.from('orders').select('delivery_address').eq('id', orderId).single();
   const cfg = loadPrompts();
@@ -882,27 +1003,13 @@ export async function initiatePharmacyNegotiation(
         neighborhoodCity: userNeighborhood,
         deliveryAddress: ordAddr?.delivery_address ?? null,
         paymentMethod: paymentMethod ?? null,
+        isWarm,
       });
 
   // Default defensivo: lista vazia/nomes em branco não pode gerar template com
   // variável vazia (a Meta rejeita) — cai pra um texto genérico válido.
   const itemsText = items.map((i) => `${itemDisplayName(i.name, i.dosage)}${i.quantity ? ` (${i.quantity})` : ''}`).join(', ').trim() || 'os itens do pedido';
   const paymentClause = paymentMethod ? ` O pagamento vai ser via ${paymentMethod}.` : '';
-
-  // CONVERSA QUENTE (incidente Santa Lúcia 07/07, 20:34): a farmácia tinha acabado de
-  // fechar um pedido e recebeu "Oi, tudo bem? Aqui é a Xarlote, assistente de saúde…"
-  // como se nunca tivessem falado — tell de robô na cara. Dentro da janela de 24h o
-  // Meta ACEITA texto livre: a abertura vira uma CONTINUAÇÃO natural da conversa (sem
-  // re-apresentação, ciente do que está pendente). Template só em conversa FRIA.
-  const { data: lastIn } = await db.from('messages')
-    .select('created_at')
-    .eq('conversation_id', conv.id)
-    .eq('direction', 'in')
-    .eq('sender_role', 'supplier')
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  const isWarm = !!lastIn?.created_at && Date.now() - new Date(lastIn.created_at).getTime() < 24 * 60 * 60 * 1000;
 
   const fallbackOpening = isWarm
     ? `oi, eu de novo por aqui 🙂 vocês teriam ${itemsText}? é pra entregar no ${userNeighborhood} — me passa o valor e o prazo?`
