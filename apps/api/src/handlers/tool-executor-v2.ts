@@ -271,6 +271,25 @@ export async function handleStartTreatmentFromOrder(args: StartTreatmentArgs, ct
 
 export async function handleLogMedicationTaken(args: LogMedicationTakenArgs, ctx: BaseToolCtx): Promise<void> {
   const likeSafe = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+
+  // CONFIRMAÇÃO DE LEMBRETE (0020 — backup condicional): carimba last_confirmed_at no
+  // lembrete cujo TÍTULO bate com o nome confirmado. Cobre medicamento E hábito (creatina,
+  // água) — é por-reminder, independe de user_medications/medication_log. Só em 'taken'
+  // (skipped/snoozed NÃO confirmam → o backup DEVE disparar). Best-effort.
+  //   • Match EXATO (case-insensitive, sem curinga) — MESMA resolução do gate/create. Antes
+  //     era substring (%nome%): vazava a confirmação pra OUTRO plano ("Creatina B12") e
+  //     suprimia o backup errado = lembrete de remédio silenciado (review 08/07).
+  //   • Guarda de nome vazio/curto: sem ela, likeSafe('') virava '%%' e carimbava TODOS os
+  //     lembretes do usuário (blast — suprimia todos os backups dele).
+  const confirmName = args.medication_name?.trim() ?? '';
+  if (args.status === 'taken' && confirmName.length >= 2) {
+    await db.from('reminders')
+      .update({ last_confirmed_at: new Date().toISOString() })
+      .eq('user_id', ctx.userId)
+      .in('status', ['pending', 'sent'])
+      .ilike('title', likeSafe(confirmName));
+  }
+
   // Acha a medicação por nome (fuzzy)
   let { data: med } = await db
     .from('user_medications')

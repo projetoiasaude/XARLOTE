@@ -327,7 +327,7 @@ export async function processInboundUser(
     // plano duplicado (caso real: 2 planos de água sobrepostos = 15 pings/dia) e
     // pra saber o que cancelar via cancel_reminders ao substituir um plano.
     db.from('reminders')
-      .select('title, type, rrule, next_run_at')
+      .select('title, type, rrule, next_run_at, payload')
       .eq('user_id', user.id)
       .eq('status', 'pending')
       .order('next_run_at', { ascending: true })
@@ -421,13 +421,18 @@ export async function processInboundUser(
   }
 
   // Lembretes ativos — visibilidade pro gerenciamento (criar/cancelar/substituir).
-  const activeReminders = (activeRemindersRes.data ?? []) as Array<{ title: string; type: string; rrule: string | null; next_run_at: string }>;
+  const activeReminders = (activeRemindersRes.data ?? []) as Array<{ title: string; type: string; rrule: string | null; next_run_at: string; payload: Record<string, unknown> | null }>;
   if (activeReminders.length > 0) {
     const fmtHora = (iso: string) => new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
     const fmtData = (iso: string) => new Date(iso).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', timeZone: 'America/Sao_Paulo' });
-    const linhas = activeReminders.map((r) =>
-      `- "${r.title}" (${r.type}) — ${r.rrule ? `recorrente, próximo às ${fmtHora(r.next_run_at)}` : `único em ${fmtData(r.next_run_at)} às ${fmtHora(r.next_run_at)}`}`);
-    systemPrompt += `\n\n## ⏰ LEMBRETES ATIVOS DESTE USUÁRIO (${activeReminders.length})\n${linhas.join('\n')}\n\nSe ele pedir pra MUDAR/REDIVIDIR um plano acima, chame cancel_reminders (title_query) ANTES de criar os novos — nunca deixe dois planos do mesmo assunto coexistirem. Se pedir pra parar, cancel_reminders resolve sozinho.`;
+    const linhas = activeReminders.map((r) => {
+      const cond = r.payload as { condition?: string; depends_on_title?: string } | null;
+      const tag = cond?.condition === 'if_not_confirmed'
+        ? ` — ⚙️ backup condicional de "${cond.depends_on_title ?? ''}" (só dispara se o primário não for confirmado)`
+        : '';
+      return `- "${r.title}" (${r.type}) — ${r.rrule ? `recorrente, próximo às ${fmtHora(r.next_run_at)}` : `único em ${fmtData(r.next_run_at)} às ${fmtHora(r.next_run_at)}`}${tag}`;
+    });
+    systemPrompt += `\n\n## ⏰ LEMBRETES ATIVOS DESTE USUÁRIO (${activeReminders.length})\n${linhas.join('\n')}\n\nEstes JÁ EXISTEM. NÃO crie de novo os mesmos (mesmo assunto/horário) — se ele reperguntar "agendou?"/"criou?", responda SIM olhando esta lista, sem chamar create_reminder. Pra MUDAR/REDIVIDIR um plano, chame cancel_reminders (title_query) ANTES de criar os novos — nunca deixe dois planos do mesmo assunto coexistirem. Se pedir pra parar, cancel_reminders resolve sozinho.`;
   }
 
   // Fix #5 — desfecho REAL das tools do turno anterior (anti-contradição). O loop é
@@ -440,7 +445,7 @@ export async function processInboundUser(
       start_pharmacy_order: 'cotação de medicamento INICIADA — AGUARDANDO farmácias responderem (NÃO afirme que já tem preço; se ele perguntar, use get_order_status)',
       confirm_consultation_selection: 'consulta CONFIRMADA com a clínica',
       start_consultation_search: 'busca de consulta INICIADA — AGUARDANDO clínicas responderem',
-      create_reminder: 'lembrete criado',
+      create_reminder: 'lembrete(s) criado(s) — os títulos/horários já estão em LEMBRETES ATIVOS; NÃO recrie os mesmos',
       cancel_reminders: 'lembrete(s) cancelado(s)',
       log_medication_taken: 'dose registrada',
       log_symptom: 'sintoma registrado',
@@ -601,9 +606,10 @@ export async function processInboundUser(
       history: geminiHistory,
       tools: xarloteTools,
       temperature: 0.4,
-      // 1500 (era 1024): contexto de pedido fica grande e o glm-5.2 às vezes truncava a
-      // resposta no meio → turno vazio (incidente Cefaliv). Mais folga + o fallback acima.
-      maxOutputTokens: 1500,
+      // 2000 (era 1500/1024): turnos com VÁRIAS tool calls (ex.: plano de 2 lembretes +
+      // condicional) gastam tokens nos args e truncavam o texto no meio (incidente Glauber:
+      // "...e outro de"). Mais folga + o fallback abaixo.
+      maxOutputTokens: 2000,
       timeoutMs: 60_000,
     });
   } catch (err) {
@@ -817,7 +823,7 @@ export async function processInboundUser(
         try {
           const followup = await chat(
             `(Sistema: você acabou de executar com sucesso: ${toolNames}. O usuário havia dito: "${String(lastUserText).slice(0, 200)}". Escreva uma resposta CURTA, natural e humana confirmando pra ele o que foi feito. NÃO chame nenhuma tool.)`,
-            { model, apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'], systemInstruction: systemPrompt, history: geminiHistory, tools: [], temperature: 0.4, maxOutputTokens: 200, timeoutMs: 20_000 },
+            { model, apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'], systemInstruction: systemPrompt, history: geminiHistory, tools: [], temperature: 0.4, maxOutputTokens: 400, timeoutMs: 20_000 },
           );
           replyText = followup.text.trim();
           await writeLog('info', 'agent', `Follow-up narrou turno só-tool (${toolNames})`, { traceId });

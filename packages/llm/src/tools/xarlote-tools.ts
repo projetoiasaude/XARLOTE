@@ -292,6 +292,11 @@ export const xarloteTools: ToolDefinition[] = [
             description:
               'Lembrete RECORRENTE: RRULE com BYHOUR/BYMINUTE em HORÁRIO DE BRASÍLIA (não converta pra UTC). Ex: "FREQ=DAILY;BYHOUR=8;BYMINUTE=0" ou "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=7;BYMINUTE=30"',
           },
+          depends_on_title: {
+            type: 'string',
+            description:
+              'SÓ para lembrete-BACKUP condicional ("me lembra às 9h30 E, SE eu não confirmar, de novo ao meio-dia"): título EXATO do lembrete PRIMÁRIO que este reforça. O backup só dispara se o usuário NÃO tiver confirmado o primário desde o último disparo dele. Crie DOIS lembretes (o primário normal + este backup com depends_on_title). Ex.: backup de creatina ao meio-dia → depends_on_title:"Creatina". NÃO use em lembrete comum.',
+          },
         },
         required: ['type', 'title'],
       },

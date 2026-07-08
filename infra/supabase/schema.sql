@@ -331,6 +331,7 @@ create table if not exists reminders (
   rrule         text,
   next_run_at   timestamptz,
   last_run_at   timestamptz,
+  last_confirmed_at timestamptz, -- 0020: última confirmação do usuário (gate de backup condicional)
   status        reminder_status_t not null default 'pending',
   payload       jsonb default '{}',
   medication_id uuid references user_medications(id) on delete set null,

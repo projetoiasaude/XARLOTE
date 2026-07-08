@@ -108,7 +108,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string }, ctx);
         break;
       case 'create_reminder':
-        await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown> }, ctx);
+        await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string }, ctx);
         break;
       case 'cancel_reminders':
         await handleCancelReminders(tc.args as { title_query?: string; all?: boolean }, ctx);
@@ -1260,7 +1260,7 @@ function escapeLike(s: string): string {
 }
 
 async function handleCreateReminder(
-  args: { type: string; title?: string; body?: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown> },
+  args: { type: string; title?: string; body?: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string },
   ctx: ToolContext
 ) {
   // next_run_at é o que o dispatcher olha. Recorrente sem scheduled_at calcula
@@ -1342,6 +1342,23 @@ async function handleCreateReminder(
     return;
   }
 
+  // LEMBRETE CONDICIONAL (0020 — incidente Glauber): backup "só se não confirmar" o primário.
+  // Resolve o id do primário (best-effort); se ainda não existe (tool calls do mesmo turno em
+  // ordem inversa), grava só o título e o dispatcher resolve por título no disparo.
+  let condPayload: Record<string, unknown> = {};
+  const dep = args.depends_on_title?.trim();
+  if (dep) {
+    const { data: primary } = await db.from('reminders')
+      .select('id')
+      .eq('user_id', ctx.userId)
+      .eq('status', 'pending')
+      .ilike('title', escapeLike(dep))
+      .neq('title', title) // não se auto-referencia
+      .order('created_at', { ascending: false })
+      .limit(1).maybeSingle();
+    condPayload = { condition: 'if_not_confirmed', depends_on_title: dep, depends_on_reminder_id: primary?.id ?? null };
+  }
+
   const { error: insErr } = await db.from('reminders').insert({
     user_id: ctx.userId,
     type: args.type,
@@ -1352,7 +1369,7 @@ async function handleCreateReminder(
     rrule,
     next_run_at: firstRun,
     status: 'pending',
-    payload: args.payload ?? {},
+    payload: { ...(args.payload ?? {}), ...condPayload },
   });
   if (insErr) {
     // Insert falhou (ex: enum inválido) — o turno da LLM já pode ter dito "agendei".

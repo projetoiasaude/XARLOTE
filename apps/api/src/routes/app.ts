@@ -299,9 +299,10 @@ export async function appRoute(app: FastifyInstance) {
     const nextRecurring = reminder.rrule ? nextOccurrence(reminder.rrule) : null;
     const patch: Record<string, unknown> =
       action === 'done'
+        // last_confirmed_at (0020): botão "done" = confirmação → destrava o gate do backup condicional.
         ? nextRecurring
-          ? { status: 'pending', next_run_at: nextRecurring.toISOString(), last_run_at: new Date().toISOString() }
-          : { status: 'acknowledged' }
+          ? { status: 'pending', next_run_at: nextRecurring.toISOString(), last_run_at: new Date().toISOString(), last_confirmed_at: new Date().toISOString() }
+          : { status: 'acknowledged', last_confirmed_at: new Date().toISOString() }
         : action === 'cancel'
           ? { status: 'cancelled' }
           : {

@@ -28,6 +28,9 @@ interface DueReminder {
   body: string | null;
   rrule: string | null;
   next_run_at: string;
+  last_run_at: string | null;
+  last_confirmed_at: string | null;
+  payload: Record<string, unknown> | null;
   users: { phone_e164: string | null; preferred_name: string | null } | null;
 }
 
@@ -40,7 +43,7 @@ export async function dispatchReminders(): Promise<void> {
 
   const { data: due, error } = await db
     .from('reminders')
-    .select('id, user_id, type, title, body, rrule, next_run_at, users(phone_e164, preferred_name, timezone)')
+    .select('id, user_id, type, title, body, rrule, next_run_at, last_run_at, last_confirmed_at, payload, users(phone_e164, preferred_name, timezone)')
     .eq('status', 'pending')
     .lte('next_run_at', now.toISOString())
     .order('next_run_at', { ascending: true }) // backlog processa em ordem, sem starvation
@@ -95,6 +98,58 @@ export async function dispatchReminders(): Promise<void> {
     if (reminder.rrule && lateMs > STALE_MS) {
       await writeLog('warn', 'reminder', `lembrete recorrente pulado — atrasado ${Math.round(lateMs / 60000)}min (aguarda próxima ocorrência)`, {});
       continue;
+    }
+
+    // GATE CONDICIONAL (0020 — incidente Glauber): lembrete-backup "só se não confirmar".
+    // Fica DEPOIS do claim (next_run_at já avançou — pular antes causaria re-disparo a cada
+    // 30s). Timezone-agnóstico: compara dois instantes (o primário foi confirmado DESDE o
+    // último disparo dele?). Fail-safe: qualquer null/erro/indeterminado ⇒ DISPARA (melhor
+    // lembrar do remédio do que calar por engano).
+    const cond = reminder.payload as { condition?: string; depends_on_reminder_id?: string; depends_on_title?: string } | null;
+    if (cond?.condition === 'if_not_confirmed') {
+      const escLike = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+      type PrimaryRow = { last_run_at: string | null; last_confirmed_at: string | null };
+      // Só um primário VIVO suprime. 'cancelled' fora → primário cancelado cai no fail-safe
+      // (dispara); 'acknowledged' dentro → one-shot confirmado (app botão done) é visível.
+      const ACTIVE = ['pending', 'sent', 'acknowledged'];
+      let primary: PrimaryRow | null = null;
+      if (cond.depends_on_reminder_id) {
+        const { data } = await db.from('reminders')
+          .select('last_run_at, last_confirmed_at')
+          .eq('id', cond.depends_on_reminder_id)
+          .in('status', ACTIVE)
+          .maybeSingle();
+        primary = data as PrimaryRow | null;
+      }
+      if (!primary && cond.depends_on_title) {
+        const dep = escLike(cond.depends_on_title);
+        // Exato primeiro; se o título do primário foi "decorado" (emoji/verbo no fim),
+        // cai pro prefixo. `neq id` = nunca se resolve a si mesmo (título idêntico ao backup).
+        for (const pat of [dep, `${dep}%`]) {
+          const { data } = await db.from('reminders')
+            .select('last_run_at, last_confirmed_at')
+            .eq('user_id', reminder.user_id)
+            .in('status', ACTIVE)
+            .ilike('title', pat)
+            .neq('id', reminder.id)
+            .order('created_at', { ascending: false })
+            .limit(1).maybeSingle();
+          if (data) { primary = data as PrimaryRow; break; }
+        }
+      }
+      // Suprime SÓ se o primário foi confirmado HOJE (fuso do user) E depois do último disparo
+      // dele. "Hoje" (não só ">= last_run") evita que uma confirmação de um dia com agenda
+      // DIVERGENTE (primário seg/qua/sex, backup diário) cale o backup num dia sem primário.
+      // Fail-safe: qualquer null/indeterminado ⇒ NÃO suprime → DISPARA (melhor lembrar).
+      const tzDay = (iso: string) => new Intl.DateTimeFormat('en-CA', { timeZone: userTz || 'America/Sao_Paulo' }).format(new Date(iso));
+      const confirmedToday = !!primary?.last_confirmed_at && tzDay(primary.last_confirmed_at) === tzDay(now.toISOString());
+      const afterLastRun = !primary?.last_run_at
+        || (!!primary?.last_confirmed_at && new Date(primary.last_confirmed_at).getTime() >= new Date(primary.last_run_at).getTime());
+      if (confirmedToday && afterLastRun) {
+        await writeLog('info', 'reminder', `backup condicional pulado — primário confirmado hoje ("${reminder.title}")`, {});
+        continue; // claim JÁ avançou next_run_at → recorrência intacta, sem loop
+      }
+      // não confirmado (ou indeterminado) → segue o fluxo normal e DISPARA
     }
 
     const name = user.preferred_name ?? 'você';
