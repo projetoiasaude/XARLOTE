@@ -807,6 +807,67 @@ export async function processInboundUser(
     }
   }
 
+  // 11d. BACKSTOP ANTI-MENTIRA DE LEMBRETE (incidente Waldir 09/07): o glm-5.2 disse "amanhã
+  // às 7h te lembro do Oftpred e do Hiluropt" mas NÃO chamou create_reminder → o lembrete
+  // nunca existiu e não disparou. Se o texto AFIRMA ter agendado/vai lembrar num horário e
+  // NENHUM create_reminder/cancel/list rodou, forçamos UM retry que OBRIGA a chamar a tool
+  // (o histórico tem os detalhes). Se o retry criar, a narração original vira VERDADE; se não,
+  // trocamos por resposta honesta. Espelha o backstop anti-mentira da farmácia.
+  let reminderClaimUnfulfilled = false;
+  {
+    const calledReminderTool = llmResponse.toolCalls.some((t) => ['create_reminder', 'cancel_reminders', 'list_reminders'].includes(t.name));
+    const txt = llmResponse.text ?? '';
+    // Precisa de: verbo de agendamento + menção a LEMBRETE/AGENDAMENTO (senão pega "te aviso"
+    // de contexto de PEDIDO) + HORÁRIO DE RELÓGIO (não só "amanhã") + não ser pergunta.
+    const claimsReminder =
+      /\b(te (lembro|aviso|chamo)|vou te (lembrar|avisar|chamar)|agendei|agendado|marquei o lembrete|deixei o lembrete|lembrete (criado|marcado|agendado|configurado))\b/i.test(txt)
+      // DEVE mencionar "lembr" (lembrete/lembrar/lembro) — não só "agend": senão "agendei sua
+      // consulta às 14h"/"pedido agendado pra 9h" (contexto de CONSULTA/ENTREGA) disparava.
+      && /lembr/i.test(txt)
+      && /(\b\d{1,2}\s*h\b|\b\d{1,2}:\d{2}\b|meio[- ]dia)/i.test(txt)
+      && !/\bquer que eu\b/i.test(txt);
+    if (claimsReminder && !calledReminderTool && !distressPreempted) {
+      await writeLog('warn', 'agent', `🚫 Anti-mentira de lembrete: LLM afirmou agendar SEM chamar create_reminder → retry forçado`, { traceId, textPreview: txt.slice(0, 80) });
+      let created = false;
+      try {
+        // O retry PRECISA ver o turno ATUAL: geminiHistory tira a msg atual (slice(0,-1)) e
+        // o 1º arg aqui é o nudge (não o pedido). Sem isto o retry ficaria CEGO ao pedido do
+        // Waldir → não criaria ou alucinaria horário/remédio errado (review 09/07). Anexo o
+        // pedido do usuário + a narração que o próprio LLM acabou de fazer.
+        const currentUserText = (typeof userMsgContent === 'string' ? userMsgContent : userMsgPreview) || '(pedido de lembrete do usuário)';
+        const retryHistory = [
+          ...geminiHistory,
+          { role: 'user' as const, content: currentUserText },
+          { role: 'assistant' as const, content: txt || '(prometi agendar um lembrete)' },
+        ];
+        const retry = await chat(
+          '(Sistema: você acabou de dizer ao usuário que ia CRIAR/AGENDAR um lembrete (veja sua última mensagem acima), mas NÃO chamou a tool create_reminder — então o lembrete NÃO existe e NÃO vai disparar. Chame create_reminder AGORA, uma vez para CADA lembrete que o usuário pediu, com type, title, body (no seu tom) e o horário: use scheduled_at (ISO com offset -03:00) se for único, ou rrule (BYHOUR/BYMINUTE em horário de Brasília) se for recorrente/todo dia. Baseie-se EXATAMENTE no que o usuário pediu (medicamentos e horário na conversa acima) — NÃO invente horário nem remédio. Se não tiver certeza do horário/medicamento, NÃO chame a tool. NÃO escreva texto, só chame a(s) tool(s).)',
+          {
+            model,
+            apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
+            systemInstruction: systemPrompt,
+            history: retryHistory,
+            tools: xarloteTools,
+            temperature: 0.1,
+            maxOutputTokens: 600,
+            timeoutMs: 20_000,
+          },
+        );
+        for (const tc of retry.toolCalls) {
+          if (tc.name === 'create_reminder') {
+            await writeLog('info', 'tool', `Tool call (retry lembrete): create_reminder`, { traceId, args: tc.args });
+            await handleToolCall(tc, turnToolCtx);
+            created = true;
+          }
+        }
+      } catch (err) {
+        await writeLog('error', 'agent', `Retry de lembrete falhou: ${String(err).slice(0, 120)}`, { traceId });
+      }
+      // Se nem o retry criou, a narração "te lembro às 7h" ainda é mentira → resposta honesta.
+      if (!created) reminderClaimUnfulfilled = true;
+    }
+  }
+
   // 12. Resolve o texto da resposta.
   // 🛑 TURNO SÓ-TOOL (incidente Glauber 2026-07-01): o gpt-4.1-mini às vezes executa
   // a(s) tool(s) SEM escrever texto (ex.: create_reminder criado, mas nenhuma
@@ -847,6 +908,14 @@ export async function processInboundUser(
         ? 'Deixa eu acertar direitinho: com qual farmácia do seu pedido você quer que eu fale? Me diz o nome que eu mando a mensagem na hora 💙'
         : 'Pra eu falar com uma farmácia eu preciso de um pedido ativo — me fala o remédio e o endereço que eu começo a busca 💙';
     }
+  }
+
+  // 🚫 ANTI-MENTIRA DE LEMBRETE (incidente Waldir): afirmou agendar, mas nem o LLM nem o retry
+  // criaram → NÃO deixa sair "te lembro às 7h" (mentira que fez o Waldir não ser avisado).
+  // Só quando o texto do LLM ia mesmo sair (não suprimido por outro handler — evita 2ª voz).
+  if (reminderClaimUnfulfilled && !suppressReply) {
+    await writeLog('warn', 'agent', `🚫 Anti-mentira de lembrete: nem o retry criou → resposta honesta`, { traceId });
+    replyText = 'Deixa eu confirmar certinho pra NÃO falhar: qual(is) medicamento(s), que horas, e é todo dia ou só uma vez? Aí eu agendo o lembrete na hora 💙';
   }
 
   if (!replyText && !suppressReply) {
