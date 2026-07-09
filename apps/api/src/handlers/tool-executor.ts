@@ -105,7 +105,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         await handleSaveExamResult(tc.args as unknown as SaveExamArgs, ctx);
         break;
       case 'start_pharmacy_order':
-        await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string }, ctx);
+        await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string; preferred_pharmacy_names?: string[] }, ctx);
         break;
       case 'create_reminder':
         await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string }, ctx);
@@ -174,7 +174,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         await handleSetDefaultAddress(tc.args as unknown as { address_label: string }, ctx);
         break;
       case 'save_address':
-        await handleSaveAddress(tc.args as unknown as { label: string; full_address?: string; complement?: string; notes?: string; set_default?: boolean }, ctx);
+        await handleSaveAddress(tc.args as unknown as { label: string; full_address?: string; complement?: string; notes?: string; set_default?: boolean; confirmed_residential?: boolean }, ctx);
         break;
       case 'start_consultation_search':
         await handleStartConsultationSearch(tc.args as unknown as StartConsultationArgs, ctx);
@@ -278,6 +278,17 @@ async function handleSaveProfileFact(
         label: String(args.payload['label'] ?? 'principal'),
         ...pick(['street', 'number', 'complement', 'neighborhood', 'city', 'state', 'cep', 'is_default', 'latitude', 'longitude']),
       });
+      break;
+    }
+    case 'identity': {
+      // PONTO 8 (Valdivino→Vadivino): o usuário disse/corrigiu o próprio nome → persiste no
+      // perfil (senão a saudação seguia com o pushName do WhatsApp). Só nomes plausíveis.
+      const patch: Record<string, unknown> = {};
+      const pn = String(args.payload['preferred_name'] ?? '').trim();
+      const fn = String(args.payload['full_name'] ?? '').trim();
+      if (pn && pn.length <= 40) patch['preferred_name'] = pn.slice(0, 40);
+      if (fn && fn.length <= 120) patch['full_name'] = fn.slice(0, 120);
+      if (Object.keys(patch).length) await db.from('users').update(patch).eq('id', ctx.userId);
       break;
     }
     default: {
@@ -518,7 +529,7 @@ async function handleCancelOrder(args: { order_id?: string; reason?: string }, c
  * NUNCA loga o endereço (PII — CLAUDE.md #3): só o label + id.
  */
 async function handleSaveAddress(
-  args: { label: string; full_address?: string; complement?: string; notes?: string; set_default?: boolean },
+  args: { label: string; full_address?: string; complement?: string; notes?: string; set_default?: boolean; confirmed_residential?: boolean },
   ctx: ToolContext,
 ): Promise<void> {
   const label = (args.label ?? '').trim() || 'principal';
@@ -573,6 +584,17 @@ async function handleSaveAddress(
   // Se o geocode não trouxe rua mas temos o texto do usuário, guarda o texto como rua.
   if (!street && addrText) street = addrText.slice(0, 180);
 
+  // PONTO 10 (incidente Vadivino: hospital salvo como "casa" + virou endereço default):
+  // endereço institucional (hospital/UPA/clínica) sob rótulo residencial → confirma antes
+  // de salvar (é onde a pessoa TÁ agora, não a casa dela) e NUNCA vira default automático.
+  const looksInstitutional = /\b(hospital|upa|pronto[- ]socorro|pronto atendimento|cl[íi]nica|santa casa|maternidade|ubs|posto de sa[úu]de|laborat[óo]rio)\b/i
+    .test(`${addrText ?? ''} ${street ?? ''}`);
+  if (looksInstitutional && !args.confirmed_residential && /^(casa|trabalho|home|work)$/i.test(label.trim())) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      'Esse endereço parece ser de um hospital/clínica 🙂 é só onde você tá agora (pra essa entrega) ou quer guardar como a sua casa mesmo? Me confirma que eu salvo do jeito certo.', ctx.traceId);
+    return;
+  }
+
   // 4. Upsert por (user, label) — atualiza se já existe esse rótulo.
   const { data: existing } = await db.from('user_addresses')
     .select('id').eq('user_id', ctx.userId).ilike('label', escapeLike(label)).limit(1).maybeSingle();
@@ -596,7 +618,8 @@ async function handleSaveAddress(
   if (addrId) {
     const { count } = await db.from('user_addresses')
       .select('id', { count: 'exact', head: true }).eq('user_id', ctx.userId);
-    if (args.set_default === true || (count ?? 0) <= 1) {
+    // Endereço institucional não vira default sozinho (só se o usuário pedir explicitamente).
+    if (args.set_default === true || ((count ?? 0) <= 1 && !looksInstitutional)) {
       await db.from('user_addresses').update({ is_default: false }).eq('user_id', ctx.userId);
       await db.from('user_addresses').update({ is_default: true }).eq('id', addrId);
     }
@@ -610,7 +633,7 @@ async function handleSaveAddress(
 }
 
 async function handleStartPharmacyOrder(
-  args: { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string },
+  args: { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string; preferred_pharmacy_names?: string[] },
   ctx: ToolContext
 ) {
   // ─── IDEMPOTÊNCIA + TROCA DE PRODUTO ───────────────────────────────────────
@@ -837,7 +860,7 @@ async function handleStartPharmacyOrder(
   // Marca o pedido como criado NESTE turno → cancel_order não pode cancelá-lo (HIGH-1).
   ctx.ordersCreatedThisTurn?.add(order.id as string);
 
-  await startPharmacyDiscovery(order.id, lat, lng, args.items, deliveryAddress, args.payment_method ?? null, ctx);
+  await startPharmacyDiscovery(order.id, lat, lng, args.items, deliveryAddress, args.payment_method ?? null, ctx, Array.isArray(args.preferred_pharmacy_names) ? args.preferred_pharmacy_names : []);
 }
 
 async function startPharmacyDiscovery(
@@ -847,7 +870,8 @@ async function startPharmacyDiscovery(
   items: OrderItem[],
   deliveryAddress: string | null,
   paymentMethod: string | null,
-  ctx: ToolContext
+  ctx: ToolContext,
+  preferredNames: string[] = [],
 ) {
   await writeLog('info', 'places', `Buscando farmácias via Google Places — centro: ${lat.toFixed(5)},${lng.toFixed(5)}, raio: 3km`, {
     traceId: ctx.traceId, orderId, lat, lng,
@@ -896,9 +920,16 @@ async function startPharmacyDiscovery(
   // redes; aqui trocamos por relevância real de engajamento + proximidade.
   const byDist = (a: (typeof pharmacies)[number], b: (typeof pharmacies)[number]) =>
     (a.distanceKm ?? 999) - (b.distanceKm ?? 999);
-  const independentes = pharmacies.filter((p) => !isPharmacyChain(p.name)).sort(byDist);
-  const redes = pharmacies.filter((p) => isPharmacyChain(p.name)).sort(byDist);
-  const top = [...independentes, ...redes].slice(0, 5);
+  // PONTO 5 (incidente Vadivino: pediu Drogasil/Pacheco e foram ignoradas): farmácia que o
+  // usuário NOMEOU entra no topo, IGNORANDO a despriorização de rede — se ele pediu, contata.
+  const norm = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const preferredNorm = preferredNames.map((n) => norm(n).trim()).filter((n) => n.length >= 3);
+  const isPreferred = (p: { name: string }) => preferredNorm.some((n) => norm(p.name).includes(n));
+  const preferred = preferredNorm.length ? pharmacies.filter(isPreferred).sort(byDist) : [];
+  const rest = pharmacies.filter((p) => !preferred.includes(p));
+  const independentes = rest.filter((p) => !isPharmacyChain(p.name)).sort(byDist);
+  const redes = rest.filter((p) => isPharmacyChain(p.name)).sort(byDist);
+  const top = [...preferred, ...independentes, ...redes].slice(0, Math.max(5, preferred.length));
   await writeLog('info', 'places', `Seleção Top-${top.length}: ${independentes.length} independente(s) priorizada(s), ${redes.length} rede(s) ao fim`, {
     traceId: ctx.traceId, orderId,
     selecionadas: top.map((p) => `${p.name}${isPharmacyChain(p.name) ? ' [rede]' : ''}`),
@@ -1055,8 +1086,14 @@ async function handleGetOrderStatus(ctx: ToolContext) {
  * cotações serem apresentadas conforme chegam.
  */
 async function handleExpandPharmacySearch(ctx: ToolContext) {
+  // UMA VOZ (incidente Vadivino: saiu "Ampliei a busca!" + "Vou ampliar a busca" no mesmo
+  // turno). Este handler é auto-contido → suprime o texto do LLM (senão contradiz/duplica).
+  const say = async (text: string) => {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164, text, ctx.traceId);
+    if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
+  };
   if (!loadPrompts().pharmacy_outbound_enabled) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164, 'O disparo pra farmácias está pausado no momento 💙 Já já volto a buscar pra você.', ctx.traceId);
+    await say('O disparo pra farmácias está pausado no momento 💙 Já já volto a buscar pra você.');
     return;
   }
   const { data: order } = await db
@@ -1069,8 +1106,7 @@ async function handleExpandPharmacySearch(ctx: ToolContext) {
     .maybeSingle();
 
   if (!order?.id || order.delivery_lat == null || order.delivery_lng == null) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      'Não achei um pedido ativo pra ampliar a busca 💙 Me fala o medicamento e o endereço que eu começo uma busca nova.', ctx.traceId);
+    await say('Não achei um pedido ativo pra ampliar a busca 💙 Me fala o medicamento e o endereço que eu começo uma busca nova.');
     return;
   }
   const lat = Number(order.delivery_lat);
@@ -1104,8 +1140,7 @@ async function handleExpandPharmacySearch(ctx: ToolContext) {
   ].slice(0, 5);
 
   if (top.length === 0) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      'Procurei num raio maior mas não achei farmácias NOVAS além das que já falei por aqui 😕 Se quiser, me manda outro endereço que eu busco numa região diferente.', ctx.traceId);
+    await say('Procurei num raio maior mas não achei farmácias NOVAS além das que já falei por aqui 😕 Se quiser, me manda outro endereço que eu busco numa região diferente.');
     return;
   }
 
@@ -1140,13 +1175,12 @@ async function handleExpandPharmacySearch(ctx: ToolContext) {
   }
 
   if (quoteIds.length === 0) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164, 'Achei farmácias novas mais longe, mas nenhuma com WhatsApp pra eu cotar agora 😕', ctx.traceId);
+    await say('Achei farmácias novas mais longe, mas nenhuma com WhatsApp pra eu cotar agora 😕');
     return;
   }
 
   await writeLog('info', 'order', `Busca ampliada: +${quoteIds.length} farmácias novas (raio 10km)`, { traceId: ctx.traceId, orderId: order.id });
-  await sendOutbound(ctx.conversationId, ctx.phoneE164,
-    `Ampliei a busca! 🔎 Contatei mais ${quoteIds.length} farmácia${quoteIds.length > 1 ? 's' : ''} nova${quoteIds.length > 1 ? 's' : ''} num raio maior. Assim que responderem, te aviso na hora 💙`, ctx.traceId);
+  await say(`Ampliei a busca! 🔎 Contatei mais ${quoteIds.length} farmácia${quoteIds.length > 1 ? 's' : ''} nova${quoteIds.length > 1 ? 's' : ''} num raio maior. Assim que responderem, te aviso na hora 💙`);
 
   for (let i = 0; i < quoteIds.length; i++) {
     const quoteId = quoteIds[i] as string;
@@ -1251,6 +1285,22 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
   await writeLog('info', 'order', `message_supplier → ${target.supplierName} (re-engajamento dirigido)`, {
     traceId: ctx.traceId, orderId: state.orderId, quoteId: target.quoteId, revived: revivedTerminal,
   });
+  // STATUS HONESTO pós-fechamento (incidente Vadivino): se o pedido já está fechado com ESTA
+  // farmácia, NÃO devolve o enlatado "assim que responderem te aviso". Usa sinal ORDER-SCOPED
+  // (orders.supplier_confirmed_at, setado só por record_order_confirmation DESTE pedido) — NÃO
+  // o texto cru da conversa, que é COMPARTILHADA por telefone e poderia vazar a msg de OUTRO
+  // cliente da mesma farmácia (review 09/07). O status real de entrega já chega ao cliente pelo
+  // relay pós-fechamento (notify_customer/backstop) quando a farmácia fala.
+  const closedChosen = ['confirming', 'handed_off'].includes(freshStatus ?? '') && isChosen;
+  if (closedChosen) {
+    const { data: ordConf } = await db.from('orders').select('supplier_confirmed_at').eq('id', state.orderId).maybeSingle();
+    if (ordConf?.supplier_confirmed_at) {
+      await say(`Cobrei a ${target.supplierName} de novo agora. Eles já confirmaram que tão cuidando do seu pedido, tá? Fico de olho e te aviso assim que sair pra entrega 💙`);
+    } else {
+      await say(`Cobrei a ${target.supplierName} agora de novo. Sendo sincera, eles ainda não me confirmaram o preparo desde que fechamos. Vou continuar em cima e te trago qualquer resposta na hora 💙`);
+    }
+    return;
+  }
   await say(`Prontinho, mandei pra ${target.supplierName} 💬 Assim que responderem eu te aviso aqui!`);
 }
 
@@ -1615,6 +1665,12 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
       .join(' e ') || 'o pedido';
     const paymentLabel = humanizePaymentLabel(userPaymentMethod || ((quote.payment_methods ?? ['pix']) as string[])[0] || 'pix');
 
+    // NOME DE QUEM RECEBE (incidente Vadivino: o motoboy chegou e não sabia procurar quem →
+    // entrega falhou). Vai no fechamento pra a farmácia já saber o destinatário. Só o 1º nome.
+    const { data: uName } = await db.from('users').select('preferred_name, full_name').eq('id', ctx.userId).maybeSingle();
+    const recipient = (((uName?.preferred_name as string | null)?.trim()) || ((uName?.full_name as string | null)?.trim()) || '').split(' ')[0] || '';
+    const recipientPart = recipient ? ` o pedido é pro ${recipient}, é ele que recebe.` : '';
+
     // Variação leve pra não soar template (mesma pessoa não fala igual sempre).
     const openings = ['fechou! pode preparar', 'show, fechado! pode separar', 'fechou então, pode preparar'];
     const opening = openings[Math.abs(args.order_id.charCodeAt(0) + args.order_id.charCodeAt(3)) % openings.length] as string;
@@ -1627,7 +1683,7 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
       ? ` ah, e preciso que chegue até as ${conditions.deadlineHour}${conditions.deadlineMinute ? `:${String(conditions.deadlineMinute).padStart(2, '0')}` : ''}h, consegue?`
       : '';
     const addrPart = addrHuman ? `o endereço é ${addrHuman}` : 'já te passo o endereço certinho';
-    const msg2 = `${addrPart} — pagamento no ${paymentLabel}, tá?${deadlinePart} me avisa quando sair pra entrega 🙏`;
+    const msg2 = `${addrPart} — pagamento no ${paymentLabel}, tá?${recipientPart}${deadlinePart} me avisa quando sair pra entrega 🙏`;
 
     await sendOutboundToSupplier(quote.conversation_id as string, supplierPhone, msg1, ctx.traceId);
     await sendOutboundToSupplier(quote.conversation_id as string, supplierPhone, msg2, ctx.traceId);

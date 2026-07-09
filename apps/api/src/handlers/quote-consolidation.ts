@@ -16,6 +16,10 @@ const QUOTE_WINDOW_MIN = Number(
   process.env['PHARMACY_QUOTE_WINDOW_MIN'] ?? process.env['PHARMACY_RESCUE_WINDOW_MIN'] ?? 45,
 );
 const RESCUE_WINDOW_MIN = QUOTE_WINDOW_MIN;
+// Assim que houver >=N cotações prontas, apresenta JÁ (event-driven, não espera timer).
+// Incidente Vadivino: 2 cotações em mãos às 15:12 mas as opções só apareceram às 15:52
+// (timeout de 60min) — o cliente esperou 40min à toa. Velocidade > completude (fundador).
+const EAGER_PRESENT_COUNT = Number(process.env['PHARMACY_EAGER_PRESENT_COUNT'] ?? 2);
 
 /**
  * Timers por pedido:
@@ -117,15 +121,16 @@ async function check3min(
   userPhoneE164: string,
   traceId: string,
 ): Promise<void> {
-  const { data: order } = await db.from('orders').select('status').eq('id', orderId).single();
+  const { data: order } = await db.from('orders').select('status, created_at').eq('id', orderId).single();
   if (!order || order.status !== 'quoting') return;
 
-  const { data: quotes } = await db.from('quotes').select('status').eq('order_id', orderId);
-  const quotedCount = (quotes ?? []).filter((q) => q.status === 'quoted').length;
+  const { data: quotes } = await db.from('quotes').select('status, created_at').eq('order_id', orderId);
+  const roundStart = new Date(order.created_at as string).getTime();
+  const quotedCount = (quotes ?? []).filter((q) => q.status === 'quoted' && new Date(q.created_at as string).getTime() >= roundStart).length;
 
   await db.from('orders').update({ status_3min_sent: true }).eq('id', orderId);
 
-  if (quotedCount >= 3) {
+  if (quotedCount >= EAGER_PRESENT_COUNT) {
     await writeLog('info', 'order', `3min: ${quotedCount} cotações — consolidando agora`, { traceId, orderId });
     await consolidateQuotesEarly(orderId, userConversationId, userPhoneE164, traceId);
   } else {
@@ -216,7 +221,7 @@ export async function notifyUserQuoteArrived(
 ): Promise<void> {
   const { data: order } = await db
     .from('orders')
-    .select('status, status_5min_done, conversation_id')
+    .select('status, status_5min_done, conversation_id, created_at')
     .eq('id', orderId)
     .single();
   if (!order || order.status !== 'quoting') return;
@@ -240,9 +245,21 @@ export async function notifyUserQuoteArrived(
   }
 
   // Modo normal: notifica chegada incremental
-  const { data: quotes } = await db.from('quotes').select('status').eq('order_id', orderId);
+  const { data: quotes } = await db.from('quotes').select('status, created_at').eq('order_id', orderId);
   const quotedCount = (quotes ?? []).filter((q) => q.status === 'quoted').length;
   const total = (quotes ?? []).length;
+  // Cotações da RODADA ATUAL (expand reseta orders.created_at → cotações antigas ficam de fora).
+  // Sem isto, o eager-present dispararia com as cotações VELHAS logo após um expand, matando
+  // as farmácias novas antes de responderem (review 09/07).
+  const roundStart = new Date(order.created_at as string).getTime();
+  const quotedThisRound = (quotes ?? []).filter((q) => q.status === 'quoted' && new Date(q.created_at as string).getTime() >= roundStart).length;
+
+  // EAGER PRESENT: com >=2 cotações DA RODADA em mãos, apresenta JÁ (não espera o timer).
+  if (quotedThisRound >= EAGER_PRESENT_COUNT) {
+    await writeLog('info', 'order', `${quotedThisRound} cotações da rodada em mãos — consolidando já (eager present)`, { traceId, orderId });
+    await consolidateQuotesEarly(orderId, userConversationId, userPhoneE164, traceId);
+    return;
+  }
 
   const msg =
     quotedCount === 1

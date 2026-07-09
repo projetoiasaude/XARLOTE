@@ -44,8 +44,9 @@ describe('humanizeTemplate (bate com o corpo aprovado na Meta)', () => {
   it('farmácia: corpo exato aprovado, com item {{1}} e região {{2}}', () => {
     const txt = humanizeTemplate('pharmacy_quote', ['Dipirona 1g (1 caixa)', 'Setor Oeste']);
     expect(txt).toBe(
-      'Oi, tudo bem? Aqui é a Xarlote, assistente de saúde. Você teria Dipirona 1g (1 caixa) disponível? É para entregar na região Setor Oeste. Consegue me passar o preço e o prazo de entrega, por favor?',
+      'Oi, tudo bem? Você tem Dipirona 1g (1 caixa) disponível? É para entregar Setor Oeste. Consegue me passar o preço e o prazo de entrega, por favor?',
     );
+    expect(txt.toLowerCase()).not.toContain('xarlote'); // humanizado: sem auto-apresentação
   });
   it('clínica: corpo exato, {{1}} é a necessidade inteira; NÃO pede região', () => {
     const txt = humanizeTemplate('clinic_outreach', ['uma consulta de cardiologia']);
@@ -76,14 +77,14 @@ describe('pharmacyColdOpen (cotacao_medicamento ainda pendente → coringa)', ()
     const t = pharmacyColdOpen('Dipirona 1g (1 caixa)', 'Setor Oeste');
     expect(t.key).toBe('pharmacy_quote');
     expect(t.variables).toEqual(['Dipirona 1g (1 caixa)', 'Setor Oeste']);
-    expect(buildTemplatePayload(t.key, t.variables).name).toBe('cotacao_medicamento');
+    expect(buildTemplatePayload(t.key, t.variables).name).toBe('cotacao_medicamento_2');
   });
 });
 
 describe('buildTemplatePayload', () => {
   it('farmácia: 2 variáveis → payload com nome/idioma default e ordem preservada', () => {
     const p = buildTemplatePayload('pharmacy_quote', ['itens', 'região']);
-    expect(p).toEqual({ name: 'cotacao_medicamento', language: 'pt_BR', variables: ['itens', 'região'] });
+    expect(p).toEqual({ name: 'cotacao_medicamento_2', language: 'pt_BR', variables: ['itens', 'região'] });
   });
   it('clínica: 1 variável', () => {
     const p = buildTemplatePayload('clinic_outreach', ['dermatologia']);

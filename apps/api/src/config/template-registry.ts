@@ -47,13 +47,14 @@ interface TemplateDef {
 // disparar o template (Meta preenche {{n}}); (b) humanize() é o que persistimos no
 // histórico e usamos como fallback de texto. NÃO altere sem reaprovar na Meta.
 const REGISTRY: Record<TemplateKey, TemplateDef> = {
-  // cotacao_medicamento · {{1}} = item(ns)+qtd · {{2}} = região/pedaço do endereço
-  // ⏳ AINDA EM APROVAÇÃO na Meta (ver pharmacyTemplate() — usa contato_geral até aprovar)
+  // cotacao_medicamento_2 · {{1}} = item(ns)+qtd · {{2}} = região/entrega
+  // Template HUMANIZADO (08/07): SEM auto-apresentação ("aqui é a Xarlote") — objetivo é a
+  // farmácia quase não perceber que fala com uma IA. Corpo Meta byte-a-byte igual ao humanize.
   pharmacy_quote: {
-    defaultName: 'cotacao_medicamento',
+    defaultName: 'cotacao_medicamento_2',
     varCount: 2,
     humanize: ([item, region]) =>
-      `Oi, tudo bem? Aqui é a Xarlote, assistente de saúde. Você teria ${item ?? ''} disponível? É para entregar na região ${region ?? ''}. Consegue me passar o preço e o prazo de entrega, por favor?`,
+      `Oi, tudo bem? Você tem ${item ?? ''} disponível? É para entregar ${region ?? ''}. Consegue me passar o preço e o prazo de entrega, por favor?`,
   },
   // atendimento_clinica · {{1}} = a necessidade INTEIRA (frase): "uma consulta de
   // cardiologia", "um exame de sangue (hemograma completo)", "uma sessão de fisioterapia".

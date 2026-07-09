@@ -139,4 +139,27 @@ export const agentPharmacyTools: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'notify_customer',
+      description:
+        'Envia uma mensagem PRO CLIENTE (NÃO pra farmácia) durante a logística pós-fechamento. Use quando a farmácia der um STATUS de entrega (motoboy a caminho, chegou, está na porta, ninguém atendeu), pedir um dado que só o cliente sabe (nome de quem recebe, complemento do endereço) ou avisar um problema. A mensagem vai no WhatsApp do cliente em nome da Xarlote. Sua resposta de TEXTO normal continua indo pra FARMÁCIA — esta tool é o ÚNICO jeito de falar com o cliente daqui.',
+      parameters: {
+        type: 'object',
+        properties: {
+          message: {
+            type: 'string',
+            description: 'Mensagem pro CLIENTE, em 1ª pessoa, tom acolhedor da Xarlote (ex.: "a farmácia falou que o entregador já tá chegando aí, consegue receber?").',
+          },
+          kind: {
+            type: 'string',
+            enum: ['delivery_update', 'question', 'problem', 'other'],
+            description: 'Tipo do aviso.',
+          },
+        },
+        required: ['message'],
+      },
+    },
+  },
 ];

@@ -11,8 +11,8 @@ export const xarloteTools: ToolDefinition[] = [
         properties: {
           category: {
             type: 'string',
-            enum: ['condition', 'allergy', 'medication', 'address', 'preference', 'other'],
-            description: 'Categoria do fato',
+            enum: ['condition', 'allergy', 'medication', 'address', 'preference', 'identity', 'other'],
+            description: 'Categoria do fato. Use "identity" quando o usuário disser/corrigir o próprio NOME (payload: {preferred_name} e/ou {full_name}).',
           },
           payload: {
             type: 'object',
@@ -133,6 +133,11 @@ export const xarloteTools: ToolDefinition[] = [
           payment_method: {
             type: 'string',
             description: 'Forma de pagamento que o usuário disse preferir (ex.: "pix", "cartão de crédito", "cartão de débito", "dinheiro"). Omitir se o usuário ainda não falou.',
+          },
+          preferred_pharmacy_names: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Se o usuário NOMEOU farmácias específicas que ele quer cotar (ex.: "tenta na Drogasil e na Pacheco"), liste os nomes aqui — elas entram na busca com PRIORIDADE, mesmo sendo grandes redes. Use também no expand_pharmacy_search.',
           },
         },
         required: ['items'],
@@ -445,6 +450,7 @@ export const xarloteTools: ToolDefinition[] = [
           complement: { type: 'string', description: 'Complemento/quadra/lote/ponto de referência, se o paciente informou separado (ex.: "Qd 19 Lt 28", "apto 302", "casa azul do portão branco"). Opcional.' },
           notes: { type: 'string', description: 'Instrução de entrega, se houver (ex.: "deixar com o porteiro"). Opcional.' },
           set_default: { type: 'boolean', description: 'true se esse deve virar o endereço padrão (ex.: é o primeiro, ou o paciente pediu). Opcional.' },
+          confirmed_residential: { type: 'boolean', description: 'Passe true SOMENTE quando o endereço parecia de hospital/clínica, você perguntou, e o paciente CONFIRMOU que é a casa/trabalho dele mesmo — aí salva sob o rótulo residencial sem re-perguntar.' },
         },
         required: ['label'],
       },

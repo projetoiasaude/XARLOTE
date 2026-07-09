@@ -250,8 +250,23 @@ export async function processInboundUser(
   // saudação "Prazer, X!" que merece sair como áudio.
   const wasProfiling = user.onboarding_status === 'profiling';
   if (wasProfiling) {
-    await db.from('users').update({ onboarding_status: 'active' }).eq('id', user.id);
-    user = { ...user, onboarding_status: 'active' };
+    // PONTO 8 (incidente Valdivino→Vadivino): a resposta à pergunta "como gosta de ser
+    // chamado?" NUNCA era persistida → preferred_name ficava no pushName do WhatsApp. Agora
+    // salva o nome DIGITADO (conservador: só se parece nome — curto, letras, sem verbo de pedido).
+    const typedName = (inbound.text ?? '').trim();
+    const looksLikeName = !!typedName
+      && typedName.length <= 30
+      && typedName.split(/\s+/).length <= 3
+      && /^[\p{L}][\p{L}\s'.\-]*$/u.test(typedName)
+      && !/\b(comprar|preciso|quero|rem[ée]dio|medic|cotar|pedir|ajuda|oi|ol[áa]|bom dia|boa tarde|boa noite|sim|n[ãa]o|prazer|obrigad[oa]|valeu|beleza|blz|de nada|opa|e a[íi]|tudo bem|tudo bom|ok|okay|test[ae])\b/i.test(typedName);
+    if (looksLikeName) {
+      const cleanName = typedName.replace(/\s+/g, ' ').slice(0, 40);
+      await db.from('users').update({ preferred_name: cleanName, onboarding_status: 'active' }).eq('id', user.id);
+      user = { ...user, preferred_name: cleanName, onboarding_status: 'active' };
+    } else {
+      await db.from('users').update({ onboarding_status: 'active' }).eq('id', user.id);
+      user = { ...user, onboarding_status: 'active' };
+    }
     await auditUserStateChange({
       userId: user.id,
       action: 'user.onboarding.activated',
@@ -678,8 +693,34 @@ export async function processInboundUser(
     // do LLM não sai junto contradizendo a resposta real da tool (incidente 07/07 17:34).
     turnFlags: { suppressLlmText: false },
   };
+
+  // 🚑 PREEMPÇÃO DE EMERGÊNCIA. Sinais físicos CLAROS e AGUDOS (dor no peito, falta de ar,
+  // desmaio, convulsão, AVC, sangramento) → força red_flag_check (botões SAMU) e SUPRIME a
+  // conversa de pedido/backstops neste turno. Regex CONSERVADORA de propósito: distress vago
+  // ("passando mal", "dor de cabeça forte" sem intensificador) NÃO dispara SAMU — é coberto
+  // pelo status honesto do message_supplier (nunca mais o enlatado que ignorou o Vadivino).
+  // Guarda de PASSADO/3ª pessoa: "semana passada minha mãe teve dor no peito, cota AAS" NÃO é
+  // emergência atual → não preempta (senão dropava o pedido legítimo — review 09/07).
+  const distressText = typeof userMsgContent === 'string' ? userMsgContent.replace(/^\[Áudio transcrito\]\s*/i, '').trim() : '';
+  const EMERGENCY_RE = /(dor no peito|aperto no peito|falta de ar|n[aã]o consigo respirar|desmai|convuls|derrame\b|\bavc\b|rosto torto|fala arrastada|sangrando muito|dor de cabe[çc]a (muito|t[aã]o|super|bem) forte)/i;
+  const PAST_OR_OTHER_RE = /\b(semana passada|m[êe]s passado|ano passado|ontem|anteontem|passad[oa]|minha m[ãa]e|meu pai|minha av[óo]|meu av[ôo]|minha filha|meu filho|minha esposa|meu marido|um amigo|uma amiga|j[áa] tive|tinha tido|ele teve|ela teve|costumo ter|as vezes tenho|[àa]s vezes tenho)\b/i;
+  const alreadyRedFlag = llmResponse.toolCalls.some((t) => t.name === 'red_flag_check');
+  let distressPreempted = false;
+  if (!alreadyRedFlag && EMERGENCY_RE.test(distressText) && !PAST_OR_OTHER_RE.test(distressText)) {
+    await writeLog('warn', 'red_flag', `🚑 Emergência determinística ("${distressText.slice(0, 40)}") → forçando red_flag_check`, { traceId });
+    await handleToolCall(
+      { id: randomUUID(), name: 'red_flag_check', args: { category: 'other_critical', severity: 'high', evidence: distressText.slice(0, 200) } } as unknown as Parameters<typeof handleToolCall>[0],
+      turnToolCtx,
+    );
+    turnToolCtx.turnFlags.suppressLlmText = true;
+    distressPreempted = true;
+  }
+
   if (llmResponse.toolCalls.length > 0) {
     for (const tc of llmResponse.toolCalls) {
+      // Emergência tem precedência: não deixa a conversa de PEDIDO/farmácia sair junto do
+      // protocolo de emergência (o usuário não pode ouvir "mandei msg pra farmácia" agora).
+      if (distressPreempted && ['message_supplier', 'relay_answer_to_establishment', 'confirm_order_selection', 'start_pharmacy_order', 'expand_pharmacy_search', 'get_order_status', 'contact_establishment', 'find_clinic_by_name', 'start_consultation_search', 'confirm_consultation_selection', 'cancel_order'].includes(tc.name)) continue;
       await writeLog('info', 'tool', `Tool call: ${tc.name}`, { traceId, args: tc.args });
       await handleToolCall(tc, turnToolCtx);
     }
@@ -699,7 +740,7 @@ export async function processInboundUser(
       ? userMsgContent.replace(/^\[Áudio transcrito\]\s*/i, '').trim()
       : '';
     const alreadyConfirmed = llmResponse.toolCalls.some((t) => t.name === 'confirm_order_selection');
-    if (activeOrder && activeOrder.status === 'quoted' && activeOrder.summary && !alreadyConfirmed && userTextForPick) {
+    if (activeOrder && activeOrder.status === 'quoted' && activeOrder.summary && !alreadyConfirmed && userTextForPick && !distressPreempted) {
       try {
         const parsed = JSON.parse(activeOrder.summary) as { options?: QuoteOption[] };
         const options = Array.isArray(parsed.options) ? parsed.options : [];
@@ -741,7 +782,7 @@ export async function processInboundUser(
     // são perguntas sobre o passado, não comandos → não disparam).
     const reContactVerb =
       /\b(fala|fale|falar|pergunt[ae]|perguntar|volt[ae]|voltar|entra(r)? em contato|manda|mande|mandar|contata|contatar|contate|pede|pe[çc]a|pedir|chama|chame|chamar|v[êe] com|confirma com|verifica com)\b/i.test(userText);
-    if (!alreadyContacted && reContactVerb && orderState && orderState.suppliers.length && userText) {
+    if (!alreadyContacted && reContactVerb && orderState && orderState.suppliers.length && userText && !distressPreempted) {
       const targetQuoteId = resolveSupplierByHint(
         orderState.suppliers.map((s) => ({ quote_id: s.quoteId, supplier_name: s.supplierName, status: s.status, responded: s.responded })),
         userText,

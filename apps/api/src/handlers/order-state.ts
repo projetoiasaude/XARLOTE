@@ -200,6 +200,9 @@ function orderStatusLabel(state: OrderState): string {
     case 'handed_off': {
       const chosen = state.suppliers.find((s) => s.quoteId === state.selectedQuoteId);
       const quando = state.closedAt ? ` às ${hourBRT(state.closedAt)}` : '';
+      // NÃO injeta o texto CRU da farmácia aqui: a conversa é compartilhada por telefone e
+      // poderia vazar a msg de OUTRO cliente da mesma farmácia (review 09/07). O status real
+      // de entrega chega ao cliente pelo relay pós-fechamento (notify_customer/backstop).
       const ack = state.supplierAckAfterClose
         ? 'a farmácia já respondeu depois do fechamento'
         : 'a farmácia AINDA NÃO confirmou o preparo/saída';

@@ -68,6 +68,21 @@ export interface SupplierInboundCtx {
   skipPersist?: boolean;
 }
 
+/**
+ * Relay farmácia→CLIENTE pós-fechamento (incidente Vadivino): manda uma mensagem no WhatsApp
+ * do CLIENTE (a conversa dele = orders.conversation_id, NUNCA a da farmácia). Dedup 90s pra
+ * não repetir o mesmo aviso na rajada. Devolve true se enviou.
+ */
+async function relayToCustomer(orderId: string, text: string, traceId: string): Promise<boolean> {
+  const { data: ord } = await db.from('orders').select('conversation_id').eq('id', orderId).maybeSingle();
+  if (!ord?.conversation_id) return false;
+  const { data: uc } = await db.from('conversations').select('whatsapp_jid').eq('id', ord.conversation_id).maybeSingle();
+  const digits = (uc?.whatsapp_jid as string | null)?.replace('@s.whatsapp.net', '');
+  if (!digits) return false;
+  await sendOutbound(ord.conversation_id as string, `+${digits}`, text, traceId, {}, { dedup: true, dedupWindowMs: 90_000 });
+  return true;
+}
+
 export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<void> {
   const { conversationId, supplierPhone, text, traceId } = ctx;
 
@@ -300,9 +315,12 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   // CPF do cliente (política do fundador: responder o CPF na hora e continuar). Fica no
   // contexto do agente pra ele responder direto quando a farmácia pedir — sem re-perguntar.
   let clientCpf: string | null = null;
+  let recipientName: string | null = null;
   if (order?.user_id) {
-    const { data: cpfRow } = await db.from('users').select('document_cpf').eq('id', order.user_id).maybeSingle();
-    clientCpf = (cpfRow?.document_cpf as string | null) ?? null;
+    const { data: uRow } = await db.from('users').select('document_cpf, preferred_name, full_name').eq('id', order.user_id).maybeSingle();
+    clientCpf = (uRow?.document_cpf as string | null) ?? null;
+    // Nome de quem recebe (pós-fechamento: "procura quem?") — perfil, primeiro do preferred.
+    recipientName = ((uRow?.preferred_name as string | null)?.trim()) || ((uRow?.full_name as string | null)?.trim()) || null;
   }
 
   // O que o cliente JÁ respondeu a OUTRAS farmácias deste pedido (reuso — o agente
@@ -344,6 +362,7 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         cpf: clientCpf, // responde direto se a farmácia pedir CPF (Caso F)
         clientAnswers, // reusa respostas do cliente (não re-pergunta o que ele já disse)
         isOrderConfirmation,
+        recipientName, // pós-fechamento: responde "procura quem?" com o nome de quem recebe
         // Link do Maps SÓ pra quando a farmácia pedir a localização (pedido fechado) —
         // mandado casual em 1 linha, nunca no fechamento (humano não manda link com rótulo).
         mapsUrl: order?.delivery_lat != null && order?.delivery_lng != null
@@ -390,6 +409,7 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   // CASO C3): a farmácia engajou, então NÃO fica no vácuo (silêncio) como um unavailable
   // seco — manda um ack humano segurando a conversa (incidente São Benedito 07/07).
   let conditionalOfferRecorded = false;
+  let customerNotified = false; // o agente já repassou algo ao CLIENTE neste turno (notify_customer)
 
   for (const tc of llmResponse.toolCalls) {
     switch (tc.name) {
@@ -582,6 +602,22 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         await writeLog('info', 'order', `✅ Farmácia confirmou preparo do pedido${a.estimated_delivery_minutes ? ` — ETA: ${a.estimated_delivery_minutes}min` : ''}`, { traceId, quoteId: quote.id });
         break;
       }
+      case 'notify_customer': {
+        // Relay farmácia→CLIENTE (incidente Vadivino): SÓ no modo confirmação (pós-fechamento).
+        // Fora dele, quem fala com o cliente é o inbound-user, não o agente da farmácia.
+        if (!isOrderConfirmation) {
+          await writeLog('warn', 'agent', 'notify_customer fora do modo confirmação — ignorada', { traceId, conversationId });
+          break;
+        }
+        const a = tc.args as { message?: string };
+        const m = (a.message ?? '').trim();
+        if (m && quote.order_id && await relayToCustomer(quote.order_id, m, traceId)) {
+          customerNotified = true;
+          await db.from('orders').update({ customer_relayed_at: new Date().toISOString() }).eq('id', quote.order_id);
+          await writeLog('info', 'supplier', `📣 Relay farmácia→cliente: "${m.slice(0, 80)}"`, { traceId, orderId: quote.order_id, quoteId: quote.id });
+        }
+        break;
+      }
       default:
         await writeLog('warn', 'agent', `Tool desconhecida chamada: ${tc.name}`, { traceId });
     }
@@ -665,6 +701,43 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     } else {
       // Turno genuinamente vazio (sem preço) — log de sempre.
       await writeLog('warn', 'agent', 'Agente retornou resposta vazia sem tools — nenhuma ação tomada', { traceId, conversationId });
+    }
+  }
+
+  // 10b. BACKSTOP DE RELAY PÓS-FECHAMENTO (incidente Vadivino): se a farmácia deu sinal de
+  // CHEGADA ("motoboy na porta", "ninguém achou quem pediu") ou perguntou o NOME de quem
+  // recebe, e o agente NÃO chamou notify_customer, forçamos o aviso ao cliente (rede de
+  // segurança determinística — o remédio não pode falhar porque o modelo esqueceu de avisar).
+  if (isOrderConfirmation && !customerNotified && quote.order_id) {
+    // CHEGADA: exige contexto de ENTREGADOR/entrega (não o `cheg\w*` solto, que casava
+    // "assim que chegar no estoque"/"não chegou o pagamento"/"você tá aí?" e mandava um
+    // "o entregador tá chegando" FALSO e alarmante ao cliente — review 09/07).
+    const arrival = /\b(na porta|motoq\w*|motoboy|motoca|entregador|sa[ií]u\s*(pra|para)\s*entrega|a caminho|ningu[ée]m\s+(atende\w*|abriu)|(entregador|motoq\w*|motoboy|entrega)\s+\w*\s*(cheg\w*|t[aâ]\s*a[íi]|na porta)|cheg\w*\s+(o|a)\s+(entregador|motoq\w*|motoboy|entrega))\b/i;
+    const whoAsk = /\b(procura\s+quem|nome\s+de\s+quem|quem\s+(vai\s+)?receb\w*|com\s+quem\s+deix|nome\s+d[oa]\s+(cliente|paciente|pessoa|respons))\b/i;
+    const isArrival = arrival.test(text);
+    const isWho = whoAsk.test(text);
+    // Precisa avisar o CLIENTE? Chegada sempre; pergunta-de-nome SÓ se não sabemos o nome
+    // (se já sabemos, respondemos a farmácia direto e NÃO incomodamos o cliente — review #1).
+    const relayCustomer = isArrival || (isWho && !recipientName);
+    if (isArrival || isWho) {
+      const { data: o } = await db.from('orders').select('customer_relayed_at').eq('id', quote.order_id).maybeSingle();
+      const lastRelay = o?.customer_relayed_at ? new Date(o.customer_relayed_at as string).getTime() : 0;
+      const supName = (quote.suppliers as { name?: string } | null)?.name ?? 'a farmácia';
+      // Se a farmácia pede o nome e nós TEMOS, respondemos a farmácia direto (destrava o motoboy).
+      if (isWho && recipientName) {
+        await sendOutboundToSupplier(conversationId, supplierPhone, `é pra ${recipientName.split(' ')[0]}`, traceId);
+      }
+      // Aviso ao cliente respeita cooldown de 4min (chegada) / sempre (pergunta sem nome).
+      const cooldownOk = (isWho && !recipientName) || Date.now() - lastRelay > 4 * 60_000;
+      if (relayCustomer && cooldownOk) {
+        const userMsg = isArrival
+          ? `Oi! A ${supName} falou que o entregador já tá chegando aí 🛵 consegue receber? Qualquer coisa me chama.`
+          : `Oi! A ${supName} tá perguntando o nome de quem vai receber a entrega — me confirma pra eu passar certinho?`;
+        if (await relayToCustomer(quote.order_id, userMsg, traceId)) {
+          await db.from('orders').update({ customer_relayed_at: new Date().toISOString() }).eq('id', quote.order_id);
+          await writeLog('warn', 'supplier', `🛟 Backstop de relay pós-fechamento (agente não avisou o cliente) — sinal=${isArrival ? 'chegada' : 'pergunta-nome'}`, { traceId, orderId: quote.order_id, quoteId: quote.id });
+        }
+      }
     }
   }
 
@@ -1059,14 +1132,14 @@ export async function initiatePharmacyNegotiation(
 
   const fallbackOpening = isWarm
     ? `oi, eu de novo por aqui 🙂 vocês teriam ${itemsText}? é pra entregar no ${userNeighborhood} — me passa o valor e o prazo?`
-    : `Oi, tudo bem? Aqui é a Xarlote, você teria ${itemsText}? Para entregar no ${userNeighborhood}, queria saber o preço e prazo de entrega, por favor.${paymentClause}`;
+    : `Oi, tudo bem? Você tem ${itemsText} disponível? É para entregar no ${userNeighborhood}. Consegue me passar o preço e o prazo de entrega, por favor?`;
 
   let opening: string;
   try {
     const warmHistory = isWarm ? trimHistory(messagesToHistory(await getConversationMessages(conv.id, 12) as Message[]), 10) : [];
     const openingInstr = isWarm
       ? '\n\nCONTINUAÇÃO DE CONVERSA: você JÁ conversou com esta farmácia (histórico acima) — ela te conhece. Escreva UMA mensagem curta e natural pedindo a cotação NOVA dos itens: SEM se re-apresentar (nada de "aqui é a Xarlote"/"assistente"), cumprimento leve no máximo; se houver assunto pendente com ela (ex.: entrega de um pedido anterior ainda não confirmada), reconheça em meia frase antes ("antes de mais nada, saiu aquela entrega?"). Tom de WhatsApp de gente: curto, sem formalidade, no máximo 1 emoji. Não use tools.'
-      : '\n\nEsta é a primeira mensagem. Escreva apenas a mensagem de abertura para a farmácia — apresentando-se como Xarlote e perguntando sobre os itens. Sem emojis. Sem mencionar IA/agente/sistema. Não use tools ainda.';
+      : '\n\nEsta é a primeira mensagem. Escreva a abertura para a farmácia perguntando de forma curta e natural se ela TEM os itens, o preço e o prazo de entrega — SEM se apresentar (nada de "aqui é a Xarlote"/"assistente"/"sou a Xarlote"), sem mencionar IA/agente/sistema, sem emojis. Direto ao ponto, como uma pessoa perguntaria. Não use tools ainda.';
     const res = await chat('INICIAR_COTACAO', {
       model: cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
       apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'],
