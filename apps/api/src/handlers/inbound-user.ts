@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
-import { isForgetMeRequest, buildConsentEvent } from '@iasaude/core';
+import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName } from '@iasaude/shared';
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard, QuoteOption } from '@iasaude/shared';
 import { chat, buildXarloteSystemPrompt, xarloteTools, messagesToHistory, trimHistory, embed, userContentWithImage, dataUrl, type ChatContent } from '@iasaude/llm';
@@ -161,9 +161,15 @@ export async function processInboundUser(
     // Resposta ao botão/texto. Detecta intenção: aceitar vs recusar.
     const text = (inbound.text ?? '').trim();
     const lower = text.toLowerCase();
-    // Aceita formas: 'aceitar', 'aceito', 'sim aceito', 'concordo', etc.
     const isRefuse = /^recusar?$/.test(lower) || /^n[aã]o\s*aceito$/.test(lower) || lower === 'recuso';
-    const isAccept = !isRefuse && (text.length > 0 || inbound.contentType !== 'text');
+    // 🔏 Aceite EXPLÍCITO apenas (LGPD art. 5º XII — manifestação inequívoca): botão
+    // "Aceitar" ou afirmação clara (CONSENT_ACCEPTED_PATTERNS). Antes, QUALQUER texto
+    // não-"recusar" E QUALQUER MÍDIA valiam como aceite — o consent da Elizabet (09/07)
+    // foi registrado a partir de um áudio NUNCA transcrito (evidence_text='[audio]'),
+    // com o conteúdo do áudio descartado em silêncio. Mídia nunca aceita; texto
+    // não-afirmativo cai no re-pedido logo abaixo (o pedido dele fica no histórico e é
+    // atendido normalmente depois do aceite).
+    const isAccept = !isRefuse && text.length > 0 && isConsentAccepted(text);
 
     await writeLog('info', 'consent', `Consent flow recebeu mensagem do usuário (status=${user.onboarding_status})`, {
       traceId,
@@ -219,8 +225,34 @@ export async function processInboundUser(
       return { traceId, conversationId: conversation.id };
     }
 
-    // Mensagem vazia / mídia sem contexto — reenvia o link
-    await sendOutbound(conversation.id, phoneE164, ONBOARDING_CONSENT_REPEAT_MESSAGE, traceId);
+    // Nem aceitou nem recusou: mídia (não processada antes do aceite — LGPD) ou texto
+    // não-afirmativo → re-pede o aceite SEM registrar consent. Honesto sobre o áudio:
+    // avisa que ainda não pôde ouvir, em vez de descartar em silêncio (caso Elizabet).
+    // RE-ENVIA OS BOTÕES (review 10/07 #24): o re-pedido saía como texto puro e o caminho
+    // de 1 toque sumia — idoso responde texto livre e podia ficar em loop.
+    const repeatMsg = inbound.contentType !== 'text'
+      ? `Recebi seu ${inbound.contentType === 'audio' ? 'áudio' : 'arquivo'}, mas antes do seu aceite eu ainda não posso abri-lo, tá? 🙈\n\n${ONBOARDING_CONSENT_REPEAT_MESSAGE}`
+      : ONBOARDING_CONSENT_REPEAT_MESSAGE;
+    await db.from('messages').insert({
+      conversation_id: conversation.id,
+      direction: 'out',
+      sender_role: 'assistant',
+      content_type: 'text',
+      content: repeatMsg,
+      trace_id: traceId,
+    });
+    await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversation.id);
+    if (!isSimulatorMode()) {
+      try {
+        await sendMenu(SARA_INSTANCE, phoneE164, repeatMsg, ['Aceitar', 'Recusar'], {
+          type: 'button',
+          ticketId: inbound.providerTicketId,
+        });
+      } catch (err) {
+        await writeLog('warn', 'outbound', `Re-pedido de consent: menu falhou, caindo pra texto: ${String(err).slice(0, 100)}`, { traceId });
+        await sendOutbound(conversation.id, phoneE164, repeatMsg, traceId);
+      }
+    }
     return { traceId, conversationId: conversation.id };
   }
 
@@ -823,7 +855,9 @@ export async function processInboundUser(
       /\b(te (lembro|aviso|chamo)|vou te (lembrar|avisar|chamar)|agendei|agendado|marquei o lembrete|deixei o lembrete|lembrete (criado|marcado|agendado|configurado))\b/i.test(txt)
       // DEVE mencionar "lembr" (lembrete/lembrar/lembro) — não só "agend": senão "agendei sua
       // consulta às 14h"/"pedido agendado pra 9h" (contexto de CONSULTA/ENTREGA) disparava.
-      && /lembr/i.test(txt)
+      // OU ser promessa de RE-CHAMADA/backup condicional (caso Ciro 09/07: "te chamo de novo
+      // às 8h pra garantir" não tem "lembr" nenhum e passava batido — o backup nunca existiu).
+      && (/lembr/i.test(txt) || /\b(te (chamo|aviso|lembro) de novo|volto a te (chamar|avisar|lembrar)|se (voc[êe] )?n[ãa]o confirmar)\b/i.test(txt))
       && /(\b\d{1,2}\s*h\b|\b\d{1,2}:\d{2}\b|meio[- ]dia)/i.test(txt)
       && !/\bquer que eu\b/i.test(txt);
     if (claimsReminder && !calledReminderTool && !distressPreempted) {
@@ -868,6 +902,85 @@ export async function processInboundUser(
     }
   }
 
+  // 11e. BACKSTOP DE CONFIRMAÇÃO DE REMÉDIO (caso Waldir 09/07 18:09, PÓS-deploy do 11d):
+  // o usuário respondeu "tomei" a um lembrete recém-disparado, o glm-5.2 disse "Show,
+  // anotado!" mas NÃO chamou log_medication_taken → last_confirmed_at ficou null → o gate
+  // do backup condicional (0020) acha que ele NÃO confirmou e o backup dispara à toa (ou
+  // pior: a adesão não é registrada). Determinístico: confirmação clara + lembrete disparado
+  // há pouco + tool não chamada → chamamos log_medication_taken nós mesmos com o TÍTULO do
+  // lembrete (match exato garantido — é o mesmo título que o gate/create usam). A narração
+  // "anotado!" do LLM vira VERDADE (mesma filosofia do retry 11d). Não mexe no texto.
+  {
+    const calledLog = llmResponse.toolCalls.some((t) => t.name === 'log_medication_taken');
+    const userText = (typeof userMsgContent === 'string' ? userMsgContent.replace(/^\[Áudio transcrito\]\s*/i, '') : '').trim();
+    // Confirmação FORTE = verbo de TOMADA DE MEDICAÇÃO (review 10/07 #21: "tomei um susto",
+    // "bebi um suco", "usei o app", "passei mal" NÃO são adesão). Verbos genéricos
+    // (bebi/passei/usei/coloquei) só valem com checagem de coerência pós-fetch (tipo do
+    // lembrete / palavra do título na frase). Objetos não-medicamentosos vetam.
+    const strongVerb = /\b(tomei|pinguei|apliquei|injetei)\b/i.test(userText);
+    const genericVerb = /\b(bebi|passei|usei|coloquei)\b/i.test(userText);
+    const negated = /\b(n[ãa]o|nao|esqueci|ainda n|depois|daqui a pouco|vou tomar|amanh[ãa])\b/i.test(userText);
+    const nonMedObject = /\b(tomei|levei)\s+(um\s+)?(susto|caf[ée]|banho|sol|chuva|cerveja|vinho|refri|uma?\s+(decis[ãa]o|surra))|\bpassei\s+(mal|vergonha|raiva)|\busei\s+o\s+(app|aplicativo|site)\b/i.test(userText);
+    const strongConfirm = (strongVerb || genericVerb) && !negated && !nonMedObject;
+    // Ack FRACO ("ok"/"sim"/"👍") é ambíguo — pode responder OUTRA pergunta da Xarlote
+    // (review #20: "quer que eu amplie a busca?" → "ok" carimbava remédio). Só vale se o
+    // turno não teve NENHUMA outra tool (sinal de que o ack respondeu outra coisa) e, mais
+    // abaixo, se a ÚLTIMA fala da Xarlote foi o próprio disparo do lembrete.
+    const weakAck = /^(ok(ay)?|sim|feito|pronto|tomado|blz|beleza|👍|✅|joia|j[óo]ia)[.!\s]*$/i.test(userText)
+      && llmResponse.toolCalls.length === 0;
+    if (!calledLog && (strongConfirm || weakAck) && !distressPreempted) {
+      const windowMs = strongConfirm ? 3 * 60 * 60_000 : 20 * 60_000;
+      const { data: recentRem } = await db.from('reminders')
+        .select('id, title, type, last_run_at')
+        .eq('user_id', user.id)
+        .in('status', ['pending', 'sent'])
+        .gte('last_run_at', new Date(Date.now() - windowMs).toISOString())
+        .order('last_run_at', { ascending: false })
+        .limit(1).maybeSingle();
+      // Coerência verbo↔lembrete: "bebi" só confirma lembrete de hidratação; verbo genérico
+      // (passei/usei/coloquei sem verbo forte) exige palavra do título (≥4 chars) na frase
+      // (ex.: "passei nas sobrancelhas" ↔ título "Passar remédio nas sobrancelhas").
+      let coherent = Boolean(recentRem?.title);
+      if (coherent && !strongVerb && !weakAck) {
+        if (/\bbebi\b/i.test(userText)) {
+          coherent = recentRem!.type === 'hydration';
+        } else {
+          const fold = (s: string) => s.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+          const titleWords = fold(recentRem!.title).split(/\W+/).filter((w) => w.length >= 4);
+          const textFolded = fold(userText);
+          coherent = titleWords.some((w) => textFolded.includes(w.slice(0, Math.max(4, w.length - 2))));
+        }
+      }
+      // Ack fraco: a última fala da Xarlote precisa ser o PRÓPRIO disparo do lembrete
+      // (mirror inserido no despacho ±90s do last_run_at) — sem pergunta no meio.
+      if (coherent && weakAck && recentRem?.last_run_at) {
+        const { data: lastOut } = await db.from('messages')
+          .select('created_at')
+          .eq('conversation_id', conversation.id)
+          .eq('direction', 'out')
+          .order('created_at', { ascending: false })
+          .limit(1).maybeSingle();
+        const outTs = lastOut?.created_at ? new Date(lastOut.created_at as string).getTime() : 0;
+        coherent = Math.abs(outTs - new Date(recentRem.last_run_at).getTime()) < 90_000;
+      }
+      if (recentRem && coherent) {
+        // Carimba DIRETO por id (determinístico, zero efeito colateral) — passar o TÍTULO
+        // pro log_medication_taken criava user_medications FANTASMA ("Hora do Dipirona
+        // 500mg" virava remédio no perfil — review #23). Adesão/analytics via event_log.
+        await db.from('reminders').update({ last_confirmed_at: new Date().toISOString() }).eq('id', recentRem.id);
+        await writeLog('warn', 'agent', `🛟 Backstop de confirmação: adesão registrada sem log_medication_taken (reminder ${recentRem.id})`, {
+          traceId, userId: user.id, reminderId: recentRem.id,
+        });
+        void writeEvent({
+          eventName: 'reminder.confirmed_backstop',
+          userId: user.id,
+          conversationId: conversation.id,
+          payload: { reminder_id: recentRem.id, via: strongConfirm ? 'strong' : 'weak_ack' },
+        });
+      }
+    }
+  }
+
   // 12. Resolve o texto da resposta.
   // 🛑 TURNO SÓ-TOOL (incidente Glauber 2026-07-01): o gpt-4.1-mini às vezes executa
   // a(s) tool(s) SEM escrever texto (ex.: create_reminder criado, mas nenhuma
@@ -900,8 +1013,27 @@ export async function processInboundUser(
   // deixa a mentira sair: troca por uma resposta HONESTA que pede o nome da farmácia.
   if (replyText && !backstopReContacted) {
     const reallyContacted = llmResponse.toolCalls.some((t) =>
-      ['message_supplier', 'contact_establishment', 'relay_answer_to_establishment', 'confirm_order_selection'].includes(t.name));
-    const claimsContact = /(mandei\s+(uma\s+)?(mensagem|msg|recado)|entrei\s+em\s+contato|acabei de falar com (a|as|o) ?(farm|drog)|j[áa]\s+(falei|avisei|mandei|entrei em contato)\s+(com\s+)?(a\s+|as\s+|na\s+|pra\s+|para\s+|o\s+)?(farm[aá]cia|drog|eles\b|a loja))/i.test(replyText);
+      ['message_supplier', 'contact_establishment', 'relay_answer_to_establishment', 'confirm_order_selection', 'start_pharmacy_order', 'expand_pharmacy_search', 'find_clinic_by_name', 'start_consultation_search'].includes(t.name));
+    const claimsContactPast = /(mandei\s+(uma\s+)?(mensagem|msg|recado)|entrei\s+em\s+contato|acabei de falar com (a|as|o) ?(farm|drog)|j[áa]\s+(falei|avisei|mandei|entrei em contato)\s+(com\s+)?(a\s+|as\s+|na\s+|pra\s+|para\s+|o\s+)?(farm[aá]cia|drog|eles\b|a loja))/i.test(replyText);
+    // FUTURO também é mentira se nenhuma tool saiu (incidente Pague Menos 09/07: "Vou falar
+    // com a Pague Menos agora! 💙" repetido 2x e o contato NUNCA foi feito — o usuário ficou
+    // esperando uma cotação que não existia). O ALVO tem que vir LOGO APÓS a preposição —
+    // um \p{Lu}\p{Ll}+ solto casava qualquer palavra capitalizada da frase (inclusive o
+    // "Vou" inicial) e "Vou verificar pra você" virava non-sequitur de farmácia (review
+    // 10/07 #22; "verificar" fora do gatilho pelo mesmo motivo). Nome Próprio é checado
+    // case-SENSITIVE em regex separada ( /i + \p{Lu} casaria "ele/eles" minúsculo).
+    let claimsContactFuture = false;
+    {
+      const lead = /\b(vou (falar|conversar|entrar em contato|mandar (mensagem|msg)|cotar)|(j[áa] )?t[ôo] falando)\s+(com|na|no|pra|para)\s+(a\s+|o\s+|as\s+|os\s+)?/iu.exec(replyText);
+      if (lead) {
+        const target = replyText.slice(lead.index + lead[0].length);
+        claimsContactFuture =
+          (/^(farm[aá]c\w*|drog\w*|loja|televendas|atendimento|unidade|cl[íi]nica|eles\b|elas\b)/i.test(target)
+            || /^\p{Lu}\p{Ll}+/u.test(target))
+          && !/^voc[êe]\b/i.test(target);
+      }
+    }
+    const claimsContact = claimsContactPast || claimsContactFuture;
     if (claimsContact && !reallyContacted) {
       await writeLog('warn', 'agent', `🚫 Anti-mentira: LLM afirmou contato com farmácia sem chamar tool → resposta honesta`, { traceId, textPreview: replyText.slice(0, 60) });
       replyText = orderState && orderState.suppliers.length

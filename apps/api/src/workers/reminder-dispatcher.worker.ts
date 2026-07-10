@@ -15,7 +15,7 @@
  */
 import { db, writeEvent, writeLog, listDeviceTokens, deleteDeviceTokens } from '@iasaude/db';
 import { isSimulatorMode } from '@iasaude/whatsapp';
-import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone } from '@iasaude/shared';
+import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBody } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
@@ -30,8 +30,14 @@ interface DueReminder {
   next_run_at: string;
   last_run_at: string | null;
   last_confirmed_at: string | null;
+  created_at: string;
   payload: Record<string, unknown> | null;
-  users: { phone_e164: string | null; preferred_name: string | null } | null;
+  users: {
+    phone_e164: string | null;
+    preferred_name: string | null;
+    reminder_max_per_day: number | null;
+    metadata: Record<string, unknown> | null;
+  } | null;
 }
 
 export async function dispatchReminders(): Promise<void> {
@@ -43,7 +49,7 @@ export async function dispatchReminders(): Promise<void> {
 
   const { data: due, error } = await db
     .from('reminders')
-    .select('id, user_id, type, title, body, rrule, next_run_at, last_run_at, last_confirmed_at, payload, users(phone_e164, preferred_name, timezone)')
+    .select('id, user_id, type, title, body, rrule, next_run_at, last_run_at, last_confirmed_at, created_at, payload, users(phone_e164, preferred_name, timezone, reminder_max_per_day, metadata)')
     .eq('status', 'pending')
     .lte('next_run_at', now.toISOString())
     .order('next_run_at', { ascending: true }) // backlog processa em ordem, sem starvation
@@ -56,6 +62,7 @@ export async function dispatchReminders(): Promise<void> {
   if (!due?.length) return;
 
   const STALE_MS = 45 * 60_000; // recorrente atrasado > 45min = pula (espera a próxima)
+  const reengagedThisTick = new Set<string>(); // no máx 1 check-in de re-engajamento por usuário por tick
 
   for (const reminder of due as unknown as DueReminder[]) {
     const user = reminder.users;
@@ -152,10 +159,69 @@ export async function dispatchReminders(): Promise<void> {
       // não confirmado (ou indeterminado) → segue o fluxo normal e DISPARA
     }
 
+    // 🧯 CAP DIÁRIO (incidente Antônia Flávia 09/07): a coluna users.reminder_max_per_day
+    // existia SÓ no banco — o código nunca a leu, e ela recebia 10 lembretes/dia há 6 dias
+    // SEM responder um único (fadiga real + risco de block/ban do WhatsApp). Janela ROLLING
+    // de 24h (sem matemática de fuso; espaçamento até mais suave que "dia civil").
+    // Fica DEPOIS do claim (ocorrência consumida, recorrência intacta — mesma semântica do
+    // staleness) e NUNCA corta one-shot (aviso único de consulta/quimio passa SEMPRE — cap
+    // é anti-flood de recorrente, não anti-cuidado).
+    // Backup CONDICIONAL (if_not_confirmed) é ISENTO do cap: ele só chega aqui quando o
+    // primário NÃO foi confirmado — é rede de segurança de dose, volume baixo e alto valor
+    // (capar o backup da insulina não-confirmada inverteria o fail-safe do 0020).
+    const isConditionalBackup = (reminder.payload as { condition?: string } | null)?.condition === 'if_not_confirmed';
+    if (reminder.rrule && !isConditionalBackup) {
+      const cap = user.reminder_max_per_day ?? 6;
+      // Conta ENVIOS reais (event_log reminder.dispatched) — last_run_at não serve de proxy
+      // porque o claim carimba também ocorrências PULADAS (staleness/condicional/cap).
+      // ⚠️ Coluna é occurred_at (migration 0002), NÃO created_at — o review pegou a query
+      // com coluna errada que fazia o PostgREST devolver {error, count:null} e o cap virar
+      // no-op silencioso. Erro de query agora é logado e decide fail-open EXPLICITAMENTE.
+      const { count: sent24h, error: capErr } = await db
+        .from('event_log')
+        .select('id', { count: 'exact', head: true })
+        .eq('event_name', 'reminder.dispatched')
+        .eq('user_id', reminder.user_id)
+        .gte('occurred_at', new Date(now.getTime() - 24 * 60 * 60_000).toISOString());
+      if (capErr) {
+        // fail-open deliberado (melhor lembrar demais que calar remédio) — mas NUNCA mudo.
+        await writeLog('warn', 'reminder', `cap: query do event_log falhou (${capErr.message.slice(0, 80)}) — fail-open, enviando`, {});
+      } else if ((sent24h ?? 0) >= cap) {
+        await writeLog('warn', 'reminder', `cap diário atingido (${sent24h}/${cap} em 24h) — "${reminder.title}" pulado (ocorrência consumida)`, {});
+        void writeEvent({
+          eventName: 'reminder.capped',
+          userId: reminder.user_id,
+          payload: { reminder_id: reminder.id, cap, sent_24h: sent24h ?? 0 },
+        });
+        continue;
+      }
+    }
+
     const name = user.preferred_name ?? 'você';
     // body:"" (string vazia que a LLM às vezes manda) NÃO é null → `?? fallback`
     // não pega e o WhatsApp recebia mensagem VAZIA (rejeitada). Trata vazio.
-    const msg = reminder.body?.trim() ? reminder.body : `Ei ${name}, lembrete: ${reminder.title} 💊`;
+    const rawMsg = reminder.body?.trim() ? reminder.body : `Ei ${name}, lembrete: ${reminder.title} 💊`;
+
+    // 🕐 RE-ANCORAGEM DE DÊITICO NO DISPARO (incidente Elizabeth 09/07): rows ONE-SHOT
+    // criadas antes do fix (ou por um LLM desobediente) podem ter "amanhã" congelado da
+    // criação — entregue no dia do evento vira mentira ("Amanhã é dia da quimioterapia"
+    // NO dia da quimio). Re-ancora da perspectiva de AGORA. RECORRENTE nunca é re-ancorado
+    // (o "hoje"/"amanhã" genérico de um body diário é atemporal por escolha do autor —
+    // "separar os remédios de amanhã" todo dia às 21h deve continuar "de amanhã" sempre).
+    // Log SEM conteúdo do body (regra 3 do CLAUDE.md: dado clínico não vai a log ≥ info).
+    let msg = rawMsg;
+    if (!reminder.rrule) {
+      const norm = normalizeReminderBody(rawMsg, {
+        authoredAtIso: reminder.created_at,
+        fireAtIso: now.toISOString(),
+        eventAtIso: (reminder.payload as { event_at?: string } | null)?.event_at ?? null,
+        timeZone: userTz ?? null,
+      });
+      if (norm.changed) {
+        await writeLog('info', 'reminder', `body re-ancorado no disparo (dêitico corrigido) — reminder ${reminder.id}`, {});
+      }
+      msg = norm.body;
+    }
 
     // 2. Espelha na conversa canônica (mesma do WhatsApp) → app vê via realtime.
     const { data: conv } = await db
@@ -206,7 +272,9 @@ export async function dispatchReminders(): Promise<void> {
       await writeLog('warn', 'reminder', `push falhou: ${String(err).slice(0, 120)}`, { traceId: undefined });
     }
 
-    void writeEvent({
+    // AWAIT (não fire-and-forget): o cap do PRÓXIMO lembrete deste tick conta este evento —
+    // sem await, 8 lembretes às 8h do mesmo usuário passariam todos antes do 1º ser contado.
+    await writeEvent({
       eventName: 'reminder.dispatched',
       userId: reminder.user_id,
       conversationId: conv?.id,
@@ -218,5 +286,54 @@ export async function dispatchReminders(): Promise<void> {
         mirrored_to_app: Boolean(conv),
       },
     });
+
+    // 🤝 RE-ENGAJAMENTO (incidente Antônia Flávia 09/07: 69 mensagens de lembrete e NEM UMA
+    // resposta em 6 dias): usuário recebendo lembretes recorrentes e mudo há 5+ dias ganha
+    // UM check-in perguntando se estão ajudando (cooldown de 7 dias via
+    // users.metadata.reminder_reengage_at). NÃO pausa nada sozinho — remédio de paciente
+    // silencioso é exatamente o que NÃO se pausa por conta própria (fail-safe pró-cuidado);
+    // só abre a porta pro usuário ajustar/parar. Best-effort: falha aqui nunca derruba o tick.
+    if (reminder.rrule && conv && !reengagedThisTick.has(reminder.user_id)) {
+      try {
+        // RE-LÊ o metadata fresco (o snapshot do join é do início do tick — com 2+ lembretes
+        // do MESMO usuário vencidos no mesmo tick, o snapshot stale mandaria 2 check-ins) e
+        // grava o carimbo ANTES de enviar com guard condicional: só envia quem GANHOU o
+        // update (elimina corrida entre rows e minimiza a janela contra outros RMW de
+        // metadata — audio_intro/update_profile).
+        const { data: freshUser } = await db.from('users').select('metadata').eq('id', reminder.user_id).maybeSingle();
+        const meta = (freshUser?.metadata ?? {}) as Record<string, unknown> & { reminder_reengage_at?: string };
+        const askedAgo = meta.reminder_reengage_at ? now.getTime() - new Date(meta.reminder_reengage_at).getTime() : Infinity;
+        if (askedAgo > 7 * 24 * 60 * 60_000) {
+          const { data: lastIn } = await db
+            .from('messages')
+            .select('created_at')
+            .eq('conversation_id', conv.id)
+            .eq('direction', 'in')
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          const silentMs = lastIn?.created_at ? now.getTime() - new Date(lastIn.created_at as string).getTime() : Infinity;
+          if (silentMs > 5 * 24 * 60 * 60_000) {
+            reengagedThisTick.add(reminder.user_id);
+            await db.from('users').update({ metadata: { ...meta, reminder_reengage_at: now.toISOString() } }).eq('id', reminder.user_id);
+            // Vocativo só com nome REAL — "você, tô te mandando..." não existe em PT-BR.
+            const firstName = user.preferred_name?.trim() ? user.preferred_name.trim().split(' ')[0] : null;
+            const checkin = firstName
+              ? `${firstName}, tô te mandando esses lembretes todo dia e queria saber: tão te ajudando de verdade? Se quiser mudar horário, diminuir ou parar algum, é só me falar aqui 💙`
+              : `Oi! Tô te mandando esses lembretes todo dia e queria saber: tão te ajudando de verdade? Se quiser mudar horário, diminuir ou parar algum, é só me falar aqui 💙`;
+            await db.from('messages').insert({
+              conversation_id: conv.id, direction: 'out', sender_role: 'assistant', content_type: 'text', content: checkin,
+            });
+            if (!isSimulatorMode()) {
+              await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: checkin });
+            }
+            await writeLog('info', 'reminder', `check-in de re-engajamento enviado (mudo há ${Math.round(silentMs / 86_400_000)}d recebendo lembretes)`, {});
+            void writeEvent({ eventName: 'reminder.reengage_checkin', userId: reminder.user_id, conversationId: conv.id, payload: { silent_days: Math.round(silentMs / 86_400_000) } });
+          }
+        }
+      } catch (err) {
+        await writeLog('warn', 'reminder', `re-engajamento falhou (ignorado): ${String(err).slice(0, 100)}`, {});
+      }
+    }
   }
 }

@@ -3,7 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber } from '@iasaude/shared';
+import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -108,7 +108,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string; preferred_pharmacy_names?: string[] }, ctx);
         break;
       case 'create_reminder':
-        await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string }, ctx);
+        await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string; event_at?: string }, ctx);
         break;
       case 'cancel_reminders':
         await handleCancelReminders(tc.args as { title_query?: string; all?: boolean }, ctx);
@@ -1310,7 +1310,7 @@ function escapeLike(s: string): string {
 }
 
 async function handleCreateReminder(
-  args: { type: string; title?: string; body?: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string },
+  args: { type: string; title?: string; body?: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string; event_at?: string },
   ctx: ToolContext
 ) {
   // next_run_at é o que o dispatcher olha. Recorrente sem scheduled_at calcula
@@ -1409,17 +1409,44 @@ async function handleCreateReminder(
     condPayload = { condition: 'if_not_confirmed', depends_on_title: dep, depends_on_reminder_id: primary?.id ?? null };
   }
 
+  // 🕐 RE-ANCORAGEM DE DÊITICO (incidente Elizabeth 09/07): o body é redigido AGORA mas
+  // lido NO DISPARO — "amanhã" copiado da fala do usuário chega errado no dia do evento
+  // ("Amanhã é dia da quimioterapia" entregue NO dia da quimio). Normaliza da perspectiva
+  // do disparo; event_at (quando o LLM passou) ancora véspera legítima. Conservador:
+  // fora do alcance dêitico o texto fica intacto (ver packages/shared/reminder-deictics.ts).
+  const eventAt = args.event_at?.trim() || null;
+  let body = args.body?.trim() ? args.body.trim() : null;
+  // SÓ one-shot: recorrente com dêitico genérico ("separar os remédios de AMANHÃ" todo dia
+  // às 21h) seria corrompido permanentemente ("de hoje") ao normalizar contra o 1º disparo
+  // — o dêitico de recorrente é atemporal por escolha do autor (review 10/07).
+  // Log SEM o conteúdo do body (regra 3 do CLAUDE.md: dado clínico não vai a log ≥ info).
+  if (body && !rrule) {
+    const norm = normalizeReminderBody(body, {
+      authoredAtIso: new Date().toISOString(),
+      fireAtIso: firstRun,
+      eventAtIso: eventAt,
+      timeZone: userTz,
+    });
+    if (norm.changed) {
+      await writeLog('info', 'tool', `create_reminder: body re-ancorado pro momento do disparo (dêitico corrigido) — "${title}"`, {
+        traceId: ctx.traceId, userId: ctx.userId,
+      });
+      body = norm.body;
+    }
+  }
+
   const { error: insErr } = await db.from('reminders').insert({
     user_id: ctx.userId,
     type: args.type,
     title,
     // body:"" (string vazia da LLM) → null, senão o dispatcher mandaria msg vazia.
-    body: args.body?.trim() ? args.body.trim() : null,
+    body,
     scheduled_at: scheduledAt,
     rrule,
     next_run_at: firstRun,
     status: 'pending',
-    payload: { ...(args.payload ?? {}), ...condPayload },
+    // event_at no payload → o dispatcher re-ancora rows de véspera no disparo também.
+    payload: { ...(args.payload ?? {}), ...(eventAt ? { event_at: eventAt } : {}), ...condPayload },
   });
   if (insErr) {
     // Insert falhou (ex: enum inválido) — o turno da LLM já pode ter dito "agendei".

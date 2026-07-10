@@ -11,7 +11,7 @@ import {
 } from '@iasaude/llm';
 import { fetchInboundMedia } from '@iasaude/whatsapp';
 import { transcribeAudio } from '@iasaude/integrations';
-import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone, toE164BR, brPhoneVariants, extractPriceBRL, parseUnitCount, shortSupplierAddress, mentionsFreeShipping, itemDisplayName, noteSignalsConditionalOffer } from '@iasaude/shared';
+import { AGENT_INSTANCE, whatsappJidVariants, isPlaceholderPhone, toE164BR, brPhoneVariants, extractPriceBRL, parseUnitCount, shortSupplierAddress, mentionsFreeShipping, itemDisplayName, noteSignalsConditionalOffer, postSaleWindowExpired, sanitizeSupplierNote } from '@iasaude/shared';
 import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier, sendTemplateOpeningToSupplier } from './outbound-agent.js';
@@ -73,6 +73,43 @@ export interface SupplierInboundCtx {
  * do CLIENTE (a conversa dele = orders.conversation_id, NUNCA a da farmácia). Dedup 90s pra
  * não repetir o mesmo aviso na rajada. Devolve true se enviou.
  */
+// Sinais de logística pós-venda (compartilhados pelo roteador de lane e pelo backstop 10b).
+// CHEGADA: exige contexto de ENTREGADOR/entrega (não o `cheg\w*` solto, que casava
+// "assim que chegar no estoque"/"não chegou o pagamento" — review 09/07).
+const ARRIVAL_RE = /\b(na porta|motoq\w*|motoboy|motoca|entregador|sa[ií]u\s*(pra|para)\s*entrega|a caminho|ningu[ée]m\s+(atende\w*|abriu)|(entregador|motoq\w*|motoboy|entrega)\s+\w*\s*(cheg\w*|t[aâ]\s*a[íi]|na porta)|cheg\w*\s+(o|a)\s+(entregador|motoq\w*|motoboy|entrega))\b/i;
+const WHO_ASK_RE = /\b(procura\s+quem|nome\s+de\s+quem|quem\s+(vai\s+)?receb\w*|com\s+quem\s+deix|nome\s+d[oa]\s+(cliente|paciente|pessoa|respons))\b/i;
+
+/**
+ * Acha a cotação de PÓS-VENDA desta conversa: busca por PEDIDO (orders!inner filtrado por
+ * status confirming/handed_off), não por recência de quote — a conversa é compartilhada
+ * por telefone e a rajada de quotes de outros pedidos empurraria a escolhida pra fora de
+ * um top-N por recência (review 10/07 #7 — chegava a vazar a msg de entrega pro cliente
+ * ERRADO via o branch de atualização pós-cotação). Preferência: a quote apontada por
+ * orders.selected_quote_id (mesmo com status corrompido — bug irmão 09/07); fallback a
+ * 'quoted' mais recente. Dois pedidos em pós-venda simultâneo = ambiguidade grave (loga
+ * error, atribui ao mais recente).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function findPostSaleQuote(conversationId: string, traceId: string): Promise<any | null> {
+  const { data: rows } = await db
+    .from('quotes')
+    .select('*, orders!inner(*), suppliers(*)')
+    .eq('conversation_id', conversationId)
+    .in('orders.status', ['confirming', 'handed_off'])
+    .order('created_at', { ascending: false })
+    .limit(20);
+  if (!rows?.length) return null;
+  const distinctOrders = new Set(rows.map((q) => q.order_id));
+  if (distinctOrders.size > 1) {
+    await writeLog('error', 'supplier', `🚨 ${distinctOrders.size} pedidos em PÓS-VENDA simultâneo na mesma conversa — mensagem atribuída ao mais recente (risco de misturar entregas)`, {
+      traceId, conversationId, orderIds: [...distinctOrders],
+    });
+  }
+  const selectedOf = (q: { id: string; orders?: unknown }) =>
+    ((q.orders as { selected_quote_id?: string | null } | null)?.selected_quote_id) === q.id;
+  return rows.find(selectedOf) ?? rows.find((q) => q.status === 'quoted') ?? null;
+}
+
 async function relayToCustomer(orderId: string, text: string, traceId: string): Promise<boolean> {
   const { data: ord } = await db.from('orders').select('conversation_id').eq('id', orderId).maybeSingle();
   if (!ord?.conversation_id) return false;
@@ -145,18 +182,32 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     quote = data;
   }
 
-  // Check if this is a post-confirmation reply (order in 'confirming' or 'handed_off' state)
+  // 📦 CHEGADA/NOME durante negociação de OUTRO pedido (review 10/07 #9): a trava de
+  // isolamento libera a farmácia no instante do handed_off, então um pedido NOVO pode
+  // ocupar a conversa enquanto o motoboy do pedido FECHADO ainda está na rua. "motoboy na
+  // porta"/"procura quem?" não é resposta de cotação — se existe pedido fechado recente
+  // NESTA conversa, roteia pro pós-venda dele (senão a msg iria pro fluxo de negociação
+  // do cliente novo e o sinal de entrega morria — ou vazava).
+  if (quote && (ARRIVAL_RE.test(text) || WHO_ASK_RE.test(text))) {
+    const ps = await findPostSaleQuote(conversationId, traceId);
+    const psOrd = ps?.orders as { closed_at?: string | null } | null;
+    if (ps && !postSaleWindowExpired(psOrd?.closed_at ?? null, ps.completed_at ?? null, Date.now())) {
+      await writeLog('warn', 'supplier', 'Sinal de chegada/nome durante negociação de outro pedido — roteado pro PÓS-VENDA do pedido fechado desta conversa', {
+        traceId, conversationId, fromQuoteId: quote.id, toQuoteId: ps.id, toOrderId: ps.order_id,
+      });
+      quote = ps;
+      isOrderConfirmation = true;
+    }
+  }
+
+  // Check if this is a post-confirmation reply (order in 'confirming' or 'handed_off' state).
+  // Busca por PEDIDO via findPostSaleQuote (preferência: a quote apontada por
+  // orders.selected_quote_id, mesmo com status corrompido — bug irmão 09/07, pedido
+  // Pietra ED 7a3d5a94; fallback: a 'quoted' mais recente de pedido fechado).
   if (!quote) {
-    const { data } = await db
-      .from('quotes')
-      .select('*, orders(*), suppliers(*)')
-      .eq('conversation_id', conversationId)
-      .eq('status', 'quoted')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-    if (data && ['confirming', 'handed_off'].includes((data.orders as any)?.status)) {
-      quote = data;
+    const chosen = await findPostSaleQuote(conversationId, traceId);
+    if (chosen) {
+      quote = chosen;
       isOrderConfirmation = true;
     }
   }
@@ -280,19 +331,40 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     }
   }
 
-  // 4. Guard: turn limit (12 turns = 24 messages) — CONTA SÓ ESTA NEGOCIAÇÃO.
+  // 4. Guard: turn limit (12 turns = 24 messages) — SÓ NEGOCIAÇÃO, NUNCA pós-venda.
   // A conversa de fornecedor é COMPARTILHADA por telefone e reusada entre pedidos;
   // contar a vida inteira fazia a 2ª cotação com a mesma farmácia bater o limite já
   // na 1ª resposta e morrer como 'timeout'. Conta a partir da criação da quote atual.
-  const { count: msgCount } = await db
-    .from('messages')
-    .select('*', { count: 'exact', head: true })
-    .eq('conversation_id', conversationId)
-    .gte('created_at', quote.created_at);
+  //
+  // 🔴 INCIDENTE VADIVINO-2 (09/07): este guard rodava TAMBÉM no modo isOrderConfirmation
+  // e executava ANTES dos ramos de relay pós-fechamento. Negociação longa + followups
+  // estouravam as 24 msgs e TODA a logística pós-venda ("procura quem?", "motoboy foi
+  // 4x e não achou ninguém") morria aqui em finalizeQuote('timeout') — que ainda por
+  // cima era no-op (a escolhida está 'quoted', fora do filtro do update) → loop eterno
+  // e silencioso. O fix de relay do a0083bd era INALCANÇÁVEL nesse cenário.
+  // Pós-venda não tem limite de turnos; a proteção anti-conversa-morta é a janela de
+  // 72h pós-fechamento (âncora closed_at, fallback completed_at da cotação). Anti-loop
+  // do relay já existe em outra camada (dedup 90s do relayToCustomer, cooldown 4min do
+  // backstop, debounce 8s da rajada).
+  if (isOrderConfirmation) {
+    const ordClosedAt = (quote.orders as { closed_at?: string | null } | null)?.closed_at ?? null;
+    if (postSaleWindowExpired(ordClosedAt, quote.completed_at ?? null, Date.now())) {
+      await writeLog('warn', 'supplier', 'Mensagem da farmácia fora da janela de 72h de pós-venda — não processada (conversa de pedido antigo)', {
+        traceId, conversationId, orderId: quote.order_id, quoteId: quote.id, closedAt: ordClosedAt ?? quote.completed_at,
+      });
+      return;
+    }
+  } else {
+    const { count: msgCount } = await db
+      .from('messages')
+      .select('*', { count: 'exact', head: true })
+      .eq('conversation_id', conversationId)
+      .gte('created_at', quote.created_at);
 
-  if ((msgCount ?? 0) > 24) {
-    await finalizeQuote(quote.id, quote.order_id, 'timeout', traceId);
-    return;
+    if ((msgCount ?? 0) > 24) {
+      await finalizeQuote(quote.id, quote.order_id, 'timeout', traceId);
+      return;
+    }
   }
 
   // 5. Mark as negotiating
@@ -451,6 +523,29 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
       }
       case 'record_supplier_unavailable': {
         const a = tc.args as { reason?: string };
+        // 🔴 BUG IRMÃO (09/07, pedido Pietra ED 7a3d5a94): no modo confirmação a cotação
+        // é a ESCOLHIDA de um pedido JÁ FECHADO — rebaixá-la pra 'unavailable' quebra o
+        // lookup do pós-venda (que busca 'quoted') e mata o relay pra sempre. Pós-fechamento,
+        // "indisponível" é NOTÍCIA GRAVE pro cliente (a farmácia não vai entregar!): preserva
+        // a cotação (registro histórico do pedido) e leva a notícia ao cliente na hora.
+        if (isOrderConfirmation) {
+          await writeLog('warn', 'supplier', `Farmácia sinalizou problema PÓS-fechamento ("${(a.reason ?? 'sem motivo').slice(0, 80)}") — cotação escolhida preservada; avisando o cliente`, { traceId, quoteId: quote.id, orderId: quote.order_id });
+          if (quote.order_id) {
+            const supName = (quote.suppliers as { name?: string } | null)?.name ?? 'A farmácia';
+            // sanitizeSupplierNote: o reason é texto do LLM alimentado pela FARMÁCIA — vai
+            // pro WhatsApp do paciente, então mascara telefone/CPF e remove URLs (padrão
+            // defense-in-depth da casa; review 10/07 #8).
+            const reason = sanitizeSupplierNote(a.reason);
+            const userMsg = reason
+              ? `Oi! A ${supName} avisou que teve um problema com o seu pedido: "${reason}". Quer que eu procure outra farmácia pra você?`
+              : `Oi! A ${supName} avisou que não vai conseguir atender o seu pedido 😔 Quer que eu procure outra farmácia pra você?`;
+            if (await relayToCustomer(quote.order_id, userMsg, traceId)) {
+              customerNotified = true;
+              await db.from('orders').update({ customer_relayed_at: new Date().toISOString() }).eq('id', quote.order_id);
+            }
+          }
+          break;
+        }
         await db.from('quotes').update({ status: 'unavailable', completed_at: new Date().toISOString(), notes: a.reason ?? null }).eq('id', quote.id);
         // CASO C3: tem o item mas com ressalva / ofereceu alternativa (Uber, retirada…) →
         // a farmácia engajou, não deixa no vácuo (o ack humano do LLM vai sair na etapa 10).
@@ -610,7 +705,9 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
           break;
         }
         const a = tc.args as { message?: string };
-        const m = (a.message ?? '').trim();
+        // sanitizeSupplierNote: msg redigida pelo agente A PARTIR do texto da farmácia —
+        // defense-in-depth contra telefone/pix/URL injetados chegando ao paciente (review #8).
+        const m = sanitizeSupplierNote(a.message);
         if (m && quote.order_id && await relayToCustomer(quote.order_id, m, traceId)) {
           customerNotified = true;
           await db.from('orders').update({ customer_relayed_at: new Date().toISOString() }).eq('id', quote.order_id);
@@ -709,13 +806,10 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   // recebe, e o agente NÃO chamou notify_customer, forçamos o aviso ao cliente (rede de
   // segurança determinística — o remédio não pode falhar porque o modelo esqueceu de avisar).
   if (isOrderConfirmation && !customerNotified && quote.order_id) {
-    // CHEGADA: exige contexto de ENTREGADOR/entrega (não o `cheg\w*` solto, que casava
-    // "assim que chegar no estoque"/"não chegou o pagamento"/"você tá aí?" e mandava um
-    // "o entregador tá chegando" FALSO e alarmante ao cliente — review 09/07).
-    const arrival = /\b(na porta|motoq\w*|motoboy|motoca|entregador|sa[ií]u\s*(pra|para)\s*entrega|a caminho|ningu[ée]m\s+(atende\w*|abriu)|(entregador|motoq\w*|motoboy|entrega)\s+\w*\s*(cheg\w*|t[aâ]\s*a[íi]|na porta)|cheg\w*\s+(o|a)\s+(entregador|motoq\w*|motoboy|entrega))\b/i;
-    const whoAsk = /\b(procura\s+quem|nome\s+de\s+quem|quem\s+(vai\s+)?receb\w*|com\s+quem\s+deix|nome\s+d[oa]\s+(cliente|paciente|pessoa|respons))\b/i;
-    const isArrival = arrival.test(text);
-    const isWho = whoAsk.test(text);
+    // Regexes de chegada/nome agora são módulo-level (ARRIVAL_RE/WHO_ASK_RE) — compartilhados
+    // com o roteador de lane pós-venda (review 10/07 #9).
+    const isArrival = ARRIVAL_RE.test(text);
+    const isWho = WHO_ASK_RE.test(text);
     // Precisa avisar o CLIENTE? Chegada sempre; pergunta-de-nome SÓ se não sabemos o nome
     // (se já sabemos, respondemos a farmácia direto e NÃO incomodamos o cliente — review #1).
     const relayCustomer = isArrival || (isWho && !recipientName);
@@ -1175,12 +1269,25 @@ async function finalizeQuote(quoteId: string, orderId: string, outcome: string, 
   const finalStatus = outcome === 'quoted' ? 'quoted' : outcome === 'unavailable' ? 'unavailable' : 'timeout';
 
   // Only update if not already in a terminal state
-  await db.from('quotes')
+  const { data: updatedRows } = await db.from('quotes')
     .update({ status: finalStatus, completed_at: new Date().toISOString() })
     .eq('id', quoteId)
-    .in('status', ['pending', 'contacting', 'negotiating']);
+    .in('status', ['pending', 'contacting', 'negotiating'])
+    .select('id');
 
-  await writeLog('info', 'quote', `Quote finalized: ${finalStatus}`, { traceId, quoteId });
+  // Observabilidade HONESTA (09/07): o log dizia "Quote finalized: timeout" mesmo quando o
+  // update era no-op (cotação já terminal) — foi isso que mascarou o loop do incidente
+  // Vadivino-2 (4 finalizações "fantasma" na auditoria). ⚠️ O no-op NÃO pula a consolidação
+  // (review 10/07 #6): record_quote_price/record_supplier_unavailable/auto-captura gravam o
+  // status terminal DIRETO antes de chamar finalizeQuote — o update aqui é SEMPRE no-op
+  // nesses caminhos e este é o ÚNICO ponto que consolida o caso all-unavailable ("as 3
+  // farmácias disseram não temos" tem que virar relatório honesto na hora, não em 45min).
+  // consolidateQuotes é idempotente (guard de status + transição atômica), re-checar é seguro.
+  if (!updatedRows?.length) {
+    await writeLog('info', 'quote', `finalizeQuote(${finalStatus}) no-op (cotação já terminal) — seguindo pro check de consolidação`, { traceId, quoteId });
+  } else {
+    await writeLog('info', 'quote', `Quote finalized: ${finalStatus}`, { traceId, quoteId });
+  }
 
   // Check whether to consolidate
   const { data: quotes } = await db.from('quotes').select('status').eq('order_id', orderId);

@@ -633,6 +633,33 @@ export function isServiceNumber(phone: string | null | undefined): boolean {
 }
 
 /**
+ * Janela de PÓS-VENDA (modo isOrderConfirmation): por quanto tempo depois do fechamento
+ * a Xarlote ainda processa mensagem da farmácia como logística do pedido (relay ao
+ * cliente, "procura quem?", "cheguei"). Fora da janela a mensagem é logada e ignorada
+ * (conversa morta não gasta LLM).
+ */
+export const POST_SALE_WINDOW_MS = 72 * 60 * 60 * 1000;
+
+/**
+ * A janela de pós-venda expirou? Âncora = closed_at do pedido; fallback completed_at
+ * da cotação (2 pedidos reais têm closed_at null — 09/07). SEM âncora nenhuma →
+ * fail-open (false): melhor processar uma mensagem velha do que silenciar o pós-venda
+ * (a regra da casa é fail-safe pró-paciente; o incidente Vadivino nasceu de um guard
+ * silencioso demais).
+ */
+export function postSaleWindowExpired(
+  closedAtIso: string | null | undefined,
+  fallbackIso: string | null | undefined,
+  nowMs: number,
+): boolean {
+  const anchor = closedAtIso || fallbackIso;
+  if (!anchor) return false;
+  const t = new Date(anchor).getTime();
+  if (Number.isNaN(t)) return false;
+  return nowMs - t > POST_SALE_WINDOW_MS;
+}
+
+/**
  * Higieniza texto ENVIADO a um estabelecimento (farmácia/clínica) pra soar HUMANO
  * (incidente Santa Lúcia 07/07: a farmácia achou que era robô e não entregou):
  *   - tira TODO emoji/pictograma (uma pessoa texta a farmácia sem emoji);

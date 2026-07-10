@@ -16,6 +16,8 @@ import {
   isServiceNumber,
   humanizePaymentLabel,
   humanizeSupplierText,
+  postSaleWindowExpired,
+  POST_SALE_WINDOW_MS,
   type QuoteOption,
   type SupplierCandidate,
 } from '../packages/shared/src/pharmacy.js';
@@ -618,5 +620,40 @@ describe('humanizeSupplierText — sem emoji, sem travessão (farmácia não pod
   it('intervalo numérico com travessão vira "a" (não "," que viraria lista/decimal)', () => {
     expect(humanizeSupplierText('entrega entre 10—15 minutos')).toBe('entrega entre 10 a 15 minutos');
     expect(humanizeSupplierText('fica R$ 10–15')).toBe('fica R$ 10 a 15');
+  });
+});
+
+describe('postSaleWindowExpired (incidente Vadivino-2 09/07 — guard não pode matar pós-venda)', () => {
+  const now = new Date('2026-07-09T10:23:00Z').getTime(); // hora real das msgs da Drogamarys
+
+  it('dentro da janela: pedido fechado ontem (18h atrás) → NÃO expirou', () => {
+    expect(postSaleWindowExpired('2026-07-08T16:00:17Z', null, now)).toBe(false);
+  });
+  it('borda: exatamente 72h → NÃO expirou (só > 72h expira)', () => {
+    const closed = new Date(now - POST_SALE_WINDOW_MS).toISOString();
+    expect(postSaleWindowExpired(closed, null, now)).toBe(false);
+  });
+  it('fora da janela: fechado há 73h → expirou', () => {
+    const closed = new Date(now - POST_SALE_WINDOW_MS - 60 * 60 * 1000).toISOString();
+    expect(postSaleWindowExpired(closed, null, now)).toBe(true);
+  });
+  it('closed_at null usa o fallback (completed_at da cotação)', () => {
+    expect(postSaleWindowExpired(null, '2026-07-08T14:55:00Z', now)).toBe(false);
+    const old = new Date(now - POST_SALE_WINDOW_MS - 1000).toISOString();
+    expect(postSaleWindowExpired(null, old, now)).toBe(true);
+  });
+  it('closed_at string vazia cai pro fallback (|| e não ??)', () => {
+    const old = new Date(now - POST_SALE_WINDOW_MS - 1000).toISOString();
+    expect(postSaleWindowExpired('', old, now)).toBe(true);
+  });
+  it('SEM âncora nenhuma → fail-open (não silencia o pós-venda)', () => {
+    expect(postSaleWindowExpired(null, null, now)).toBe(false);
+    expect(postSaleWindowExpired(undefined, undefined, now)).toBe(false);
+  });
+  it('data inválida → fail-open (nunca quebra o relay por lixo no banco)', () => {
+    expect(postSaleWindowExpired('não-é-data', null, now)).toBe(false);
+  });
+  it('caso Vadivino literal: fechado 08/07 16:00Z, farmácia escreve 09/07 10:23Z → processa', () => {
+    expect(postSaleWindowExpired('2026-07-08T16:00:17.991+00:00', '2026-07-08T14:55:00.692+00:00', now)).toBe(false);
   });
 });

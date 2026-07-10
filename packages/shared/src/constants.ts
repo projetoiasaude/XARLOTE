@@ -18,15 +18,32 @@ ${LGPD_POLICY_URL}
 
 Quando aceitar, é só me responder por aqui que eu sigo de onde a gente parou.`;
 
+// Aceite LGPD = manifestação INEQUÍVOCA (art. 5º XII): botão "Aceitar" ou afirmação clara.
+// Texto qualquer ("me lembra do remédio") e MÍDIA nunca valem como aceite — ver
+// inbound-user (incidente Elizabet 09/07: consent registrado de um áudio nunca transcrito).
 export const CONSENT_ACCEPTED_PATTERNS = [
-  /^sim\s*aceito$/i,
+  /^aceitar$/i, // label do BOTÃO do menu de consent (zpro/WABA devolve o texto do botão)
+  /^sim,?\s*aceito$/i,
   /^aceito$/i,
+  /^(j[áa]\s*)?aceitei$/i, // "aceitei"/"já aceitei" — resposta natural ao re-pedido
+  /^aceito,?\s*sim$/i,
+  /^sim,?\s*quero$/i,
   /^sim$/i,
   /^concordo$/i,
-  /^ok\s*aceito?$/i,
-  /^sim\s*eu\s*aceito$/i,
+  /^ok(ay)?$/i,
+  /^ok,?\s*aceito?$/i,
+  /^sim,?\s*eu\s*aceito$/i,
   /^topei$/i,
   /^pode$/i,
+  /^pode\s*ser$/i,
+  /^t[áa]\s*bom$/i,
+  /^beleza$/i,
+  /^blz$/i,
+  /^de\s*acordo$/i,
+  /^claro$/i,
+  /^autorizo$/i,
+  /^👍\s*$/u,
+  /^✅\s*$/u,
 ];
 
 export const FORGET_ME_PATTERNS = [

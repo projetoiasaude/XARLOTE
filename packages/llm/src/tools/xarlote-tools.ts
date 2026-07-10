@@ -286,7 +286,13 @@ export const xarloteTools: ToolDefinition[] = [
           title: { type: 'string', description: 'Título curto (aparece na tela de lembretes do app)' },
           body: {
             type: 'string',
-            description: 'A mensagem que a Xarlote vai enviar quando o lembrete disparar, no tom dela (ex: "Oi Pedro! Hora da Losartana 💊 Já tomou?")',
+            description:
+              'A mensagem que a Xarlote vai enviar quando o lembrete disparar, no tom dela (ex: "Oi Pedro! Hora da Losartana 💊 Já tomou?"). ⏰ O body é lido NO MOMENTO DO DISPARO, não agora: escreva da perspectiva desse momento futuro. Se o evento acontece no dia do disparo, é "hoje" — NUNCA copie o "amanhã" da fala do usuário (ex.: pediu "me lembra da quimio amanhã às 7h" → body "Hoje é dia da quimioterapia, 7h!" — o lembrete toca no próprio dia).',
+          },
+          event_at: {
+            type: 'string',
+            description:
+              'Data/hora do EVENTO em si (ISO -03:00), quando for DIFERENTE do horário do disparo — ex.: aviso de véspera às 20h pra consulta amanhã 16h30 → scheduled_at=hoje 20h, event_at=amanhã 16h30. Permite corrigir "hoje/amanhã" do body automaticamente. Se o lembrete dispara na hora do próprio evento, omita.',
           },
           scheduled_at: {
             type: 'string',
