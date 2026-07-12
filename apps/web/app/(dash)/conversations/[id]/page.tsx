@@ -32,6 +32,13 @@ export default function ConversationDetailPage({ params }: { params: { id: strin
   const [messages, setMessages] = useState<Message[]>([]);
   const [conv, setConv] = useState<Conv | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Auto-scroll SÓ quando o usuário já está no fim (como um app de chat). Se ele
+  // rolou pra cima pra ler o histórico, o polling de 5s NÃO pode arrancá-lo de volta.
+  const pinnedToBottom = useRef(true);
+  // Chave da última msg (count + id) pra só rolar quando há msg NOVA — o polling cria
+  // um array novo a cada 5s mesmo sem mudança, e isso disparava o scroll à toa.
+  const lastMsgKey = useRef('');
 
   // Leitura via API (service role + token do login). Antes era Supabase anon
   // direto, que o RLS (is_staff) bloqueia. "Tempo real" via polling leve.
@@ -46,14 +53,36 @@ export default function ConversationDetailPage({ params }: { params: { id: strin
   }
 
   useEffect(() => {
+    // Troca de conversa: reseta o estado de scroll pra a nova abrir no fim.
+    lastMsgKey.current = '';
+    pinnedToBottom.current = true;
     load();
     const t = setInterval(load, 5000);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
+  // Atualiza "está no fim?" a cada rolagem do usuário. Tolerância de 100px pra contar
+  // como "no fim" mesmo com um resquício de folga.
+  function handleScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    pinnedToBottom.current = distanceFromBottom < 100;
+  }
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const key = messages.length ? `${messages.length}:${messages[messages.length - 1]!.id}` : '';
+    if (key === lastMsgKey.current) return; // nada novo → não rola (evita o yank do polling)
+    const isInitial = lastMsgKey.current === '';
+    lastMsgKey.current = key;
+    // Abertura da conversa: salta pro fim (instantâneo). Msg nova: só rola se o usuário
+    // estava no fim — se ele subiu pra ler, fica onde está.
+    if (isInitial) {
+      bottomRef.current?.scrollIntoView();
+    } else if (pinnedToBottom.current) {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
   }, [messages]);
 
   const displayName =
@@ -83,7 +112,7 @@ export default function ConversationDetailPage({ params }: { params: { id: strin
       </GlassPanel>
 
       {/* Thread */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-2 mt-4">
+      <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-4 py-4 space-y-2 mt-4">
         {messages.map((msg, idx) => {
           const isOut = msg.direction === 'out';
           const showAvatar = idx === 0 || messages[idx - 1]!.direction !== msg.direction;
