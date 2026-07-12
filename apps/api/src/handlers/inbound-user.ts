@@ -839,6 +839,54 @@ export async function processInboundUser(
     }
   }
 
+  // 11c2. BACKSTOP DE CANCELAMENTO (incidente Glauber 12/07): ele mandou só "Cancelar", o
+  // glm-5.2 devolveu turno VAZIO (fallback "me atrapalhei") e NÃO chamou cancel_order → o
+  // pedido ficou vivo, indo pra entrega (ainda por cima no endereço errado). Se o usuário
+  // pede cancelamento CLARO, há pedido ATIVO e o LLM não cancelou (nem tratou como troca),
+  // cancelamos determinístico + mensagem honesta. Não confunde com cancelar LEMBRETE.
+  let backstopCancelled = false;
+  {
+    // Amplia o "já tratou": qualquer ação de progresso de pedido no turno significa que o
+    // LLM NÃO leu como cancelamento — não força cancel (review 12/07: "não quero mais o
+    // genérico, quero a marca" é refino, não cancelamento).
+    const calledCancel = llmResponse.toolCalls.some((t) =>
+      ['cancel_order', 'start_pharmacy_order', 'confirm_order_selection', 'message_supplier', 'relay_answer_to_establishment', 'expand_pharmacy_search', 'contact_establishment'].includes(t.name));
+    const uText = typeof userMsgContent === 'string' ? userMsgContent.replace(/^\[Áudio transcrito\]\s*/i, '').trim() : '';
+    // Intenção de cancelar O PEDIDO, CLARA e sem ambiguidade (review 12/07 endureceu):
+    //  • "cancela/cancelar" isolado (bare "Cancelar" do Glauber);
+    //  • "desisti/desistir DO PEDIDO/da compra" (não "desisti de esperar, tenta outra");
+    //  • "deixa pra lá" isolado;
+    //  • "não quero mais O PEDIDO/a compra/o remédio/nada" (objeto OBRIGATÓRIO — "não quero
+    //    mais o genérico"/"não quero mais essa farmácia" são REFINO, não cancelamento).
+    const cancelWord = /(^|\b)(cancela|cancelar|cancele)(\b|$)/i.test(uText);
+    const desistOrder = /\bdesist\w+\s+(d[oa]\s+)?(pedido|compra|rem[ée]dio|medicamento|tudo)\b/i.test(uText)
+      || /^\s*desisti\.?\s*$/i.test(uText);
+    const deixaPraLa = /(^|\b)deixa\s+pra?\s+l[áa](\b|$)/i.test(uText) && uText.length < 25;
+    const naoQueroMais = /\bn[ãa]o\s+quero\s+mais\s+(o\s+pedido|a\s+compra|o\s+rem[ée]dio|o\s+medicamento|a\s+entrega|nada)\b/i.test(uText);
+    const cancelIntent = (cancelWord || desistOrder || deixaPraLa || naoQueroMais)
+      && !/\blembrete|lembra|alarme|despertador\b/i.test(uText)  // cancelar LEMBRETE é outro caminho
+      && !/\btroca(r)?\b/i.test(uText)                            // troca de remédio é outro fluxo
+      && !/\b(essa|dessa|aquela|outra)\s+farm[áa]cia\b/i.test(uText); // "cancela ESSA farmácia" = trocar farmácia, não o pedido
+    // Cobre handed_off (incidente Glauber: pedido fecha em handed_off no MESMO turno; o
+    // "Cancelar" seguinte precisa alcançá-lo). cancelActiveOrder avisa a farmácia nesse caso.
+    const activeOrderId = orderState && ['quoting', 'quoted', 'confirming', 'handed_off'].includes(orderState.status) ? orderState.orderId : null;
+    // Exclusão mútua com o backstop de re-contato (11c) — os dois não disparam no mesmo turno.
+    if (cancelIntent && activeOrderId && !calledCancel && !distressPreempted && !backstopReContacted) {
+      await writeLog('warn', 'order', `🔒 Backstop de cancelamento: usuário pediu cancelar ("${uText.slice(0, 40)}") e o LLM não chamou cancel_order → cancelando (status=${orderState!.status})`, {
+        traceId, orderId: activeOrderId,
+      });
+      try {
+        await handleToolCall(
+          { id: randomUUID(), name: 'cancel_order', args: { order_id: activeOrderId, reason: 'cancelado pelo usuário' } } as unknown as Parameters<typeof handleToolCall>[0],
+          turnToolCtx,
+        );
+        backstopCancelled = true;
+      } catch (err) {
+        await writeLog('error', 'order', `Backstop de cancelamento falhou: ${String(err).slice(0, 120)}`, { traceId });
+      }
+    }
+  }
+
   // 11d. BACKSTOP ANTI-MENTIRA DE LEMBRETE (incidente Waldir 09/07): o glm-5.2 disse "amanhã
   // às 7h te lembro do Oftpred e do Hiluropt" mas NÃO chamou create_reminder → o lembrete
   // nunca existiu e não disparou. Se o texto AFIRMA ter agendado/vai lembrar num horário e
@@ -1004,8 +1052,24 @@ export async function processInboundUser(
   //     empacotada roda (o lembrete é criado); só a narração conflitante é engolida.
   //   • backstopConfirmed é FORÇADO em silêncio (o LLM não sabia) → só suprime quando o
   //     turno foi PURAMENTE o aceite; senão engoliria a narração de uma ação legítima.
-  const suppressReply = (backstopConfirmed && onlyAcceptTurn) || turnToolCtx.turnFlags.suppressLlmText || backstopReContacted;
+  // Cancelamento PURO = o backstop cancelou e o LLM não narrou OUTRA ação legítima
+  // (ex.: create_reminder empacotado). Se narrou, mantém a narração e só ANEXA o "cancelei".
+  const onlyCancelTurn = !llmResponse.toolCalls.some((t) => !['cancel_order', 'start_pharmacy_order'].includes(t.name));
+  const suppressReply = (backstopConfirmed && onlyAcceptTurn) || turnToolCtx.turnFlags.suppressLlmText
+    || backstopReContacted || (backstopCancelled && onlyCancelTurn);
   let replyText = suppressReply ? '' : llmResponse.text.trim();
+
+  // Backstop de cancelamento (11c2): o cancelActiveOrder só mexe no banco, não avisa o
+  // usuário — então a confirmação honesta sai daqui (senão ele veria o fallback "me
+  // atrapalhei" e não saberia que cancelou). Se o turno foi SÓ o cancelamento, sobrescreve;
+  // se o LLM também narrou outra ação (lembrete etc.), ANEXA sem engolir a narração dela.
+  if (backstopCancelled) {
+    const itemName = orderState?.items?.map((i) => itemDisplayName(i.name, i.dosage)).filter(Boolean).join(', ');
+    const cancelMsg = itemName
+      ? `Pronto, cancelei seu pedido de ${itemName} 💙`
+      : `Pronto, cancelei seu pedido 💙`;
+    replyText = onlyCancelTurn || !replyText ? `${cancelMsg} Se precisar de mais alguma coisa, é só falar!` : `${cancelMsg}\n\n${replyText}`;
+  }
 
   // 🚫 GUARDA ANTI-MENTIRA RESIDUAL (incidente 07/07): o LLM afirma ter contatado a
   // farmácia ("já falei com a farmácia", "mandei mensagem", "entrei em contato") mas

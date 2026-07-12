@@ -437,6 +437,11 @@ async function handleSaveExamResult(args: SaveExamArgs, ctx: ToolContext) {
 }
 
 const ACTIVE_ORDER_STATUSES = ['drafting', 'quoting', 'quoted', 'confirming'];
+// Cancelável = ativo + JÁ FECHADO ('handed_off'). O usuário pode cancelar depois do
+// fechamento (incidente Glauber 12/07: confirmou → handed_off → "Cancelar" e o pedido
+// seguia vivo pra entrega). Pós-fechamento, cancelar TAMBÉM avisa a farmácia (não é flip
+// silencioso no banco) — ver cancelActiveOrder.
+const CANCELLABLE_ORDER_STATUSES = [...ACTIVE_ORDER_STATUSES, 'handed_off'];
 
 /**
  * Cancela um pedido de medicamento: marca 'cancelled', congela as cotações vivas
@@ -447,14 +452,27 @@ const ACTIVE_ORDER_STATUSES = ['drafting', 'quoting', 'quoted', 'confirming'];
  * terminal 'timeout' usado no freeze de cotações irmãs do confirm_order_selection.
  */
 async function cancelActiveOrder(orderId: string, reason: string, traceId: string): Promise<boolean> {
+  // Lê o estado ANTES de cancelar: se o pedido já estava FECHADO (handed_off), a farmácia
+  // foi acionada e precisa ser AVISADA do cancelamento (não some no banco em silêncio).
+  const { data: before } = await db.from('orders')
+    .select('status, selected_quote_id, items, user_id')
+    .eq('id', orderId).maybeSingle();
+  const wasHandedOff = before?.status === 'handed_off';
+
   // Checa o erro do update do PEDIDO (review hardening): se falhar (DB transiente), o
   // caller da TROCA aborta em vez de criar um 2º pedido vivo com o antigo ainda ativo.
-  const { error: ordErr } = await db.from('orders')
+  const { data: updated, error: ordErr } = await db.from('orders')
     .update({ status: 'cancelled', cancelled_reason: reason.slice(0, 500) })
     .eq('id', orderId)
-    .in('status', ACTIVE_ORDER_STATUSES);
+    .in('status', CANCELLABLE_ORDER_STATUSES)
+    .select('id');
   if (ordErr) {
     await writeLog('error', 'order', `Falha ao cancelar pedido ${orderId}: ${String(ordErr.message ?? ordErr).slice(0, 160)}`, { traceId, orderId });
+    return false;
+  }
+  if (!updated?.length) {
+    // Nada mudou (já terminal) — no-op honesto.
+    await writeLog('info', 'order', `cancelActiveOrder no-op — pedido ${orderId} já não estava cancelável`, { traceId, orderId });
     return false;
   }
   await db.from('quotes')
@@ -466,6 +484,33 @@ async function cancelActiveOrder(orderId: string, reason: string, traceId: strin
     .eq('order_id', orderId)
     .eq('clarification_status', 'awaiting_user');
   await writeLog('info', 'order', `Pedido cancelado — ${reason}`, { traceId, orderId });
+
+  // 📣 AVISO À FARMÁCIA no cancelamento PÓS-FECHAMENTO (incidente Glauber 12/07): o pedido
+  // fechado foi entregue à farmácia — cancelar sem avisar deixaria ela preparando/entregando.
+  // Best-effort: acha a conversa da cotação escolhida e manda um pedido de parada humano.
+  if (wasHandedOff && before?.selected_quote_id) {
+    try {
+      const { data: q } = await db.from('quotes')
+        .select('conversation_id, suppliers(phone_e164, whatsapp_e164)')
+        .eq('id', before.selected_quote_id as string).maybeSingle();
+      const sup = q?.suppliers as { phone_e164?: string; whatsapp_e164?: string } | null;
+      const phone = sup?.whatsapp_e164 || sup?.phone_e164;
+      // isServiceNumber: não manda "cancela" pra call-center 4002/0800 (não é WhatsApp de loja).
+      if (q?.conversation_id && phone && !isServiceNumber(phone) && !isPlaceholderPhone(phone)) {
+        const items = (before.items ?? []) as OrderItem[];
+        const itemName = items.map((it) => itemDisplayName(it.name, it.dosage)).filter(Boolean).join(', ') || 'aquele pedido';
+        await sendOutboundToSupplier(
+          q.conversation_id as string,
+          phone,
+          `Oi! Preciso cancelar o pedido de ${itemName} que a gente tinha fechado, por favor não prepara nem envia. Desculpa o transtorno e obrigada pela compreensão!`,
+          traceId,
+        );
+        await writeLog('info', 'order', `Farmácia avisada do cancelamento pós-fechamento`, { traceId, orderId, quoteId: before.selected_quote_id });
+      }
+    } catch (err) {
+      await writeLog('warn', 'order', `Falha ao avisar farmácia do cancelamento (ignorado): ${String(err).slice(0, 120)}`, { traceId, orderId });
+    }
+  }
   return true;
 }
 
@@ -494,7 +539,7 @@ async function handleCancelOrder(args: { order_id?: string; reason?: string }, c
         .select('id, status, user_id')
         .eq('id', args.order_id)
         .maybeSingle();
-      if (byId && byId.user_id === ctx.userId && ACTIVE_ORDER_STATUSES.includes(byId.status as string)) {
+      if (byId && byId.user_id === ctx.userId && CANCELLABLE_ORDER_STATUSES.includes(byId.status as string)) {
         targetId = byId.id as string;
       }
     }
@@ -505,7 +550,7 @@ async function handleCancelOrder(args: { order_id?: string; reason?: string }, c
       .from('orders')
       .select('id')
       .eq('user_id', ctx.userId)
-      .in('status', ACTIVE_ORDER_STATUSES)
+      .in('status', CANCELLABLE_ORDER_STATUSES)
       .order('created_at', { ascending: false })
       .limit(5);
     targetId = (actives ?? []).map((o) => o.id as string).find((id) => !createdThisTurn?.has(id)) ?? null;

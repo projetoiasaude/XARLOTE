@@ -16,7 +16,7 @@ import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToSupplier, sendTemplateOpeningToSupplier } from './outbound-agent.js';
 import { sendOutbound } from './outbound.js';
-import { consolidateQuotes, notifyUserQuoteArrived } from './quote-consolidation.js';
+import { consolidateQuotes, notifyUserQuoteArrived, notifyBetterQuoteIfPresented } from './quote-consolidation.js';
 import { relaySupplierQuestionToUser } from './clarification.js';
 import { templatesEnabled, pharmacyColdOpen } from '../config/template-registry.js';
 
@@ -110,14 +110,67 @@ async function findPostSaleQuote(conversationId: string, traceId: string): Promi
   return rows.find(selectedOf) ?? rows.find((q) => q.status === 'quoted') ?? null;
 }
 
-async function relayToCustomer(orderId: string, text: string, traceId: string): Promise<boolean> {
+// 🔁 DEDUP POR SIMILARIDADE DO RELAY (incidente Glauber 12/07: a farmácia repetiu "quadra e
+// lote" e o cliente levou 4 pings quase idênticos em 4min). O dedup do sendOutbound é por
+// TEXTO exato — o LLM varia o fraseado ("tá pedindo" vs "precisa") e escapa. Aqui comparamos
+// por SIMILARIDADE (Jaccard de tokens): só engolimos repetições QUASE-IDÊNTICAS, deixando
+// passar uma pergunta DIFERENTE ("e o complemento?" depois de "quadra e lote" — review #12).
+// CHEGADA nunca é deduplicada (uma 2ª tentativa real de entrega não pode sumir — review #11).
+// Estado local do processo (single-instance, como o debounce) — reset no deploy é aceitável.
+const recentRelays = new Map<string, Array<{ tokens: Set<string>; ts: number }>>(); // orderId → relays recentes
+const RELAY_DEDUP_MS = 8 * 60_000;
+// 0.5: o LLM reescreve a MESMA pergunta com drift (as 4 do Glauber ficam 0.55–0.75 entre
+// si), mas uma pergunta DIFERENTE ("e o complemento?", "nome de quem recebe") fica ~0.07 —
+// gap enorme, então 0.5 engole só as repetições e nunca uma pergunta nova.
+const RELAY_SIMILAR_THRESHOLD = 0.5;
+const RELAY_STOPWORDS = new Set(['para', 'pelo', 'pela', 'dele', 'dela', 'esse', 'essa', 'isso', 'aqui', 'consegue', 'pode', 'poderia', 'favor', 'obrigada', 'seu', 'sua', 'você', 'voce', 'que', 'com', 'pra', 'sobre']);
+
+function relayTokenSet(text: string): Set<string> {
+  const folded = text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
+  return new Set(folded.split(/\s+/).filter((w) => w.length >= 4 && !RELAY_STOPWORDS.has(w)));
+}
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+// Reusa ARRIVAL_RE (módulo-level) pra NÃO divergir do que o backstop 10b considera chegada
+// (review r2 d): uma msg de chegada nunca pode ser silenciada pelo dedup de similaridade.
+function isArrivalRelay(text: string): boolean {
+  return ARRIVAL_RE.test(text);
+}
+
+/** Relay pós-venda ao CLIENTE. 'sent' = enviou · 'deduped' = repetição quase-idêntica recente
+ * (já avisado) · 'failed' = sem canal. Callers só marcam customer_relayed_at/log em 'sent'. */
+async function relayToCustomer(orderId: string, text: string, traceId: string): Promise<'sent' | 'deduped' | 'failed'> {
+  const now = Date.now();
+  // Prune entradas velhas (evita leak — review #13).
+  for (const [k, arr] of recentRelays) {
+    const kept = arr.filter((r) => now - r.ts < RELAY_DEDUP_MS);
+    if (kept.length) recentRelays.set(k, kept); else recentRelays.delete(k);
+  }
+  const tokens = relayTokenSet(text);
+  const dedupable = !isArrivalRelay(text) && tokens.size > 0;
+  // Registra o token-set em TODA tentativa dedupável (enviada OU deduplicada) — assim o
+  // drift do LLM encadeia: g2≈g1 dedupa, e g3/g4 comparam contra g1+g2+g3, não só g1.
+  const record = () => { if (dedupable) { const arr = recentRelays.get(orderId) ?? []; arr.push({ tokens, ts: now }); recentRelays.set(orderId, arr); } };
+  if (dedupable) {
+    const recent = recentRelays.get(orderId) ?? [];
+    if (recent.some((r) => jaccard(tokens, r.tokens) >= RELAY_SIMILAR_THRESHOLD)) {
+      record();
+      await writeLog('info', 'supplier', `Relay pós-venda deduplicado (repetição quase-idêntica há <8min) — não reenvia ao cliente`, { traceId, orderId });
+      return 'deduped';
+    }
+  }
   const { data: ord } = await db.from('orders').select('conversation_id').eq('id', orderId).maybeSingle();
-  if (!ord?.conversation_id) return false;
+  if (!ord?.conversation_id) return 'failed';
   const { data: uc } = await db.from('conversations').select('whatsapp_jid').eq('id', ord.conversation_id).maybeSingle();
   const digits = (uc?.whatsapp_jid as string | null)?.replace('@s.whatsapp.net', '');
-  if (!digits) return false;
+  if (!digits) return 'failed';
   await sendOutbound(ord.conversation_id as string, `+${digits}`, text, traceId, {}, { dedup: true, dedupWindowMs: 90_000 });
-  return true;
+  record();
+  return 'sent';
 }
 
 export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<void> {
@@ -516,6 +569,8 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
           await notifyUserQuoteArrived(quote.order_id, supplierName, traceId).catch((e) =>
             writeLog('warn', 'order', `Falha ao notificar cliente da cotação: ${String(e)}`, { traceId }),
           );
+          // Se as opções JÁ foram apresentadas e esta é mais barata, avisa (incidente Glauber).
+          await notifyBetterQuoteIfPresented(quote.order_id, quote.id, traceId).catch(() => { /* aviso é cortesia */ });
         }
         shouldFinalize = true;
         outcome = 'quoted';
@@ -539,8 +594,9 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
             const userMsg = reason
               ? `Oi! A ${supName} avisou que teve um problema com o seu pedido: "${reason}". Quer que eu procure outra farmácia pra você?`
               : `Oi! A ${supName} avisou que não vai conseguir atender o seu pedido 😔 Quer que eu procure outra farmácia pra você?`;
-            if (await relayToCustomer(quote.order_id, userMsg, traceId)) {
-              customerNotified = true;
+            const relayed = await relayToCustomer(quote.order_id, userMsg, traceId);
+            if (relayed !== 'failed') customerNotified = true; // avisado (ou já avisado há pouco)
+            if (relayed === 'sent') {
               await db.from('orders').update({ customer_relayed_at: new Date().toISOString() }).eq('id', quote.order_id);
             }
           }
@@ -708,10 +764,13 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         // sanitizeSupplierNote: msg redigida pelo agente A PARTIR do texto da farmácia —
         // defense-in-depth contra telefone/pix/URL injetados chegando ao paciente (review #8).
         const m = sanitizeSupplierNote(a.message);
-        if (m && quote.order_id && await relayToCustomer(quote.order_id, m, traceId)) {
-          customerNotified = true;
-          await db.from('orders').update({ customer_relayed_at: new Date().toISOString() }).eq('id', quote.order_id);
-          await writeLog('info', 'supplier', `📣 Relay farmácia→cliente: "${m.slice(0, 80)}"`, { traceId, orderId: quote.order_id, quoteId: quote.id });
+        if (m && quote.order_id) {
+          const relayed = await relayToCustomer(quote.order_id, m, traceId);
+          if (relayed !== 'failed') customerNotified = true;
+          if (relayed === 'sent') {
+            await db.from('orders').update({ customer_relayed_at: new Date().toISOString() }).eq('id', quote.order_id);
+            await writeLog('info', 'supplier', `📣 Relay farmácia→cliente: "${m.slice(0, 80)}"`, { traceId, orderId: quote.order_id, quoteId: quote.id });
+          }
         }
         break;
       }
@@ -788,6 +847,7 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         await writeLog('info', 'quote', `💰 Fix#3: preço R$${price} capturado do texto (agente ficou mudo)${substNote}`, { traceId, quoteId: quote.id, price });
         const supplierName = (quote.suppliers as { name?: string } | null)?.name ?? 'farmácia';
         await notifyUserQuoteArrived(quote.order_id, supplierName, traceId).catch(() => { /* aviso é cortesia */ });
+        await notifyBetterQuoteIfPresented(quote.order_id, quote.id, traceId).catch(() => { /* cortesia */ });
         const addr = shortSupplierAddress(order?.delivery_address) || userNeighborhood;
         // Se a farmácia já disse grátis na mesma mensagem do preço, não re-pergunta o frete.
         const followUp = freteKnown
@@ -827,7 +887,7 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         const userMsg = isArrival
           ? `Oi! A ${supName} falou que o entregador já tá chegando aí 🛵 consegue receber? Qualquer coisa me chama.`
           : `Oi! A ${supName} tá perguntando o nome de quem vai receber a entrega — me confirma pra eu passar certinho?`;
-        if (await relayToCustomer(quote.order_id, userMsg, traceId)) {
+        if (await relayToCustomer(quote.order_id, userMsg, traceId) === 'sent') {
           await db.from('orders').update({ customer_relayed_at: new Date().toISOString() }).eq('id', quote.order_id);
           await writeLog('warn', 'supplier', `🛟 Backstop de relay pós-fechamento (agente não avisou o cliente) — sinal=${isArrival ? 'chegada' : 'pergunta-nome'}`, { traceId, orderId: quote.order_id, quoteId: quote.id });
         }

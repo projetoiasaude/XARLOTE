@@ -269,6 +269,107 @@ export async function notifyUserQuoteArrived(
   await sendOutbound(userConversationId, userPhoneE164, msg, traceId);
 }
 
+/**
+ * 💰 COTAÇÃO MELHOR PÓS-APRESENTAÇÃO (incidente Glauber 12/07): as opções já foram
+ * mostradas (order 'quoted') mas o cliente AINDA não confirmou, e chega uma cotação MAIS
+ * BARATA. Antes, notifyUserQuoteArrived saía cedo (status != 'quoting') e a opção melhor
+ * era ENGOLIDA — o Glauber confirmou a Portal (R$42,90) 45s depois da Extra Mais (R$40,
+ * frete grátis) chegar, sem nunca vê-la. Agora: avisa o cliente E anexa a nova opção ao
+ * summary (pra ele conseguir escolher por nome). Silencioso se a nova não for mais barata.
+ */
+// Throttle: no máx 1 aviso "opção melhor" por pedido a cada 5min (evita rajada de avisos
+// quando várias cotações mais baratas chegam em sequência). Estado local do processo.
+const betterQuotePingSeen = new Map<string, number>();
+const BETTER_QUOTE_COOLDOWN_MS = 5 * 60_000;
+
+export async function notifyBetterQuoteIfPresented(
+  orderId: string,
+  newQuoteId: string,
+  traceId: string,
+): Promise<void> {
+  const { data: order } = await db
+    .from('orders')
+    .select('status, selected_quote_id, summary, conversation_id')
+    .eq('id', orderId)
+    .maybeSingle();
+  // Só quando JÁ apresentado ('quoted') e AINDA não escolhido.
+  if (!order || order.status !== 'quoted' || order.selected_quote_id || !order.summary) return;
+
+  const originalSummary = order.summary as string;
+  let summary: { options?: Array<{ option: number; quote_id: string; supplier_name?: string; total?: number; delivery_fee?: number | null }> };
+  try { summary = JSON.parse(originalSummary); } catch { return; }
+  const options = summary.options ?? [];
+  if (!options.length) return;
+  if (options.some((o) => o.quote_id === newQuoteId)) return; // já apresentada
+
+  const { data: nq } = await db
+    .from('quotes')
+    .select('id, total, delivery_fee, supplier_id, suppliers(name)')
+    .eq('id', newQuoteId)
+    .maybeSingle();
+  if (!nq || nq.total == null) return;
+  const newTotal = Number(nq.total);
+  const newFee = nq.delivery_fee == null ? null : Number(nq.delivery_fee);
+
+  // COMPARAÇÃO HONESTA (review 12/07): só avisa se o REMÉDIO for estritamente mais barato E
+  // nenhuma opção já apresentada com frete CONHECIDO tiver efetivo ≤ o efetivo (melhor caso)
+  // da nova — senão uma "mais barata no remédio" com frete alto pareceria melhor sem ser.
+  const minPresentedTotal = Math.min(...options.map((o) => (o.total == null ? Infinity : Number(o.total))));
+  if (!(newTotal < minPresentedTotal)) return;
+  const newEffBestCase = newTotal + (newFee ?? 0);
+  const presentedEffKnown = Math.min(
+    Infinity,
+    ...options
+      .filter((o) => o.delivery_fee != null && o.total != null)
+      .map((o) => Number(o.total) + Number(o.delivery_fee)),
+  );
+  if (newEffBestCase >= presentedEffKnown) return; // uma apresentada com frete conhecido já é ≤
+
+  const supName = (nq.suppliers as { name?: string } | null)?.name ?? 'outra farmácia';
+
+  // Anexa ao summary de forma ATÔMICA (CAS pela string original — review 12/07: 2 cotações
+  // gravando quase juntas perdiam uma no read-modify-write). Se outra atualização entrou no
+  // meio, não sobrescreve (o aviso ainda sai; a próxima passada anexa).
+  const nextOption = Math.max(0, ...options.map((o) => o.option)) + 1;
+  options.push({ option: nextOption, quote_id: nq.id as string, supplier_name: supName, total: newTotal, delivery_fee: newFee });
+  summary.options = options;
+  await db.from('orders')
+    .update({ summary: JSON.stringify(summary, null, 2) })
+    .eq('id', orderId)
+    .eq('summary', originalSummary);
+
+  // Throttle do AVISO (não do append): no máx 1 ping / 5min por pedido.
+  const nowMs = Date.now();
+  // Prune entradas velhas (evita leak — o Map só cresce por pedido com opção melhor).
+  for (const [k, ts] of betterQuotePingSeen) if (nowMs - ts >= BETTER_QUOTE_COOLDOWN_MS) betterQuotePingSeen.delete(k);
+  const last = betterQuotePingSeen.get(orderId) ?? 0;
+  if (nowMs - last < BETTER_QUOTE_COOLDOWN_MS) {
+    await writeLog('info', 'order', `Cotação mais barata anexada ao summary, mas aviso throttled (<5min do último) — ${supName}`, { traceId, orderId });
+    return;
+  }
+  betterQuotePingSeen.set(orderId, Date.now());
+
+  const userPhone = await userPhoneForOrder(order.conversation_id as string);
+  if (!userPhone) return;
+  const freteTxt = newFee === 0 ? ', com frete grátis' : (newFee != null ? `, frete R$${newFee.toFixed(2)}` : ' (frete a confirmar)');
+  await sendOutbound(
+    order.conversation_id as string,
+    userPhone,
+    `Opa, chegou uma opção com o remédio mais barato: *${supName}* por R$${newTotal.toFixed(2)}${freteTxt} 💙 Quer trocar pra ela? É só me dizer o nome — ou seguimos com a que você já ia escolher.`,
+    traceId,
+  );
+  await writeLog('info', 'order', `💰 Cotação mais barata pós-apresentação avisada (${supName} R$${newTotal} < R$${minPresentedTotal})`, {
+    traceId, orderId, newQuoteId,
+  });
+}
+
+/** Telefone E.164 do cliente a partir da conversa do pedido. */
+async function userPhoneForOrder(conversationId: string): Promise<string | null> {
+  const { data: c } = await db.from('conversations').select('whatsapp_jid').eq('id', conversationId).maybeSingle();
+  const digits = (c?.whatsapp_jid as string | null)?.replace('@s.whatsapp.net', '');
+  return digits ? `+${digits}` : null;
+}
+
 /** Consolida prematuramente fechando as quotes ainda pendentes. */
 async function consolidateQuotesEarly(
   orderId: string,
