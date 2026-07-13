@@ -9,9 +9,9 @@
 
 'use strict';
 
-/* ⚠️ CONFIG — TROCAR antes de publicar: número oficial da Xarlote
-   (só dígitos, com DDI 55 + DDD; ex.: '5562999998888') */
-const WHATSAPP_NUMBER = '5562XXXXXXXXX';
+/* Número oficial da Xarlote no WhatsApp (só dígitos, DDI 55 + DDD).
+   +55 62 98228-0719 */
+const WHATSAPP_NUMBER = '5562982280719';
 const WHATSAPP_TEXT = 'Oi, Xarlote!';
 
 const RM = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -69,6 +69,10 @@ scheduleBlinks();
    Fallbacks independentes: herói → mascote SVG; nadador → ícone liquid-glass. */
 const heroMascot = $('#heroMascot');
 const swimmerEl = $('#swimmer');
+/* Nadador = ícone liquid-glass girando (V2, oficial). `?v=1` na URL volta
+   ao render 3D do mascote (mantido como alternativa). */
+const SWIMMER_V2 = new URLSearchParams(location.search).get('v') !== '1';
+if (SWIMMER_V2 && swimmerEl) swimmerEl.classList.add('icon-mode');
 let videoEl = null;
 let glStop = null;
 let drawAlphaOnce = null; // usado pelo watchdog quando o rAF está pausado
@@ -150,8 +154,8 @@ function initAlphaVideo() {
   const heroView = createGlView(heroCanvas);
   if (!heroView) { heroFallback(); swimmerFallback(); return; }
 
-  let swimView = createGlView($('.sw-canvas'));
-  if (!swimView) swimmerFallback();
+  let swimView = SWIMMER_V2 ? null : createGlView($('.sw-canvas'));
+  if (!swimView && !SWIMMER_V2) swimmerFallback();
 
   const video = document.createElement('video');
   video.muted = true; video.defaultMuted = true; video.loop = true;
@@ -458,7 +462,10 @@ function applySwimmer(scrollY, now, hard) {
   swimmer.classList.toggle('on', sw.o > 0.06);
   swimmer.style.transform = `translate3d(${sw.x}px, ${sw.y}px, 0)`;
   swimmer.style.opacity = String(sw.o);
-  swSvgWrap.style.transform = `rotate(${sw.rot * sw.dir}deg) scale(${sw.s * sw.dir}, ${sw.s})`;
+  // v2 (ícone): sem espelhar — o giro 3D é contínuo; só inclina e escala
+  swSvgWrap.style.transform = SWIMMER_V2
+    ? `rotate(${sw.rot}deg) scale(${sw.s})`
+    : `rotate(${sw.rot * sw.dir}deg) scale(${sw.s * sw.dir}, ${sw.s})`;
 }
 
 /* easter egg: clica no mascote → festinha */

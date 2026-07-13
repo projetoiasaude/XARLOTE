@@ -221,6 +221,46 @@ main { position: relative; z-index: 1; }
 #swimmer.fallback-on .sw-canvas { display: none; }
 #swimmer.fallback-on .sw-fallback { display: grid; }
 
+/* ── V2 do nadador (?v=2): ícone de app liquid-glass girando em 3D ── */
+.sw-icon-wrap { display: none; position: absolute; inset: 0; perspective: 620px; }
+#swimmer.icon-mode .sw-icon-wrap { display: block; }
+#swimmer.icon-mode .sw-canvas,
+#swimmer.icon-mode .sw-fallback { display: none !important; }
+
+.sw-icon {
+  position: absolute; inset: 7%;
+  transform-style: preserve-3d;
+  animation: icon-spin3d 5.6s linear infinite;
+}
+@keyframes icon-spin3d { to { transform: rotateY(360deg); } }
+
+.sw-icon-face {
+  position: absolute; inset: 0;
+  border-radius: 27%;
+  display: grid; place-items: center;
+  backface-visibility: hidden;
+  background:
+    radial-gradient(120% 95% at 20% 90%, rgba(59, 110, 245, 0.30), transparent 55%),
+    radial-gradient(130% 100% at 82% 8%, rgba(155, 92, 246, 0.20), transparent 60%),
+    linear-gradient(155deg, rgba(34, 38, 70, 0.92), rgba(8, 10, 26, 0.95));
+  border: 1px solid rgba(255, 255, 255, 0.34);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.45),
+    inset 0 -10px 22px rgba(59, 110, 245, 0.20),
+    0 14px 36px -12px rgba(0, 0, 0, 0.85),
+    0 0 38px rgba(139, 92, 246, 0.35);
+}
+.sw-icon-face.back { transform: rotateY(180deg); }
+.sw-icon-face::after {
+  content: ""; position: absolute; inset: 0; border-radius: inherit;
+  background: linear-gradient(115deg, transparent 32%, rgba(255, 255, 255, 0.17) 46%, transparent 62%);
+  pointer-events: none;
+}
+.sw-icon-face img {
+  width: 74%; height: 74%; object-fit: contain;
+  filter: drop-shadow(0 0 7px rgba(255, 255, 255, 0.4));
+}
+
 /* festinha do easter egg (clique no mascote) */
 .sw-bob.happy { animation: sw-bob 4s ease-in-out infinite alternate, happy-wiggle 0.85s var(--spring); }
 

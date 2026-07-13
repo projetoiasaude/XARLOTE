@@ -7,12 +7,14 @@
   <meta name="description" content="A Xarlote compra seu remédio, lembra seus horários e cuida de quem você ama — tudo pelo WhatsApp. Sem app, sem cadastro, de graça." />
   <meta name="theme-color" content="#06061c" />
 
-  <!-- Open Graph (ao publicar, troque og:image por URL absoluta do domínio final) -->
+  <!-- Open Graph — URL absoluta (crawlers de WhatsApp/Meta não resolvem caminho relativo) -->
   <meta property="og:title" content="Xarlote — manda um “oi” e ela cuida do resto" />
   <meta property="og:description" content="Sua assistente de saúde no WhatsApp: compra remédio, lembra horários e cuida de você. De graça." />
   <meta property="og:type" content="website" />
-  <meta property="og:image" content="assets/xarlote-icon-512.png" />
+  <meta property="og:url" content="https://xarlote-site.vercel.app/" />
+  <meta property="og:image" content="https://xarlote-site.vercel.app/assets/xarlote-icon-512.png" />
   <meta property="og:locale" content="pt_BR" />
+  <meta name="twitter:card" content="summary_large_image" />
 
   <link rel="icon" href="assets/xarlote-icon-192.png" />
   <link rel="apple-touch-icon" href="assets/apple-touch-icon.png" />
@@ -138,6 +140,13 @@
       <div class="sw-svg">
         <canvas class="sw-canvas" width="320" height="320"></canvas>
         <div class="sw-fallback"><img src="assets/xarlote-icon-192.png" alt="" width="64" height="64" /></div>
+        <!-- V2 (?v=2): ícone de app em liquid glass girando, com a logo em traço -->
+        <div class="sw-icon-wrap">
+          <div class="sw-icon">
+            <div class="sw-icon-face"><img src="assets/xarlote-logo.svg" alt="" /></div>
+            <div class="sw-icon-face back"><img src="assets/xarlote-logo.svg" alt="" /></div>
+          </div>
+        </div>
       </div>
       <div class="sw-hearts"></div>
     </div>

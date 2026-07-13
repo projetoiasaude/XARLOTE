@@ -1,7 +1,8 @@
 # Site da Xarlote — landing page
 
-Landing page estática da Xarlote (xarlote.com.br ou similar). **Zero dependências de build**:
-HTML + CSS + JS puros — é só servir a pasta.
+Landing page estática da Xarlote. **Zero dependências de build**: HTML + CSS + JS puros — é só servir a pasta.
+
+**🌐 NO AR:** https://xarlote-site.vercel.app (Vercel, conta `diretoria-2205`, projeto `xarlote-site`).
 
 ```
 site/
@@ -11,16 +12,12 @@ site/
   assets/        ← marca (copiados de apps/web/public)
 ```
 
-## ⚠️ Antes de publicar (2 minutos)
+## Config atual (já publicada)
 
-1. **Número do WhatsApp** — em [main.js](main.js), primeira linha de config:
-   ```js
-   const WHATSAPP_NUMBER = '5562XXXXXXXXX'; // ← número OFICIAL da Xarlote (só dígitos, DDI+DDD)
-   ```
-   Enquanto for placeholder, os botões apontam pra `#cta` (e o console avisa).
-2. **og:image** — em [index.html](index.html), troque `assets/xarlote-icon-512.png`
-   pela **URL absoluta** do domínio final (crawlers de WhatsApp/Meta não resolvem
-   caminho relativo), ex.: `https://xarlote.com.br/assets/xarlote-icon-512.png`.
+- **Número do WhatsApp** — `WHATSAPP_NUMBER` em [main.js](main.js) = `5562982280719`
+  (+55 62 98228-0719). Todos os CTAs abrem `wa.me/5562982280719`.
+- **og:image** — URL absoluta em [index.html](index.html) apontando pro domínio Vercel.
+  Se trocar pra domínio próprio (ex.: xarlote.com.br), atualize `og:url` + `og:image`.
 
 ## Rodar local
 
@@ -32,11 +29,23 @@ python3 -m http.server 3005 -d site --bind 127.0.0.1
 
 ## Deploy
 
-Qualquer host estático. Vercel (mesma conta do dashboard):
+Vercel (projeto já linkado — `.vercel/` local, fora do git):
 
 ```bash
 cd site && npx vercel --prod --yes
 ```
+O domínio público de produção é `xarlote-site.vercel.app` (o alias limpo é público;
+as URLs internas com hash ficam atrás do SSO da equipe — isso é normal e não afeta o público).
+Pra domínio próprio: `npx vercel domains add <domínio>` ou pelo painel.
+
+## Nadador — V2 (oficial) × V1
+
+- **V2 (padrão, oficial)** — ícone de app liquid-glass com a logo em traço, girando
+  em 3D (rotateY contínuo). É o que está no ar.
+- **V1 (alternativa)** — `…/?v=1` → o nadador vira o render 3D do mascote (o mesmo do herói).
+  Trocar o padrão: inverter a constante `SWIMMER_V2` em main.js.
+- Histórico: V1 (render 3D nadando) foi salva no commit `89596b3`; o fundador
+  escolheu a V2 (ícone girando) e ela virou a oficial + foi publicada.
 
 ## Como funciona (pro futuro-eu)
 
@@ -44,12 +53,12 @@ cd site && npx vercel --prod --yes
   recomposto com alpha via WebGL — mesma técnica do app (`XarloteVideoAlpha.tsx`),
   roda em iOS e Android. **Gotcha aprendido**: chame `gl.viewport()` depois de
   redimensionar o canvas (o contexto nasce 300×150). Sem GPU/erro → cai no mascote SVG.
-- **Nadador**: o MESMO render 3D do herói num mini-canvas WebGL (um único `<video>`
-  alimenta os dois contextos; cada um pinta só quando visível). Viaja por waypoints
-  interpolados pelo scroll (`buildWaypoints`/`applySwimmer`), vira pro lado do
-  movimento, doca no centro da órbita da memória e no CTA final. Clique nele:
-  easter egg de corações. Fallback (sem GL): ícone oficial em squircle glass girando.
-  O SVG rigado (template `#mascotTpl`) segue existindo como fallback do herói.
+- **Nadador (V2, oficial)**: ícone de app liquid-glass com a logo em traço, girando
+  em 3D (`.sw-icon` com `rotateY` contínuo + duas faces). Viaja por waypoints
+  interpolados pelo scroll (`buildWaypoints`/`applySwimmer`), inclina com a velocidade,
+  doca no centro da órbita da memória e no CTA final. Clique: easter egg de corações.
+  `?v=1` troca pra V1: o mesmo render 3D do herói num mini-canvas WebGL (um único
+  `<video>` alimenta os dois contextos). O SVG rigado (`#mascotTpl`) é fallback do herói.
 - **Cenas com scrub**: seções `[data-scene]` têm altura extra (`--len`) + conteúdo
   sticky; o progresso do scroll (0→1) anima chat/relógio/órbita — rolar pra trás rebobina.
 - **Watchdog**: rAF pausa em aba oculta; um `setInterval` (200ms) aplica os alvos
