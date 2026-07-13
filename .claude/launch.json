@@ -2,6 +2,12 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "xarlote-site",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "3005", "-d", "site", "--bind", "127.0.0.1"],
+      "port": 3005
+    },
+    {
       "name": "xarlote-web",
       "runtimeExecutable": "env",
       "runtimeArgs": ["NEXT_PUBLIC_API_URL=http://localhost:3001", "pnpm", "--filter", "web", "dev"],
