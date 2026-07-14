@@ -13,6 +13,7 @@ import { handleToolCall } from './tool-executor.js';
 import { saveContactsToMemory } from './reach-out.js';
 import { findPendingClarificationForUser } from './clarification.js';
 import { loadLatestOrderState, buildOrderStateBlock } from './order-state.js';
+import { consolidateQuotes } from './quote-consolidation.js';
 
 // Queue pra disparar enricher async — instância única por processo
 const enricherQueue = new Queue(QUEUE_NAMES.PROFILE_ENRICHER, {
@@ -755,6 +756,44 @@ export async function processInboundUser(
       if (distressPreempted && ['message_supplier', 'relay_answer_to_establishment', 'confirm_order_selection', 'start_pharmacy_order', 'expand_pharmacy_search', 'get_order_status', 'contact_establishment', 'find_clinic_by_name', 'start_consultation_search', 'confirm_consultation_selection', 'cancel_order'].includes(tc.name)) continue;
       await writeLog('info', 'tool', `Tool call: ${tc.name}`, { traceId, args: tc.args });
       await handleToolCall(tc, turnToolCtx);
+    }
+  }
+
+  // 11a. BACKSTOP DE CONSOLIDAÇÃO SOB DEMANDA (auditoria 1º pedido 14/07): o usuário disse
+  // "pode pedir" com uma farmácia já precificada, mas o pedido ainda estava 'quoting' (NÃO
+  // consolidado) → o glm-5.2 NARROU "deixa eu pegar os detalhes / deixa eu verificar" SEM
+  // chamar tool, e a consolidação só veio por TIMEOUT (5min depois). Se o usuário quer
+  // decidir/saber e já há preço, consolidamos AGORA — independe do humor do LLM.
+  // ⚠️ Estado FRESCO (o snapshot do início do turno pode estar velho: um timer pode ter
+  // consolidado no meio) e só suprime o LLM se a consolidação REALMENTE apresentou — senão
+  // seria TURNO MUDO (consolidateQuotes sai calada em bail: pendingClarif, status, no-op).
+  {
+    const decideText = typeof userMsgContent === 'string' ? userMsgContent.replace(/^\[Áudio transcrito\]\s*/i, '').trim() : '';
+    const DECIDE_RE = /\b(pode (pedir|fechar|ir|mandar|seguir)|quero (fechar|pedir|essa|a de|a mais)|fecha (essa|a[íi]|com|logo)|vai nessa|manda ver|a mais barata|qual (a mais|melhor|mais em conta|mais barat)|alguma (resposta|not[íi]cia)|tem (not[íi]cia|resposta)|j[áa] (respondeu|tem pre[çc]o))/i;
+    const wantsToDecide = !!decideText && (isOrderAcceptance(decideText) || DECIDE_RE.test(decideText));
+    const alreadyClosing = llmResponse.toolCalls.some((t) => t.name === 'confirm_order_selection');
+    if (wantsToDecide && !distressPreempted && !alreadyClosing) {
+      const { data: fresh } = await db.from('orders')
+        .select('id, status, summary').eq('user_id', user.id).eq('status', 'quoting')
+        .order('created_at', { ascending: false }).limit(1).maybeSingle();
+      if (fresh && !fresh.summary) {
+        const { data: pricedQ } = await db.from('quotes').select('id').eq('order_id', fresh.id).not('total', 'is', null).limit(1);
+        if (pricedQ && pricedQ.length) {
+          // "pode pedir" é a RESPOSTA a uma eventual pergunta pendente desse pedido → marca
+          // 'answered' pra destravar a consolidação (que senão bailaria em hasPendingClarification).
+          await db.from('quotes').update({ clarification_status: 'answered' }).eq('order_id', fresh.id).eq('clarification_status', 'awaiting_user');
+          await consolidateQuotes(fresh.id, conversation.id, phoneE164, traceId);
+          // só suprime o texto do LLM se a consolidação REALMENTE apresentou (virou 'quoted'
+          // com summary); senão deixa o LLM responder — NUNCA cala o turno.
+          const { data: after } = await db.from('orders').select('status, summary').eq('id', fresh.id).maybeSingle();
+          if (after?.status === 'quoted' && after.summary) {
+            turnToolCtx.turnFlags.suppressLlmText = true;
+            await writeLog('info', 'order', `🔒 Backstop 11a: consolidação sob demanda apresentada ("${decideText.slice(0, 40)}")`, { traceId, orderId: fresh.id });
+          } else {
+            await writeLog('info', 'order', `Backstop 11a: consolidação não apresentou (bail) — deixando o LLM responder`, { traceId, orderId: fresh.id });
+          }
+        }
+      }
     }
   }
 

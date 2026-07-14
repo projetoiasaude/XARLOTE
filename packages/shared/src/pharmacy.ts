@@ -187,6 +187,48 @@ export function mentionsFreeShipping(text: string | null | undefined): boolean {
  * (ex.: name="Pietra ED 2mg" + dosage="2mg" → "Pietra ED 2mg", não "Pietra ED 2mg 2mg").
  */
 /**
+ * Formata pro CLIENTE o que a farmácia disse/perguntou, de forma CONTEXTUAL (auditoria
+ * 1º pedido: antes era sempre "Oi! Pra fechar… a farmácia retornou X. Quer seguir com ela
+ * assim mesmo?" — o "quer seguir?" não fazia sentido quando a farmácia PERGUNTAVA algo,
+ * e o "Oi!" repetia numa conversa já em andamento).
+ *   • pergunta da farmácia  → repassa e pede a resposta do cliente
+ *   • resposta com preço    → repassa e oferece fechar
+ *   • proposta/condição     → repassa e oferece seguir ou ver outra
+ */
+export function formatSupplierRelayToUser(supplierName: string, rawText: string): string {
+  const t = (rawText ?? '').trim();
+  const snippet = t.length > 200 ? `${t.slice(0, 200).trim()}…` : t;
+  const low = t.toLowerCase();
+  const hasPrice = /\$\s?\d|\d+[.,]\d{2}\b|\b\d+\s?(reais|conto)\b/.test(low);
+  const isQuestion = /\?\s*$/.test(t) ||
+    /\b(qual|quais|quanto|quantos|quantas|prefere|gostaria|aceita|voc[eê]\s+(quer|queria|tem|prefere|gostaria)|me confirma|confirma pra|seria|pode ser|é pra|é para)\b/.test(low);
+  if (isQuestion && !hasPrice) {
+    return `A ${supplierName} perguntou uma coisinha: "${snippet}"\n\nComo você quer que eu responda? 😊`;
+  }
+  if (hasPrice) {
+    return `A ${supplierName} respondeu: "${snippet}"\n\nQuer que eu feche com ela, ou prefere que eu veja outra opção?`;
+  }
+  return `A ${supplierName} respondeu: "${snippet}"\n\nQuer seguir com ela, ou prefere que eu veja outra opção?`;
+}
+
+/**
+ * Total FINAL legível pro cliente: soma remédios + frete quando o frete é conhecido, com
+ * o detalhamento entre parênteses. Antes a apresentação mostrava só o preço dos remédios e
+ * o frete separado — o cliente via "R$28,89" mas pagava R$35,89 (auditoria 1º pedido 14/07).
+ *   fee > 0  → "R$35.89 (remédios R$28.89 + entrega R$7.00)"
+ *   fee = 0  → "R$28.89 (entrega grátis)"
+ *   fee null → "R$28.89 + frete a confirmar"
+ */
+export function formatOrderTotal(total: number | null | undefined, deliveryFee: number | null | undefined): string {
+  if (total == null) return '';
+  const meds = Number(total);
+  if (deliveryFee == null) return `R$${meds.toFixed(2)} + frete a confirmar`;
+  const fee = Number(deliveryFee);
+  if (fee === 0) return `R$${meds.toFixed(2)} (entrega grátis)`;
+  return `R$${(meds + fee).toFixed(2)} (remédios R$${meds.toFixed(2)} + entrega R$${fee.toFixed(2)})`;
+}
+
+/**
  * Prefixo do `orders.summary` que marca um pedido como HANDOFF DE PLATAFORMA — cotado nas
  * grandes redes (links enviados), sem farmácia de bairro/negociação. O get_order_status usa
  * pra descrever o pedido corretamente ("te enviei os links") em vez de "fechado com a farmácia".

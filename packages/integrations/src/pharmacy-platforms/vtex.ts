@@ -166,6 +166,24 @@ export function estimateToMinutes(est: string): number {
 }
 
 /**
+ * Melhor entrega e retirada a partir do logisticsInfo, descartando SLA-sentinela (frete
+ * gigante + prazo enorme, ex.: São João "30 dias / R$1000" = "não entrego de verdade aqui").
+ */
+function bestSlasFromLogistics(li: Record<string, unknown>[]): { delivery: FulfillmentOption | null; pickup: FulfillmentOption | null } {
+  const slas = li[0] && Array.isArray(li[0]['slas']) ? (li[0]['slas'] as Record<string, unknown>[]) : [];
+  const ok = (s: Record<string, unknown>) => {
+    const feeCents = typeof s['price'] === 'number' ? (s['price'] as number) : 0;
+    return feeCents <= MAX_REALISTIC_FEE_CENTS && estimateToMinutes(String(s['shippingEstimate'] ?? '')) <= MAX_REALISTIC_ETA_MIN;
+  };
+  const deliverySlas = slas.filter((s) => s['deliveryChannel'] !== 'pickup-in-point').filter(ok);
+  const pickupSlas = slas.filter((s) => s['deliveryChannel'] === 'pickup-in-point').filter(ok);
+  return {
+    delivery: deliverySlas.length ? pickBestSla(deliverySlas) : null,
+    pickup: pickupSlas.length ? pickBestSla(pickupSlas) : null,
+  };
+}
+
+/**
  * Parser do orderForms/simulation → preço/estoque/entrega por CEP. Exportado pra teste.
  */
 export function parseVtexSimulation(raw: unknown): PlatformFulfillment | null {
@@ -181,24 +199,8 @@ export function parseVtexSimulation(raw: unknown): PlatformFulfillment | null {
   const available = String(it['availability'] ?? '') === 'available';
 
   const li = Array.isArray(d['logisticsInfo']) ? (d['logisticsInfo'] as Record<string, unknown>[]) : [];
-  const slas = li[0] && Array.isArray(li[0]['slas']) ? (li[0]['slas'] as Record<string, unknown>[]) : [];
-  // Alguns VTEX devolvem um SLA-sentinela (frete gigante + prazo enorme, ex.: São João
-  // "30 dias / R$1000") pra dizer "não entrego de verdade nesse CEP". Filtra o que é irreal
-  // pra não poluir a cotação — melhor mostrar "sem entrega local" do que um frete falso.
-  const isRealisticSla = (s: Record<string, unknown>) => {
-    const feeCents = typeof s['price'] === 'number' ? (s['price'] as number) : 0;
-    return feeCents <= MAX_REALISTIC_FEE_CENTS && estimateToMinutes(String(s['shippingEstimate'] ?? '')) <= MAX_REALISTIC_ETA_MIN;
-  };
-  const deliverySlas = slas.filter((s) => s['deliveryChannel'] !== 'pickup-in-point').filter(isRealisticSla);
-  const pickupSlas = slas.filter((s) => s['deliveryChannel'] === 'pickup-in-point').filter(isRealisticSla);
-
-  return {
-    price,
-    listPrice,
-    available,
-    delivery: deliverySlas.length ? pickBestSla(deliverySlas) : null,
-    pickup: pickupSlas.length ? pickBestSla(pickupSlas) : null,
-  };
+  const { delivery, pickup } = bestSlasFromLogistics(li);
+  return { price, listPrice, available, delivery, pickup };
 }
 
 /** Simula a compra de 1 SKU num CEP → preço real + disponibilidade + entrega/retirada. */
@@ -230,4 +232,76 @@ export async function simulateVtexByCep(
 export function buildVtexCartLink(net: PlatformNetwork, sku: string, qty = 1, seller = '1'): string {
   const q = Math.max(1, Math.floor(qty));
   return `${net.host}/checkout/cart/add?sku=${encodeURIComponent(sku)}&qty=${q}&seller=${encodeURIComponent(seller)}&sc=${encodeURIComponent(net.salesChannel)}`;
+}
+
+// ─── Cesta multi-item (pedido com N remédios → 1 carrinho, 1 pagamento) ───────
+
+export interface BasketItem { sku: string; seller: string; qty: number; }
+
+/**
+ * Carrinho pré-montado com VÁRIOS SKUs (sku/qty/seller repetidos). Validado ao vivo:
+ * `?sku=A&qty=1&seller=1&sku=B&qty=1&seller=1&sc=1` → 302 pro /checkout/#/cart com os dois.
+ */
+export function buildVtexCartLinkMulti(net: PlatformNetwork, items: BasketItem[]): string {
+  const parts = items
+    .map((it) => `sku=${encodeURIComponent(it.sku)}&qty=${Math.max(1, Math.floor(it.qty))}&seller=${encodeURIComponent(it.seller)}`)
+    .join('&');
+  return `${net.host}/checkout/cart/add?${parts}&sc=${encodeURIComponent(net.salesChannel)}`;
+}
+
+export interface VtexBasketResult {
+  /** preço UNITÁRIO por sku no CEP (reais) */
+  perSku: Record<string, { price: number; available: boolean }>;
+  /** total da cesta no CEP (reais) — soma de price×qty dos itens disponíveis */
+  total: number;
+  /** todos os itens simulados estão disponíveis? */
+  allAvailable: boolean;
+  delivery: FulfillmentOption | null;
+  pickup: FulfillmentOption | null;
+}
+
+/** Parser da simulação multi-item → preço por sku + total + entrega. Exportado pra teste. */
+export function parseVtexBasketSimulation(raw: unknown): VtexBasketResult | null {
+  const d = raw as Record<string, unknown>;
+  if (!d || typeof d !== 'object') return null;
+  const items = Array.isArray(d['items']) ? (d['items'] as Record<string, unknown>[]) : [];
+  if (items.length === 0) return null;
+  const perSku: Record<string, { price: number; available: boolean }> = {};
+  let total = 0;
+  let allAvailable = true;
+  for (const it of items) {
+    const id = String(it['id'] ?? '');
+    const price = centavosToReais(typeof it['price'] === 'number' ? (it['price'] as number) : 0);
+    const qty = typeof it['quantity'] === 'number' ? (it['quantity'] as number) : 1;
+    const available = String(it['availability'] ?? '') === 'available';
+    if (id) perSku[id] = { price, available };
+    if (available) total += price * qty;
+    else allAvailable = false;
+  }
+  const li = Array.isArray(d['logisticsInfo']) ? (d['logisticsInfo'] as Record<string, unknown>[]) : [];
+  const { delivery, pickup } = bestSlasFromLogistics(li);
+  return { perSku, total, allAvailable, delivery, pickup };
+}
+
+/** Simula uma CESTA (N skus) num CEP → preço por sku + total + entrega. */
+export async function simulateVtexBasket(
+  net: PlatformNetwork,
+  items: BasketItem[],
+  cep: string,
+  opts: { timeoutMs?: number; retries?: number } = {},
+): Promise<VtexBasketResult | null> {
+  const postalCode = onlyDigits(cep);
+  if (postalCode.length !== 8 || items.length === 0) return null;
+  const url = `${net.host}/api/checkout/pub/orderForms/simulation?sc=${encodeURIComponent(net.salesChannel)}`;
+  const body = {
+    items: items.map((it) => ({ id: String(it.sku), quantity: Math.max(1, Math.floor(it.qty)), seller: String(it.seller) })),
+    postalCode,
+    country: 'BRA',
+  };
+  const cfg: AxiosRequestConfig = {
+    timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    headers: { ...headers(), 'Content-Type': 'application/json' },
+  };
+  const data = await withRetry(async () => (await axios.post<unknown>(url, body, cfg)).data, opts.retries ?? 2);
+  return parseVtexBasketSimulation(data);
 }

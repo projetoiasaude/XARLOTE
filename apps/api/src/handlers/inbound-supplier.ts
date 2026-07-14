@@ -346,7 +346,7 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
         try {
           await relaySupplierQuestionToUser(
             { id: posted.id, order_id: posted.order_id, conversation_id: posted.conversation_id, suppliers: { name: supName } },
-            `a farmácia retornou: "${text.slice(0, 180)}". Quer seguir com ela assim mesmo, ou prefere que eu veja outra opção?`,
+            text.slice(0, 200), // texto CRU — relaySupplierQuestionToUser formata contextual (pergunta≠proposta)
             traceId,
           );
           await writeLog('info', 'supplier', `📨 Atualização pós-cotação da farmácia levada ao cliente`, { traceId, conversationId, quoteId: posted.id });

@@ -11,8 +11,8 @@
  */
 import { activeNetworks, type PlatformNetwork } from './registry.js';
 import { rankProductMatches } from './matching.js';
-import { searchVtexProducts, simulateVtexByCep, buildVtexCartLink, onlyDigits } from './vtex.js';
-import type { PlatformQuote } from './types.js';
+import { searchVtexProducts, simulateVtexByCep, buildVtexCartLink, buildVtexCartLinkMulti, simulateVtexBasket, onlyDigits, type BasketItem } from './vtex.js';
+import type { PlatformQuote, PlatformProduct, PlatformBasketQuote, PlatformBasketLine } from './types.js';
 
 export * from './types.js';
 export * from './registry.js';
@@ -20,7 +20,10 @@ export {
   searchVtexProducts,
   simulateVtexByCep,
   buildVtexCartLink,
+  buildVtexCartLinkMulti,
+  simulateVtexBasket,
   parseVtexSimulation,
+  parseVtexBasketSimulation,
   mapVtexProduct,
   formatShippingEstimate,
   estimateToMinutes,
@@ -176,6 +179,107 @@ export async function quotePlatforms(
   }
 
   return quotes.sort((a, b) => a.price - b.price);
+}
+
+// ─── Cesta: pedido com N remédios → 1 carrinho por rede (auditoria 1º pedido) ──
+
+export interface BasketRequestItem { query: string; label: string; qty?: number }
+
+/** Cota TODOS os itens numa rede, monta 1 carrinho com o que ela tem e lista o que falta. */
+async function quoteBasketOneNetwork(
+  net: PlatformNetwork,
+  items: BasketRequestItem[],
+  cep8: string,
+  opts: QuotePlatformsOptions,
+): Promise<PlatformBasketQuote | null> {
+  if (net.access !== 'rest') return null;
+
+  // 1) casa cada item na rede; item sem match vai pra `missing`.
+  const found: { req: BasketRequestItem; product: PlatformProduct; score: number }[] = [];
+  const missing: string[] = [];
+  for (const req of items) {
+    let products: PlatformProduct[] = [];
+    try {
+      products = await searchVtexProducts(net, req.query, { limit: 12, timeoutMs: opts.timeoutMs, retries: 1 });
+    } catch { products = []; }
+    const best = rankProductMatches(req.query, products, { minScore: opts.minScore })[0];
+    if (best) found.push({ req, product: best.product, score: best.score });
+    else missing.push(req.label);
+  }
+  if (!found.length) return null; // rede não tem NENHUM item → fora do pool
+
+  // 2) simula a cesta no CEP → preço por sku + total + entrega.
+  const basketItems: BasketItem[] = found.map((f) => ({ sku: f.product.sku, seller: f.product.sellerId, qty: Math.max(1, f.req.qty ?? 1) }));
+  let sim: Awaited<ReturnType<typeof simulateVtexBasket>> = null;
+  try { sim = await simulateVtexBasket(net, basketItems, cep8, { timeoutMs: opts.timeoutMs, retries: 1 }); } catch { sim = null; }
+
+  // item indisponível na simulação sai da cesta (não montar link com item sem estoque) e vira "falta".
+  const kept: typeof found = [];
+  const droppedByStock: string[] = [];
+  for (const f of found) {
+    if (sim && sim.perSku[f.product.sku]?.available === false) droppedByStock.push(f.req.label);
+    else kept.push(f);
+  }
+  const usable = kept.length ? kept : found; // se a sim não trouxe estoque, mantém pelo catálogo
+
+  const lines: PlatformBasketLine[] = usable.map((f) => {
+    const qty = Math.max(1, f.req.qty ?? 1);
+    const simPrice = sim?.perSku[f.product.sku]?.price;
+    const price = simPrice != null && simPrice > 0 ? simPrice : f.product.price;
+    return { requested: f.req.label, productName: f.product.productName, sku: f.product.sku, sellerId: f.product.sellerId, price, qty, matchScore: f.score };
+  });
+  const total = lines.reduce((s, l) => s + l.price * l.qty, 0);
+  const cartItems: BasketItem[] = lines.map((l) => ({ sku: l.sku, seller: l.sellerId, qty: l.qty }));
+
+  // droppedByStock só entra em `missing` quando REALMENTE dropamos (kept não-vazio). No
+  // fallback de catálogo (kept vazio → mostramos os itens mesmo), NÃO reportar os mesmos
+  // itens como "não achei" — seria contradizer a própria cotação (review MEDIUM-2).
+  const finalMissing = kept.length ? [...missing, ...droppedByStock] : missing;
+  return {
+    network: net.id, networkLabel: net.label, group: net.group,
+    lines, missing: finalMissing,
+    total, available: lines.length > 0,
+    delivery: sim?.delivery ?? null, pickup: sim?.pickup ?? null,
+    checkoutUrl: affiliateWrap(net.id, buildVtexCartLinkMulti(net, cartItems)),
+    pricedByCep: !!sim,
+  };
+}
+
+/**
+ * Cota uma CESTA (N remédios) nas redes ativas. Cada rede vira UMA cotação com 1 carrinho
+ * dos itens que ela tem + a lista do que falta. Dedup por grupo (cesta mais completa vence);
+ * ordena por completude (mais itens) e depois menor total.
+ */
+export async function quotePlatformBasket(
+  items: BasketRequestItem[],
+  cep: string,
+  opts: QuotePlatformsOptions = {},
+): Promise<PlatformBasketQuote[]> {
+  const cep8 = onlyDigits(cep);
+  const valid = items.filter((i) => i.query.trim());
+  if (cep8.length !== 8 || !valid.length) return [];
+
+  let nets = activeNetworks();
+  if (opts.networkIds && opts.networkIds.length) {
+    const want = new Set(opts.networkIds);
+    nets = nets.filter((n) => want.has(n.id));
+  }
+
+  const settled = await Promise.allSettled(nets.map((n) => quoteBasketOneNetwork(n, valid, cep8, opts)));
+  let quotes = settled
+    .filter((r): r is PromiseFulfilledResult<PlatformBasketQuote | null> => r.status === 'fulfilled')
+    .map((r) => r.value)
+    .filter((q): q is PlatformBasketQuote => q != null && q.available);
+
+  if (opts.dedupeByGroup !== false) {
+    const best = new Map<string, PlatformBasketQuote>();
+    for (const q of quotes) {
+      const cur = best.get(q.group);
+      if (!cur || q.lines.length > cur.lines.length || (q.lines.length === cur.lines.length && q.total < cur.total)) best.set(q.group, q);
+    }
+    quotes = [...best.values()];
+  }
+  return quotes.sort((a, b) => (b.lines.length - a.lines.length) || (a.total - b.total));
 }
 
 /** Limpa o cache em memória (teste/manutenção). */

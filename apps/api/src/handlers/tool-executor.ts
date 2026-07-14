@@ -3,7 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY } from '@iasaude/shared';
+import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -1311,18 +1311,18 @@ async function startPharmacyDiscovery(
         soleChannel: true,
       }).catch(async (err) => {
         await writeLog('warn', 'platform', `Falha apresentando plataformas (canal único): ${String(err).slice(0, 140)}`, { traceId: ctx.traceId, orderId });
-        return { itemsWithQuotes: 0, totalQuotes: 0 };
+        return { networksPresented: 0, itemsCovered: 0 };
       });
-      if (pres.itemsWithQuotes > 0) {
+      if (pres.networksPresented > 0) {
         // Handoff de plataforma: entregamos os links das grandes redes; não há negociação nem
         // fechamento pela Xarlote. Marca 'handed_off' + summary com o prefixo PLATFORM_HANDOFF
         // (o get_order_status distingue por ele). NÃO usar 'quoted' — dispararia o nudge "as
         // farmácias te esperam, quer fechar/cancelar?" pra um handoff sem o que fechar (review M2).
         await db.from('orders').update({
           status: 'handed_off',
-          summary: `${PLATFORM_HANDOFF_SUMMARY} — ${pres.totalQuotes} opção(ões) enviada(s) com link pra finalizar direto no site da rede.`,
+          summary: `${PLATFORM_HANDOFF_SUMMARY} — ${pres.networksPresented} opção(ões) de rede enviada(s) com link pra finalizar direto no site.`,
         }).eq('id', orderId);
-        await writeLog('info', 'order', `Sem farmácia de bairro com WhatsApp — ${pres.totalQuotes} cotação(ões) de grande rede apresentada(s) (handoff)`, { traceId: ctx.traceId, orderId });
+        await writeLog('info', 'order', `Sem farmácia de bairro com WhatsApp — ${pres.networksPresented} rede(s) apresentada(s) (handoff)`, { traceId: ctx.traceId, orderId });
         return;
       }
     }
@@ -2075,7 +2075,10 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     // Variação leve pra não soar template (mesma pessoa não fala igual sempre).
     const openings = ['fechou! pode preparar', 'show, fechado! pode separar', 'fechou então, pode preparar'];
     const opening = openings[Math.abs(args.order_id.charCodeAt(0) + args.order_id.charCodeAt(3)) % openings.length] as string;
-    const msg1 = `${opening} ${itemsInline} pra mim`;
+    // Nome do destinatário JÁ na 1ª msg (associado ao pedido) + de novo no recipientPart da 2ª
+    // (auditoria 1º pedido: farmácia anotou "Igor" no lugar de "Hiago" — o nome aparecer cedo
+    // e 2× reduz o erro de anotação humana da farmácia).
+    const msg1 = `${opening} ${itemsInline}${recipient ? ` pro ${recipient}` : ' pra mim'}`;
 
     // Prazo em fala natural — SÓ quando extraímos uma HORA clara do aceite. Cláusula livre
     // (ex.: "vai ser cartão", "obrigado") NÃO vai pra farmácia (review: mandaria ruído tipo
@@ -2147,8 +2150,8 @@ function buildPaymentMessage(quote: Record<string, unknown>, supplierName: strin
   const total = quote['total'] as number | null;
   const deliveryFee = quote['delivery_fee'] as number | null;
   if (total != null) {
-    const freteStr = deliveryFee != null ? ` (frete R$${Number(deliveryFee).toFixed(2)})` : '';
-    lines.push(`💰 *Total:* R$${Number(total).toFixed(2)}${freteStr}`);
+    // Total FINAL = remédios + frete (auditoria 1º pedido: cliente via "R$28,89" mas pagava R$35,89).
+    lines.push(`💰 *Total:* ${formatOrderTotal(total, deliveryFee)}`);
   }
 
   const eta = quote['eta_minutes'] as number | null;

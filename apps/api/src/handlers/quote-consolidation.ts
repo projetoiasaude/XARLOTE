@@ -1,5 +1,5 @@
 import { db, writeLog } from '@iasaude/db';
-import { sanitizeSupplierNote, noteSignalsConditionalOffer } from '@iasaude/shared';
+import { sanitizeSupplierNote, noteSignalsConditionalOffer, formatOrderTotal } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { hasPendingClarification } from './clarification.js';
 
@@ -491,26 +491,28 @@ export async function consolidateQuotes(
   for (let i = 0; i < sorted.length; i++) {
     const q = sorted[i] as QuoteRow;
     const name = supplierMap.get(q.supplier_id) ?? 'Farmácia';
-    const total = q.total?.toFixed(2);
-    // frete: null = ainda não informado ("a confirmar") — NÃO mostrar "grátis" (mentira,
-    // caso Hiago 06/07). 0 = grátis confirmado. >0 = valor real.
-    const frete = q.delivery_fee == null ? 'frete a confirmar' : (q.delivery_fee === 0 ? 'frete grátis' : `frete R$${q.delivery_fee.toFixed(2)}`);
+    // TOTAL FINAL = remédios + frete (auditoria 1º pedido: antes mostrava só os remédios e o
+    // frete solto, o cliente via "R$28,89" mas pagava R$35,89). frete null = "a confirmar" (NÃO
+    // vira "grátis" — mentira, caso Hiago 06/07); 0 = grátis; >0 = somado no total.
+    const totalStr = formatOrderTotal(q.total, q.delivery_fee);
     const eta = q.eta_minutes ? `~${q.eta_minutes}min` : '';
     const payment = (q.payment_methods ?? []).join('/') || 'consulte';
     const pix = q.pix_key ? ` · Pix: ${q.pix_key}` : '';
 
-    const parts = [frete, eta, payment].filter(Boolean).join(' · ');
+    const parts = [eta, payment].filter(Boolean).join(' · ');
     // Substituição de apresentação (Fix #3): SÓ do marcador canônico "subst:só tem N comp"
     // que o fallback determinístico grava — nunca de texto livre do LLM (que poderia
     // vazar nota interna truncada tipo "só tem plano Unimed" ao usuário; review).
     const substMatch = (q.notes ?? '').match(/subst:\s*(só tem \d+\s*comp)/i);
     const subst = substMatch ? `\n   ⚠️ ${(substMatch[1] as string).trim()}` : '';
-    lines.push(`${NUMBERS[i] ?? `${i + 1}.`} *${name}* — R$${total}\n   ${parts}${pix}${subst}`);
+    lines.push(`${NUMBERS[i] ?? `${i + 1}.`} *${name}* — ${totalStr}\n   ${parts}${pix}${subst}`);
   }
 
   const unavailableCount = (quotes ?? []).filter((q) => ['unavailable', 'timeout'].includes(q.status)).length;
   if (unavailableCount > 0) {
-    lines.push(`\n_(${unavailableCount} farmácia${unavailableCount > 1 ? 's' : ''} não respondeu ou não tinha em estoque)_`);
+    const plural = unavailableCount > 1;
+    const verb = plural ? 'não responderam ou não tinham em estoque' : 'não respondeu ou não tinha em estoque';
+    lines.push(`\n_(${unavailableCount} farmácia${plural ? 's' : ''} ${verb})_`);
   }
 
   lines.push('\nQual você prefere? Pode me dizer o número ou o nome da farmácia 😊');

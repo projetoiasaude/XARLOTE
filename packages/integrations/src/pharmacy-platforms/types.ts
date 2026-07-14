@@ -49,6 +49,40 @@ export interface FulfillmentOption {
   feeReais: number;
 }
 
+// ─── Cesta (pedido com N medicamentos numa MESMA rede → 1 carrinho) ───────────
+
+/** Uma linha da cesta: o que o usuário pediu × o produto real casado na rede. */
+export interface PlatformBasketLine {
+  /** rótulo do que o usuário pediu (ex.: "Dorflex 300mg") */
+  requested: string;
+  productName: string;
+  sku: string;
+  sellerId: string;
+  /** preço unitário no CEP (× qty já refletido no total) */
+  price: number;
+  qty: number;
+  matchScore: number;
+}
+
+/** Cotação de uma REDE pra uma cesta: itens que ela tem, itens que faltam, total e 1 link. */
+export interface PlatformBasketQuote {
+  network: string;
+  networkLabel: string;
+  group: string;
+  /** itens encontrados nessa rede (>=1) */
+  lines: PlatformBasketLine[];
+  /** rótulos dos itens que a rede NÃO tem */
+  missing: string[];
+  /** total da cesta no CEP (soma das linhas × qty) */
+  total: number;
+  available: boolean;
+  delivery: FulfillmentOption | null;
+  pickup: FulfillmentOption | null;
+  /** UM link de carrinho com TODOS os itens encontrados (multi-sku) */
+  checkoutUrl: string;
+  pricedByCep: boolean;
+}
+
 /** Uma cotação de plataforma pronta pra entrar no pool e virar handoff. */
 export interface PlatformQuote {
   network: string;

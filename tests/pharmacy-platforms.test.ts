@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 import {
   mapVtexProduct,
   parseVtexSimulation,
+  parseVtexBasketSimulation,
   formatShippingEstimate,
   estimateToMinutes,
   buildVtexCartLink,
+  buildVtexCartLinkMulti,
 } from '../packages/integrations/src/pharmacy-platforms/vtex.js';
 import {
   parseMedicationQuery,
@@ -285,6 +287,41 @@ describe('sellerId propagado (review M1) + affiliateWrap', () => {
     process.env['PLATFORM_AFFILIATE_PAGUE_MENOS'] = 'https://awin/cread?ued={url}';
     expect(affiliateWrap('pague-menos', 'https://x/cart?a=1')).toBe('https://awin/cread?ued=' + encodeURIComponent('https://x/cart?a=1'));
     delete process.env['PLATFORM_AFFILIATE_PAGUE_MENOS'];
+  });
+});
+
+describe('cesta multi-item (auditoria 1º pedido — P2)', () => {
+  it('buildVtexCartLinkMulti: 1 link com os N SKUs (sku/qty/seller repetidos)', () => {
+    const pm = PLATFORM_REGISTRY.find((n) => n.id === 'pague-menos')!;
+    const url = buildVtexCartLinkMulti(pm, [{ sku: '52332', seller: '1', qty: 1 }, { sku: '110303', seller: '1', qty: 2 }]);
+    expect(url).toBe('https://www.paguemenos.com.br/checkout/cart/add?sku=52332&qty=1&seller=1&sku=110303&qty=2&seller=1&sc=1');
+  });
+
+  it('parseVtexBasketSimulation: soma o total (price×qty) e separa por sku', () => {
+    const sim = {
+      items: [
+        { id: '52332', price: 2699, quantity: 1, availability: 'available' },
+        { id: '110303', price: 499, quantity: 2, availability: 'available' },
+      ],
+      logisticsInfo: [{ slas: [{ deliveryChannel: 'delivery', shippingEstimate: '60m', price: 790 }] }],
+    };
+    const r = parseVtexBasketSimulation(sim)!;
+    expect(r.total).toBeCloseTo(26.99 + 4.99 * 2, 2); // 36.97
+    expect(r.perSku['52332']).toEqual({ price: 26.99, available: true });
+    expect(r.allAvailable).toBe(true);
+    expect(r.delivery).toEqual({ etaText: '60 min', feeReais: 7.9 });
+  });
+
+  it('parseVtexBasketSimulation: item indisponível não entra no total e marca allAvailable=false', () => {
+    const r = parseVtexBasketSimulation({
+      items: [
+        { id: 'a', price: 1000, quantity: 1, availability: 'available' },
+        { id: 'b', price: 5000, quantity: 1, availability: 'unavailable' },
+      ],
+    })!;
+    expect(r.total).toBe(10); // só o item 'a'
+    expect(r.allAvailable).toBe(false);
+    expect(r.perSku['b']!.available).toBe(false);
   });
 });
 
