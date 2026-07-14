@@ -224,12 +224,17 @@ describe('buildVtexCartLink + registry', () => {
     );
   });
 
-  it('activeNetworks default = só Grupo A (rest, enabled)', () => {
+  it('activeNetworks default = só Grupo A (rest, enabled) — 10 redes', () => {
     const act = activeNetworks();
-    expect(act.length).toBeGreaterThanOrEqual(5);
+    expect(act.length).toBeGreaterThanOrEqual(10);
     expect(act.every((n) => n.access === 'rest' && n.enabled)).toBe(true);
-    expect(act.map((n) => n.id)).toContain('pague-menos');
-    expect(act.map((n) => n.id)).not.toContain('drogasil'); // Akamai desligada
+    const ids = act.map((n) => n.id);
+    expect(ids).toContain('pague-menos');
+    expect(ids).toContain('drogal'); // regional VTEX adicionada 14/07
+    expect(ids).toContain('catarinense');
+    expect(ids).not.toContain('drogasil'); // Akamai desligada
+    expect(ids).not.toContain('onofre'); // Akamai desligada
+    expect(ids).not.toContain('nissei'); // plataforma própria desligada
   });
 });
 

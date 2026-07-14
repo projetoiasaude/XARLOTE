@@ -220,7 +220,11 @@ async function quoteBasketOneNetwork(
     if (sim && sim.perSku[f.product.sku]?.available === false) droppedByStock.push(f.req.label);
     else kept.push(f);
   }
-  const usable = kept.length ? kept : found; // se a sim não trouxe estoque, mantém pelo catálogo
+  // Fallback pro catálogo SÓ quando a simulação NÃO rodou (sim == null). Se a sim rodou e
+  // marcou TODOS os itens indisponíveis no CEP, a rede não serve aqui → fora do pool (não
+  // mostrar rede que dá withoutStock, ex.: Venancio-RJ pra cliente de GO — probe ao vivo 14/07).
+  const usable = kept.length ? kept : (sim ? [] : found);
+  if (!usable.length) return null;
 
   const lines: PlatformBasketLine[] = usable.map((f) => {
     const qty = Math.max(1, f.req.qty ?? 1);

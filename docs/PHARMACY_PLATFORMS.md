@@ -8,24 +8,42 @@
 
 ## 1. Mapa das redes (probe real do endpoint VTEX REST público)
 
-| Rede | Grupo | Lojas (aprox) | Stack | REST público server-side | Integração |
-|---|---|---|---|---|---|
-| **Drogasil** | RD | ~1600 | VTEX + BFF GraphQL + **Akamai** | ❌ 403/503 | anti-WAF + GraphQL |
-| **Droga Raia** | RD | ~1400 | idem | ❌ 403 | anti-WAF + GraphQL |
-| **Pague Menos** | Pague Menos | ~1200 | VTEX | ✅ 206 | conector VTEX genérico |
-| **Extrafarma** | Pague Menos | ~400 | VTEX | ✅ 206 | idem (catálogo compartilhado) |
-| **Drog. São Paulo** | DPSP | ~900 | VTEX | ✅ 206 | conector VTEX genérico |
-| **Pacheco** | DPSP | ~650 | VTEX | ✅ 206 | idem |
-| **São João** | São João | ~1200 | VTEX | ✅ 206 | conector VTEX genérico |
-| **Araujo** | Araujo | ~250 | VTEX + **Akamai** | ❌ 403 | anti-WAF |
-| **Nissei** | — | ~450 | próprio (SPA) | ⚠️ 404 | adaptador dedicado |
-| **Panvel** | Dimed | ~500 | próprio | ⚠️ 404 | adaptador dedicado |
+Probe ao vivo 14/07 (dipirona). **Grupo A = 10 redes VTEX-abertas LIGADAS** (`enabled:true`):
 
-- **Grupo A — REST aberto (server-side direto, ZERO fricção):** Pague Menos + Extrafarma +
-  DPSP (São Paulo + Pacheco) + São João ≈ **~5.000 lojas** por UM conector genérico.
-- **Grupo B — Akamai (403):** RD (Drogasil + Droga Raia, a MAIOR ≈ 3.000 lojas) + Araujo.
-  Exige browser headless (Playwright) OU proxy anti-bot (ScraperAPI/ZenRows/BrightData). ROI alto.
-- **Grupo C — plataforma própria:** Nissei (SPA), Panvel (Dimed). Adaptador dedicado, fase posterior.
+| Rede | Grupo | Stack | REST público | Status |
+|---|---|---|---|---|
+| **Pague Menos** | PagueMenos | VTEX | ✅ 206 | 🟢 ligada |
+| **Extrafarma** | PagueMenos | VTEX | ✅ 206 | 🟢 ligada |
+| **Drog. São Paulo** | DPSP | VTEX | ✅ 206 | 🟢 ligada |
+| **Pacheco** | DPSP | VTEX | ✅ 206 | 🟢 ligada |
+| **São João** | SaoJoao | VTEX | ✅ 206 | 🟢 ligada |
+| **Drogal** (SP) | Drogal | VTEX | ✅ 206 | 🟢 ligada |
+| **Venancio** (RJ) | Venancio | VTEX | ✅ 206 | 🟢 ligada |
+| **Drogaria Globo** (RJ) | Globo | VTEX | ✅ 206 | 🟢 ligada |
+| **Drog. Catarinense** (SC) | Catarinense | VTEX | ✅ 206 | 🟢 ligada |
+| **Farmácia Indiana** | Indiana | VTEX | ✅ 206 | 🟢 ligada |
+| **Drogasil** | RD | VTEX+BFF GraphQL+**Akamai** | ❌ 403 (tudo, até sitemap) | 🔒 proxy |
+| **Droga Raia** | RD | idem | ❌ 403 | 🔒 proxy |
+| **Onofre** | RD | idem | ❌ 403 | 🔒 proxy |
+| **Araujo** | Araujo | VTEX+**Akamai** | ❌ 403 | 🔒 proxy |
+| **Nissei** | Nissei | próprio (SPA) | ⚠️ 404 | 🔧 adaptador |
+| **Panvel** | Dimed | próprio | ⚠️ 404 | 🔧 adaptador |
+| **Ultrafarma** | Ultrafarma | próprio (SPA) | ⚠️ 404 | 🔧 adaptador |
+
+- **Grupo A — REST aberto (LIGADO, server-side direto, sem custo):** as 10 acima. Um conector
+  genérico. Regionais (Drogal/Venancio/Globo/Catarinense) cobrem SP/RJ/SC além do nacional; a
+  simulação por CEP já filtra quem não entrega na região do cliente (`withoutStock` → fora do pool).
+- **Grupo B — Akamai (403 em TUDO, inclusive sitemap.xml):** RD (Drogasil+Raia+Onofre, a MAIOR) +
+  Araujo. **Sem caminho server-side** — SÓ com **proxy anti-bot pago** (ScraperAPI/ZenRows ~US$50/mês)
+  OU browser headless. Registry pronto (`enabled:false`); ligar = decisão de custo do fundador + o
+  adaptador precisa falar o **BFF GraphQL** deles (`POST /api/next/middlewareGraphql`), não o REST.
+- **Grupo C — plataforma própria:** Nissei/Panvel/Ultrafarma (SPA não-VTEX). Adaptador dedicado por rede.
+
+### Nota — CEP no link (menor fricção)
+O **preço já vem pronto** (simulado no CEP do cliente → total exibido). Pré-preencher o CEP *no link
+de guest* NÃO é possível no VTEX sem criar um orderForm com session (POST/PATCH shippingData) — não há
+parâmetro de URL. Então a fricção mínima hoje = abrir o carrinho montado → confirmar o CEP 1× → pagar.
+Eliminar o CEP por completo ("só pagar") = Fase 2 (Xarlote compradora com orderForm próprio + pagamento).
 
 ## 2. O "molde" da API VTEX (validado ao vivo)
 
