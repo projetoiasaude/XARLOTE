@@ -23,7 +23,8 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
 
-  <link rel="stylesheet" href="styles.css" />
+  <!-- ?r bump a cada deploy: força iOS Safari a buscar CSS/JS novos (evita mix de versões entre aparelhos) -->
+  <link rel="stylesheet" href="styles.css?r=2" />
 
   <noscript>
     <style>
@@ -359,7 +360,7 @@
     <section class="feel" id="familia">
       <p class="feel-line reveal">Quem ama, lembra.</p>
       <p class="feel-line big grad reveal" style="--d:.15s">A Xarlote lembra por você.</p>
-      <p class="feel-sub reveal" style="--d:.3s">Coloca ela pra cuidar da rotina de remédios da sua mãe —<br class="desk-br" /> e dorme tranquilo.</p>
+      <p class="feel-sub reveal" style="--d:.3s">Coloque ela pra cuidar da rotina de remédios da sua mãe<br class="desk-br" /> e durma tranquilo.</p>
       <span class="heart h1" aria-hidden="true">💜</span>
       <span class="heart h2" aria-hidden="true">💜</span>
       <span class="heart h3" aria-hidden="true">💜</span>
@@ -413,6 +414,6 @@
     </a>
   </div>
 
-  <script src="main.js" defer></script>
+  <script src="main.js?r=2" defer></script>
 </body>
 </html>
