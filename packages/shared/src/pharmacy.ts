@@ -186,6 +186,28 @@ export function mentionsFreeShipping(text: string | null | undefined): boolean {
  * Nome do item pra exibição SEM repetir a dosagem quando ela já está no nome
  * (ex.: name="Pietra ED 2mg" + dosage="2mg" → "Pietra ED 2mg", não "Pietra ED 2mg 2mg").
  */
+/**
+ * Prefixo do `orders.summary` que marca um pedido como HANDOFF DE PLATAFORMA — cotado nas
+ * grandes redes (links enviados), sem farmácia de bairro/negociação. O get_order_status usa
+ * pra descrever o pedido corretamente ("te enviei os links") em vez de "fechado com a farmácia".
+ */
+export const PLATFORM_HANDOFF_SUMMARY = 'Cotado nas grandes redes (handoff de plataforma)';
+
+/**
+ * Extrai um CEP (8 dígitos) de um texto de endereço. Prioriza o formato canônico com hífen
+ * (12345-678, inequívoco); senão o ÚLTIMO grupo de 8 dígitos (o CEP costuma vir no fim do
+ * endereço, evitando confundir com número de rua/telefone no meio); por fim "12345 678".
+ */
+export function extractCep(address: string | null | undefined): string | null {
+  const text = address ?? '';
+  const hyph = text.match(/\b\d{5}-\d{3}\b/g);
+  if (hyph && hyph.length) return hyph[hyph.length - 1]!.replace('-', '');
+  const bare = text.match(/\b\d{8}\b/g);
+  if (bare && bare.length) return bare[bare.length - 1]!;
+  const sp = /\b(\d{5})\s(\d{3})\b/.exec(text);
+  return sp ? `${sp[1]}${sp[2]}` : null;
+}
+
 export function itemDisplayName(name: string | null | undefined, dosage?: string | null): string {
   const n = (name ?? '').trim();
   const d = (dosage ?? '').trim();

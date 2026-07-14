@@ -1,5 +1,5 @@
 import { db } from '@iasaude/db';
-import { AGENT_INSTANCE, sanitizeSupplierNote, noteSignalsConditionalOffer, resolveSupplierByHint, itemDisplayName } from '@iasaude/shared';
+import { AGENT_INSTANCE, sanitizeSupplierNote, noteSignalsConditionalOffer, resolveSupplierByHint, itemDisplayName, PLATFORM_HANDOFF_SUMMARY } from '@iasaude/shared';
 import type { OrderItem } from '@iasaude/shared';
 import { providerFor } from '@iasaude/whatsapp';
 
@@ -61,6 +61,8 @@ export interface OrderState {
   closeConditions: string | null;
   /** A farmácia ESCOLHIDA respondeu algo DEPOIS do fechamento? (confirmação de preparo) */
   supplierAckAfterClose: boolean;
+  /** Handoff de plataforma: cotado nas grandes redes (links enviados), sem farmácia de bairro. */
+  platformHandoff: boolean;
 }
 
 interface QuoteJoinRow {
@@ -83,7 +85,7 @@ export async function loadLatestOrderState(userId: string): Promise<OrderState |
   const sinceIso = new Date(Date.now() - WINDOW_MS).toISOString();
   const { data: order } = await db
     .from('orders')
-    .select('id, status, items, created_at, selected_quote_id, closed_at, delivery_deadline, close_conditions')
+    .select('id, status, items, created_at, selected_quote_id, closed_at, delivery_deadline, close_conditions, summary')
     .eq('user_id', userId)
     .in('status', RELEVANT_STATUSES as unknown as string[])
     .gte('created_at', sinceIso)
@@ -162,6 +164,7 @@ export async function loadLatestOrderState(userId: string): Promise<OrderState |
     deliveryDeadline: (order.delivery_deadline as string | null) ?? null,
     closeConditions: (order.close_conditions as string | null) ?? null,
     supplierAckAfterClose,
+    platformHandoff: typeof order.summary === 'string' && order.summary.startsWith(PLATFORM_HANDOFF_SUMMARY),
   };
 }
 
@@ -193,6 +196,9 @@ function hourBRT(iso: string): string {
 
 /** Rótulo humano do estado do PEDIDO como um todo. */
 function orderStatusLabel(state: OrderState): string {
+  if (state.platformHandoff) {
+    return 'cotado nas grandes redes — os links de compra já foram enviados ao usuário pra ele finalizar direto no site (sem farmácia de bairro nem entrega gerenciada pela Xarlote)';
+  }
   switch (state.status) {
     case 'quoting': return 'buscando/negociando com as farmácias';
     case 'quoted': return 'com cotações prontas (veja PEDIDO ATIVO pra fechar)';
@@ -222,6 +228,20 @@ function orderStatusLabel(state: OrderState): string {
  */
 export function buildOrderStateBlock(state: OrderState): string {
   const itemNames = state.items.map((i) => itemDisplayName(i.name, i.dosage)).join(', ') || 'o pedido';
+
+  // Handoff de plataforma: não há farmácias/negociação a descrever. Bloco próprio, honesto.
+  if (state.platformHandoff) {
+    return [
+      `## ESTADO DO PEDIDO`,
+      `Pedido de **${itemNames}** — ${orderStatusLabel(state)}.`,
+      '',
+      '### COMO AGIR NESTE PEDIDO',
+      '- Este pedido foi cotado nas GRANDES REDES (ex.: Pague Menos, Drogaria São Paulo, Pacheco) e os links de compra JÁ foram enviados ao usuário — ele finaliza o pagamento direto no site da rede. NÃO há farmácia de bairro nem negociação por WhatsApp aqui.',
+      '- Se o usuário perguntar "cadê meu pedido", explique que você mandou os links das grandes redes pra ele finalizar por lá. Se ele quiser que você procure outras opções (inclusive farmácias de bairro), inicie um novo pedido com **start_pharmacy_order**.',
+      '- 🚫 NUNCA diga que "a farmácia está preparando", que o pedido "saiu pra entrega" ou que "está a caminho": não existe entrega gerenciada pela Xarlote neste pedido.',
+    ].join('\n');
+  }
+
   const lines: string[] = [
     `## ESTADO DO PEDIDO (visão completa — todas as farmácias deste pedido)`,
     `Pedido de **${itemNames}** — situação: ${orderStatusLabel(state)}.`,

@@ -3,11 +3,12 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber } from '@iasaude/shared';
+import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { markSupplierVerifiedById } from './supplier-directory.js';
+import { presentPlatformQuotes, extractCep } from './platform-quotes.js';
 import { loadPrompts } from '../config/prompts.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
@@ -1151,6 +1152,17 @@ async function startPharmacyDiscovery(
     traceId: ctx.traceId, orderId, lat, lng,
   });
 
+  // CEP pra cotar nas grandes redes (plataformas VTEX): do endereço de entrega e, se não
+  // vier ali, um reverse-geocode leve pelas coordenadas. Sem CEP, a simulação por região
+  // não roda (fica só o WhatsApp das farmácias de bairro).
+  let userCep = extractCep(deliveryAddress);
+  if (!userCep) {
+    try {
+      const rg = await reverseGeocodeNominatim(lat, lng, 4000); // fallback curto — não segura o discovery
+      userCep = extractCep(rg?.postcode ?? null);
+    } catch { /* segue sem CEP */ }
+  }
+
   let pharmacies: Awaited<ReturnType<typeof findNearbyPharmacies>> = [];
   let apiError = '';
 
@@ -1288,9 +1300,32 @@ async function startPharmacyDiscovery(
     await writeLog('warn', 'places', `${semTelefone} farmácia(s) sem telefone no Places — NÃO contatadas (nunca fabricar número)`, { traceId: ctx.traceId, orderId });
   }
 
-  // Nenhuma farmácia com telefone real → NÃO tem quem contatar. Avisa com franqueza
-  // (nunca fabricar número) e encerra o pedido em vez de fingir que contatou.
+  // Nenhuma farmácia de bairro com WhatsApp → antes de desistir, tenta as GRANDES REDES
+  // (o buraco clássico: região só com Drogasil/Pacheco/etc., que não atendem WhatsApp mas
+  // têm vitrine online pública). Se cotou, apresenta e NÃO falha o pedido.
   if (quoteIds.length === 0) {
+    if (userCep) {
+      const pres = await presentPlatformQuotes({
+        orderId, items, cep: userCep,
+        conversationId: ctx.conversationId, phoneE164: ctx.phoneE164, traceId: ctx.traceId,
+        soleChannel: true,
+      }).catch(async (err) => {
+        await writeLog('warn', 'platform', `Falha apresentando plataformas (canal único): ${String(err).slice(0, 140)}`, { traceId: ctx.traceId, orderId });
+        return { itemsWithQuotes: 0, totalQuotes: 0 };
+      });
+      if (pres.itemsWithQuotes > 0) {
+        // Handoff de plataforma: entregamos os links das grandes redes; não há negociação nem
+        // fechamento pela Xarlote. Marca 'handed_off' + summary com o prefixo PLATFORM_HANDOFF
+        // (o get_order_status distingue por ele). NÃO usar 'quoted' — dispararia o nudge "as
+        // farmácias te esperam, quer fechar/cancelar?" pra um handoff sem o que fechar (review M2).
+        await db.from('orders').update({
+          status: 'handed_off',
+          summary: `${PLATFORM_HANDOFF_SUMMARY} — ${pres.totalQuotes} opção(ões) enviada(s) com link pra finalizar direto no site da rede.`,
+        }).eq('id', orderId);
+        await writeLog('info', 'order', `Sem farmácia de bairro com WhatsApp — ${pres.totalQuotes} cotação(ões) de grande rede apresentada(s) (handoff)`, { traceId: ctx.traceId, orderId });
+        return;
+      }
+    }
     await writeLog('warn', 'order', `Nenhuma farmácia com telefone/WhatsApp encontrada — pedido não pôde ser cotado`, { traceId: ctx.traceId, orderId, semTelefone });
     await sendOutbound(
       ctx.conversationId,
@@ -1321,6 +1356,16 @@ async function startPharmacyDiscovery(
     `Achei ${quoteIds.length} farmácia${quoteIds.length > 1 ? 's' : ''} aqui na sua região e já entrei em contato com ${quoteIds.length > 1 ? 'elas' : 'ela'} ✨ assim que chegarem as respostas eu te aviso na hora.${nightNote}`,
     ctx.traceId,
   );
+
+  // Em PARALELO (não bloqueia as negociações): cota nas grandes redes e apresenta o pool com
+  // link pra pagar agora. Fire-and-forget — a mensagem chega em ~2s, junto do WhatsApp do bairro.
+  if (userCep) {
+    presentPlatformQuotes({
+      orderId, items, cep: userCep,
+      conversationId: ctx.conversationId, phoneE164: ctx.phoneE164, traceId: ctx.traceId,
+      soleChannel: false,
+    }).catch((err) => writeLog('warn', 'platform', `Falha apresentando plataformas (paralelo): ${String(err).slice(0, 140)}`, { traceId: ctx.traceId, orderId }));
+  }
 
   // Setor/bairro real do usuário pra passar pra farmácia (não a cidade da farmácia em si).
   const userNeighborhood =
