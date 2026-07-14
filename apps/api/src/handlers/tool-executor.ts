@@ -3,10 +3,11 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody } from '@iasaude/shared';
-import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone } from '@iasaude/integrations';
+import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber } from '@iasaude/shared';
+import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
+import { markSupplierVerifiedById } from './supplier-directory.js';
 import { loadPrompts } from '../config/prompts.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
@@ -908,6 +909,234 @@ async function handleStartPharmacyOrder(
   await startPharmacyDiscovery(order.id, lat, lng, args.items, deliveryAddress, args.payment_method ?? null, ctx, Array.isArray(args.preferred_pharmacy_names) ? args.preferred_pharmacy_names : []);
 }
 
+// ─── Seleção v2 de farmácias + substituição dinâmica (análise 12/07) ─────────
+// Celular responde 61%, fixo 8% — o Google Places devolve o FIXO do balcão. O diretório
+// aprende quem tem WhatsApp (whatsapp_verified_at via ack/resposta; strikes via silêncio)
+// e a seleção prioriza quem REALMENTE conversa. Orçamentos controlam custo por pedido.
+const PHARMACY_TARGET_SLOTS = Number(process.env['PHARMACY_TARGET_SLOTS'] ?? 5);
+const PHARMACY_DETAILS_BUDGET = Number(process.env['PHARMACY_DETAILS_BUDGET'] ?? 12);
+const PHARMACY_WAME_BUDGET = Number(process.env['PHARMACY_WAME_BUDGET'] ?? 4);
+const PHARMACY_CHAIN_CAP = Number(process.env['PHARMACY_CHAIN_CAP'] ?? 2);
+const PHARMACY_TOPUP_CHECK_MS = Number(process.env['PHARMACY_TOPUP_CHECK_MS'] ?? 180_000);
+const PHARMACY_MAX_TOPUP = Number(process.env['PHARMACY_MAX_TOPUP'] ?? 2);
+
+interface EnrichedPharmacy {
+  place: PlaceResult;
+  supplierId: string;
+  /** número que será usado no contato (whatsapp_e164 preferido) */
+  contact: string;
+  tier: 'verificada' | 'celular' | 'fixo';
+}
+
+interface PharmacyBackupState {
+  candidates: PlaceResult[];
+  items: OrderItem[];
+  userNeighborhood: string;
+  paymentMethod: string | null;
+  userConversationId: string;
+  userPhoneE164: string;
+  traceId: string;
+  createdAt: number;
+}
+// Estado local do processo (single-instance, como o debounce do supplier). Perde no
+// deploy → só pula a substituição dos pedidos em voo naquele instante.
+const pharmacyBackups = new Map<string, PharmacyBackupState>();
+
+/**
+ * Resolve telefone + WhatsApp real de uma candidata e a classifica por probabilidade de
+ * conversa. Cache-first: se o supplier já existe com telefone, NÃO gasta Details. Minera
+ * wa.me do site quando o telefone do Google é fixo (o celular verdadeiro mora no site).
+ * Devolve null quando não há número utilizável (placeholder/serviço/nenhum).
+ */
+async function enrichPharmacyCandidate(
+  pharmacy: PlaceResult,
+  opts: { traceId: string; allowDetails: () => boolean; allowWame: () => boolean; onDetails: () => void; onWame: () => void },
+): Promise<EnrichedPharmacy | 'budget' | null> {
+  // 1) Diretório primeiro (barato + carrega o aprendizado: já verificada?).
+  const { data: existing } = await db.from('suppliers')
+    .select('id, whatsapp_e164, phone_e164, whatsapp_verified_at')
+    .eq('google_place_id', pharmacy.placeId)
+    .maybeSingle();
+
+  let phoneE164: string | null = (existing?.phone_e164 as string | null) ?? null;
+  let whatsappE164: string | null = (existing?.whatsapp_e164 as string | null) ?? null;
+  let website: string | null = null;
+  const verifiedAlready = Boolean(existing?.whatsapp_verified_at);
+
+  // 2) Details só quando precisa CHAMAR o Google (mesmo call traz o website de graça):
+  //    - sem número nenhum, OU
+  //    - número FIXO ainda não verificado (pra minerar o WhatsApp real do site — os ~65
+  //      fixos legados do banco eram invisíveis pro mining porque nunca re-chamavam Details).
+  const cachedCls = classifyBrPhone(whatsappE164 ?? phoneE164);
+  const wantsMining = !verifiedAlready && (cachedCls === 'landline' || cachedCls === 'invalid');
+  const needsDetails = (!whatsappE164 && !phoneE164) || (wantsMining && !website);
+  if (needsDetails) {
+    if (!opts.allowDetails()) return 'budget'; // orçamento estourou — devolve pro backup (não é "sem número")
+    opts.onDetails();
+    const contact = await getPlaceContact(pharmacy.placeId);
+    if (!phoneE164) phoneE164 = toE164BR(contact.phone);
+    website = contact.website;
+    if (!whatsappE164) whatsappE164 = phoneE164;
+  }
+
+  // 3) Telefone fixo/sem número + site → minera o WhatsApp real (wa.me).
+  const currentCls = classifyBrPhone(whatsappE164 ?? phoneE164);
+  if (!verifiedAlready && (currentCls === 'landline' || currentCls === 'invalid') && website && opts.allowWame()) {
+    opts.onWame();
+    const html = await fetchWebsiteHtml(website);
+    const mined = extractWaMeNumber(html);
+    if (mined && !isPlaceholderPhone(mined) && !isServiceNumber(mined)) {
+      whatsappE164 = mined;
+      await writeLog('info', 'places', `⛏️ WhatsApp minerado do site de ${pharmacy.name}: ${classifyBrPhone(mined)}`, { traceId: opts.traceId });
+    }
+  }
+
+  // 4) Upsert no diretório (não sobrescreve telefone bom com null).
+  const upsertData: Record<string, unknown> = {
+    type: 'pharmacy', name: pharmacy.name, google_place_id: pharmacy.placeId,
+    address: pharmacy.address, city: pharmacy.city, state: pharmacy.state,
+    latitude: pharmacy.lat, longitude: pharmacy.lng, rating: pharmacy.rating,
+    reviews: pharmacy.userRatingCount, status: 'active',
+  };
+  if (phoneE164) upsertData['phone_e164'] = phoneE164;
+  if (whatsappE164) upsertData['whatsapp_e164'] = whatsappE164;
+  const { data: supplier } = await db.from('suppliers').upsert(upsertData, { onConflict: 'google_place_id' })
+    .select('id, whatsapp_e164, phone_e164, whatsapp_verified_at').single();
+  if (!supplier?.id) return null;
+
+  const contact = (supplier.whatsapp_e164 as string | null) || (supplier.phone_e164 as string | null);
+  if (!contact || isPlaceholderPhone(contact) || isServiceNumber(contact)) return null;
+
+  // Tier = probabilidade de conversa. SÓ sinais POSITIVOS/estruturais (verificada, tipo do
+  // número) — sem strikes (review 13/07: strike deduzido de silêncio/ack especulativo
+  // envenenaria o diretório; a seleção prioriza sozinha sem punir ninguém).
+  const verified = Boolean(supplier.whatsapp_verified_at);
+  const tier: EnrichedPharmacy['tier'] = verified ? 'verificada' : classifyBrPhone(contact) === 'mobile' ? 'celular' : 'fixo';
+  return { place: pharmacy, supplierId: supplier.id as string, contact, tier };
+}
+
+function scheduleTopUpCheck(orderId: string): void {
+  setTimeout(() => {
+    topUpIfDeadAir(orderId).catch((err) =>
+      writeLog('warn', 'places', `top-up check falhou (ignorado): ${String(err).slice(0, 120)}`, { orderId }),
+    );
+  }, PHARMACY_TOPUP_CHECK_MS);
+}
+
+/**
+ * TOP-UP ADITIVO (3min apos as aberturas). ADITIVO por design (review 13/07): NUNCA mata
+ * nem pune farmacia por silencio — o sinal de "sem WhatsApp" viria de um parser de status
+ * do zpro NAO-DOCUMENTADO + 3min e curto demais pra farmacia lenta (respondem em 15-60min).
+ * Punir/matar com base nisso envenenaria o diretorio em TODO pedido. Entao aqui so ADICIONA
+ * mais farmacias do backup quando o pedido esta em VACUO TOTAL (zero sinal de vida): nenhuma
+ * verificada e nenhuma resposta ainda. As originais seguem vivas (os timers de 45min cuidam
+ * delas). Verificacao POSITIVA (respondeu em alguma epoca) e carimbada de passagem.
+ */
+async function topUpIfDeadAir(orderId: string): Promise<void> {
+  const info = pharmacyBackups.get(orderId);
+  const now = Date.now();
+  // Limpeza oportunista de estados velhos (>1h) — o Map nao cresce sem fim.
+  for (const [k, v] of pharmacyBackups) if (now - v.createdAt > 60 * 60_000) pharmacyBackups.delete(k);
+  if (!info) return;
+
+  const { data: order } = await db.from('orders').select('status').eq('id', orderId).maybeSingle();
+  if (!order || order.status !== 'quoting') { pharmacyBackups.delete(orderId); return; }
+
+  // Ja tem PRECO? Entao ha vida — nao precisa top-up (e a consolidacao esta a caminho).
+  const { count: quotedCount } = await db.from('quotes')
+    .select('id', { count: 'exact', head: true })
+    .eq('order_id', orderId)
+    .in('status', ['quoted']);
+  if ((quotedCount ?? 0) > 0) { pharmacyBackups.delete(orderId); return; }
+
+  // Conta SINAIS DE VIDA nas cotacoes vivas: verificada (ack/resposta) OU respondeu agora.
+  const { data: quotes } = await db.from('quotes')
+    .select('id, conversation_id, supplier_id, suppliers(whatsapp_verified_at)')
+    .eq('order_id', orderId)
+    .in('status', ['pending', 'contacting', 'negotiating']);
+  let live = 0;
+  for (const q of quotes ?? []) {
+    const sup = q.suppliers as { whatsapp_verified_at?: string | null } | null;
+    if (sup?.whatsapp_verified_at) { live++; continue; }
+    const { count } = await db.from('messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('conversation_id', q.conversation_id)
+      .eq('direction', 'in');
+    if ((count ?? 0) > 0) {
+      live++;
+      void markSupplierVerifiedById(q.supplier_id as string).catch(() => { /* aprendizado */ });
+    }
+  }
+
+  // Vacuo total (zero vida) + ha backups → ADICIONA ate PHARMACY_MAX_TOPUP. Nao mata ninguem.
+  if (live === 0 && info.candidates.length) {
+    let added = 0;
+    for (let i = 0; i < PHARMACY_MAX_TOPUP; i++) {
+      const name = await launchNextBackup(orderId, info);
+      if (!name) break;
+      added++;
+    }
+    if (added) {
+      await writeLog('info', 'places', `Top-up: pedido em vacuo (0 sinais de vida em 3min) → +${added} farmacia(s) do backup (aditivo, nada removido)`, {
+        traceId: info.traceId, orderId,
+      });
+    }
+  }
+  pharmacyBackups.delete(orderId);
+}
+
+/** Lanca a proxima candidata VIAVEL do backup como cotacao NOVA (aditiva) do pedido. */
+async function launchNextBackup(orderId: string, info: PharmacyBackupState): Promise<string | null> {
+  let attempts = 0;
+  let wame = 0;
+  let details = 0;
+  while (info.candidates.length && attempts < 5) {
+    const candidate = info.candidates.shift()!;
+    attempts++;
+    // Re-le os JA cotados a cada tentativa (o launch anterior deste mesmo top-up adicionou
+    // um) pra nunca duplicar fornecedor/telefone dentro do pedido.
+    const { data: existing } = await db.from('quotes')
+      .select('supplier_id, suppliers(whatsapp_e164, phone_e164)')
+      .eq('order_id', orderId);
+    const usedSupplierIds = new Set((existing ?? []).map((q) => q.supplier_id as string));
+    const usedPhones = new Set(
+      (existing ?? []).map((q) => {
+        const s = q.suppliers as { whatsapp_e164?: string | null; phone_e164?: string | null } | null;
+        return ((s?.whatsapp_e164 || s?.phone_e164) ?? '').replace(/\D/g, '');
+      }).filter(Boolean),
+    );
+    let enriched: EnrichedPharmacy | 'budget' | null = null;
+    try {
+      enriched = await enrichPharmacyCandidate(candidate, {
+        traceId: info.traceId,
+        allowDetails: () => details < 3,
+        allowWame: () => wame < 1,
+        onDetails: () => { details++; },
+        onWame: () => { wame++; },
+      });
+    } catch { /* tenta a proxima */ }
+    if (!enriched || enriched === 'budget') continue;
+    if (usedSupplierIds.has(enriched.supplierId) || usedPhones.has(enriched.contact.replace(/\D/g, ''))) continue;
+    const { data: quote } = await db.from('quotes').insert({
+      order_id: orderId,
+      supplier_id: enriched.supplierId,
+      status: 'pending',
+      distance_km: enriched.place.distanceKm,
+    }).select('id').single();
+    if (!quote?.id) continue;
+    await db.from('suppliers').update({ last_contacted_at: new Date().toISOString() }).eq('id', enriched.supplierId);
+    setImmediate(() => {
+      initiatePharmacyNegotiation(
+        quote.id as string, orderId, info.items, info.userNeighborhood, info.paymentMethod,
+        info.userConversationId, info.userPhoneE164, info.traceId,
+      ).catch((err) => writeLog('error', 'places', `Top-up: negociacao falhou: ${String(err).slice(0, 120)}`, { traceId: info.traceId }));
+    });
+    return enriched.place.name;
+  }
+  return null;
+}
+
+
 async function startPharmacyDiscovery(
   orderId: string,
   lat: number,
@@ -972,57 +1201,89 @@ async function startPharmacyDiscovery(
   const isPreferred = (p: { name: string }) => preferredNorm.some((n) => norm(p.name).includes(n));
   const preferred = preferredNorm.length ? pharmacies.filter(isPreferred).sort(byDist) : [];
   const rest = pharmacies.filter((p) => !preferred.includes(p));
-  const independentes = rest.filter((p) => !isPharmacyChain(p.name)).sort(byDist);
-  const redes = rest.filter((p) => isPharmacyChain(p.name)).sort(byDist);
-  const top = [...preferred, ...independentes, ...redes].slice(0, Math.max(5, preferred.length));
-  await writeLog('info', 'places', `Seleção Top-${top.length}: ${independentes.length} independente(s) priorizada(s), ${redes.length} rede(s) ao fim`, {
+  // SELEÇÃO v2 (análise 12/07: celular responde 61%, fixo 8% — o Google dá o FIXO do balcão):
+  // abertas (open_now) antes das fechadas em cada grupo (o Google nos DIZ quem está aberta
+  // e isso era ignorado — pedido noturno contatou 15 fechadas); redes com CAP além de
+  // despriorizadas (fixo de loja de rede é quase sempre void — nunca mais 15 Drogasil).
+  const openTier = (arr: typeof pharmacies) => [...arr.filter((p) => p.isOpen !== false), ...arr.filter((p) => p.isOpen === false)];
+  const independentes = openTier(rest.filter((p) => !isPharmacyChain(p.name)).sort(byDist));
+  const redes = openTier(rest.filter((p) => isPharmacyChain(p.name)).sort(byDist));
+  const rankedAll = [...preferred, ...independentes, ...redes.slice(0, PHARMACY_CHAIN_CAP)];
+  await writeLog('info', 'places', `Seleção v2: ${independentes.length} independente(s), ${Math.min(redes.length, PHARMACY_CHAIN_CAP)}/${redes.length} rede(s) (cap ${PHARMACY_CHAIN_CAP})`, {
     traceId: ctx.traceId, orderId,
-    selecionadas: top.map((p) => `${p.name}${isPharmacyChain(p.name) ? ' [rede]' : ''}`),
+    candidatas: rankedAll.slice(0, 10).map((p) => `${p.name}${isPharmacyChain(p.name) ? ' [rede]' : ''}${p.isOpen === false ? ' [fechada]' : ''}`),
   });
+
   const quoteIds: string[] = [];
   let semTelefone = 0;
+  // Enriquece candidato a candidato até ter 5 VÁLIDAS (não 5 brutas): telefone real via
+  // Details (+ website no MESMO call/custo) e, quando o telefone é fixo, minera o WhatsApp
+  // verdadeiro do site (wa.me). Orçamentos limitam custo/latência por pedido.
+  let detailsCalls = 0;
+  let wameCalls = 0;
+  const usedPhones = new Set<string>();
+  const preferredPool: EnrichedPharmacy[] = []; // NOMEADA pelo usuário — SEMPRE no time (nunca cortada)
+  const slotPool: EnrichedPharmacy[] = [];      // verificada/celular — contata primeiro
+  const fixoPool: EnrichedPharmacy[] = [];      // fixo desconhecido — completa se faltar
+  const backupCandidates: PlaceResult[] = [];   // sobras → top-up (3min, aditivo)
+  const preferredSet = new Set(preferred);
 
-  for (const pharmacy of top) {
-    // 📞 Puxa o TELEFONE REAL via Place Details — a busca básica do Places NÃO traz
-    // telefone. Sem isto, a farmácia ficava sem número e o código fabricava um FAKE
-    // (+555500000<id>) → disparo pra número aleatório (incidente 2026-07-01). Mesmo
-    // padrão da clínica. Custa 1 request por farmácia (top-5) — aceitável.
-    let phoneE164: string | null = null;
-    try {
-      phoneE164 = toE164BR(await getPlacePhone(pharmacy.placeId));
-    } catch (err) {
-      await writeLog('warn', 'places', `Falha ao buscar telefone da farmácia ${pharmacy.name}: ${String(err).slice(0, 120)}`, { traceId: ctx.traceId });
+  for (const pharmacy of rankedAll) {
+    const isPref = preferredSet.has(pharmacy);
+    // Para de considerar quando o time (não-preferido) já encheu — MAS preferidas seguem
+    // sempre (o usuário pediu por nome). Cache-hit não gasta Details, então NÃO paramos por
+    // budget: o enrich devolve 'budget' quando PRECISARIA chamar o Google e não pode.
+    if (!isPref && slotPool.length + fixoPool.length >= PHARMACY_TARGET_SLOTS + 3) {
+      backupCandidates.push(pharmacy);
+      continue;
     }
+    let enriched: EnrichedPharmacy | 'budget' | null = null;
+    try {
+      enriched = await enrichPharmacyCandidate(pharmacy, {
+        traceId: ctx.traceId,
+        allowDetails: () => detailsCalls < PHARMACY_DETAILS_BUDGET,
+        allowWame: () => wameCalls < PHARMACY_WAME_BUDGET,
+        onDetails: () => { detailsCalls++; },
+        onWame: () => { wameCalls++; },
+      });
+    } catch (err) {
+      await writeLog('warn', 'places', `Falha ao enriquecer ${pharmacy.name}: ${String(err).slice(0, 120)}`, { traceId: ctx.traceId });
+    }
+    if (enriched === 'budget') { backupCandidates.push(pharmacy); continue; } // orçamento — pro backup, não é "sem número"
+    if (!enriched) { semTelefone++; continue; }
+    const phoneKey = enriched.contact.replace(/\D/g, '');
+    if (usedPhones.has(phoneKey)) continue; // mesmo número em 2 entradas = 1 contato só
+    usedPhones.add(phoneKey);
+    if (isPref) preferredPool.push(enriched);
+    else if (enriched.tier === 'verificada' || enriched.tier === 'celular') slotPool.push(enriched);
+    else fixoPool.push(enriched);
+  }
 
-    // Não sobrescreve um telefone já conhecido com null (se o Details falhar agora).
-    const upsertData: Record<string, unknown> = {
-      type: 'pharmacy', name: pharmacy.name, google_place_id: pharmacy.placeId,
-      address: pharmacy.address, city: pharmacy.city, state: pharmacy.state,
-      latitude: pharmacy.lat, longitude: pharmacy.lng, rating: pharmacy.rating,
-      reviews: pharmacy.userRatingCount, status: 'active',
-    };
-    if (phoneE164) { upsertData['phone_e164'] = phoneE164; upsertData['whatsapp_e164'] = phoneE164; }
+  // Time final: NOMEADAS sempre (mesmo fixas — o usuário pediu), depois verificadas/
+  // celulares, fixos completam. Cap = max(TARGET, nº de preferidas) pra nunca cortar nomeada.
+  const cap = Math.max(PHARMACY_TARGET_SLOTS, preferredPool.length);
+  const finalTeam = [...preferredPool, ...slotPool, ...fixoPool].slice(0, cap);
+  // Enriquecidas que sobraram viram backup de 1ª linha (telefone já resolvido no diretório).
+  for (const left of [...slotPool, ...fixoPool].slice(Math.max(0, cap - preferredPool.length))) {
+    if (!finalTeam.includes(left)) backupCandidates.push(left.place);
+  }
+  await writeLog('info', 'places', `Time final (${finalTeam.length}): ${finalTeam.map((e) => `${e.place.name} [${e.tier}]`).join(' · ') || 'nenhuma'} — ${detailsCalls} Details, ${wameCalls} site(s) minerado(s), ${backupCandidates.length} backup(s)`, {
+    traceId: ctx.traceId, orderId,
+  });
 
-    const { data: supplier } = await db.from('suppliers').upsert(upsertData, { onConflict: 'google_place_id' })
-      .select('id, whatsapp_e164, phone_e164').single();
-    if (!supplier?.id) continue;
-
-    // Só cria cotação (= só CONTATA) farmácia com telefone REAL. Sem número → fica no
-    // diretório mas NÃO é contatada. NUNCA fabricar número (ver isPlaceholderPhone).
-    const reachable = supplier.whatsapp_e164 || supplier.phone_e164;
-    // isServiceNumber: 4002/0800/3003 é call-center (caso Pague Menos 4002-8282) — não é
-    // WhatsApp de loja; cotar ali é jogar mensagem no void.
-    if (!reachable || isPlaceholderPhone(reachable) || isServiceNumber(reachable)) { semTelefone++; continue; }
-
+  for (const e of finalTeam) {
     const { data: quote } = await db.from('quotes').insert({
       order_id: orderId,
-      supplier_id: supplier.id,
+      supplier_id: e.supplierId,
       status: 'pending',
-      distance_km: pharmacy.distanceKm,
+      distance_km: e.place.distanceKm,
     }).select('id').single();
-
-    if (quote?.id) quoteIds.push(quote.id);
+    if (quote?.id) {
+      quoteIds.push(quote.id);
+      await db.from('suppliers').update({ last_contacted_at: new Date().toISOString() }).eq('id', e.supplierId);
+    }
   }
+
   if (semTelefone > 0) {
     await writeLog('warn', 'places', `${semTelefone} farmácia(s) sem telefone no Places — NÃO contatadas (nunca fabricar número)`, { traceId: ctx.traceId, orderId });
   }
@@ -1043,21 +1304,44 @@ async function startPharmacyDiscovery(
 
   await writeLog('info', 'order', `${quoteIds.length} cotações criadas para o pedido — iniciando negociações`, {
     traceId: ctx.traceId, orderId,
-    farmácias: top.map((p, i) => `${i + 1}. ${p.name} (${p.distanceKm?.toFixed(2)}km)`),
+    farmácias: finalTeam.map((e, i) => `${i + 1}. ${e.place.name} [${e.tier}] (${e.place.distanceKm?.toFixed(2)}km)`),
   });
 
-  // Notifica o usuário que farmácias foram encontradas e contatos iniciaram
+  // Notifica o usuário — com HONESTIDADE NOTURNA: se a maioria das escolhidas está
+  // fechada agora (open_now), avisa que a resposta vem quando abrirem (senão ele fica
+  // esperando resposta de loja fechada, caso Glauber 22h).
+  const openKnown = finalTeam.filter((e) => e.place.isOpen !== undefined);
+  const allClosed = openKnown.length >= 3 && openKnown.every((e) => e.place.isOpen === false);
+  const nightNote = allClosed
+    ? ' Ah, esse horário a maioria já tá fechada — deixei a mensagem lá e assim que abrirem elas costumam responder cedinho, tá?'
+    : '';
   await sendOutbound(
     ctx.conversationId,
     ctx.phoneE164,
-    `Achei ${quoteIds.length} farmácia${quoteIds.length > 1 ? 's' : ''} aqui na sua região e já entrei em contato com ${quoteIds.length > 1 ? 'elas' : 'ela'} ✨ assim que chegarem as respostas eu te aviso na hora.`,
+    `Achei ${quoteIds.length} farmácia${quoteIds.length > 1 ? 's' : ''} aqui na sua região e já entrei em contato com ${quoteIds.length > 1 ? 'elas' : 'ela'} ✨ assim que chegarem as respostas eu te aviso na hora.${nightNote}`,
     ctx.traceId,
   );
 
   // Setor/bairro real do usuário pra passar pra farmácia (não a cidade da farmácia em si).
   const userNeighborhood =
     extractDeliverySector(deliveryAddress) ||
-    (top[0]?.city ? `${top[0].city}` : `lat ${lat.toFixed(4)}, lng ${lng.toFixed(4)}`);
+    (finalTeam[0]?.place.city ? `${finalTeam[0].place.city}` : `lat ${lat.toFixed(4)}, lng ${lng.toFixed(4)}`);
+
+  // Guarda os backups pra TOP-UP ADITIVO: se em ~3min o pedido estiver em VÁCUO TOTAL
+  // (zero sinal de vida), adiciona mais farmácias do backup — sem NUNCA matar nem punir
+  // as originais (elas podem responder em 15-60min). Estado local (single-instance, como o
+  // debounce; deploy no meio só pula o top-up daquele pedido).
+  pharmacyBackups.set(orderId, {
+    candidates: backupCandidates,
+    items,
+    userNeighborhood,
+    paymentMethod,
+    userConversationId: ctx.conversationId,
+    userPhoneE164: ctx.phoneE164,
+    traceId: ctx.traceId,
+    createdAt: Date.now(),
+  });
+  scheduleTopUpCheck(orderId);
 
   // Initiate negotiations staggered by 2s each to avoid hammering the LLM
   for (let i = 0; i < quoteIds.length; i++) {

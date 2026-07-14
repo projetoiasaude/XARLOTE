@@ -633,6 +633,52 @@ export function isServiceNumber(phone: string | null | undefined): boolean {
 }
 
 /**
+ * Classe de um telefone BR pra fins de WhatsApp (análise 12/07: CELULAR responde 61%,
+ * FIXO 8% — o Google Places devolve o FIXO do balcão, que raramente tem WhatsApp).
+ *   mobile   = DDD + 9 dígitos começando em 9 (WhatsApp provável)
+ *   landline = DDD + 8 dígitos começando em 2-5 (WhatsApp raro)
+ *   service  = 4002/4004/4020/3003/0800/0300 (call-center — nunca é WhatsApp de loja)
+ *   invalid  = curto/estranho demais pra confiar
+ */
+export function classifyBrPhone(phone: string | null | undefined): 'mobile' | 'landline' | 'service' | 'invalid' {
+  if (!phone) return 'invalid';
+  if (isServiceNumber(phone)) return 'service';
+  const d = phone.replace(/\D/g, '');
+  const local = d.startsWith('55') ? d.slice(2) : d;
+  if (local.length < 10 || local.length > 11) return 'invalid';
+  const subscriber = local.slice(2);
+  if (subscriber.length === 9 && subscriber.startsWith('9')) return 'mobile';
+  if (subscriber.length === 8 && /^[2-5]/.test(subscriber)) return 'landline';
+  return 'invalid';
+}
+
+/**
+ * Minera um número de WhatsApp REAL (link wa.me / api.whatsapp.com) do HTML de um site.
+ * Farmácia quase nunca publica o celular no Google — mas publica o botão de WhatsApp no
+ * site/bio. Aceita só números BR plausíveis; devolve E.164 ou null. Conservador: nada de
+ * chutar DDI — só links com 55 explícito ou 10-11 dígitos locais (assume BR +55).
+ */
+export function extractWaMeNumber(html: string | null | undefined): string | null {
+  if (!html) return null;
+  const s = String(html);
+  const candidates: string[] = [];
+  // wa.me/5562999999999 | wa.me/+55... | whatsapp://send?phone=...
+  for (const m of s.matchAll(/wa\.me\/(?:\+|%2B)?(\d{10,15})/gi)) candidates.push(m[1]!);
+  for (const m of s.matchAll(/(?:api\.whatsapp\.com\/send|whatsapp:\/\/send)[^"'\s>]*?phone=(?:\+|%2B)?(\d{10,15})/gi)) candidates.push(m[1]!);
+  for (const raw of candidates) {
+    let d = raw;
+    if (!d.startsWith('55') && (d.length === 10 || d.length === 11)) d = `55${d}`; // local BR sem DDI
+    if (!d.startsWith('55')) continue; // DDI estrangeiro — fora
+    const local = d.slice(2);
+    if (local.length < 10 || local.length > 11) continue;
+    const e164 = `+${d}`;
+    const cls = classifyBrPhone(e164);
+    if (cls === 'mobile' || cls === 'landline') return e164; // fixo com WA Business existe — aceita
+  }
+  return null;
+}
+
+/**
  * Janela de PÓS-VENDA (modo isOrderConfirmation): por quanto tempo depois do fechamento
  * a Xarlote ainda processa mensagem da farmácia como logística do pedido (relay ao
  * cliente, "procura quem?", "cheguei"). Fora da janela a mensagem é logada e ignorada

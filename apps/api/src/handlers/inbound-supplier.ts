@@ -19,6 +19,7 @@ import { sendOutbound } from './outbound.js';
 import { consolidateQuotes, notifyUserQuoteArrived, notifyBetterQuoteIfPresented } from './quote-consolidation.js';
 import { relaySupplierQuestionToUser } from './clarification.js';
 import { templatesEnabled, pharmacyColdOpen } from '../config/template-registry.js';
+import { markSupplierVerifiedById } from './supplier-directory.js';
 
 /**
  * Extrai "Rua/Avenida X, Setor Y" do endereço completo (Nominatim/ViaCEP / Google reverse).
@@ -186,6 +187,12 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
   if (!conv) {
     await writeLog('warn', 'supplier', 'Conversa não encontrada', { traceId, conversationId });
     return;
+  }
+
+  // 📬 Verificação POSITIVA do diretório: a farmácia RESPONDEU → esse número tem
+  // WhatsApp de verdade (sinal mais forte que o ack de entrega). Fire-and-forget.
+  if (conv.supplier_id) {
+    void markSupplierVerifiedById(conv.supplier_id as string).catch(() => { /* bônus */ });
   }
 
   // 3. Find the active quote — prefer lookup by conversation_id (most precise).

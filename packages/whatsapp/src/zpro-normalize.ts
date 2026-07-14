@@ -154,6 +154,48 @@ export function isZproStatusEcho(payload: unknown): boolean {
   return !!method && !['message', 'messages', 'message_received', 'onmessage'].includes(method);
 }
 
+export interface ZproDeliverySignal {
+  /** Telefone do DESTINATÁRIO da nossa mensagem (E.164 sem garantia de 9º dígito). */
+  phoneE164: string;
+  /** positivo = a mensagem CHEGOU no aparelho (delivered/read/played/ack>=2). */
+  kind: 'delivered' | 'read' | 'sent';
+}
+
+/**
+ * Extrai o SINAL DE ENTREGA de um callback de status do zpro (análise 12/07: 39% das
+ * cotações iam pra número FIXO sem WhatsApp e a mensagem nunca chegava — e este webhook,
+ * que PROVA quem tem WhatsApp de verdade, era descartado). delivered/read/played ou
+ * ack>=2 = o número TEM WhatsApp (verificação positiva do diretório de farmácias).
+ * 'sent'/ack=1 = só aceito pelo servidor (não prova nada). Shape do zpro é
+ * não-documentado → chaves candidatas, mesmo espírito do normalizador.
+ */
+export function extractZproDeliverySignal(payload: unknown): ZproDeliverySignal | null {
+  if (!payload || typeof payload !== 'object') return null;
+
+  // Status textual OU ack numérico (padrão WhatsApp: 1=servidor, 2=entregue, 3=lido, 4=tocado)
+  const status = (pickStr(payload, ['msg.status', 'status', 'data.status']) ?? '').toLowerCase();
+  const ack = pickNum(payload, ['msg.ack', 'ack', 'data.ack']);
+  let kind: ZproDeliverySignal['kind'] | null = null;
+  if (['delivered', 'received'].includes(status) || ack === 2) kind = 'delivered';
+  else if (['read', 'played'].includes(status) || (ack != null && ack >= 3)) kind = 'read';
+  else if (['sent', 'sended'].includes(status) || ack === 1) kind = 'sent';
+  if (!kind) return null;
+
+  // Destinatário: em status de mensagem NOSSA, o contato da conversa é o destinatário.
+  // Tenta 'to' primeiro (semanticamente exato), depois o contato do ticket/conversa.
+  const to = pickStr(payload, [
+    'msg.to', 'to', 'data.to',
+    'msg.chatId', 'chatId', 'data.chatId',
+    'ticket.contact.number', 'contact.number',
+    'msg.remoteJid', 'key.remoteJid', 'remoteJid', 'data.key.remoteJid',
+  ]);
+  if (!to) return null;
+  const digits = to.replace(/@.*$/, '').replace(/\D/g, '');
+  if (digits.length < 10) return null;
+
+  return { phoneE164: toE164(digits), kind };
+}
+
 export function normalizeZproWebhook(
   payload: unknown,
   instance: string,

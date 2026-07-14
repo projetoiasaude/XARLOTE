@@ -79,6 +79,27 @@ export function templatesEnabled(): boolean {
   return process.env['WHATSAPP_TEMPLATES_ENABLED'] === 'true';
 }
 
+// ─── Re-engajamento do USUÁRIO fora da janela 24h (incidente Elizabet 13/07) ──
+// Na perna oficial, texto livre fora de 24h é rejeitado pela Meta → lembrete a usuário
+// mudo nunca chega. Este HSM (patient-facing) reabre a conversa. ⚠️ PRECISA SER APROVADO
+// NA META e ligado via ZPRO_TEMPLATE_REENGAGE_APPROVED=true. Corpo a submeter (pt_BR, 1 var):
+//   "Oi {{1}}! Aqui é a Xarlote, sua assistente de saúde. Tenho um lembrete de saúde
+//    importante pra te passar. É só me responder por aqui que eu te envio na hora. Cuida bem! 💙"
+export function reengageTemplateEnabled(): boolean {
+  return process.env['ZPRO_TEMPLATE_REENGAGE_APPROVED'] === 'true';
+}
+
+export function buildReengageTemplate(firstName: string): { name: string; language: string; variables: string[]; text: string } {
+  const nome = (firstName || 'tudo bem').replace(/\s+/g, ' ').trim().slice(0, 60) || 'tudo bem';
+  const text = `Oi ${nome}! Aqui é a Xarlote, sua assistente de saúde. Tenho um lembrete de saúde importante pra te passar. É só me responder por aqui que eu te envio na hora. Cuida bem! 💙`;
+  return {
+    name: process.env['ZPRO_TEMPLATE_REENGAGE']?.trim() || 'reengajamento_lembrete',
+    language: templateLanguage(),
+    variables: [nome],
+    text,
+  };
+}
+
 /** cotacao_medicamento já foi aprovado na Meta? (até lá, farmácia usa o coringa). */
 export function pharmacyTemplateApproved(): boolean {
   return process.env['ZPRO_TEMPLATE_COTACAO_APPROVED'] === 'true';

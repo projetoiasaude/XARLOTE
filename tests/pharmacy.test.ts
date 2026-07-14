@@ -18,6 +18,8 @@ import {
   humanizeSupplierText,
   postSaleWindowExpired,
   POST_SALE_WINDOW_MS,
+  classifyBrPhone,
+  extractWaMeNumber,
   type QuoteOption,
   type SupplierCandidate,
 } from '../packages/shared/src/pharmacy.js';
@@ -655,5 +657,54 @@ describe('postSaleWindowExpired (incidente Vadivino-2 09/07 — guard não pode 
   });
   it('caso Vadivino literal: fechado 08/07 16:00Z, farmácia escreve 09/07 10:23Z → processa', () => {
     expect(postSaleWindowExpired('2026-07-08T16:00:17.991+00:00', '2026-07-08T14:55:00.692+00:00', now)).toBe(false);
+  });
+});
+
+describe('classifyBrPhone (análise 12/07 — celular responde 61%, fixo 8%)', () => {
+  it('celular: DDD + 9 dígitos começando em 9', () => {
+    expect(classifyBrPhone('+5562996075959')).toBe('mobile'); // Extra Mais (respondeu!)
+    expect(classifyBrPhone('+5562992314783')).toBe('mobile'); // Portal Pharma (respondeu!)
+    expect(classifyBrPhone('5562998539026')).toBe('mobile');
+  });
+  it('fixo: DDD + 8 dígitos começando em 2-5', () => {
+    expect(classifyBrPhone('+556235972377')).toBe('landline'); // Drogamil (timeout)
+    expect(classifyBrPhone('+556236700085')).toBe('landline'); // Drogaria Vitória (timeout)
+    expect(classifyBrPhone('+551143210000')).toBe('landline');
+  });
+  it('call-center: 4002/0800/3003', () => {
+    expect(classifyBrPhone('+555540028282')).toBe('service'); // Pague Menos nacional
+    expect(classifyBrPhone('08001234567')).toBe('service');
+  });
+  it('inválidos: curto, vazio, null, comprimento errado', () => {
+    expect(classifyBrPhone('+55629')).toBe('invalid');
+    expect(classifyBrPhone('')).toBe('invalid');
+    expect(classifyBrPhone(null)).toBe('invalid');
+    expect(classifyBrPhone('+55629960759590')).toBe('invalid'); // 12 dígitos locais
+  });
+});
+
+describe('extractWaMeNumber (minera o WhatsApp real do site da farmácia)', () => {
+  it('wa.me com DDI 55', () => {
+    expect(extractWaMeNumber('<a href="https://wa.me/5562996075959?text=oi">Zap</a>')).toBe('+5562996075959');
+  });
+  it('wa.me com + / %2B', () => {
+    expect(extractWaMeNumber('href="https://wa.me/+5562996075959"')).toBe('+5562996075959');
+    expect(extractWaMeNumber('href="https://wa.me/%2B5562996075959"')).toBe('+5562996075959');
+  });
+  it('api.whatsapp.com/send?phone= e whatsapp://send', () => {
+    expect(extractWaMeNumber('https://api.whatsapp.com/send?phone=5562996075959&text=ola')).toBe('+5562996075959');
+    expect(extractWaMeNumber("window.open('whatsapp://send?phone=5562996075959')")).toBe('+5562996075959');
+  });
+  it('número local sem DDI (10-11 dígitos) assume BR', () => {
+    expect(extractWaMeNumber('wa.me/62996075959')).toBe('+5562996075959');
+  });
+  it('fixo com WhatsApp Business no wa.me é aceito', () => {
+    expect(extractWaMeNumber('wa.me/556235972377')).toBe('+556235972377');
+  });
+  it('DDI estrangeiro / lixo / sem link → null', () => {
+    expect(extractWaMeNumber('wa.me/14155552671')).toBe(null); // US 11 dígitos sem 55 → vira 55+14155552671? não: 11 dígitos vira 55… cuidado
+    expect(extractWaMeNumber('<html>farmácia boa, ligue 3597-2377</html>')).toBe(null);
+    expect(extractWaMeNumber('')).toBe(null);
+    expect(extractWaMeNumber(null)).toBe(null);
   });
 });

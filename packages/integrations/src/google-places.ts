@@ -253,6 +253,70 @@ export async function findPlacesByTextSearch(query: string, limit = 5): Promise<
   });
 }
 
+export interface PlaceContact {
+  phone: string | null;
+  website: string | null;
+}
+
+/**
+ * Telefone + WEBSITE num único Place Details (mesmo SKU "Contact Data" — o website vem
+ * de graça no call que já pagávamos só pelo telefone). O website é a porta pro WhatsApp
+ * REAL da farmácia (link wa.me no site/bio), já que o telefone do Google é quase sempre
+ * o FIXO do balcão (análise 12/07: fixo responde 8%, celular 61%).
+ */
+export async function getPlaceContact(placeId: string): Promise<PlaceContact> {
+  const res = await axios.get(PLACE_DETAILS, {
+    params: {
+      place_id: placeId,
+      fields: 'formatted_phone_number,international_phone_number,website',
+      key: getKey(),
+      language: 'pt-BR',
+    },
+    timeout: 10_000,
+  });
+  const r = res.data?.result ?? {};
+  return {
+    phone: (r.international_phone_number as string) ?? (r.formatted_phone_number as string) ?? null,
+    website: (r.website as string) ?? null,
+  };
+}
+
+/**
+ * Busca o HTML do site da farmácia procurando link de WhatsApp (wa.me). Guardas: só
+ * http(s), 1 request, timeout curto, lê no máx ~400KB. Falha = null (nunca quebra o
+ * discovery — o site é bônus, não dependência).
+ */
+export async function fetchWebsiteHtml(url: string, timeoutMs = 6_000): Promise<string | null> {
+  try {
+    if (!/^https?:\/\//i.test(url)) return null;
+    // Anti-SSRF: nunca busca host interno/IP literal (o website vem do Google, mas o
+    // conteúdo do cadastro é de terceiros — defesa em profundidade).
+    const host = new URL(url).hostname.toLowerCase();
+    if (
+      host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')
+      || /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':')
+    ) return null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, {
+        signal: controller.signal,
+        redirect: 'follow',
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; IAdaSaude/1.0)' },
+      });
+      if (!res.ok) return null;
+      const ct = res.headers.get('content-type') ?? '';
+      if (ct && !/text\/html|text\/plain|application\/xhtml/i.test(ct)) return null;
+      const text = await res.text();
+      return text.slice(0, 400_000);
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
+
 /** Fetch phone number for a place (requires an extra Detail call). */
 export async function getPlacePhone(placeId: string): Promise<string | null> {
   try {

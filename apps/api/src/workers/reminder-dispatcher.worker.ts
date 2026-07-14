@@ -14,11 +14,38 @@
  * (contrato com a LLM) — ver packages/shared/src/rrule.ts.
  */
 import { db, writeEvent, writeLog, listDeviceTokens, deleteDeviceTokens } from '@iasaude/db';
-import { isSimulatorMode } from '@iasaude/whatsapp';
-import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBody } from '@iasaude/shared';
+import { isSimulatorMode, providerFor } from '@iasaude/whatsapp';
+import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBody, isWabaWindowOpen } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
+import { reengageTemplateEnabled, buildReengageTemplate } from '../config/template-registry.js';
+
+/** A perna do usuário (SARA) é WhatsApp oficial (zpro) → a janela de 24h se aplica? */
+function saraNeedsWabaWindow(): boolean {
+  return providerFor(SARA_INSTANCE) === 'zpro';
+}
+
+/**
+ * Timestamp (ms) do último inbound REAL DO WHATSAPP do usuário, ou null. Exclui mensagens
+ * sintéticas (app nativo /app/inbound e simulador — external_id 'sim-*'): elas NÃO abrem a
+ * janela de 24h da Meta (nunca tocaram o WhatsApp). Contá-las reabriria falsamente a janela
+ * → texto livre rejeitado marcado como entregue (a mentira que este fix elimina). Review 13/07.
+ */
+async function lastUserInboundMs(conversationId: string): Promise<number | null> {
+  const { data } = await db
+    .from('messages')
+    .select('created_at, external_id')
+    .eq('conversation_id', conversationId)
+    .eq('direction', 'in')
+    .order('created_at', { ascending: false })
+    .limit(10);
+  const real = (data ?? []).find((m) => {
+    const ext = (m.external_id as string | null) ?? '';
+    return !ext.startsWith('sim-'); // sintético (app/simulador) não abre a janela WhatsApp
+  });
+  return real?.created_at ? new Date(real.created_at as string).getTime() : null;
+}
 
 interface DueReminder {
   id: string;
@@ -245,14 +272,50 @@ export async function dispatchReminders(): Promise<void> {
       await db.from('conversations').update({ last_message_at: now.toISOString() }).eq('id', conv.id);
     }
 
+    // 🚪 JANELA WABA (incidente Elizabet 13/07): na perna oficial (zpro), texto livre fora
+    // de 24h da última msg do usuário é REJEITADO pela Meta. Antes o dispatcher mandava
+    // assim mesmo → a Meta descartava e o lembrete era marcado 'sent' sem chegar. Agora:
+    // dentro da janela → texto livre; fora → template de re-engajamento (se aprovado) OU
+    // nada por WhatsApp (o push + espelho no app cobrem quem tem app), e o não-entregue é
+    // registrado com HONESTIDADE (evento + warn) pra ser visível/acionável.
+    const needsWindow = !isSimulatorMode() && saraNeedsWabaWindow();
+    let windowOpen = !needsWindow; // uazapi/simulador: canal sem restrição de janela
+    if (needsWindow) {
+      if (!conv) {
+        // Sem conversa WhatsApp localizada → o usuário nunca falou por lá → janela FECHADA
+        // (fail-safe: melhor template/suppress do que texto livre que a Meta rejeita).
+        windowOpen = false;
+      } else {
+        const lastIn = await lastUserInboundMs(conv.id);
+        windowOpen = isWabaWindowOpen(lastIn, now.getTime());
+      }
+    }
+
     // 3. WhatsApp real, SEMPRE pela fila (rate-limit anti-ban).
+    let whatsappDelivered = false;
     if (!isSimulatorMode()) {
-      await dispatchOutbound({
-        kind: 'text',
-        instance: SARA_INSTANCE,
-        phoneE164: user.phone_e164,
-        text: msg,
-      });
+      if (windowOpen) {
+        await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: msg });
+        whatsappDelivered = true;
+      } else if (reengageTemplateEnabled()) {
+        // Fora da janela + template de re-engajamento aprovado: abre a conversa com um HSM
+        // (Meta aceita template fora de 24h). O corpo do lembrete continua no espelho/app;
+        // quando o usuário responder, a janela reabre.
+        const tpl = buildReengageTemplate(name.split(' ')[0] ?? name);
+        await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text });
+        whatsappDelivered = true;
+        await writeLog('info', 'reminder', `fora da janela 24h → template de re-engajamento enviado ("${reminder.title}")`, {});
+      } else {
+        // Fora da janela e sem template aprovado: NÃO queima texto livre (a Meta rejeitaria).
+        // Honestidade: registra o não-entregue por WhatsApp — visível pro fundador agir.
+        await writeLog('warn', 'reminder', `lembrete "${reminder.title}" NÃO entregue por WhatsApp — janela de 24h fechada (usuário mudo) e sem template de re-engajamento aprovado`, {});
+        void writeEvent({
+          eventName: 'reminder.wa_window_closed',
+          userId: reminder.user_id,
+          conversationId: conv?.id,
+          payload: { reminder_id: reminder.id, type: reminder.type },
+        });
+      }
     }
 
     // 4. Push pro app nativo (acorda mesmo com o app fechado). No-op se FCM
@@ -284,6 +347,8 @@ export async function dispatchReminders(): Promise<void> {
         recurring: Boolean(reminder.rrule),
         next_run_at: next?.toISOString() ?? null,
         mirrored_to_app: Boolean(conv),
+        whatsapp_delivered: whatsappDelivered,
+        window_open: windowOpen,
       },
     });
 
@@ -324,10 +389,18 @@ export async function dispatchReminders(): Promise<void> {
             await db.from('messages').insert({
               conversation_id: conv.id, direction: 'out', sender_role: 'assistant', content_type: 'text', content: checkin,
             });
+            // IRONIA da janela (incidente Elizabet): o check-in é EXATAMENTE pra quem está
+            // mudo 5+ dias → SEMPRE fora da janela de 24h. Texto livre não chega. Fora da
+            // janela usa o template de re-engajamento (se aprovado); senão só espelha no app.
             if (!isSimulatorMode()) {
-              await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: checkin });
+              if (!needsWindow || windowOpen) {
+                await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: checkin });
+              } else if (reengageTemplateEnabled()) {
+                const tpl = buildReengageTemplate(firstName ?? '');
+                await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text });
+              }
             }
-            await writeLog('info', 'reminder', `check-in de re-engajamento enviado (mudo há ${Math.round(silentMs / 86_400_000)}d recebendo lembretes)`, {});
+            await writeLog('info', 'reminder', `check-in de re-engajamento (mudo há ${Math.round(silentMs / 86_400_000)}d) — ${(!needsWindow || windowOpen) ? 'texto livre' : reengageTemplateEnabled() ? 'template' : 'só app (janela fechada, sem template)'}`, {});
             void writeEvent({ eventName: 'reminder.reengage_checkin', userId: reminder.user_id, conversationId: conv.id, payload: { silent_days: Math.round(silentMs / 86_400_000) } });
           }
         }

@@ -1,9 +1,10 @@
 import { randomUUID } from 'crypto';
 import type { FastifyInstance } from 'fastify';
-import { normalizeZproWebhook, zproEventId, isZproStatusEcho } from '@iasaude/whatsapp';
+import { normalizeZproWebhook, zproEventId, isZproStatusEcho, extractZproDeliverySignal } from '@iasaude/whatsapp';
 import { db, writeLog, redactPII } from '@iasaude/db';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { processInboundSupplierFromWebhook } from '../handlers/inbound-supplier.js';
+import { recordSupplierWaDelivery } from '../handlers/supplier-directory.js';
 import { AGENT_INSTANCE, SARA_INSTANCE, whatsappJidVariants } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { checkUserRateLimit } from '../middleware/rate-limit.js';
@@ -117,9 +118,20 @@ export async function webhookZproRoute(app: FastifyInstance) {
       }
 
       if (!normalized) {
-        // Callback de status/echo (entrega/leitura da própria mensagem): ignora
-        // em SILÊNCIO — todo envio gera um, não pode virar ruído de warn.
+        // Callback de status/echo (entrega/leitura da própria mensagem). Antes era
+        // descartado em silêncio — mas ele PROVA quem tem WhatsApp de verdade (análise
+        // 12/07: 39% das cotações iam pra fixo sem WhatsApp e ninguém sabia). Agora o
+        // sinal de ENTREGA alimenta o diretório de fornecedores (fire-and-forget; a
+        // resposta ao zpro não espera o banco).
         if (isZproStatusEcho(body)) {
+          const sig = extractZproDeliverySignal(body);
+          if (sig && (sig.kind === 'delivered' || sig.kind === 'read')) {
+            setImmediate(() =>
+              recordSupplierWaDelivery(sig.phoneE164, sig.kind as 'delivered' | 'read', traceId).catch(() => {
+                /* verificação é bônus — nunca pode derrubar o webhook */
+              }),
+            );
+          }
           return reply.send({ ok: true, skipped: 'status_echo' });
         }
         // Mensagem de verdade que não normalizou: registra o shape redatado
