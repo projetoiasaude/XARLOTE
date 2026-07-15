@@ -12,6 +12,7 @@
 import { activeNetworks, type PlatformNetwork } from './registry.js';
 import { rankProductMatches } from './matching.js';
 import { searchVtexProducts, simulateVtexByCep, buildVtexCartLink, buildVtexCartLinkMulti, simulateVtexBasket, onlyDigits, type BasketItem } from './vtex.js';
+import { quoteRDProduct, zenrowsConfigured } from './rd-adapter.js';
 import type { PlatformQuote, PlatformProduct, PlatformBasketQuote, PlatformBasketLine } from './types.js';
 
 export * from './types.js';
@@ -35,6 +36,7 @@ export {
   extractStrengths,
   normalize as normalizeMedName,
 } from './matching.js';
+export { quoteRDProduct, zenrowsConfigured, parseRDSearch, parseRDPrice, extractNextData } from './rd-adapter.js';
 
 /**
  * Envelopa o link de checkout num deeplink de AFILIADO, se configurado por env
@@ -186,12 +188,72 @@ export async function quotePlatforms(
 export interface BasketRequestItem { query: string; label: string; qty?: number }
 
 /** Cota TODOS os itens numa rede, monta 1 carrinho com o que ela tem e lista o que falta. */
+/** Corta uma promessa lenta num teto de tempo. A RD via ZenRows pode demorar (~3-8s/request) e
+ * NÃO pode segurar o pool das 10 VTEX rápidas (~1-2s) além disso (review MEDIUM). O trabalho
+ * segue em background populando o cache da RD pra próxima cotação. */
+async function withDeadline<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const guard = new Promise<T>((resolve) => { timer = setTimeout(() => resolve(fallback), ms); });
+  try { return await Promise.race([work, guard]); } finally { if (timer) clearTimeout(timer); }
+}
+
+const RD_DEADLINE_MS = 13000;
+const RD_REQUEST_TIMEOUT_MS = 8000;
+
+/**
+ * Cesta na RD (Drogasil/Raia/Onofre) via ZenRows — a RD não tem REST/simulação por CEP: usa o
+ * adaptador (busca+preço renderizados). Preço padrão da rede (não por CEP); cada remédio ganha
+ * o link próprio (a RD não monta carrinho multi-sku). Itens em paralelo, com teto de tempo pra
+ * não atrasar as VTEX. Sem ZenRows → null.
+ */
+async function quoteBasketRD(
+  net: PlatformNetwork,
+  items: BasketRequestItem[],
+  opts: QuotePlatformsOptions,
+): Promise<PlatformBasketQuote | null> {
+  if (!zenrowsConfigured()) return null;
+  return withDeadline(quoteBasketRDInner(net, items, opts), RD_DEADLINE_MS, null);
+}
+
+async function quoteBasketRDInner(
+  net: PlatformNetwork,
+  items: BasketRequestItem[],
+  opts: QuotePlatformsOptions,
+): Promise<PlatformBasketQuote | null> {
+  const timeoutMs = Math.min(opts.timeoutMs ?? RD_REQUEST_TIMEOUT_MS, RD_REQUEST_TIMEOUT_MS);
+  const settled = await Promise.all(items.map(async (req) => {
+    try { return { req, product: await quoteRDProduct(net, req.query, { timeoutMs, minScore: opts.minScore }) }; }
+    catch { return { req, product: null as PlatformProduct | null }; }
+  }));
+  const found = settled.filter((r) => r.product);
+  const missing = settled.filter((r) => !r.product).map((r) => r.req.label);
+  if (!found.length) return null;
+
+  // A RD não monta carrinho multi-sku → cada remédio ganha o link PRÓPRIO (productUrl na linha).
+  // Sem isso, um pedido de 2 remédios mostraria o total dos 2 mas só o link do 1º, e o 2º
+  // sumiria silenciosamente (review HIGH — perigoso em saúde).
+  const lines: PlatformBasketLine[] = found.map((f) => ({
+    requested: f.req.label, productName: f.product!.productName, sku: f.product!.sku,
+    sellerId: '1', price: f.product!.price, qty: Math.max(1, f.req.qty ?? 1), matchScore: 1,
+    productUrl: affiliateWrap(net.id, f.product!.productUrl),
+  }));
+  const total = lines.reduce((s, l) => s + l.price * l.qty, 0);
+  return {
+    network: net.id, networkLabel: net.label, group: net.group,
+    lines, missing, total, available: true,
+    delivery: null, pickup: null, // RD: preço padrão, CEP/entrega confirmados no site (handoff)
+    checkoutUrl: lines[0]!.productUrl!, // fallback (cesta de 1 item); multi-item usa o link por linha
+    pricedByCep: false,
+  };
+}
+
 async function quoteBasketOneNetwork(
   net: PlatformNetwork,
   items: BasketRequestItem[],
   cep8: string,
   opts: QuotePlatformsOptions,
 ): Promise<PlatformBasketQuote | null> {
+  if (net.access === 'akamai') return quoteBasketRD(net, items, opts);
   if (net.access !== 'rest') return null;
 
   // 1) casa cada item na rede; item sem match vai pra `missing`.

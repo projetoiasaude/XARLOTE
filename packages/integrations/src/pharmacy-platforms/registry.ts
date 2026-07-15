@@ -39,8 +39,9 @@ export const PLATFORM_REGISTRY: readonly PlatformNetwork[] = [
   { id: 'catarinense', label: 'Drogaria Catarinense', host: 'https://www.drogariacatarinense.com.br', salesChannel: '1', access: 'rest', group: 'Catarinense', enabled: true },
   { id: 'indiana', label: 'Farmácia Indiana', host: 'https://www.farmaciaindiana.com.br', salesChannel: '1', access: 'rest', group: 'Indiana', enabled: true },
 
-  // ── Grupo B: Akamai (fase 2 — anti-WAF via proxy pago) ──
-  { id: 'drogasil', label: 'Drogasil', host: 'https://www.drogasil.com.br', salesChannel: '1', access: 'akamai', group: 'RD', enabled: false },
+  // ── Grupo B: Akamai — via proxy ZenRows (rd-adapter). Drogasil é o REPRESENTANTE do grupo
+  // RD (Raia/Onofre têm o mesmo catálogo/preço → ficam off pra não gastar crédito à toa). ──
+  { id: 'drogasil', label: 'Drogasil', host: 'https://www.drogasil.com.br', salesChannel: '1', access: 'akamai', group: 'RD', enabled: true },
   { id: 'droga-raia', label: 'Droga Raia', host: 'https://www.drogaraia.com.br', salesChannel: '1', access: 'akamai', group: 'RD', enabled: false },
   { id: 'araujo', label: 'Drogaria Araujo', host: 'https://www.araujo.com.br', salesChannel: '1', access: 'akamai', group: 'Araujo', enabled: false },
   { id: 'onofre', label: 'Onofre', host: 'https://www.onofre.com.br', salesChannel: '1', access: 'akamai', group: 'RD', enabled: false },
@@ -62,5 +63,7 @@ export function activeNetworks(): PlatformNetwork[] {
     const ids = new Set(override.split(',').map((s) => s.trim()).filter(Boolean));
     return PLATFORM_REGISTRY.filter((n) => ids.has(n.id));
   }
-  return PLATFORM_REGISTRY.filter((n) => n.enabled && n.access === 'rest');
+  // RD (access 'akamai', via rd-adapter/ZenRows) entra só se o proxy estiver configurado.
+  const zenrows = !!(process.env['ZENROWS_API_KEY'] ?? '').trim();
+  return PLATFORM_REGISTRY.filter((n) => n.enabled && (n.access === 'rest' || (n.access === 'akamai' && zenrows)));
 }

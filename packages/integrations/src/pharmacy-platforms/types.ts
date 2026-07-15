@@ -62,6 +62,9 @@ export interface PlatformBasketLine {
   price: number;
   qty: number;
   matchScore: number;
+  /** link PRÓPRIO deste item — presente só quando a rede NÃO monta carrinho único (RD): aí
+   * cada remédio tem seu link (senão o 2º item sumiria atrás do link do 1º — review HIGH). */
+  productUrl?: string;
 }
 
 /** Cotação de uma REDE pra uma cesta: itens que ela tem, itens que faltam, total e 1 link. */

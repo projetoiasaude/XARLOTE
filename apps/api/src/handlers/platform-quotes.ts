@@ -36,18 +36,22 @@ function fulfillmentLine(q: PlatformBasketQuote): string {
   return parts.join(' · ');
 }
 
-/** Bloco de UMA rede: total + cada item (pedido → produto real) + o que falta + 1 link. */
+/** Bloco de UMA rede: total + cada item (pedido → produto real) + o que falta + link(s). */
 function renderNetworkBlock(idx: number, q: PlatformBasketQuote): string {
   const count = q.lines.length > 1 ? ` (${q.lines.length} itens)` : '';
   const head = `${NUM_EMOJI[idx] ?? '•'} *${q.networkLabel}* — ${formatBRL(q.total)}${count}`;
   const logi = fulfillmentLine(q);
-  // cada item: mostra o PRODUTO REAL cotado (o usuário confere dosagem/embalagem antes de pagar)
+  // Rede que NÃO monta carrinho único (RD) traz link por linha → 1 link por remédio (senão o
+  // 2º item sumiria atrás do link do 1º). VTEX = 1 carrinho com tudo (q.checkoutUrl).
+  const perItemLinks = q.lines.length > 1 && q.lines.every((l) => l.productUrl);
   const itemLines = q.lines.map((l) => {
     const qtyStr = l.qty > 1 ? ` ×${l.qty}` : '';
-    return `   • ${l.productName.slice(0, 46)} — ${formatBRL(l.price)}${qtyStr}`;
+    const base = `   • ${l.productName.slice(0, 46)} — ${formatBRL(l.price)}${qtyStr}`;
+    return perItemLinks ? `${base}\n     🛒 ${l.productUrl}` : base;
   });
   const miss = q.missing.length ? `\n   ⚠️ não achei aqui: ${q.missing.join(', ')}` : '';
-  return `${head}${logi ? `\n   ${logi}` : ''}\n${itemLines.join('\n')}${miss}\n   🛒 ${q.checkoutUrl}`;
+  const foot = perItemLinks ? '\n   (cada remédio no seu link acima)' : `\n   🛒 ${q.checkoutUrl}`;
+  return `${head}${logi ? `\n   ${logi}` : ''}\n${itemLines.join('\n')}${miss}${foot}`;
 }
 
 export interface PresentPlatformQuotesResult {
@@ -95,8 +99,8 @@ export async function presentPlatformQuotes(params: {
   const blocks = top.map((q, i) => renderNetworkBlock(i, q));
 
   const intro = soleChannel
-    ? 'Não achei farmácia de bairro com WhatsApp aqui na sua região agora 😕 mas dá pra pedir nas grandes redes pertinho de você — tudo num link só, é só tocar e finalizar o pagamento no site 👇\n\n'
-    : 'Também achei nas grandes redes aqui perto — dá pra pedir tudo de uma vez, é só tocar e finalizar o pagamento no site 👇\n\n';
+    ? 'Não achei farmácia de bairro com WhatsApp aqui na sua região agora 😕 mas dá pra pedir nas grandes redes pertinho de você — é só tocar e finalizar o pagamento no site 👇\n\n'
+    : 'Também achei nas grandes redes aqui perto — é só tocar e finalizar o pagamento no site 👇\n\n';
   const outro = soleChannel
     ? '\n\nQualquer dúvida na hora de finalizar, é só me chamar 💙'
     : '\n\nEnquanto isso sigo cotando nas farmácias do bairro — se aparecer melhor, te aviso! 😊';

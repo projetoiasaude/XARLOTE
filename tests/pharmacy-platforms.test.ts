@@ -18,6 +18,7 @@ import {
 } from '../packages/integrations/src/pharmacy-platforms/matching.js';
 import { PLATFORM_REGISTRY, activeNetworks } from '../packages/integrations/src/pharmacy-platforms/registry.js';
 import { affiliateWrap } from '../packages/integrations/src/pharmacy-platforms/index.js';
+import { parseRDSearch, parseRDPrice } from '../packages/integrations/src/pharmacy-platforms/rd-adapter.js';
 import { extractCep } from '../packages/shared/src/pharmacy.js';
 
 const NET = { id: 'x', label: 'Rede X', group: 'GX' };
@@ -224,17 +225,27 @@ describe('buildVtexCartLink + registry', () => {
     );
   });
 
-  it('activeNetworks default = só Grupo A (rest, enabled) — 10 redes', () => {
+  it('activeNetworks SEM ZenRows = só Grupo A (rest, enabled) — 10 redes', () => {
+    const prev = process.env['ZENROWS_API_KEY'];
+    delete process.env['ZENROWS_API_KEY'];
     const act = activeNetworks();
-    expect(act.length).toBeGreaterThanOrEqual(10);
+    expect(act.length).toBe(10);
     expect(act.every((n) => n.access === 'rest' && n.enabled)).toBe(true);
     const ids = act.map((n) => n.id);
     expect(ids).toContain('pague-menos');
     expect(ids).toContain('drogal'); // regional VTEX adicionada 14/07
     expect(ids).toContain('catarinense');
-    expect(ids).not.toContain('drogasil'); // Akamai desligada
-    expect(ids).not.toContain('onofre'); // Akamai desligada
+    expect(ids).not.toContain('drogasil'); // RD só com ZenRows
+    expect(ids).not.toContain('onofre'); // representada pela Drogasil
     expect(ids).not.toContain('nissei'); // plataforma própria desligada
+    if (prev) process.env['ZENROWS_API_KEY'] = prev;
+  });
+
+  it('activeNetworks COM ZENROWS_API_KEY inclui a RD (Drogasil)', () => {
+    const prev = process.env['ZENROWS_API_KEY'];
+    process.env['ZENROWS_API_KEY'] = 'test-key';
+    expect(activeNetworks().map((n) => n.id)).toContain('drogasil');
+    if (prev) process.env['ZENROWS_API_KEY'] = prev; else delete process.env['ZENROWS_API_KEY'];
   });
 });
 
@@ -327,6 +338,32 @@ describe('cesta multi-item (auditoria 1º pedido — P2)', () => {
     expect(r.total).toBe(10); // só o item 'a'
     expect(r.allAvailable).toBe(false);
     expect(r.perSku['b']!.available).toBe(false);
+  });
+});
+
+describe('adaptador RD (Drogasil via ZenRows) — parsing do __NEXT_DATA__', () => {
+  it('parseRDSearch extrai produtos válidos (sku+name+url) e filtra os incompletos', () => {
+    const nd = { props: { pageProps: { pageProps: { results: { products: [
+      { sku: '19853', name: 'Novalgina Infantil Dipirona 50mg/ml', url: '/novalgina.html?origin=search', brand: 'Novalgina', isKit: false },
+      { sku: '999', name: '', url: '/x' }, // sem name → filtrado
+    ] } } } } };
+    const hits = parseRDSearch(nd);
+    expect(hits.length).toBe(1);
+    expect(hits[0]!.sku).toBe('19853');
+    expect(hits[0]!.url).toContain('novalgina');
+  });
+  it('parseRDSearch: shape ausente → []', () => {
+    expect(parseRDSearch({})).toEqual([]);
+    expect(parseRDSearch(null)).toEqual([]);
+  });
+  it('parseRDPrice extrai value_to (preço) e value_from (de)', () => {
+    const nd = { props: { pageProps: { productData: { sku: '19853', price: 0, price_aux: { value_to: 41.99, value_from: 49.03 } } } } };
+    expect(parseRDPrice(nd)).toEqual({ price: 41.99, listPrice: 49.03 });
+  });
+  it('parseRDPrice: value_from ≤ preço → sem listPrice; sem preço → null', () => {
+    expect(parseRDPrice({ props: { pageProps: { productData: { price_aux: { value_to: 10, value_from: 10 } } } } })).toEqual({ price: 10, listPrice: null });
+    expect(parseRDPrice({ props: { pageProps: { productData: { price_aux: { value_to: 0 } } } } })).toBeNull();
+    expect(parseRDPrice({})).toBeNull();
   });
 });
 
