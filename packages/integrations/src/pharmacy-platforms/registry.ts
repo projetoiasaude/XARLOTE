@@ -46,10 +46,13 @@ export const PLATFORM_REGISTRY: readonly PlatformNetwork[] = [
   { id: 'araujo', label: 'Drogaria Araujo', host: 'https://www.araujo.com.br', salesChannel: '1', access: 'akamai', group: 'Araujo', enabled: false },
   { id: 'onofre', label: 'Onofre', host: 'https://www.onofre.com.br', salesChannel: '1', access: 'akamai', group: 'RD', enabled: false },
 
-  // ── Grupo C: plataforma própria (fase 3 — adaptador dedicado) ──
-  { id: 'nissei', label: 'Farmácias Nissei', host: 'https://www.farmaciasnissei.com.br', salesChannel: '1', access: 'custom', group: 'Nissei', enabled: false },
+  // ── Grupo C: plataforma própria (adaptador dedicado por rede) ──
+  // Nissei (Django) e Ultrafarma (Angular SSR) são ABERTAS server-side → LIGADAS (sem proxy).
+  // Panvel (API atrás do Azion + cadeia de headers user-id/client-ip/sessionId) fica registry-ready
+  // e DESLIGADA — o ZenRows renderiza preço/nome mas o link de produto ainda não sai limpo (ver docs).
+  { id: 'nissei', label: 'Farmácias Nissei', host: 'https://www.farmaciasnissei.com.br', salesChannel: '1', access: 'custom', group: 'Nissei', enabled: true },
+  { id: 'ultrafarma', label: 'Ultrafarma', host: 'https://www.ultrafarma.com.br', salesChannel: '1', access: 'custom', group: 'Ultrafarma', enabled: true },
   { id: 'panvel', label: 'Panvel', host: 'https://www.panvel.com', salesChannel: '1', access: 'custom', group: 'Dimed', enabled: false },
-  { id: 'ultrafarma', label: 'Ultrafarma', host: 'https://www.ultrafarma.com.br', salesChannel: '1', access: 'custom', group: 'Ultrafarma', enabled: false },
 ];
 
 /**
@@ -64,6 +67,9 @@ export function activeNetworks(): PlatformNetwork[] {
     return PLATFORM_REGISTRY.filter((n) => ids.has(n.id));
   }
   // RD (access 'akamai', via rd-adapter/ZenRows) entra só se o proxy estiver configurado.
+  // 'custom' (Nissei/Ultrafarma via adaptador próprio) entra quando enabled — são abertas server-side.
   const zenrows = !!(process.env['ZENROWS_API_KEY'] ?? '').trim();
-  return PLATFORM_REGISTRY.filter((n) => n.enabled && (n.access === 'rest' || (n.access === 'akamai' && zenrows)));
+  return PLATFORM_REGISTRY.filter(
+    (n) => n.enabled && (n.access === 'rest' || n.access === 'custom' || (n.access === 'akamai' && zenrows)),
+  );
 }

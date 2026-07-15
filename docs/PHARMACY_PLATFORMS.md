@@ -26,9 +26,9 @@ Probe ao vivo 14/07 (dipirona). **Grupo A = 10 redes VTEX-abertas LIGADAS** (`en
 | **Droga Raia** | RD | idem | ❌ 403 | 🔒 proxy |
 | **Onofre** | RD | idem | ❌ 403 | 🔒 proxy |
 | **Araujo** | Araujo | VTEX+**Akamai** | ❌ 403 | 🔒 proxy |
-| **Nissei** | Nissei | próprio (SPA) | ⚠️ 404 | 🔧 adaptador |
-| **Panvel** | Dimed | próprio | ⚠️ 404 | 🔧 adaptador |
-| **Ultrafarma** | Ultrafarma | próprio (SPA) | ⚠️ 404 | 🔧 adaptador |
+| **Nissei** | Nissei | próprio (Django+ES) | ✅ 200 (API) | 🟢 ligada (adaptador) |
+| **Ultrafarma** | Ultrafarma | próprio (Angular SSR) | ✅ 200 (SSR) | 🟢 ligada (adaptador) |
+| **Panvel** | Dimed | próprio (Angular BFF) | ⚠️ Azion + headers | 🔧 registry-ready (desligada) |
 
 - **Grupo A — REST aberto (LIGADO, server-side direto, sem custo):** as 10 acima. Um conector
   genérico. Regionais (Drogal/Venancio/Globo/Catarinense) cobrem SP/RJ/SC além do nacional; a
@@ -37,7 +37,9 @@ Probe ao vivo 14/07 (dipirona). **Grupo A = 10 redes VTEX-abertas LIGADAS** (`en
   Araujo. **Sem caminho server-side** — SÓ com **proxy anti-bot pago** (ScraperAPI/ZenRows ~US$50/mês)
   OU browser headless. Registry pronto (`enabled:false`); ligar = decisão de custo do fundador + o
   adaptador precisa falar o **BFF GraphQL** deles (`POST /api/next/middlewareGraphql`), não o REST.
-- **Grupo C — plataforma própria:** Nissei/Panvel/Ultrafarma (SPA não-VTEX). Adaptador dedicado por rede.
+- **Grupo C — plataforma própria (adaptador dedicado por rede):** **Nissei** (Django+Elasticsearch) e
+  **Ultrafarma** (Angular SSR) são ABERTAS server-side → **LIGADAS, sem proxy, sem custo** (§3b).
+  **Panvel** (BFF atrás do Azion) fica registry-ready/desligada.
 
 ### Nota — CEP no link (menor fricção)
 O **preço já vem pronto** (simulado no CEP do cliente → total exibido). Pré-preencher o CEP *no link
@@ -103,6 +105,38 @@ Retorna (evidência Drogaria São Paulo, dipirona @ 74230-100):
   ~US$ dezenas/mês) fazendo a chamada REST/GraphQL; (b) **Playwright headless** próprio resolvendo
   o challenge Akamai e lendo o BFF. Fazer só depois do Grupo A (RD vale pelo tamanho).
 
+## 3b. Grupo C (plataforma própria) — mapa das APIs (probe ao vivo 15/07)
+
+Cada uma tem site próprio (nem VTEX nem Akamai). Um adaptador dedicado por rede.
+
+### Nissei — Django + Elasticsearch (🟢 LIGADA, `nissei-adapter.ts`, sem proxy)
+⚠️ O HTML de `/pesquisa/?q=` traz um **grid DEFAULT fixo** (ninho, gatorade… iguais pra qualquer
+termo) — **NÃO os resultados**. Nunca parsear esse HTML. A busca é 100% via API:
+- **csrf:** `GET {host}/pesquisa/` → cookie `csrftoken` + `<input name="csrfmiddlewaretoken">`.
+- **busca:** `POST {host}/pesquisa/pesquisar` (form `csrfmiddlewaretoken` + `termo=…`, header
+  `X-CSRFToken` + `Cookie: csrftoken=…`) → `{"produtos":[{"_id","_source":{"nm_produto","url_produto","is_disponivel"}}],"quantidade"}` (Elasticsearch).
+- **preço:** `POST {host}/pegar/preco` (form `csrfmiddlewaretoken` + `produtos_ids[]=…`) →
+  `{"precos":{"<id>":{"publico":{"valor_fim"(final),"valor_ini"("de"),"is_disponivel","produto_url"}}}}`.
+- Ranqueia por `nm_produto` e só então busca o preço dos melhores ids. Preço **nacional** (não por CEP;
+  filial/entrega confirmados no site → handoff). Django CSRF exige o par cookie+token junto no POST.
+
+### Ultrafarma — Angular SSR + Linx (🟢 LIGADA, `ultrafarma-adapter.ts`, sem proxy)
+A busca renderiza os cards no **próprio HTML** (SSR) — preço incluso, 1 request:
+- `GET {host}/busca?q={termo}` → 302 → `{host}/lp/{termo}` (HTML com os cards).
+- Card = `<div class="product-item …">` com `product-item-name`, `<a class="product-item-link" href="/{slug}">`,
+  `product-item-price-info` (preço), `product-item-old-price` ("de"), img `/produtos/{id}/small`.
+- Parser divide por container `product-item` (isolado — lookahead exclui `-name`/`-price`) pra não cruzar
+  cards. Preço **nacional** (online-nacional; CEP/entrega no site → handoff).
+
+### Panvel — Angular + BFF `panvel-ecommerce-bff` (🔧 registry-ready, DESLIGADA)
+- Busca: `POST {host}/api/v3/search?type=CSR&uf={UF}` (JSON), mas exige **headers** `user-id`,
+  `client-ip`, `sessionId` + body específico, atrás do **Azion Bot Manager** (cookies `az_botm`/`az_asm`).
+  Valores sintéticos passam a validação mas dão 500 (precisam ser consistentes com a sessão).
+- **ZenRows renderizando** `buscarProduto.do?termoPesquisa=…` (js_render) devolve **preço + nome**, mas o
+  **link do produto não sai limpo** (Angular usa routerLink, não `href`) → handoff incompleto.
+- Decisão: registry-ready + desligada até (a) capturar a sessão/headers do BFF server-side, ou (b) resolver
+  o link no render ZenRows. Menos prioritária (forte no Sul; fundador em GO). Nunca quebra o pool (sem adaptador → null).
+
 ## 4. Arquitetura do conector (proposta)
 ```
 packages/integrations/src/pharmacy-platforms/
@@ -146,5 +180,6 @@ packages/integrations/src/pharmacy-platforms/
 - **Fase 1 (dias):** conector VTEX genérico do **Grupo A** (5 redes, ~5.000 lojas) + matching +
   cache + pool no fluxo atual + link de carrinho. Cobre a maioria dos CEPs sem parceria.
 - **Fase 2:** **RD (Drogasil+Raia)** via anti-WAF (proxy/headless) — a maior rede. + afiliação.
-- **Fase 3:** Nissei, Panvel e regionais (Rosário em GO/DF etc.) com adaptadores dedicados.
+- **Fase 3:** plataformas próprias com adaptador dedicado — **Nissei + Ultrafarma FEITAS (§3b, ligadas)**;
+  Panvel registry-ready (Azion); regionais (Rosário GO/DF etc.) como follow-up.
 ```

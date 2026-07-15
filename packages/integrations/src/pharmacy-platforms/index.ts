@@ -13,7 +13,28 @@ import { activeNetworks, type PlatformNetwork } from './registry.js';
 import { rankProductMatches } from './matching.js';
 import { searchVtexProducts, simulateVtexByCep, buildVtexCartLink, buildVtexCartLinkMulti, simulateVtexBasket, onlyDigits, type BasketItem } from './vtex.js';
 import { quoteRDProduct, zenrowsConfigured } from './rd-adapter.js';
+import { quoteNisseiProduct } from './nissei-adapter.js';
+import { quoteUltrafarmaProduct } from './ultrafarma-adapter.js';
 import type { PlatformQuote, PlatformProduct, PlatformBasketQuote, PlatformBasketLine } from './types.js';
+
+/**
+ * Adaptadores das redes de PLATAFORMA PRÓPRIA (access 'custom' — nem VTEX nem Akamai). Cada uma
+ * tem site próprio: um adaptador dedicado por rede. Ligados por `id` do registry. Todos server-side
+ * abertos (sem proxy). Ver nissei-adapter.ts / ultrafarma-adapter.ts.
+ *   Nissei     → Django   (busca HTML + POST /pegar/preco)
+ *   Ultrafarma → Angular SSR (busca renderiza os cards com preço)
+ * (Panvel: API atrás do Azion + cadeia de headers; registry-ready, desligada — ver docs.)
+ */
+type CustomAdapter = (
+  net: PlatformNetwork,
+  query: string,
+  opts: { timeoutMs?: number; minScore?: number },
+) => Promise<PlatformProduct | null>;
+
+const CUSTOM_ADAPTERS: Record<string, CustomAdapter> = {
+  nissei: quoteNisseiProduct,
+  ultrafarma: quoteUltrafarmaProduct,
+};
 
 export * from './types.js';
 export * from './registry.js';
@@ -37,6 +58,8 @@ export {
   normalize as normalizeMedName,
 } from './matching.js';
 export { quoteRDProduct, zenrowsConfigured, parseRDSearch, parseRDPrice, extractNextData } from './rd-adapter.js';
+export { quoteNisseiProduct, parseNisseiCsrf, parseNisseiResults, parseNisseiPrices, humanizeNisseiSlug } from './nissei-adapter.js';
+export { quoteUltrafarmaProduct, parseUltrafarmaProducts, parseBrl } from './ultrafarma-adapter.js';
 
 /**
  * Envelopa o link de checkout num deeplink de AFILIADO, se configurado por env
@@ -200,6 +223,11 @@ async function withDeadline<T>(work: Promise<T>, ms: number, fallback: T): Promi
 const RD_DEADLINE_MS = 13000;
 const RD_REQUEST_TIMEOUT_MS = 8000;
 
+// Redes próprias (Nissei/Ultrafarma) fazem múltiplos requests sequenciais por item → teto de
+// wall-clock (senão uma rede lenta segura o pool das 10 VTEX rápidas) + teto por request (review H1).
+const CUSTOM_DEADLINE_MS = 12000;
+const CUSTOM_REQUEST_TIMEOUT_MS = 6500;
+
 /**
  * Cesta na RD (Drogasil/Raia/Onofre) via ZenRows — a RD não tem REST/simulação por CEP: usa o
  * adaptador (busca+preço renderizados). Preço padrão da rede (não por CEP); cada remédio ganha
@@ -247,6 +275,54 @@ async function quoteBasketRDInner(
   };
 }
 
+/**
+ * Cesta numa rede de plataforma PRÓPRIA (Nissei/Ultrafarma) via adaptador dedicado. Como a RD,
+ * essas redes NÃO montam carrinho multi-sku → cada remédio ganha o link PRÓPRIO (productUrl na
+ * linha), senão o 2º item sumiria atrás do link do 1º. Preço padrão da rede (não por CEP → handoff).
+ * Itens em paralelo; adaptador ausente (ex.: rede custom sem código) → null (nunca quebra o pool).
+ */
+async function quoteBasketCustom(
+  net: PlatformNetwork,
+  items: BasketRequestItem[],
+  opts: QuotePlatformsOptions,
+): Promise<PlatformBasketQuote | null> {
+  const adapter = CUSTOM_ADAPTERS[net.id];
+  if (!adapter) return null;
+  // teto de wall-clock: uma rede própria lenta NÃO pode segurar as 10 VTEX rápidas (review H1).
+  return withDeadline(quoteBasketCustomInner(net, items, adapter, opts), CUSTOM_DEADLINE_MS, null);
+}
+
+async function quoteBasketCustomInner(
+  net: PlatformNetwork,
+  items: BasketRequestItem[],
+  adapter: CustomAdapter,
+  opts: QuotePlatformsOptions,
+): Promise<PlatformBasketQuote | null> {
+  const timeoutMs = Math.min(opts.timeoutMs ?? CUSTOM_REQUEST_TIMEOUT_MS, CUSTOM_REQUEST_TIMEOUT_MS);
+
+  const settled = await Promise.all(items.map(async (req) => {
+    try { return { req, product: await adapter(net, req.query, { timeoutMs, minScore: opts.minScore }) }; }
+    catch { return { req, product: null as PlatformProduct | null }; }
+  }));
+  const found = settled.filter((r) => r.product);
+  const missing = settled.filter((r) => !r.product).map((r) => r.req.label);
+  if (!found.length) return null;
+
+  const lines: PlatformBasketLine[] = found.map((f) => ({
+    requested: f.req.label, productName: f.product!.productName, sku: f.product!.sku,
+    sellerId: '1', price: f.product!.price, qty: Math.max(1, f.req.qty ?? 1), matchScore: 1,
+    productUrl: affiliateWrap(net.id, f.product!.productUrl),
+  }));
+  const total = lines.reduce((s, l) => s + l.price * l.qty, 0);
+  return {
+    network: net.id, networkLabel: net.label, group: net.group,
+    lines, missing, total, available: true,
+    delivery: null, pickup: null, // preço padrão; CEP/entrega confirmados no site (handoff)
+    checkoutUrl: lines[0]!.productUrl!, // fallback (cesta de 1 item); multi-item usa o link por linha
+    pricedByCep: false,
+  };
+}
+
 async function quoteBasketOneNetwork(
   net: PlatformNetwork,
   items: BasketRequestItem[],
@@ -254,6 +330,7 @@ async function quoteBasketOneNetwork(
   opts: QuotePlatformsOptions,
 ): Promise<PlatformBasketQuote | null> {
   if (net.access === 'akamai') return quoteBasketRD(net, items, opts);
+  if (net.access === 'custom') return quoteBasketCustom(net, items, opts);
   if (net.access !== 'rest') return null;
 
   // 1) casa cada item na rede; item sem match vai pra `missing`.

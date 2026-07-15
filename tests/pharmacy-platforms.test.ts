@@ -19,6 +19,8 @@ import {
 import { PLATFORM_REGISTRY, activeNetworks } from '../packages/integrations/src/pharmacy-platforms/registry.js';
 import { affiliateWrap } from '../packages/integrations/src/pharmacy-platforms/index.js';
 import { parseRDSearch, parseRDPrice } from '../packages/integrations/src/pharmacy-platforms/rd-adapter.js';
+import { parseNisseiResults, parseNisseiPrices, parseNisseiCsrf, humanizeNisseiSlug } from '../packages/integrations/src/pharmacy-platforms/nissei-adapter.js';
+import { parseUltrafarmaProducts, parseBrl } from '../packages/integrations/src/pharmacy-platforms/ultrafarma-adapter.js';
 import { extractCep } from '../packages/shared/src/pharmacy.js';
 
 const NET = { id: 'x', label: 'Rede X', group: 'GX' };
@@ -225,26 +227,31 @@ describe('buildVtexCartLink + registry', () => {
     );
   });
 
-  it('activeNetworks SEM ZenRows = só Grupo A (rest, enabled) — 10 redes', () => {
+  it('activeNetworks SEM ZenRows = 10 VTEX + 2 próprias (Nissei/Ultrafarma) = 12 redes', () => {
     const prev = process.env['ZENROWS_API_KEY'];
     delete process.env['ZENROWS_API_KEY'];
     const act = activeNetworks();
-    expect(act.length).toBe(10);
-    expect(act.every((n) => n.access === 'rest' && n.enabled)).toBe(true);
+    expect(act.length).toBe(12);
+    expect(act.every((n) => (n.access === 'rest' || n.access === 'custom') && n.enabled)).toBe(true);
     const ids = act.map((n) => n.id);
     expect(ids).toContain('pague-menos');
     expect(ids).toContain('drogal'); // regional VTEX adicionada 14/07
     expect(ids).toContain('catarinense');
+    expect(ids).toContain('nissei'); // plataforma própria (Django) — ligada 15/07
+    expect(ids).toContain('ultrafarma'); // plataforma própria (Angular SSR) — ligada 15/07
     expect(ids).not.toContain('drogasil'); // RD só com ZenRows
     expect(ids).not.toContain('onofre'); // representada pela Drogasil
-    expect(ids).not.toContain('nissei'); // plataforma própria desligada
+    expect(ids).not.toContain('panvel'); // própria, atrás do Azion → registry-ready, desligada
     if (prev) process.env['ZENROWS_API_KEY'] = prev;
   });
 
-  it('activeNetworks COM ZENROWS_API_KEY inclui a RD (Drogasil)', () => {
+  it('activeNetworks COM ZENROWS_API_KEY inclui a RD (Drogasil) = 13 redes', () => {
     const prev = process.env['ZENROWS_API_KEY'];
     process.env['ZENROWS_API_KEY'] = 'test-key';
-    expect(activeNetworks().map((n) => n.id)).toContain('drogasil');
+    const ids = activeNetworks().map((n) => n.id);
+    expect(ids).toContain('drogasil');
+    expect(ids).toContain('nissei');
+    expect(ids.length).toBe(13);
     if (prev) process.env['ZENROWS_API_KEY'] = prev; else delete process.env['ZENROWS_API_KEY'];
   });
 });
@@ -380,5 +387,149 @@ describe('extractCep (review L3)', () => {
   it('sem CEP → null', () => {
     expect(extractCep('Rua sem cep, Bairro X')).toBeNull();
     expect(extractCep(null)).toBeNull();
+  });
+});
+
+// ─── Adaptador Nissei (plataforma própria Django+ES) — shapes REAIS capturados 15/07 ──────────
+describe('adaptador Nissei — parsing da busca (POST /pesquisa/pesquisar)', () => {
+  const NISSEI_SEARCH = {
+    produtos: [
+      { _id: '355521', _score: 7.05, _source: { nm_produto: 'Losartana Potássica Ems 50mg 30 Comprimidos', url_produto: 'losartana-potassica-ems-50mg-30-comprimidos', is_disponivel: true } },
+      { _id: '568523', _score: 6.9, _source: { nm_produto: 'Aradois H Losartana 50mg + Hidroclorotiazida 12,5mg 90 Comprimidos', url_produto: 'aradois-h-losartana-50mg-hidroclorotiazida-125mg-90-comprimidos', is_disponivel: true } },
+      { _id: '999', _source: { nm_produto: '', url_produto: '' } }, // incompleto → filtrado
+    ],
+    quantidade: 423,
+  };
+
+  it('parseNisseiResults extrai id, nome, slug e disponibilidade; filtra os incompletos', () => {
+    const r = parseNisseiResults(NISSEI_SEARCH);
+    expect(r.length).toBe(2);
+    expect(r[0]).toEqual({ id: '355521', name: 'Losartana Potássica Ems 50mg 30 Comprimidos', slug: 'losartana-potassica-ems-50mg-30-comprimidos', available: true });
+  });
+
+  it('parseNisseiResults: shape ausente → []', () => {
+    expect(parseNisseiResults({})).toEqual([]);
+    expect(parseNisseiResults(null)).toEqual([]);
+  });
+
+  it('o "+" do combo (Aradois H) é penalizado → losartana pura ranqueia à frente', () => {
+    const net = { id: 'nissei', label: 'Farmácias Nissei', group: 'Nissei' };
+    const cands = parseNisseiResults(NISSEI_SEARCH).map((r) => ({
+      network: net.id, networkLabel: net.label, group: net.group, productName: r.name, sku: r.id,
+      sellerId: '1', ean: null, price: 0, listPrice: null, availableQuantity: 1, productUrl: r.slug, activeIngredient: null,
+    }));
+    const ranked = rankProductMatches('losartana 50mg', cands);
+    expect(ranked[0]!.product.sku).toBe('355521'); // Losartana pura no topo (o combo com "+" cai)
+  });
+});
+
+describe('adaptador Nissei — parsing do preço (POST /pegar/preco)', () => {
+  const NISSEI_PRECOS = {
+    precos: {
+      '355521': { publico: { produto_id: '355521', is_disponivel: true, produto_url: 'losartana-potassica-ems-50mg-30-comprimidos', valor_ini: '7.90', valor_fim: '4.90', produto_tipo: 'medicamento' } },
+      '158925': { publico: { is_disponivel: true, produto_url: 'x', valor_ini: '170.83', valor_fim: '170.83' } }, // sem desconto → listPrice null
+      '888': { publico: { is_disponivel: true, produto_url: 'w', valor_ini: '1.500,00', valor_fim: '1.234,56' } }, // formato BR (review M2)
+      '777': { clube: { is_disponivel: true, produto_url: 'z', valor_fim: '9.90' } }, // SÓ clube, sem publico (review M1)
+      '999': { publico: { is_disponivel: false, produto_url: 'y', valor_fim: '0' } }, // preço 0 → filtrado
+    },
+  };
+
+  it('extrai valor_fim (preço), valor_ini (de) e disponibilidade; filtra preço 0', () => {
+    const p = parseNisseiPrices(NISSEI_PRECOS);
+    expect(p['355521']).toEqual({ url: 'losartana-potassica-ems-50mg-30-comprimidos', price: 4.9, listPrice: 7.9, available: true, tipo: 'medicamento' });
+    expect(p['158925']!.listPrice).toBeNull(); // valor_ini == valor_fim → sem "de"
+    expect(p['999']).toBeUndefined(); // preço 0 não entra
+  });
+
+  it('preço em formato BR "1.234,56" → 1234.56, NÃO 1.234 (review M2)', () => {
+    const p = parseNisseiPrices(NISSEI_PRECOS);
+    expect(p['888']!.price).toBe(1234.56);
+    expect(p['888']!.listPrice).toBe(1500);
+  });
+
+  it('produto SÓ com preço de clube (sem publico) é PULADO — nunca expõe preço de sócio (review M1)', () => {
+    expect(parseNisseiPrices(NISSEI_PRECOS)['777']).toBeUndefined();
+  });
+
+  it('shape ausente → {}', () => {
+    expect(parseNisseiPrices({})).toEqual({});
+    expect(parseNisseiPrices(null)).toEqual({});
+  });
+});
+
+describe('adaptador Nissei — csrf + slug', () => {
+  it('parseNisseiCsrf lê o token inline e o cookie csrftoken do Set-Cookie', () => {
+    const html = '<form><input type="hidden" name="csrfmiddlewaretoken" value="TOKENinline1234567890abcd"></form>';
+    const r = parseNisseiCsrf(html, ['csrftoken=COOKIEval9876543210; Path=/; SameSite=Lax']);
+    expect(r.csrf).toBe('TOKENinline1234567890abcd');
+    expect(r.cookie).toBe('COOKIEval9876543210');
+  });
+  it('sem token inline → usa o valor do cookie como csrf (Django aceita X-CSRFToken == cookie)', () => {
+    const r = parseNisseiCsrf('<html>sem form</html>', ['csrftoken=SOcookie123456; Path=/']);
+    expect(r.csrf).toBe('SOcookie123456');
+    expect(r.cookie).toBe('SOcookie123456');
+  });
+  it('humanizeNisseiSlug: converte "1gr"→"1g" e Title Case', () => {
+    expect(humanizeNisseiSlug('dipirona-1gr-10-comprimidos-medley')).toBe('Dipirona 1g 10 Comprimidos Medley');
+  });
+});
+
+// ─── Adaptador Ultrafarma (Angular SSR) — HTML de card REAL (estrutura capturada 15/07) ───────
+describe('adaptador Ultrafarma — parsing dos cards SSR', () => {
+  const ULTRA = PLATFORM_REGISTRY.find((n) => n.id === 'ultrafarma')!;
+  // Estrutura REAL (capturada ao vivo): o "De" (riscado) vem ANTES do "Por"; o preço de venda é o
+  // "R$ x,yy" APÓS o rótulo "Por". Card 1 = com desconto (De R$12,90 / Por R$9,73); card 2 = sem
+  // desconto num <section> (tag não-div); card 3 = sem preço (descartado).
+  const ULTRA_HTML = `
+    <div class="product-item col-3">
+      <div class="product-image"><img src="https://cdn.ultrafarma.com.br/static/produtos/809350/small-x-809350.png" title="Dipirona 500mg 30 Comprimidos - Germed Gen&#233;rico" alt="Dipirona"></div>
+      <div class="product-item-info">
+        <a class="product-item-link" href="/dipirona-500-mg-com-30-comprimidos-germed-generico">ver</a>
+        <span class="product-item-name">Dipirona 500mg 30 Comprimidos - Germed Gen&#233;rico</span>
+        <div class="product-item-old-price-info"><p class="subtitle">De</p><span class="product-item-old-price" data-preco="12,900">R$ 12,90</span></div>
+        <div class="product-item-new-price-info"><p class="subtitle">Por</p><span class="product-item-new-price" data-preco="9,730">R$ 9,73</span></div>
+      </div>
+    </div>
+    <section class="product-item col-3">
+      <div class="product-image"><img src="https://cdn.ultrafarma.com.br/static/produtos/190/small-190.jpg" title="Magnopyrol Gotas 10ml"></div>
+      <div class="product-item-info">
+        <a class="product-item-link" href="/magnopyrol-gotas-com-10-ml">ver</a>
+        <span class="product-item-name">Magnopyrol Gotas 10ml</span>
+        <span class="product-item-new-price" data-preco="21,340">R$ 21,34</span>
+      </div>
+    </section>
+    <div class="product-item col-3">
+      <div class="product-item-info"><span class="product-item-name">Sem preço não entra</span><a class="product-item-link" href="/sem-preco">x</a></div>
+    </div>`;
+
+  it('preço de VENDA vem do "Por" (pula o "De" que vem antes — review M3); "de" vira listPrice', () => {
+    const ps = parseUltrafarmaProducts(ULTRA, ULTRA_HTML);
+    expect(ps.length).toBe(2); // dipirona + magnopyrol; "sem preço" descartado
+    expect(ps[0]!.productName).toBe('Dipirona 500mg 30 Comprimidos - Germed Genérico');
+    expect(ps[0]!.sku).toBe('809350');
+    expect(ps[0]!.price).toBe(9.73); // "Por R$ 9,73", NÃO o "De R$ 12,90" que vem antes
+    expect(ps[0]!.listPrice).toBe(12.9);
+    expect(ps[0]!.productUrl).toBe('https://www.ultrafarma.com.br/dipirona-500-mg-com-30-comprimidos-germed-generico');
+  });
+
+  it('card em <section> sem desconto (sem "Por") → 1º R$ = venda; listPrice null (review M4)', () => {
+    const ps = parseUltrafarmaProducts(ULTRA, ULTRA_HTML);
+    expect(ps[1]!.productName).toBe('Magnopyrol Gotas 10ml'); // parseado apesar da tag <section>
+    expect(ps[1]!.price).toBe(21.34);
+    expect(ps[1]!.listPrice).toBeNull();
+    expect(ps[1]!.sku).toBe('190');
+  });
+
+  it('o matching escolhe o produto certo entre os cards parseados', () => {
+    const ranked = rankProductMatches('dipirona 500mg comprimido', parseUltrafarmaProducts(ULTRA, ULTRA_HTML));
+    expect(ranked[0]!.product.productName).toContain('Dipirona 500mg');
+  });
+
+  it('parseBrl: milhar/decimal BR e casos inválidos', () => {
+    expect(parseBrl('1.234,56')).toBe(1234.56);
+    expect(parseBrl('4,27')).toBe(4.27);
+    expect(parseBrl('R$ 9,73')).toBe(9.73);
+    expect(parseBrl('0,00')).toBeNull();
+    expect(parseBrl('grátis')).toBeNull();
   });
 });
