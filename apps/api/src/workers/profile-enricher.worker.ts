@@ -77,26 +77,37 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
     return;
   }
 
-  // 4. Chama LLM extrator
-  let parsed: EnrichOutput;
-  try {
-    const resp = await chat(transcript, {
-      model,
-      apiKey,
-      systemInstruction: PROFILE_ENRICHER_SYSTEM,
-      temperature: 0.1,
-      maxOutputTokens: 800,
-      timeoutMs: 30_000,
-    });
-    const jsonMatch = resp.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      await writeLog('warn', 'enrichment', 'Enricher: sem JSON na resposta', { traceId, preview: resp.text.slice(0, 200) });
-      return;
+  // 4. Chama LLM extrator — com RETRY (review item 11): o glm-5.2 às vezes devolve prosa antes/depois
+  // do JSON (ou nenhum JSON). Uma 2ª tentativa com instrução mais firme costuma resolver — sem ela a
+  // memória DESTE turno se perdia (afetou o Waldik em 09/07). Roda no worker (async), sem custo p/ o user.
+  let parsed: EnrichOutput | null = null;
+  for (let attempt = 1; attempt <= 2 && parsed === null; attempt++) {
+    try {
+      const resp = await chat(transcript, {
+        model,
+        apiKey,
+        systemInstruction:
+          attempt === 1
+            ? PROFILE_ENRICHER_SYSTEM
+            : `${PROFILE_ENRICHER_SYSTEM}\n\nIMPORTANTE: responda APENAS com o objeto JSON válido, sem nenhum texto, explicação ou markdown antes ou depois.`,
+        temperature: 0.1,
+        maxOutputTokens: 800,
+        timeoutMs: 30_000,
+      });
+      const jsonMatch = resp.text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        await writeLog(attempt === 1 ? 'info' : 'warn', 'enrichment', `Enricher: sem JSON na resposta (tentativa ${attempt}/2)`, { traceId, preview: resp.text.slice(0, 200) });
+        continue; // re-tenta com a instrução firme
+      }
+      parsed = JSON.parse(jsonMatch[0]) as EnrichOutput;
+    } catch (err) {
+      // JSON.parse malformado OU o chat lançou (timeout/rede). Re-tenta na 1ª; na 2ª, desiste.
+      await writeLog(attempt === 1 ? 'info' : 'error', 'enrichment', `Enricher parse/LLM falhou (tentativa ${attempt}/2): ${String(err).slice(0, 160)}`, { traceId });
+      if (attempt === 2) captureError(err, { traceId, phase: 'enricher-llm', conversationId });
     }
-    parsed = JSON.parse(jsonMatch[0]) as EnrichOutput;
-  } catch (err) {
-    await writeLog('error', 'enrichment', `Enricher LLM falhou: ${String(err).slice(0, 200)}`, { traceId });
-    captureError(err, { traceId, phase: 'enricher-llm', conversationId });
+  }
+  if (parsed === null) {
+    await writeLog('warn', 'enrichment', 'Enricher: sem JSON válido após 2 tentativas — memória deste turno não enriquecida', { traceId });
     return;
   }
 
@@ -128,7 +139,7 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
         });
         if (!error) saved++;
       }
-    } catch {}
+    } catch (e) { await writeLog('debug', 'enrichment', `enricher: insert estruturado falhou — ${String(e).slice(0, 90)}`, { traceId }); }
   }
   for (const c of parsed.conditions ?? []) {
     if (c.confidence < MIN_CONFIDENCE) continue;
@@ -149,7 +160,7 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
         });
         if (!error) saved++;
       }
-    } catch {}
+    } catch (e) { await writeLog('debug', 'enrichment', `enricher: insert estruturado falhou — ${String(e).slice(0, 90)}`, { traceId }); }
   }
   for (const m of parsed.medications ?? []) {
     if (m.confidence < MIN_CONFIDENCE) continue;
@@ -171,7 +182,7 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
         });
         if (!error) saved++;
       }
-    } catch {}
+    } catch (e) { await writeLog('debug', 'enrichment', `enricher: insert estruturado falhou — ${String(e).slice(0, 90)}`, { traceId }); }
   }
   for (const ad of parsed.addresses ?? []) {
     if (ad.confidence < MIN_CONFIDENCE) continue;
@@ -195,7 +206,7 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
         is_default: false,
       });
       if (!error) saved++;
-    } catch {}
+    } catch (e) { await writeLog('debug', 'enrichment', `enricher: insert estruturado falhou — ${String(e).slice(0, 90)}`, { traceId }); }
   }
   }); // withUserLock — fim da seção serializada (só os check-then-insert estruturados)
 

@@ -102,7 +102,10 @@ export function parseMedicationQuery(text: string): ParsedMedication {
   const strengths = extractStrengths(norm);
   const form = detectForm(norm);
   const quantity = detectQuantity(norm);
-  const wantsKit = /\b(kit|combo)\b/.test(norm);
+  // Reconhece "+"/"leve N" além de kit/combo (review M5): se o USUÁRIO pediu explicitamente um combo
+  // ("losartana + hidroclorotiazida"), `wantsKit` tem que ser true — senão a penalidade de kit (que
+  // usa KIT_RE, com "+") derrubaria o próprio produto que ele quer. Alinhado ao KIT_RE.
+  const wantsKit = KIT_RE.test(norm);
   // nameTokens = o que sobra depois de tirar dosagem/forma/qtd/stopwords/números soltos.
   const strengthWords = new Set(strengths.flatMap((s) => [s, s.replace(/[a-z%]+$/i, '')]));
   const nameTokens = norm

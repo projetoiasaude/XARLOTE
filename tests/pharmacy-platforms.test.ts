@@ -174,6 +174,12 @@ describe('parseMedicationQuery', () => {
     expect(q.nameTokens).toEqual(['losartana', 'potassica']);
     expect(q.strengths).toEqual(['50mg']);
   });
+  it('wantsKit reconhece "+" e "leve N" (review M5) — user pedindo combo explícito', () => {
+    expect(parseMedicationQuery('losartana + hidroclorotiazida').wantsKit).toBe(true);
+    expect(parseMedicationQuery('leve 2 dipirona').wantsKit).toBe(true);
+    expect(parseMedicationQuery('kit primeiros socorros').wantsKit).toBe(true);
+    expect(parseMedicationQuery('dipirona 500mg').wantsKit).toBe(false); // sem combo → penaliza kits
+  });
 });
 
 describe('scoreProductMatch (o ponto crítico de qualidade)', () => {

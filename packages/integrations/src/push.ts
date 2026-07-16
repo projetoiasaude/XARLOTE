@@ -80,6 +80,9 @@ async function getAccessToken(clientEmail: string, privateKey: string, nowMs: nu
       grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
       assertion: jwt,
     }),
+    // teto de tempo (review M4): sem isso uma conexão FCM meio-aberta segura o `await` do
+    // dispatcher de lembretes. O caller já trata erro (return sent:0) → degrada gracioso.
+    signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(`FCM oauth falhou: ${res.status} ${await res.text().catch(() => '')}`);
   const json = (await res.json()) as { access_token: string; expires_in: number };
@@ -130,6 +133,7 @@ export async function sendPush(
           method: 'POST',
           headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
           body: JSON.stringify(message),
+          signal: AbortSignal.timeout(10_000), // teto de tempo (review M4)
         });
         if (res.ok) {
           sent++;
