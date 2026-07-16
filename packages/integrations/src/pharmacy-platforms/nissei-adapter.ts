@@ -17,7 +17,7 @@
 import axios from 'axios';
 import type { PlatformNetwork } from './registry.js';
 import type { PlatformProduct } from './types.js';
-import { rankProductMatches } from './matching.js';
+import { rankProductMatches, medNameForSearch } from './matching.js';
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const DEFAULT_TIMEOUT_MS = 9000;
@@ -229,7 +229,9 @@ async function quoteNisseiUncached(
   // busca + preço num closure — se QUALQUER POST der 403 (token expirado), renova o csrf UMA vez
   // e refaz TUDO (a renovação cobre busca E preço — review M5).
   const run = async (): Promise<PlatformProduct | null> => {
-    const results = await searchNissei(net, query, csrf!, cookie!, timeout);
+    // Busca pelo NOME (sem dosagem/forma) — a dose entra no ranqueador, não na busca textual
+    // (senão uma dose torta zera tudo: incidente Arthur 16/07). Ver medNameForSearch.
+    const results = await searchNissei(net, medNameForSearch(query), csrf!, cookie!, timeout);
     if (!results.length) return null;
 
     // candidatos SEM preço (matching usa só o nome) → ranqueia → preço só dos melhores.

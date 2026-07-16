@@ -10,7 +10,7 @@
  * Ver docs/PHARMACY_PLATFORMS.md.
  */
 import { activeNetworks, type PlatformNetwork } from './registry.js';
-import { rankProductMatches } from './matching.js';
+import { rankProductMatches, medNameForSearch } from './matching.js';
 import { searchVtexProducts, simulateVtexByCep, buildVtexCartLink, buildVtexCartLinkMulti, simulateVtexBasket, onlyDigits, type BasketItem } from './vtex.js';
 import { quoteRDProduct, zenrowsConfigured } from './rd-adapter.js';
 import { quoteNisseiProduct } from './nissei-adapter.js';
@@ -55,6 +55,7 @@ export {
   scoreProductMatch,
   rankProductMatches,
   extractStrengths,
+  medNameForSearch,
   normalize as normalizeMedName,
 } from './matching.js';
 export { quoteRDProduct, zenrowsConfigured, parseRDSearch, parseRDPrice, extractNextData } from './rd-adapter.js';
@@ -119,7 +120,10 @@ async function quoteOneNetwork(
 
   // retries:1 (sem retry) — latência limitada importa mais que completude aqui: se uma rede
   // falha, as outras cobrem e o WhatsApp do bairro é o backbone. Evita o pior caso de 4×timeout.
-  const products = await searchVtexProducts(net, term, { limit: 12, timeoutMs: opts.timeoutMs, retries: 1 });
+  // Busca pelo NOME (medNameForSearch), NÃO pelo termo cru: a dosagem/forma vão pro ranqueador
+  // (canonStrength casa 1g=1000mg melhor que o `ft` literal). limit 16 (era 12) pra dar folga
+  // ao ranqueador agora que a dose não pré-filtra a busca — o item certo pode não vir no top-12.
+  const products = await searchVtexProducts(net, medNameForSearch(term), { limit: 16, timeoutMs: opts.timeoutMs, retries: 1 });
   const ranked = rankProductMatches(term, products, { minScore: opts.minScore });
   const best = ranked[0];
   if (!best) {
@@ -339,7 +343,11 @@ async function quoteBasketOneNetwork(
   for (const req of items) {
     let products: PlatformProduct[] = [];
     try {
-      products = await searchVtexProducts(net, req.query, { limit: 12, timeoutMs: opts.timeoutMs, retries: 1 });
+      // ESTE é o path VIVO das redes VTEX (10 das 13) — a `presentPlatformQuotes` do fluxo real
+      // passa por aqui. Busca pelo NOME (medNameForSearch), NÃO pelo `req.query` cru: era o bug
+      // do Arthur — `ft=Neblock 0.5mg`→0, `ft=amplictil gotas`→0. O ranqueador (req.query completo)
+      // reimpõe dose/forma. limit 16 (era 12) pra dar folga agora que a busca é mais ampla.
+      products = await searchVtexProducts(net, medNameForSearch(req.query), { limit: 16, timeoutMs: opts.timeoutMs, retries: 1 });
     } catch { products = []; }
     const best = rankProductMatches(req.query, products, { minScore: opts.minScore })[0];
     if (best) found.push({ req, product: best.product, score: best.score });

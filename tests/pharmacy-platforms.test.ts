@@ -15,6 +15,7 @@ import {
   normalize,
   extractStrengths,
   strengthsCompatible,
+  medNameForSearch,
 } from '../packages/integrations/src/pharmacy-platforms/matching.js';
 import { PLATFORM_REGISTRY, activeNetworks } from '../packages/integrations/src/pharmacy-platforms/registry.js';
 import { affiliateWrap } from '../packages/integrations/src/pharmacy-platforms/index.js';
@@ -179,6 +180,36 @@ describe('parseMedicationQuery', () => {
     expect(parseMedicationQuery('leve 2 dipirona').wantsKit).toBe(true);
     expect(parseMedicationQuery('kit primeiros socorros').wantsKit).toBe(true);
     expect(parseMedicationQuery('dipirona 500mg').wantsKit).toBe(false); // sem combo → penaliza kits
+  });
+});
+
+describe('medNameForSearch — busca pelo NOME (dosagem+forma+qtd fora); incidente Arthur 16/07', () => {
+  it('remove a dosagem (a dose vai pro ranqueador, não pro ft que ela zeraria)', () => {
+    // `ft=Neblock 0.5mg` devolvia 0 na VTEX; `ft=Neblock` devolve os 5 reais.
+    expect(medNameForSearch('Neblock 0.5mg')).toBe('neblock');
+    expect(medNameForSearch('losartana potássica 50mg')).toBe('losartana potassica');
+  });
+  it('remove FORMA e QUANTIDADE — também envenenam o ft literal', () => {
+    // medido ao vivo: `ft=amplictil gotas` → 0 na São João; `ft=amplictil` → 3.
+    expect(medNameForSearch('amplictil gotas')).toBe('amplictil');
+    expect(medNameForSearch('dipirona 500mg 30 comprimidos')).toBe('dipirona');
+  });
+  it('dose com ESPAÇO não vaza a unidade como token-veneno (review Leva 1 #2)', () => {
+    // "neblock 5 mg" NÃO pode virar "neblock mg" (mg zeraria o ft mesmo com a dose certa).
+    expect(medNameForSearch('neblock 5 mg')).toBe('neblock');
+    expect(medNameForSearch('dipirona 500 mg')).toBe('dipirona');
+    expect(medNameForSearch('insulina 100 ui')).toBe('insulina');
+  });
+  it('PRESERVA sufixo curto distintivo (d3/b12) — não vira só "vitamina" (anti-regressão)', () => {
+    expect(medNameForSearch('vitamina d3 2000ui')).toBe('vitamina d3');
+    expect(medNameForSearch('vitamina b12')).toBe('vitamina b12');
+  });
+  it('preserva o nome quando não há dosagem', () => {
+    expect(medNameForSearch('amoxicilina')).toBe('amoxicilina');
+  });
+  it('fallback pro termo normalizado quando só sobra dosagem', () => {
+    // Sem nome extraível, busca com o que der (não retorna vazio, que zeraria a rede).
+    expect(medNameForSearch('500mg').length).toBeGreaterThan(0);
   });
 });
 

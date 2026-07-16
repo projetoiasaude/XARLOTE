@@ -10,7 +10,7 @@
  */
 import { writeLog } from '@iasaude/db';
 import { itemDisplayName, extractCep, type OrderItem } from '@iasaude/shared';
-import { quotePlatformBasket, type PlatformBasketQuote, type BasketRequestItem } from '@iasaude/integrations';
+import { quotePlatformBasket, medNameForSearch, type PlatformBasketQuote, type BasketRequestItem } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 
 export { extractCep };
@@ -84,7 +84,10 @@ export async function presentPlatformQuotes(params: {
       qty: 1,
     }))
     .filter((b) => b.query);
-  if (!basket.length) return { networksPresented: 0, itemsCovered: 0 };
+  if (!basket.length) {
+    await writeLog('warn', 'platform', `Cotação de plataformas: cesta vazia (nenhum item com termo de busca)`, { traceId, orderId });
+    return { networksPresented: 0, itemsCovered: 0 };
+  }
 
   let quotes: PlatformBasketQuote[] = [];
   try {
@@ -93,7 +96,17 @@ export async function presentPlatformQuotes(params: {
     await writeLog('warn', 'platform', `Cotação de plataformas (cesta) falhou: ${String(err).slice(0, 140)}`, { traceId, orderId });
     return { networksPresented: 0, itemsCovered: 0 };
   }
-  if (!quotes.length) return { networksPresented: 0, itemsCovered: 0 };
+  // Pool vazio NUNCA em silêncio (incidente Arthur 16/07: 0 redes, sem log — impossível saber
+  // que ele foi afetado sem investigação manual). Registra o termo de busca REAL de cada item
+  // (pós-medNameForSearch) pra a causa aparecer no log: "Neblock 0.5mg → neblock" = achou nome
+  // mas nenhuma dose casou; "xyz → xyz" = nem catálogo tem. Nome de remédio é operacional (não PII).
+  if (!quotes.length) {
+    await writeLog('info', 'platform', `Cotação de plataformas (cesta): 0 redes — nenhum item casou nas grandes redes`, {
+      traceId, orderId,
+      buscas: basket.map((b) => `${b.label} → "${medNameForSearch(b.query)}"`),
+    });
+    return { networksPresented: 0, itemsCovered: 0 };
+  }
 
   const top = quotes.slice(0, MAX_NETWORKS);
   const blocks = top.map((q, i) => renderNetworkBlock(i, q));

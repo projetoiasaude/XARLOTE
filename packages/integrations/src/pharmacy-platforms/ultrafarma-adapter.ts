@@ -14,7 +14,7 @@
 import axios from 'axios';
 import type { PlatformNetwork } from './registry.js';
 import type { PlatformProduct } from './types.js';
-import { rankProductMatches } from './matching.js';
+import { rankProductMatches, medNameForSearch } from './matching.js';
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const DEFAULT_TIMEOUT_MS = 9000;
@@ -139,7 +139,8 @@ async function quoteUltrafarmaUncached(
   opts: { timeoutMs?: number; minScore?: number },
 ): Promise<PlatformProduct | null> {
   const timeout = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const res = await axios.get(`${net.host}/busca?q=${encodeURIComponent(query)}`, {
+  // Busca pelo NOME (sem dosagem/forma) — a dose entra no ranqueador (ver medNameForSearch).
+  const res = await axios.get(`${net.host}/busca?q=${encodeURIComponent(medNameForSearch(query))}`, {
     timeout,
     responseType: 'text',
     transformResponse: [(d) => d],

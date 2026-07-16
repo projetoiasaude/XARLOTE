@@ -97,6 +97,38 @@ function detectQuantity(text: string): number | null {
   return m ? Number(m[1]) : null;
 }
 
+/**
+ * Termo de BUSCA (o `ft=`/`q=`/`w=` das plataformas) a partir do pedido: SÓ o nome do remédio,
+ * sem dosagem, forma nem quantidade. A dosagem/forma entram depois no RANQUEADOR
+ * (`scoreProductMatch`, que canonicaliza unidade — 1g=1000mg — e compara melhor que a busca
+ * textual literal). Motivo (medido ao vivo 16/07): a busca `ft` das plataformas é LITERAL e
+ * qualquer token extra zera o resultado —
+ *   • `ft=Neblock 0.5mg` → 0 produtos (0.5mg de nebivolol nem existe); `ft=Neblock` → 5. (Arthur)
+ *   • `ft=amplictil gotas` → 0 na São João; `ft=amplictil` → 3. (a FORMA também envenenava —
+ *     o pedido "que funcionou" hoje perdeu redes por causa do "gotas".)
+ *
+ * É o mesmo pipeline do `nameTokens`, MAS sem o corte de <3 letras — senão "Vitamina D3" viraria
+ * "vitamina" (d3 tem 2 letras) e o produto certo poderia não vir no top-N. Mantém tokens ≥2
+ * (d3/b12/k2/t4). Fallback pro termo normalizado quando não sobra nome (pedido veio só dosagem).
+ */
+export function medNameForSearch(term: string): string {
+  // "500 mg"/"5 mg" (número ESPAÇO unidade, um dos formatos mais digitados) → cola em "500mg"
+  // pra o strip de dosagem pegar. Senão a unidade ficava SOLTA e virava token-veneno no ft:
+  // "neblock 5 mg" → "neblock mg" → 0 produtos, mesmo com a dose CERTA (review Leva 1 #2).
+  const norm = normalize(term).replace(/(\d)\s+(mg|mcg|g|ml|ui|%)\b/gi, '$1$2');
+  const strengths = extractStrengths(norm);
+  const strengthWords = new Set(strengths.flatMap((s) => [s, s.replace(/[a-z%]+$/i, '')]));
+  const kept = norm
+    .split(' ')
+    .filter((t) => t.length >= 2)
+    .filter((t) => !STOPWORDS.has(t))
+    .filter((t) => !/^\d+([.,]\d+)?(mg|mcg|g|ml|ui|%)?$/i.test(t)) // dosagem colada OU quantidade solta
+    .filter((t) => !/^(mg|mcg|ml|ui|kg)$/i.test(t))               // unidade SOLTA remanescente (belt-and-suspenders)
+    .filter((t) => !strengthWords.has(t))
+    .filter((t) => !FORMS.some(([, re]) => re.test(t))); // forma envenena o ft literal (amplictil gotas→0)
+  return kept.join(' ').trim() || norm.trim() || term.trim(); // nunca vazio (não zera a busca à toa)
+}
+
 export function parseMedicationQuery(text: string): ParsedMedication {
   const norm = normalize(text);
   const strengths = extractStrengths(norm);

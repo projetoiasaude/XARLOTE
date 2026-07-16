@@ -1578,25 +1578,31 @@ async function handleExpandPharmacySearch(ctx: ToolContext) {
 async function handleMessageSupplier(args: { supplier_hint?: string; message?: string }, ctx: ToolContext) {
   // Toda resposta deste handler é AUTO-CONTIDA → suprime o texto do LLM do turno
   // (uma voz só; senão sai "Não tenho certeza…" + "Deixa eu mandar mensagem 💙" juntos).
-  const say = async (text: string) => {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164, text, ctx.traceId);
+  // `dedup:true` SÓ nos galhos de ERRO ENLATADO ("ainda não respondeu", "não achei pedido"):
+  // se o usuário INSISTE (o Arthur mandou 2× em 50s), a LLM re-chama a tool e sairia texto
+  // IDÊNTICO de novo — a "bugada" que ele viu. Janela 180s (maior que os 12s conversacionais)
+  // porque a repetição vem de insistência humana. NÃO dedupa os `say()` de SUCESSO/re-cobra
+  // (default): lá um side-effect REAL aconteceu (mandei à farmácia) e dois follow-ups distintos
+  // podem gerar a MESMA confirmação — suprimir deixaria o paciente no escuro (review Leva 1 #3).
+  const say = async (text: string, opts: { dedup?: boolean } = {}) => {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164, text, ctx.traceId, {}, opts.dedup ? { dedup: true, dedupWindowMs: 180_000 } : {});
     if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
   };
   // Kill-switch de disparo (a msg vai pra uma farmácia) — freio de emergência.
   if (!loadPrompts().pharmacy_outbound_enabled) {
-    await say('O contato com farmácias está pausado no momento 💙 Já já volto a falar com elas pra você.');
+    await say('O contato com farmácias está pausado no momento 💙 Já já volto a falar com elas pra você.', { dedup: true });
     return;
   }
   const hint = (args.supplier_hint ?? '').trim();
   const message = (args.message ?? '').trim();
   if (!message) {
-    await say('Me diz o que você quer que eu fale pra farmácia que eu mando na hora 💙');
+    await say('Me diz o que você quer que eu fale pra farmácia que eu mando na hora 💙', { dedup: true });
     return;
   }
 
   const state = await loadLatestOrderState(ctx.userId);
   if (!state || !state.suppliers.length) {
-    await say('Não achei um pedido recente com farmácias pra eu falar 💙 Se quiser, me fala o remédio e o endereço que eu começo uma busca nova.');
+    await say('Não achei um pedido recente com farmácias pra eu falar 💙 Se quiser, me fala o remédio e o endereço que eu começo uma busca nova.', { dedup: true });
     return;
   }
 
@@ -1609,18 +1615,27 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
   }
   if (!target) {
     const nomes = state.suppliers.map((s) => s.supplierName).slice(0, 6).join(', ');
-    await say(`Não tenho certeza de qual farmácia você quer que eu fale 🤔 As do seu pedido são: ${nomes}. Me diz o nome que eu mando na hora.`);
+    await say(`Não tenho certeza de qual farmácia você quer que eu fale 🤔 As do seu pedido são: ${nomes}. Me diz o nome que eu mando na hora.`, { dedup: true });
     return;
   }
 
   if (!target.conversationId || !target.phoneE164 || isPlaceholderPhone(target.phoneE164)) {
-    await say(`Não tenho um WhatsApp válido da ${target.supplierName} pra falar direto com ela 😕 Quer que eu procure em outras farmácias?`);
+    await say(`Não tenho um WhatsApp válido da ${target.supplierName} pra falar direto com ela 😕 Quer que eu procure em outras farmácias?`, { dedup: true });
     return;
   }
 
-  // Janela de 24h (WABA/zpro): fora dela, texto livre não é entregue — seja honesta.
+  // Fora da janela de texto livre (WABA/zpro): seja HONESTA sobre o PORQUÊ. O copy antigo dizia
+  // "faz mais de 24h" pra QUALQUER caso — inclusive uma farmácia contatada agora há pouco que
+  // simplesmente não respondeu (incidente Arthur 16/07: contato às 11h36, e às 13h ela afirmou
+  // "faz mais de 24h" — o paciente pegou na hora: "tem nem 4h isso"). Distingue os dois casos:
+  //   • nunca respondeu (lastSupplierInboundAt=null) → a janela nunca abriu; não é questão de 24h.
+  //   • respondeu antes, mas há >24h → a janela de sessão do Meta realmente expirou.
   if (!target.contactableFreeText) {
-    await say(`Faz mais de 24h que a ${target.supplierName} não me responde, então não consigo reabrir a conversa direto com ela 😕 Quer que eu procure em outras farmácias num raio maior?`);
+    const neverReplied = !target.lastSupplierInboundAt;
+    const msg = neverReplied
+      ? `A ${target.supplierName} ainda não respondeu o meu contato 😕 Enquanto ela não responder, o WhatsApp não me deixa insistir por lá. Quer que eu procure em mais farmácias pra você?`
+      : `A ${target.supplierName} não fala comigo há mais de 24h, então o WhatsApp não deixa eu reabrir a conversa direto com ela 😕 Quer que eu procure em outras farmácias num raio maior?`;
+    await say(msg, { dedup: true });
     return;
   }
 
@@ -1633,7 +1648,7 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
   const freshStatus = freshOrder?.status;
   const isChosen = !!freshOrder?.selected_quote_id && freshOrder.selected_quote_id === target.quoteId;
   if (!freshStatus || (['confirming', 'handed_off', 'cancelled'].includes(freshStatus) && !isChosen)) {
-    await say('Esse pedido já foi fechado 💙 Se quiser falar com outra farmácia, me fala que eu começo um pedido novo.');
+    await say('Esse pedido já foi fechado 💙 Se quiser falar com outra farmácia, me fala que eu começo um pedido novo.', { dedup: true });
     return;
   }
 

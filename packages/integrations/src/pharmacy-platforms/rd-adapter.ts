@@ -16,7 +16,7 @@
 import axios from 'axios';
 import type { PlatformNetwork } from './registry.js';
 import type { PlatformProduct } from './types.js';
-import { rankProductMatches } from './matching.js';
+import { rankProductMatches, medNameForSearch } from './matching.js';
 
 const ZENROWS_BASE = 'https://api.zenrows.com/v1/';
 const DEFAULT_TIMEOUT_MS = 25000; // ZenRows resolve Akamai — bem mais lento que REST
@@ -140,7 +140,10 @@ async function quoteRDProductUncached(
   query: string,
   opts: { timeoutMs?: number; minScore?: number },
 ): Promise<PlatformProduct | null> {
-  const hits = await searchRD(net, query, opts.timeoutMs);
+  // Busca pelo NOME (sem dosagem/forma) — a dose entra no ranqueador (ver medNameForSearch).
+  // Extra importante na RD: cada busca custa 1 request ZenRows; um `w=` com dose torta gastava
+  // crédito pra voltar 0.
+  const hits = await searchRD(net, medNameForSearch(query), opts.timeoutMs);
   if (!hits.length) return null;
   // hits → PlatformProduct SEM preço (o matching não usa preço); price real vem depois.
   const candidates: PlatformProduct[] = hits.map((h) => ({
