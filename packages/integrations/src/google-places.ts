@@ -1,4 +1,13 @@
 import axios from 'axios';
+import { getBreaker } from '@iasaude/shared';
+
+// Circuit breaker (review B9): numa queda sustentada do Google (≥5 falhas), abre o circuito e as
+// chamadas de busca seguintes falham NA HORA (fail-fast, CircuitOpenError) por 30s em vez de gastar
+// ~10s de timeout cada. Os callers da busca (tool-executor / clinic-discovery) já degradam com erro
+// (try/catch → []), então o CircuitOpenError propaga limpo como qualquer falha.
+function placesExec<T>(fn: () => Promise<T>): Promise<T> {
+  return getBreaker('google-places', { failureThreshold: 5, cooldownMs: 30_000 }).execute(fn);
+}
 
 // Uses the Legacy Places API (Nearby Search) which is enabled on this project.
 // Places API (New) requires separate activation at console.developers.google.com.
@@ -97,7 +106,7 @@ export async function findNearbyClinics(
   radiusMeters = 5000,
   limit = 8
 ): Promise<PlaceResult[]> {
-  const res = await axios.get(NEARBY_SEARCH, {
+  const res = await placesExec(() => axios.get(NEARBY_SEARCH, {
     params: {
       location: `${lat},${lng}`,
       radius: radiusMeters,
@@ -107,7 +116,7 @@ export async function findNearbyClinics(
       language: 'pt-BR',
     },
     timeout: 10_000,
-  });
+  }));
 
   if (res.data?.status !== 'OK' && res.data?.status !== 'ZERO_RESULTS') {
     throw new Error(`Places API error (clinics): ${res.data?.status} — ${res.data?.error_message ?? ''}`);
@@ -149,7 +158,7 @@ export async function findNearbyPharmacies(
   lng: number,
   radiusMeters = 3000
 ): Promise<PlaceResult[]> {
-  const res = await axios.get(NEARBY_SEARCH, {
+  const res = await placesExec(() => axios.get(NEARBY_SEARCH, {
     params: {
       location: `${lat},${lng}`,
       radius: radiusMeters,
@@ -159,7 +168,7 @@ export async function findNearbyPharmacies(
       language: 'pt-BR',
     },
     timeout: 10_000,
-  });
+  }));
 
   if (res.data?.status !== 'OK' && res.data?.status !== 'ZERO_RESULTS') {
     throw new Error(`Places API error: ${res.data?.status} — ${res.data?.error_message ?? ''}`);

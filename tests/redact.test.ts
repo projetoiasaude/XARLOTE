@@ -75,4 +75,18 @@ describe('redactPII — redige por chave sensível, preserva operacional', () =>
     expect(out.lat).toBe('[redacted]');
     expect(out.lng).toBe('[redacted]');
   });
+  it('redige campos clínicos de PERFIL (condition/allergy/diagnosis/symptom/substance) — LGPD (B6)', () => {
+    const out = redactPII({ condition: 'diabetes tipo 2', allergy: 'dipirona', diagnosis: 'hipertensão', substance: 'penicilina', symptom: 'cefaleia', label: 'perfil' });
+    expect(out.condition).toBe('[redacted]');
+    expect(out.allergy).toBe('[redacted]');
+    expect(out.diagnosis).toBe('[redacted]'); // casa 'diagnos'
+    expect(out.substance).toBe('[redacted]');
+    expect(out.symptom).toBe('[redacted]');
+    expect(out.label).toBe('perfil'); // não-clínico preserva
+  });
+  it('NÃO redige medication/items — operacional do fluxo de pedido (escolha deliberada)', () => {
+    const out = redactPII({ medication: 'dipirona 500mg', items: ['dorflex'] });
+    expect(out.medication).toBe('dipirona 500mg'); // 'medication' fora do SENSITIVE_KEY de propósito
+    expect((out.items as string[])[0]).toBe('dorflex');
+  });
 });

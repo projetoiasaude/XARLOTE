@@ -21,6 +21,11 @@ const SENSITIVE_KEY = new RegExp(
     'full_name', 'preferred_name', 'patient_name', 'contact_name',
     'emergency_contact_name', 'emergency_contact_phone',
     'birth', 'nascimento', 'rg', 'passport',
+    // dados clínicos de PERFIL (LGPD dado sensível — CLAUDE.md #3). NÃO inclui 'medication'/
+    // 'medicamento' de propósito: é amplo demais (o fluxo de pedido loga o nome do remédio pra
+    // debug operacional); aqui só os campos de condição/alergia/diagnóstico/sintoma do perfil.
+    'condition', 'allergy', 'alergia', 'diagnos', 'clinical', 'clinico',
+    'symptom', 'sintoma', 'substance', 'prescription', 'receita',
   ].join('|'),
   'i',
 );
