@@ -214,7 +214,7 @@ async function contactClinic(phone: string, clinicName: string, specialty: strin
 
   const { data: clinic, error: cErr } = await db.from('clinics').insert({
     type: 'clinic', name: clinicName, whatsapp_e164: phone, phone_e164: phone,
-    city: city ?? '', state: (profile?.home_state as string | null) ?? '', status: 'active',
+    city: city ?? '', state: (profile?.home_state as string | null) ?? '',
   }).select('id').single();
   if (cErr || !clinic?.id) {
     await writeLog('error', 'lookup', `contactClinic: falha ao criar clínica: ${cErr?.message ?? 'sem id'}`, { traceId: ctx.traceId });

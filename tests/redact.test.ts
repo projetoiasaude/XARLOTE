@@ -25,6 +25,15 @@ describe('maskString — mascara PII em texto livre (F0.5/LGPD)', () => {
   it('preserva texto clínico sem PII', () => {
     expect(maskString('quero comprar dipirona 500mg')).toBe('quero comprar dipirona 500mg');
   });
+  it('mascara par de coordenadas lat,lng — geolocalização (audit 15/07 item 4)', () => {
+    expect(maskString('centro: -16.68690,-49.26430, raio 3km')).toContain('[geo]');
+    expect(maskString('centro: -16.68690,-49.26430')).not.toContain('16.68690');
+    expect(maskString('Cidade "Goiânia" geocodada → -16.6869,-49.2643')).toContain('[geo]'); // toFixed(4)
+  });
+  it('NÃO confunde preço BR nem decimal comum com coordenada', () => {
+    expect(maskString('total R$ 1.234,56 com frete')).toContain('1.234,56'); // vírgula é o decimal, não coord
+    expect(maskString('dipirona por R$ 4,27')).toContain('4,27');
+  });
 });
 
 describe('redactPII — redige por chave sensível, preserva operacional', () => {
@@ -58,5 +67,12 @@ describe('redactPII — redige por chave sensível, preserva operacional', () =>
   it('mascara CPF dentro de string de mensagem', () => {
     const out = redactPII({ message: 'cpf do paciente: 123.456.789-09' });
     expect(out.message).toContain('[cpf]');
+  });
+  it('mascara coordenada dentro da mensagem E redige lat/lng do meta (defesa dupla — item 4)', () => {
+    const out = redactPII({ message: 'Buscando farmácias — centro: -16.68690,-49.26430', lat: -16.6869, lng: -49.2643 });
+    expect(out.message).not.toContain('16.68690');
+    expect(out.message).toContain('[geo]');
+    expect(out.lat).toBe('[redacted]');
+    expect(out.lng).toBe('[redacted]');
   });
 });

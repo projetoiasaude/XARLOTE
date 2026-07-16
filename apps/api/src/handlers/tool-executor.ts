@@ -790,19 +790,19 @@ async function handleStartPharmacyOrder(
       return;
     }
   } else if (args.location?.address) {
-    await writeLog('info', 'geocoding', `Geocodificando endereço: ${args.location.address}`, { traceId: ctx.traceId });
+    await writeLog('info', 'geocoding', `Geocodificando endereço do usuário`, { traceId: ctx.traceId, address: args.location.address });
     const geo = await geocodeAddress(args.location.address);
     if (geo && geo.confidence === 'precise') {
       lat = geo.lat;
       lng = geo.lng;
       deliveryAddress = geo.formattedAddress || args.location.address;
       locationSource = `geocoded:${geo.formattedAddress}`;
-      await writeLog('info', 'geocoding', `Endereço localizado (preciso): ${geo.formattedAddress} → ${lat.toFixed(5)},${lng.toFixed(5)}`, { traceId: ctx.traceId, lat, lng });
+      await writeLog('info', 'geocoding', `Endereço localizado (confiança: precise)`, { traceId: ctx.traceId, lat, lng, address: geo.formattedAddress });
     } else if (geo && geo.confidence === 'low') {
       // Geocoder caiu no fallback de cidade/estado — provavelmente bairro/rua não existe.
       // Não usa pra busca local (centro da cidade pode estar a km do usuário); pede refinamento.
-      await writeLog('warn', 'geocoding', `Match impreciso (só cidade/UF): ${geo.formattedAddress} — pedindo refinamento`, {
-        traceId: ctx.traceId, queriedAddress: args.location.address, matched: geo.formattedAddress,
+      await writeLog('warn', 'geocoding', `Match impreciso (só cidade/UF) — pedindo refinamento`, {
+        traceId: ctx.traceId, queriedAddress: args.location.address, matchedAddress: geo.formattedAddress,
       });
       await sendOutbound(
         ctx.conversationId,
@@ -812,7 +812,7 @@ async function handleStartPharmacyOrder(
       );
       return;
     } else {
-      await writeLog('warn', 'geocoding', `Endereço não encontrado: ${args.location.address}`, { traceId: ctx.traceId });
+      await writeLog('warn', 'geocoding', `Endereço não encontrado`, { traceId: ctx.traceId, address: args.location.address });
       await sendOutbound(
         ctx.conversationId,
         ctx.phoneE164,
@@ -833,16 +833,16 @@ async function handleStartPharmacyOrder(
       const nomi = await reverseGeocodeNominatim(lat, lng);
       if (nomi) {
         deliveryAddress = nomi.formattedAddress;
-        await writeLog('info', 'geocoding', `Reverse geocode (Nominatim): ${nomi.shortAddress}`, {
-          traceId: ctx.traceId, lat, lng,
+        await writeLog('info', 'geocoding', `Reverse geocode (Nominatim) OK`, {
+          traceId: ctx.traceId, lat, lng, address: nomi.shortAddress,
           road: nomi.road, neighborhood: nomi.neighborhood, city: nomi.city, postcode: nomi.postcode,
         });
       } else {
         const goog = await reverseGeocode(lat, lng).catch(() => null);
         if (goog) {
           deliveryAddress = goog;
-          await writeLog('info', 'geocoding', `Reverse geocode (Google fallback): ${goog}`, {
-            traceId: ctx.traceId, lat, lng,
+          await writeLog('info', 'geocoding', `Reverse geocode (Google fallback) OK`, {
+            traceId: ctx.traceId, lat, lng, address: goog,
           });
         } else {
           deliveryAddress = `Localização compartilhada via WhatsApp (lat ${lat.toFixed(5)}, lng ${lng.toFixed(5)})`;
@@ -886,7 +886,7 @@ async function handleStartPharmacyOrder(
     ctx.traceId,
   );
 
-  await writeLog('info', 'order', `Criando pedido — localização: ${lat.toFixed(5)},${lng.toFixed(5)} (fonte: ${locationSource})`, {
+  await writeLog('info', 'order', `Criando pedido (fonte da localização: ${locationSource.split(':')[0]})`, {
     traceId: ctx.traceId, lat, lng, items: args.items.map((i) => i.name),
   });
 
@@ -1148,7 +1148,7 @@ async function startPharmacyDiscovery(
   ctx: ToolContext,
   preferredNames: string[] = [],
 ) {
-  await writeLog('info', 'places', `Buscando farmácias via Google Places — centro: ${lat.toFixed(5)},${lng.toFixed(5)}, raio: 3km`, {
+  await writeLog('info', 'places', `Buscando farmácias via Google Places (raio 3km)`, {
     traceId: ctx.traceId, orderId, lat, lng,
   });
 
