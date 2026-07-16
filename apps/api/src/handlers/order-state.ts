@@ -63,6 +63,11 @@ export interface OrderState {
   supplierAckAfterClose: boolean;
   /** Handoff de plataforma: cotado nas grandes redes (links enviados), sem farmácia de bairro. */
   platformHandoff: boolean;
+  /** Endereço de entrega do pedido (pra extrair CEP e re-cotar por nome numa grande rede). */
+  deliveryAddress: string | null;
+  /** Coordenadas de entrega — fallback pra reverse-geocode do CEP quando o endereço não traz. */
+  deliveryLat: number | null;
+  deliveryLng: number | null;
 }
 
 interface QuoteJoinRow {
@@ -85,7 +90,7 @@ export async function loadLatestOrderState(userId: string): Promise<OrderState |
   const sinceIso = new Date(Date.now() - WINDOW_MS).toISOString();
   const { data: order } = await db
     .from('orders')
-    .select('id, status, items, created_at, selected_quote_id, closed_at, delivery_deadline, close_conditions, summary')
+    .select('id, status, items, created_at, selected_quote_id, closed_at, delivery_deadline, close_conditions, summary, delivery_address, delivery_lat, delivery_lng')
     .eq('user_id', userId)
     .in('status', RELEVANT_STATUSES as unknown as string[])
     .gte('created_at', sinceIso)
@@ -165,6 +170,9 @@ export async function loadLatestOrderState(userId: string): Promise<OrderState |
     closeConditions: (order.close_conditions as string | null) ?? null,
     supplierAckAfterClose,
     platformHandoff: typeof order.summary === 'string' && order.summary.startsWith(PLATFORM_HANDOFF_SUMMARY),
+    deliveryAddress: (order.delivery_address as string | null) ?? null,
+    deliveryLat: (order.delivery_lat as number | null) ?? null,
+    deliveryLng: (order.delivery_lng as number | null) ?? null,
   };
 }
 

@@ -17,7 +17,7 @@ import {
   strengthsCompatible,
   medNameForSearch,
 } from '../packages/integrations/src/pharmacy-platforms/matching.js';
-import { PLATFORM_REGISTRY, activeNetworks } from '../packages/integrations/src/pharmacy-platforms/registry.js';
+import { PLATFORM_REGISTRY, activeNetworks, matchPlatformNetworkByName } from '../packages/integrations/src/pharmacy-platforms/registry.js';
 import { affiliateWrap } from '../packages/integrations/src/pharmacy-platforms/index.js';
 import { parseRDSearch, parseRDPrice } from '../packages/integrations/src/pharmacy-platforms/rd-adapter.js';
 import { parseNisseiResults, parseNisseiPrices, parseNisseiCsrf, humanizeNisseiSlug } from '../packages/integrations/src/pharmacy-platforms/nissei-adapter.js';
@@ -180,6 +180,32 @@ describe('parseMedicationQuery', () => {
     expect(parseMedicationQuery('leve 2 dipirona').wantsKit).toBe(true);
     expect(parseMedicationQuery('kit primeiros socorros').wantsKit).toBe(true);
     expect(parseMedicationQuery('dipirona 500mg').wantsKit).toBe(false); // sem combo → penaliza kits
+  });
+});
+
+describe('matchPlatformNetworkByName — discernimento nome→canal (fundador 16/07)', () => {
+  it('casa GRANDE REDE nomeada (rest/custom sempre ativas) → cota no site', () => {
+    expect(matchPlatformNetworkByName('Pacheco')?.id).toBe('pacheco');
+    expect(matchPlatformNetworkByName('tenta na São João')?.id).toBe('sao-joao');
+    expect(matchPlatformNetworkByName('vê o preço na Ultrafarma')?.id).toBe('ultrafarma');
+    expect(matchPlatformNetworkByName('Nissei')?.id).toBe('nissei');
+    expect(matchPlatformNetworkByName('Pague Menos')?.id).toBe('pague-menos');
+  });
+  it('NÃO casa farmácia de bairro (fora do registry) → segue no WhatsApp', () => {
+    expect(matchPlatformNetworkByName('Drogaria São Benedito')).toBeNull();
+    expect(matchPlatformNetworkByName('Farmácia do Trabalhador')).toBeNull();
+    expect(matchPlatformNetworkByName('a que respondeu')).toBeNull();
+    expect(matchPlatformNetworkByName('a farmácia')).toBeNull();
+  });
+  it('robusto a hint vazio/curto/nulo', () => {
+    expect(matchPlatformNetworkByName('')).toBeNull();
+    expect(matchPlatformNetworkByName('   ')).toBeNull();
+    expect(matchPlatformNetworkByName(null)).toBeNull();
+    expect(matchPlatformNetworkByName('rd')).toBeNull(); // <4 chars = ruído
+  });
+  it('word-boundary: não casa alias/label dentro de token maior (review Leva 2 #7)', () => {
+    expect(matchPlatformNetworkByName('Drogalândia da esquina')).toBeNull(); // não casa "drogal"
+    expect(matchPlatformNetworkByName('Farmácia Indianópolis')).toBeNull();  // não casa "indiana"
   });
 });
 

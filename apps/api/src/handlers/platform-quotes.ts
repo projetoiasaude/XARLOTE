@@ -74,8 +74,14 @@ export async function presentPlatformQuotes(params: {
   phoneE164: string;
   traceId: string;
   soleChannel?: boolean;
+  /** Limita a cotação a redes específicas (ex.: usuário pediu SÓ a Drogasil pelo nome). */
+  networkIds?: string[];
+  /** Sobrescreve o texto de abertura (ex.: "Cotei na Drogasil pra você 👇"). */
+  introText?: string;
+  /** Sobrescreve o texto de fecho (o default fala em "sigo cotando no bairro", falso na cotação por nome). */
+  outroText?: string;
 }): Promise<PresentPlatformQuotesResult> {
-  const { orderId, items, cep, conversationId, phoneE164, traceId, soleChannel } = params;
+  const { orderId, items, cep, conversationId, phoneE164, traceId, soleChannel, networkIds, introText, outroText } = params;
 
   const basket: BasketRequestItem[] = items
     .map((it) => ({
@@ -91,7 +97,7 @@ export async function presentPlatformQuotes(params: {
 
   let quotes: PlatformBasketQuote[] = [];
   try {
-    quotes = await quotePlatformBasket(basket, cep, { timeoutMs: 9000, traceId });
+    quotes = await quotePlatformBasket(basket, cep, { timeoutMs: 9000, traceId, ...(networkIds?.length ? { networkIds } : {}) });
   } catch (err) {
     await writeLog('warn', 'platform', `Cotação de plataformas (cesta) falhou: ${String(err).slice(0, 140)}`, { traceId, orderId });
     return { networksPresented: 0, itemsCovered: 0 };
@@ -111,12 +117,12 @@ export async function presentPlatformQuotes(params: {
   const top = quotes.slice(0, MAX_NETWORKS);
   const blocks = top.map((q, i) => renderNetworkBlock(i, q));
 
-  const intro = soleChannel
+  const intro = introText ?? (soleChannel
     ? 'Não achei farmácia de bairro com WhatsApp aqui na sua região agora 😕 mas dá pra pedir nas grandes redes pertinho de você — é só tocar e finalizar o pagamento no site 👇\n\n'
-    : 'Também achei nas grandes redes aqui perto — é só tocar e finalizar o pagamento no site 👇\n\n';
-  const outro = soleChannel
+    : 'Também achei nas grandes redes aqui perto — é só tocar e finalizar o pagamento no site 👇\n\n');
+  const outro = outroText ?? (soleChannel
     ? '\n\nQualquer dúvida na hora de finalizar, é só me chamar 💙'
-    : '\n\nEnquanto isso sigo cotando nas farmácias do bairro — se aparecer melhor, te aviso! 😊';
+    : '\n\nEnquanto isso sigo cotando nas farmácias do bairro — se aparecer melhor, te aviso! 😊');
 
   await sendOutbound(conversationId, phoneE164, intro + blocks.join('\n\n') + outro, traceId);
 

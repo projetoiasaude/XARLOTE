@@ -4,7 +4,7 @@ import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
 import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal } from '@iasaude/shared';
-import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, type PlaceResult } from '@iasaude/integrations';
+import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { markSupplierVerifiedById } from './supplier-directory.js';
@@ -1613,6 +1613,53 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
       && !/\b(n[ãa]o|nunca|nem|menos|exceto)\b/i.test(hint)) {
     target = state.suppliers.find((s) => s.quoteId === state.selectedQuoteId) ?? null;
   }
+
+  // 🧭 DISCERNIMENTO NOME→CANAL (diretriz do fundador, incidente Arthur 16/07): se o usuário
+  // NOMEIA uma GRANDE REDE (Drogasil, Pacheco, Nissei…), ela NÃO se cota por WhatsApp — tem
+  // vitrine online (scraper/REST). Cota direto no site em vez de mandar WhatsApp pra uma loja
+  // física que não atende (o que gerou o "faz 24h" falso). Farmácia de BAIRRO (fora do registry)
+  // segue no WhatsApp normal. Guardas contra desvio errado:
+  //   • EXCLUSÃO: "menos a Ultrafarma", "exceto a Pacheco" — o usuário está TIRANDO a rede, não
+  //     pedindo. (NÃO barra "não dá pra cotar na Drogasil?" — "não" aqui é pedido positivo.)
+  //   • FALSO-POSITIVO de bairro: "Farmácia São João da Vila" (loja local) casa o alias "são joão"
+  //     da REDE. Só desvia pro scraper quando NÃO há alvo de bairro, OU o alvo é RECONHECIDAMENTE
+  //     uma rede (isPharmacyChain) E está morto (não respondeu E fora da janela). Loja de bairro
+  //     (isPharmacyChain=false) OU reengajável (respondeu/janela aberta) → respeita o WhatsApp.
+  const excluded = /\b(menos|exceto|tirando|fora a|afora|sem ser)\b/i.test(hint);
+  const namedNet = excluded ? null : matchPlatformNetworkByName(hint);
+  if (namedNet && (!target || (isPharmacyChain(target.supplierName) && !target.responded && !target.contactableFreeText))) {
+    const itensTxt = state.items.map((it) => itemDisplayName(it.name, it.dosage)).filter(Boolean).join(', ') || 'seu remédio';
+    // CEP: do endereço e, se não vier (pedido por PIN), reverse-geocode das coords (espelha o
+    // startPharmacyDiscovery — senão o usuário que mandou PIN fica preso num "me manda o CEP" que
+    // a tool nem sabe receber; review Leva 2 #2).
+    let cep = extractCep(state.deliveryAddress);
+    if (!cep && state.deliveryLat != null && state.deliveryLng != null) {
+      try {
+        const rg = await reverseGeocodeNominatim(state.deliveryLat, state.deliveryLng, 4000);
+        cep = extractCep(rg?.postcode ?? null);
+      } catch { /* segue sem CEP */ }
+    }
+    if (!cep) {
+      await say(`Pra cotar direto na ${namedNet.label} eu preciso do seu CEP 💙 Me manda que já busco lá pra você.`, { dedup: true });
+      return;
+    }
+    const pres = await presentPlatformQuotes({
+      orderId: state.orderId, items: state.items, cep,
+      conversationId: ctx.conversationId, phoneE164: ctx.phoneE164, traceId: ctx.traceId,
+      networkIds: [namedNet.id],
+      introText: `Cotei ${state.items.length > 1 ? 'os itens' : itensTxt} direto na ${namedNet.label} pra você — é só tocar e finalizar o pagamento no site 👇\n\n`,
+      outroText: '\n\nSe quiser que eu veja em mais alguma rede ou em farmácias perto de você, é só falar 💙',
+    }).catch(async (err) => {
+      await writeLog('warn', 'platform', `Cotação por nome (${namedNet.label}) falhou: ${String(err).slice(0, 120)}`, { traceId: ctx.traceId, orderId: state.orderId });
+      return { networksPresented: 0, itemsCovered: 0 };
+    });
+    if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true; // presentPlatformQuotes já falou (ou vamos falar abaixo)
+    if (pres.networksPresented === 0) {
+      await say(`Procurei ${itensTxt} na ${namedNet.label} agora e não achei disponível no site dela 😕 Quer que eu veja em outras redes ou em farmácias perto de você?`, { dedup: true });
+    }
+    return;
+  }
+
   if (!target) {
     const nomes = state.suppliers.map((s) => s.supplierName).slice(0, 6).join(', ');
     await say(`Não tenho certeza de qual farmácia você quer que eu fale 🤔 As do seu pedido são: ${nomes}. Me diz o nome que eu mando na hora.`, { dedup: true });

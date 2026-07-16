@@ -55,6 +55,62 @@ export const PLATFORM_REGISTRY: readonly PlatformNetwork[] = [
   { id: 'panvel', label: 'Panvel', host: 'https://www.panvel.com', salesChannel: '1', access: 'custom', group: 'Dimed', enabled: false },
 ];
 
+/** Normaliza pra casar nome de rede: minúsculo, sem acento, espaços colapsados. */
+function normNetName(s: string): string {
+  return (s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+// Como o usuário FALA a rede (curto, sem "Drogaria/Farmácia") → id do registry. O casamento por
+// label cobre o resto; aqui ficam os apelidos que o label não pega direto.
+const NETWORK_ALIASES: Record<string, string> = {
+  drogasil: 'drogasil',
+  pacheco: 'pacheco',
+  'sao joao': 'sao-joao', saojoao: 'sao-joao',
+  'pague menos': 'pague-menos', paguemenos: 'pague-menos',
+  extrafarma: 'extrafarma', 'extra farma': 'extrafarma',
+  'sao paulo': 'drogaria-sao-paulo', dpsp: 'drogaria-sao-paulo',
+  nissei: 'nissei',
+  ultrafarma: 'ultrafarma', 'ultra farma': 'ultrafarma',
+  drogal: 'drogal',
+  venancio: 'venancio',
+  globo: 'drogaria-globo',
+  catarinense: 'catarinense',
+  indiana: 'indiana',
+  raia: 'droga-raia', 'droga raia': 'droga-raia', drogaraia: 'droga-raia',
+  araujo: 'araujo',
+  onofre: 'onofre',
+  panvel: 'panvel',
+};
+
+/**
+ * Casa o NOME que o usuário falou ("cotar Drogasil", "tenta na Pacheco") com uma rede de
+ * plataforma. Discernimento pedido pelo fundador (16/07): GRANDE REDE nomeada = cota no site
+ * (scraper/REST), NÃO por WhatsApp; farmácia de BAIRRO (fora do registry) = WhatsApp. Só
+ * devolve rede COTÁVEL agora (activeNetworks) — nome de rede desativada ou desconhecida → null
+ * (cai no fluxo normal de WhatsApp). Alias mais específico (mais longo) vence, e evita casar por
+ * label curto demais (ex.: "globo" só via alias, não por substring de 2 letras).
+ */
+export function matchPlatformNetworkByName(name: string | null | undefined): PlatformNetwork | null {
+  const h = normNetName(name ?? '');
+  if (h.length < 4) return null; // "raia"(4) é o menor alias real; <4 é ruído
+  const active = activeNetworks();
+  const byId = new Map(active.map((n) => [n.id, n]));
+  // 1) apelido conhecido contido no hint — mais longo primeiro (specificidade).
+  for (const alias of Object.keys(NETWORK_ALIASES).sort((a, b) => b.length - a.length)) {
+    if (new RegExp(`\\b${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(h)) {
+      const net = byId.get(NETWORK_ALIASES[alias]!);
+      if (net) return net;
+    }
+  }
+  // 2) label do registry como PALAVRA no hint (pega variações não mapeadas, ex.: "farmácias
+  // nissei"). Word-boundary igual ao passo 1 — senão "drogal" casaria dentro de outro token.
+  for (const n of active) {
+    const label = normNetName(n.label);
+    if (label.length >= 4 && new RegExp(`\\b${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(h)) return n;
+  }
+  return null;
+}
+
 /**
  * Redes que devem ser cotadas AGORA. Default = as `enabled` do registry que são 'rest'.
  * Sobreponível por env `PLATFORM_QUOTE_NETWORKS` (csv de ids) — ex.: pra ligar a RD assim
