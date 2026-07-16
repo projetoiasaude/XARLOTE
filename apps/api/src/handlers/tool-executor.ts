@@ -1976,8 +1976,23 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     return;
   }
 
-  // 2. Só AGORA transiciona o pedido pra 'confirming' + registra a escolha.
-  await db.from('orders').update({ status: 'confirming', selected_quote_id: args.quote_id }).eq('id', args.order_id);
+  // 2. Só AGORA transiciona o pedido pra 'confirming' + registra a escolha — via CAS ATÔMICO.
+  // O guard de leitura no passo 0 tem um TOCTOU: entre ele e este update, um turno concorrente
+  // (duplo "sim", ou backstop + tool do LLM em turnos distintos) podia passar os dois pelo guard e
+  // AMBOS mandarem "pode preparar" à farmácia + 2× handoff. O CAS (update só se o status ainda NÃO
+  // é confirming/handed_off/cancelled) garante que só UM turno vence a transição; o perdedor aborta.
+  const { data: won } = await db
+    .from('orders')
+    .update({ status: 'confirming', selected_quote_id: args.quote_id })
+    .eq('id', args.order_id)
+    .not('status', 'in', '(confirming,handed_off,cancelled)')
+    .select('id');
+  if (!won || won.length === 0) {
+    await writeLog('info', 'order', `confirm_order_selection: transição perdida p/ turno concorrente — abortando (idempotência CAS)`, {
+      traceId: ctx.traceId, orderId: args.order_id, quoteId: args.quote_id,
+    });
+    return;
+  }
 
   // 3. CONGELA as cotações IRMÃS (Fix #2 — freeze): o usuário escolheu; as outras
   // farmácias do MESMO pedido param de negociar (senão uma retardatária reabre a

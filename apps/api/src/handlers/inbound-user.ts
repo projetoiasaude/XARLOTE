@@ -14,6 +14,15 @@ import { saveContactsToMemory } from './reach-out.js';
 import { findPendingClarificationForUser } from './clarification.js';
 import { loadLatestOrderState, buildOrderStateBlock } from './order-state.js';
 import { consolidateQuotes } from './quote-consolidation.js';
+import { withUserLock } from '../concurrency/user-lock.js';
+
+// Serialização de turno (review H3): 2 mensagens rápidas do MESMO telefone geram 2 turnos
+// concorrentes → dupla execução de tools + estado stale + vozes contraditórias. Espera generosa
+// pra NÃO dropar a 2ª msg; se o turno anterior demorar mais que isso (raro), processa mesmo assim.
+const TURN_LOCK_WAIT_MS = 45_000;
+// TTL > pior turno (transcrição 30s + LLM 60s + retry + follow-up ≈ 130s) pra o lock NÃO
+// auto-expirar no meio e deixar um turno concorrente entrar (review H3-ressalva).
+const TURN_LOCK_TTL_MS = 180_000;
 
 // Queue pra disparar enricher async — instância única por processo
 const enricherQueue = new Queue(QUEUE_NAMES.PROFILE_ENRICHER, {
@@ -25,6 +34,21 @@ export async function processInboundUser(
   // F1.B2: o traceId nasce no webhook (ingresso) e desce até aqui pra correlacionar
   // todo o pipeline. Default randomUUID() mantém compat com callers diretos (simulate/testes).
   traceId: string = randomUUID(),
+): Promise<{ traceId: string; conversationId: string }> {
+  // Serializa por telefone (H3). `withUserLock` é fail-open (Redis fora → roda sem lock) e devolve
+  // null só se o lock não liberou em waitMs — nesse caso processa mesmo assim pra NUNCA dropar a
+  // mensagem (degradado; os CAS/guards de cada tool cobrem a corrida remanescente).
+  const done = await withUserLock(inbound.from.phoneE164, () => processInboundUserInner(inbound, traceId), {
+    scope: 'turn', waitMs: TURN_LOCK_WAIT_MS, ttlMs: TURN_LOCK_TTL_MS,
+  });
+  if (done !== null) return done;
+  await writeLog('warn', 'lock', `turn-lock não liberou em ${TURN_LOCK_WAIT_MS}ms — processando sem serialização (degradado)`, { traceId });
+  return processInboundUserInner(inbound, traceId);
+}
+
+async function processInboundUserInner(
+  inbound: NormalizedInbound,
+  traceId: string,
 ): Promise<{ traceId: string; conversationId: string }> {
   const phoneE164 = inbound.from.phoneE164;
 
@@ -1153,7 +1177,12 @@ export async function processInboundUser(
     replyText = 'Deixa eu confirmar certinho pra NÃO falhar: qual(is) medicamento(s), que horas, e é todo dia ou só uma vez? Aí eu agendo o lembrete na hora 💙';
   }
 
-  if (!replyText && !suppressReply) {
+  // Roda mesmo sob suppressReply (review M1): se um handler setou suppressLlmText porque "já
+  // respondeu" mas o ENVIO falhou (ex.: message_supplier caiu, ou confirm sem supplierPhone), a
+  // supressão engoliria a fala E esta rede nunca dispararia → turno mudo no aceite/re-contato. O
+  // árbitro é o `sentThisTurn`: se NADA saiu de fato neste turno, gera fallback; se o handler enviou
+  // (sentThisTurn>0), o guard interno não dispara (sem 2ª voz).
+  if (!replyText) {
     const { count: sentThisTurn } = await db
       .from('messages')
       .select('id', { count: 'exact', head: true })
@@ -1176,11 +1205,13 @@ export async function processInboundUser(
           await writeLog('warn', 'agent', `Follow-up do turno só-tool falhou: ${String(err).slice(0, 120)}`, { traceId });
         }
         if (!replyText) replyText = 'Prontinho, já cuidei disso aqui! 💙 Precisa de mais alguma coisa?';
-      } else {
+      } else if (!suppressReply) {
         // 🛡️ TURNO VAZIO: o LLM não gerou texto NEM tool (ex.: estourou o limite de tokens
         // numa resposta truncada / contexto gigante). NUNCA ficar muda — incidente Cefaliv
         // 06/07 (ela ficou muda 2 turnos seguidos, 1024/1024 tokens de saída). Fallback honesto
-        // que reengata a conversa.
+        // que reengata a conversa. SÓ quando não-suprimido (review M1-LOW): sob supressão sem
+        // tool, um handler/backstop assumiu e corretamente não enviou nada aqui (ex.: confirm
+        // abortado por outro turno já ter fechado) → ficar calado, não contradizer com "me atrapalhei".
         replyText = 'Opa, me atrapalhei aqui por um instante 🙈 Pode me falar de novo o que você precisa? Já cuido pra você 💙';
         await writeLog('warn', 'llm', `Turno vazio (sem texto e sem tool — LLM truncado?) — fallback gracioso`, { traceId, tokensOut: llmResponse.tokensOut });
       }

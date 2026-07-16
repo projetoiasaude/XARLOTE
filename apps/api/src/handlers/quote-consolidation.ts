@@ -85,15 +85,37 @@ export function scheduleQuoteTimeout(
  */
 export async function rescueOrphanedPharmacyQuotes(): Promise<void> {
   try {
-    const cutoff = new Date(Date.now() - RESCUE_WINDOW_MIN * 60_000).toISOString();
-    const { data: orders } = await db
+    const windowAgo = new Date(Date.now() - RESCUE_WINDOW_MIN * 60_000).toISOString();
+    const fiveMinAgo = new Date(Date.now() - CHECK_5MIN_MS).toISOString();
+
+    // (A) JANELA FECHADA (>RESCUE_WINDOW): consolida com o que tiver (mesmo 0 cotações → msg honesta).
+    const { data: expired } = await db
       .from('orders')
       .select('id, conversation_id, created_at')
       .eq('status', 'quoting')
-      .lt('created_at', cutoff)
+      .lt('created_at', windowAgo)
       .limit(50);
 
-    for (const o of orders ?? []) {
+    // (B) TIMER PERDIDO (review M2 — durabiliza a consolidação): um deploy/crash apaga os setTimeout
+    // de 3/5min (vivem em memória); um pedido com cotação JÁ PRONTA que perdeu o timer esperaria os
+    // 45min do passo (A). Aqui pegamos os que já passaram do ponto de 5min E têm ≥1 cotação 'quoted' e
+    // consolidamos em ≤30s (próximo tick do worker). Casa a regra do check5min; idempotente (CAS
+    // quoting→quoted, então rodar junto com um timer sobrevivente vira no-op). Faixa [5min, janela).
+    const { data: staleWithQuotes } = await db
+      .from('orders')
+      .select('id, conversation_id, created_at, quotes!inner(status)')
+      .eq('status', 'quoting')
+      .lt('created_at', fiveMinAgo)
+      .gte('created_at', windowAgo)
+      .eq('quotes.status', 'quoted')
+      .limit(50);
+
+    // dedup por id (as bandas de tempo são disjuntas, mas o Map protege de qualquer sobreposição).
+    const byId = new Map<string, { id: string; conversation_id: string | null }>();
+    for (const o of expired ?? []) byId.set(o.id, { id: o.id, conversation_id: o.conversation_id });
+    for (const o of staleWithQuotes ?? []) byId.set(o.id, { id: o.id, conversation_id: o.conversation_id });
+
+    for (const o of byId.values()) {
       try {
         if (!o.conversation_id) continue;
         const { data: conv } = await db
@@ -104,7 +126,7 @@ export async function rescueOrphanedPharmacyQuotes(): Promise<void> {
         const phone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
         if (!phone) continue;
         const traceId = `rescue-${o.id}`;
-        await writeLog('warn', 'order', `Resgatando pedido órfão preso em 'quoting' (>${RESCUE_WINDOW_MIN}min)`, { traceId, orderId: o.id });
+        await writeLog('warn', 'order', `Resgatando pedido preso em 'quoting' (timer perdido ou janela fechada)`, { traceId, orderId: o.id });
         await consolidateQuotesEarly(o.id, o.conversation_id, `+${phone}`, traceId);
       } catch (err) {
         await writeLog('error', 'order', `rescue de pedido falhou: ${String(err).slice(0, 160)}`, { orderId: o.id });
