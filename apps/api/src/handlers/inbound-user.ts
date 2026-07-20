@@ -1,7 +1,15 @@
 import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName } from '@iasaude/shared';
+
+/**
+ * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
+ * Fechar compra é irreversível e preço/estoque envelhecem — passado isso, só a LLM fecha
+ * (com o paciente reconfirmando). Incidente Vadivino 17/07: pedido de 3,5 DIAS fechado por
+ * um "Ok" solto.
+ */
+const BACKSTOP_MAX_PRESENTED_AGE_MS = 24 * 60 * 60 * 1000;
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard, QuoteOption } from '@iasaude/shared';
 import { chat, buildXarloteSystemPrompt, xarloteTools, messagesToHistory, trimHistory, embed, userContentWithImage, dataUrl, type ChatContent } from '@iasaude/llm';
 import { sendMenu, isSimulatorMode, fetchInboundMedia } from '@iasaude/whatsapp';
@@ -378,7 +386,7 @@ async function processInboundUserInner(
     getConversationMessages(conversation.id, 30),
     queryUser360(user.id),
     db.from('orders')
-      .select('id, status, items, summary')
+      .select('id, status, items, summary, presented_at')
       .eq('user_id', user.id)
       .in('status', ['quoting', 'quoted', 'confirming'])
       .order('created_at', { ascending: false })
@@ -748,7 +756,7 @@ async function processInboundUserInner(
     ordersCreatedThisTurn: new Set<string>(),
     // UMA VOZ: handlers auto-contidos (message_supplier) setam suppressLlmText — o texto
     // do LLM não sai junto contradizendo a resposta real da tool (incidente 07/07 17:34).
-    turnFlags: { suppressLlmText: false },
+    turnFlags: { suppressLlmText: false, supplierMessaged: false },
   };
 
   // 🚑 PREEMPÇÃO DE EMERGÊNCIA. Sinais físicos CLAROS e AGUDOS (dor no peito, falta de ar,
@@ -830,7 +838,7 @@ async function processInboundUserInner(
   // devolve null quando é ambíguo (não fecha errado).
   let backstopConfirmed = false;
   {
-    const activeOrder = activeOrderRes.data as { id: string; status: string; summary: string | null } | null;
+    const activeOrder = activeOrderRes.data as { id: string; status: string; summary: string | null; presented_at: string | null } | null;
     const userTextForPick = typeof userMsgContent === 'string'
       ? userMsgContent.replace(/^\[Áudio transcrito\]\s*/i, '').trim()
       : '';
@@ -839,15 +847,62 @@ async function processInboundUserInner(
       try {
         const parsed = JSON.parse(activeOrder.summary) as { options?: QuoteOption[] };
         const options = Array.isArray(parsed.options) ? parsed.options : [];
-        const pickedQuoteId = resolveQuotePick(options, userTextForPick);
-        // GUARDA CRÍTICA (review): só fecha se houver ACEITE VERBAL claro OU não houver
-        // pergunta pendente da farmácia. Sem isso, um "2" respondendo "quantas caixas?"
-        // (pendingClarif) fecharia a opção 2 por engano. resolveQuotePick já barra
-        // negação/quantidade/ambiguidade; aqui somamos o contexto de pergunta pendente.
-        const safeToConfirm = pickedQuoteId && (isOrderAcceptance(userTextForPick) || !pendingClarif);
+        // ESPECÍFICA (número/nome/superlativo) se auto-identifica; GENÉRICA ("ok"/"sim"/"👍")
+        // é contextual — só quer dizer "sim" pra ÚLTIMA coisa que a Xarlote falou.
+        const specificQuoteId = resolveSpecificPick(options, userTextForPick);
+        const pickedQuoteId = specificQuoteId ?? resolveQuotePick(options, userTextForPick);
+        const isGenericYes = !!pickedQuoteId && !specificQuoteId;
+
+        // ─── CONSENTIMENTO: 3 guardas em camadas (incidente Vadivino 17/07 02:48) ───
+        // Ele respondeu "Ok" a um "salvei o contato da Célia" e o backstop fechou um pedido
+        // apresentado 3,5 DIAS antes — mandando a farmácia preparar de verdade, com preço
+        // errado (R$4,95 auto-capturado vs "74,94" que a farmácia disse) e com a pergunta
+        // da farmácia SEM resposta. A LLM tinha acertado ("Precisa de mais alguma coisa?");
+        // o backstop determinístico atropelou. Fechar compra é irreversível → só com sinal
+        // INEQUÍVOCO. Na dúvida, não fecha: a LLM ainda pode conduzir e o paciente confirma.
+        const presentedAt = activeOrder.presented_at ? new Date(activeOrder.presented_at).getTime() : null;
+        const ageMs = presentedAt != null ? Date.now() - presentedAt : Infinity;
+
+        // G1 — RECÊNCIA: só restringe o aceite GENÉRICO. Uma escolha ESPECÍFICA ("quero a 2",
+        // "a mais barata") é consentimento inequívoco por si — barrá-la por idade regredia o
+        // Fix #1 inteiro, inclusive pra todo pedido já aberto no dia do deploy, que tem
+        // presented_at NULL → ageMs=Infinity (review).
+        const fresh = !isGenericYes || ageMs <= BACKSTOP_MAX_PRESENTED_AGE_MS;
+
+        // G2 — PERGUNTA PENDENTE nunca cede a aceite genérico: com a farmácia esperando
+        // resposta, um "ok" provavelmente RESPONDE a pergunta, não fecha a compra.
+        const clarifOk = !pendingClarif || !isGenericYes;
+
+        // G3 — ADJACÊNCIA (a que teria evitado o incidente): aceite genérico só vale se a
+        // apresentação das opções for a ÚLTIMA fala da Xarlote. Se ela falou outra coisa
+        // depois (salvar contato, lembrete, etc.), o "ok" é sobre AQUILO.
+        let adjacencyOk = true;
+        if (isGenericYes) {
+          if (presentedAt == null) {
+            adjacencyOk = false; // pedido antigo, sem âncora de apresentação → não arrisca
+          } else {
+            const { data: laterOut } = await db.from('messages')
+              .select('id')
+              .eq('conversation_id', conversation.id)
+              .eq('direction', 'out')
+              .gt('created_at', activeOrder.presented_at as string)
+              .limit(1);
+            adjacencyOk = !(laterOut && laterOut.length > 0);
+          }
+        }
+
+        const safeToConfirm = !!pickedQuoteId && fresh && clarifOk && adjacencyOk;
+        if (!safeToConfirm && pickedQuoteId) {
+          await writeLog('info', 'order', `🛡️ Backstop de fechamento ABORTADO (consentimento não inequívoco) — deixando a LLM conduzir`, {
+            traceId, orderId: activeOrder.id, quoteId: pickedQuoteId,
+            motivo: !fresh ? `apresentação antiga (${Math.round(ageMs / 3_600_000)}h)` : !clarifOk ? 'aceite genérico com pergunta da farmácia pendente' : 'aceite genérico não responde à apresentação (a Xarlote falou outra coisa depois)',
+            generico: isGenericYes, texto: userTextForPick.slice(0, 40),
+          });
+        }
         if (safeToConfirm && pickedQuoteId) {
           await writeLog('info', 'order', `🔒 Backstop: aceite detectado ("${userTextForPick.slice(0, 40)}") → forçando confirm_order_selection`, {
             traceId, orderId: activeOrder.id, quoteId: pickedQuoteId, llmTools: llmResponse.toolCalls.map((t) => t.name), hadPendingClarif: !!pendingClarif,
+            especifica: !isGenericYes, apresentadaHaMin: presentedAt != null ? Math.round(ageMs / 60_000) : null,
           });
           await handleToolCall(
             { id: randomUUID(), name: 'confirm_order_selection', args: { order_id: activeOrder.id, quote_id: pickedQuoteId } } as unknown as Parameters<typeof handleToolCall>[0],
@@ -1139,8 +1194,17 @@ async function processInboundUserInner(
   // NENHUM contato real ocorreu (nem tool nem backstop — alvo ambíguo/sem pedido). Não
   // deixa a mentira sair: troca por uma resposta HONESTA que pede o nome da farmácia.
   if (replyText && !backstopReContacted) {
-    const reallyContacted = llmResponse.toolCalls.some((t) =>
-      ['message_supplier', 'contact_establishment', 'relay_answer_to_establishment', 'confirm_order_selection', 'start_pharmacy_order', 'expand_pharmacy_search', 'find_clinic_by_name', 'start_consultation_search'].includes(t.name));
+    // `message_supplier` NÃO conta por NOME: 10 dos seus 12 caminhos são dead-end (alvo
+    // ambíguo, fora da janela, sem CEP, pedido fechado…). Contar o nome dava `reallyContacted
+    // = true` mesmo sem nada ter saído — foi assim que "Falei com as 5 redes" passou pelo
+    // guard (incidente Vadivino 17/07). Agora vale o sinal REAL de envio. As demais tools
+    // abaixo disparam contato por construção.
+    const reallyContacted = turnToolCtx.turnFlags.supplierMessaged === true
+      || llmResponse.toolCalls.some((t) =>
+        // `find_clinic_by_name` FORA: ela só BUSCA no Google e devolve "achei X, é essa?" —
+        // nunca contata ninguém. Mantê-la aqui liberava "Já entrei em contato com a Clínica
+        // São Lucas!" passar pelo guard (review).
+        ['contact_establishment', 'relay_answer_to_establishment', 'confirm_order_selection', 'start_pharmacy_order', 'expand_pharmacy_search', 'start_consultation_search'].includes(t.name));
     const claimsContactPast = /(mandei\s+(uma\s+)?(mensagem|msg|recado)|entrei\s+em\s+contato|acabei de falar com (a|as|o) ?(farm|drog)|j[áa]\s+(falei|avisei|mandei|entrei em contato)\s+(com\s+)?(a\s+|as\s+|na\s+|pra\s+|para\s+|o\s+)?(farm[aá]cia|drog|eles\b|a loja))/i.test(replyText);
     // FUTURO também é mentira se nenhuma tool saiu (incidente Pague Menos 09/07: "Vou falar
     // com a Pague Menos agora! 💙" repetido 2x e o contato NUNCA foi feito — o usuário ficou
@@ -1196,7 +1260,18 @@ async function processInboundUserInner(
         const lastUserText = typeof userMsgContent === 'string' ? userMsgContent : userMsgPreview;
         try {
           const followup = await chat(
-            `(Sistema: você acabou de executar com sucesso: ${toolNames}. O usuário havia dito: "${String(lastUserText).slice(0, 200)}". Escreva uma resposta CURTA, natural e humana confirmando pra ele o que foi feito. NÃO chame nenhuma tool.)`,
+            // ⚠️ NUNCA afirmar sucesso aqui. O prompt antigo dizia "você acabou de executar com
+            // sucesso: {tools}… confirme o que foi feito" — mas o turno chega aqui JUSTAMENTE
+            // quando nada saiu, e o modelo só recebe NOMES de tool, nunca o resultado delas.
+            // Foi essa instrução que produziu "Falei com as 5 redes que você pediu…" com ZERO
+            // mensagens enviadas (incidente Vadivino 17/07), deixando o paciente esperando dias.
+            `(Sistema: o turno terminou sem nenhuma mensagem ao usuário. Ferramentas acionadas: ${toolNames}. ` +
+            `⚠️ Você NÃO recebeu o resultado delas e NÃO tem confirmação de que deram certo. Portanto: NÃO afirme ` +
+            `que falou/mandou mensagem/entrou em contato com farmácia, rede ou clínica; NÃO cite nomes de ` +
+            `estabelecimentos que teria contatado; NÃO invente preço, prazo ou disponibilidade; NÃO prometa ` +
+            `resposta de terceiros ("assim que responderem"). O usuário havia dito: "${String(lastUserText).slice(0, 200)}". ` +
+            `Escreva 1-2 linhas curtas e humanas dizendo que você está cuidando disso e que avisa assim que tiver ` +
+            `novidade. NÃO chame nenhuma tool.)`,
             { model, apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'], systemInstruction: systemPrompt, history: geminiHistory, tools: [], temperature: 0.4, maxOutputTokens: 400, timeoutMs: 20_000 },
           );
           replyText = followup.text.trim();

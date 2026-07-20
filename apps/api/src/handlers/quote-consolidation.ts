@@ -559,8 +559,29 @@ export async function consolidateQuotes(
     instructions: 'Quando o usuário escolher uma opção (ex: "quero a 1", "prefiro a Droga Raia", "pode ser a mais barata"), identifique qual option corresponde e chame confirm_order_selection com o order_id e o quote_id corretos.',
   };
 
+  // O `summary` vai SOZINHO: se ele falhar junto de outra coluna, as opções ficam
+  // apresentadas ao paciente mas invisíveis pro LLM e pro backstop (nenhuma escolha
+  // resolveria). Update separado = uma falha não leva a outra junto (review).
   await db.from('orders').update({
     summary: JSON.stringify(summaryForLLM, null, 2),
+  }).eq('id', orderId);
+
+  // `presented_at` = o instante em que o paciente VIU as opções. É a âncora de CONSENTIMENTO:
+  // um aceite genérico ("ok"/"sim") só pode fechar o pedido se for resposta a ESTA apresentação
+  // (ver backstop 11b em inbound-user.ts). Sem essa âncora, um "ok" sobre outro assunto dias
+  // depois fechava a compra — incidente Vadivino 17/07.
+  // ⚠️ Usa o created_at da PRÓPRIA mensagem de apresentação (relógio do Postgres), não
+  // `new Date()` (relógio do Node): com skew entre os dois, a própria apresentação contaria
+  // como "mensagem posterior" e TODO aceite genérico morreria em silêncio (review).
+  const { data: presMsg } = await db.from('messages')
+    .select('created_at')
+    .eq('conversation_id', userConversationId)
+    .eq('direction', 'out')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  await db.from('orders').update({
+    presented_at: (presMsg?.created_at as string | undefined) ?? new Date().toISOString(),
   }).eq('id', orderId);
 
   await writeLog('info', 'order', `Consolidated ${sorted.length} quotes for order`, {

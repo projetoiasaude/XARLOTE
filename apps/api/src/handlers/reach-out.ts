@@ -25,7 +25,7 @@ interface ReachCtx {
   phoneE164: string;
   traceId: string;
   /** UMA VOZ: handlers auto-contidos setam suppressLlmText (ver ToolContext). */
-  turnFlags?: { suppressLlmText: boolean };
+  turnFlags?: { suppressLlmText: boolean; supplierMessaged?: boolean };
 }
 
 /** E.164 SÓ se for BR plausível — rejeita país estrangeiro explícito (não fabrica número BR). */

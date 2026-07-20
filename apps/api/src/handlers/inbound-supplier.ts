@@ -824,7 +824,43 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     // registramos a cotação. Conservador: se não houver preço confiável, extractPriceBRL
     // devolve null e caímos no log de "resposta vazia" de sempre.
     const price = extractPriceBRL(text);
+    // 🛡️ SANIDADE DE PREÇO (incidente Vadivino 13–17/07): a auto-captura é TERMINAL — grava
+    // `status='quoted'` e a cotação some do lookup de negociação, então um valor errado
+    // CONGELA e nunca mais é corrigido (a farmácia disse "74,94" e o pedido fechou com
+    // R$4,95). O número pode vir de outra mensagem da rajada, de foto de etiqueta ou de
+    // preço unitário. Antes de congelar, compara com as IRMÃS do mesmo pedido: divergência
+    // absurda pra baixo (>4×) não vira cotação — segue como conversa pro agente/farmácia
+    // esclarecerem. Sem irmãs com preço, não há base de comparação → deixa passar (como antes).
+    let priceLooksSane = true;
     if (price != null && quote.status !== 'quoted') {
+      const { data: siblings } = await db.from('quotes')
+        .select('total').eq('order_id', quote.order_id).not('total', 'is', null).neq('id', quote.id);
+      const totals = (siblings ?? []).map((s) => Number(s.total)).filter((n) => Number.isFinite(n) && n > 0);
+      if (totals.length) {
+        const cheapest = Math.min(...totals);
+        if (price * 4 < cheapest) {
+          priceLooksSane = false;
+          await writeLog('warn', 'quote', `Auto-captura de preço RECUSADA por sanidade: R$${price} destoa das outras cotações (mais barata R$${cheapest}) — perguntando à farmácia em vez de congelar`, {
+            traceId, quoteId: quote.id, orderId: quote.order_id,
+          });
+          // NÃO descarta em silêncio: um preço destoante pode ser (a) unitário em vez do
+          // total, (b) de outro item da rajada — ou (c) uma oferta LEGÍTIMA bem mais barata
+          // (genérico). Descartar calado perderia a (c) e deixaria a farmácia no vácuo até
+          // dar timeout. Pergunta e deixa ELA esclarecer — vira conversa, não aposta (review).
+          try {
+            await sendOutboundToSupplier(
+              conversationId,
+              supplierPhone,
+              `Só pra eu não errar: o R$ ${price.toFixed(2).replace('.', ',')} é o valor TOTAL do pedido ou o preço de uma unidade? 🙏`,
+              traceId,
+            );
+          } catch (e) {
+            await writeLog('warn', 'quote', `Falha ao pedir confirmação de preço à farmácia: ${String(e).slice(0, 120)}`, { traceId, quoteId: quote.id });
+          }
+        }
+      }
+    }
+    if (price != null && priceLooksSane && quote.status !== 'quoted') {
       const offered = parseUnitCount(text);
       const requested = parseUnitCount(
         (order?.items ?? []).map((i) => `${i.dosage ?? ''} ${i.quantity ?? ''}`).join(' '),

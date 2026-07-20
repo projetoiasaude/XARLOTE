@@ -4,6 +4,10 @@ import {
   humanizeTemplate,
   templatesEnabled,
   pharmacyColdOpen,
+  reengageTemplateEnabled,
+  buildReengageTemplate,
+  reengageReasonForReminder,
+  REENGAGE_REASON_SILENT,
 } from '../apps/api/src/config/template-registry.js';
 
 // Limpa as envs que o registry lê, pra cada teste partir de estado conhecido.
@@ -14,6 +18,8 @@ const ENV_KEYS = [
   'ZPRO_TEMPLATE_CLINIC_OUTREACH',
   'ZPRO_TEMPLATE_GENERAL',
   'ZPRO_TEMPLATE_COTACAO_APPROVED',
+  'ZPRO_TEMPLATE_REENGAGE_APPROVED',
+  'ZPRO_TEMPLATE_REENGAGE',
 ];
 const saved: Record<string, string | undefined> = {};
 beforeEach(() => {
@@ -113,5 +119,63 @@ describe('buildTemplatePayload', () => {
     const p = buildTemplatePayload('pharmacy_quote', ['x', 'y']);
     expect(p.name).toBe('cotacao_v2');
     expect(p.language).toBe('pt_PT');
+  });
+});
+
+// ─── Re-engajamento do PACIENTE (reengajamento_lembrete) — 2 variáveis ───────
+// Corpo APROVADO na Meta (não alterar sem reaprovar):
+//   Oi, {{1}}! Aqui é a Xarlote,\n\n{{2}}\n\nTô por aqui com você pro que precisar, é só
+//   me responder nesta conversa.
+describe('reengajamento_lembrete (patient-facing, 2 vars)', () => {
+  it('gate default é OFF; liga só com a env exatamente "true"', () => {
+    expect(reengageTemplateEnabled()).toBe(false);
+    process.env['ZPRO_TEMPLATE_REENGAGE_APPROVED'] = 'True';
+    expect(reengageTemplateEnabled()).toBe(false); // case-sensitive de propósito
+    process.env['ZPRO_TEMPLATE_REENGAGE_APPROVED'] = 'true';
+    expect(reengageTemplateEnabled()).toBe(true);
+  });
+
+  it('monta 2 variáveis (nome + motivo) e o corpo aprovado', () => {
+    const t = buildReengageTemplate('Dona Maria', 'Passei só pra te lembrar de tomar o seu Puran T4 hoje às 8h, em jejum. Não vale esquecer, tá?');
+    expect(t.name).toBe('reengajamento_lembrete');
+    expect(t.variables).toHaveLength(2);
+    expect(t.variables[0]).toBe('Dona Maria');
+    expect(t.variables[1]).toContain('Puran T4');
+    expect(t.text).toBe(
+      'Oi, Dona Maria! Aqui é a Xarlote,\n\n' +
+      'Passei só pra te lembrar de tomar o seu Puran T4 hoje às 8h, em jejum. Não vale esquecer, tá?\n\n' +
+      'Tô por aqui com você pro que precisar, é só me responder nesta conversa.',
+    );
+  });
+
+  it('SANITIZA as variáveis — a Meta rejeita parâmetro com \\n/\\t/espaço duplo', () => {
+    const t = buildReengageTemplate('  Ana\nPaula  ', 'Linha 1\n\nLinha 2\tcom tab');
+    expect(t.variables[0]).toBe('Ana Paula');
+    expect(t.variables[1]).toBe('Linha 1 Linha 2 com tab');
+    for (const v of t.variables) expect(v).not.toMatch(/[\r\n\t]|\s{2,}/);
+  });
+
+  it('nome do template sobreponível por env (se a Meta aprovou com outro nome)', () => {
+    process.env['ZPRO_TEMPLATE_REENGAGE'] = 'reativacao_paciente';
+    expect(buildReengageTemplate('Ana', 'oi').name).toBe('reativacao_paciente');
+  });
+
+  it('motivo vazio cai na reativação pura (nunca manda {{2}} em branco)', () => {
+    const t = buildReengageTemplate('Ana', '   ');
+    expect(t.variables[1]).toBe(REENGAGE_REASON_SILENT);
+  });
+
+  it('motivo por tipo de lembrete segue o estilo aprovado', () => {
+    expect(reengageReasonForReminder({ type: 'medication', title: 'Neblock 5mg' }, 'hoje às 7h'))
+      .toBe('Passei só pra te lembrar de tomar o seu Neblock 5mg hoje às 7h. Não vale esquecer, tá?');
+    expect(reengageReasonForReminder({ type: 'appointment', title: 'Consulta Dr. Ferdinando' }, 'amanhã às 16h30'))
+      .toBe('Passando pra lembrar do seu compromisso: Consulta Dr. Ferdinando amanhã às 16h30.');
+    expect(reengageReasonForReminder({ type: 'custom', title: 'Beber água' }, null))
+      .toBe('Passei só pra te lembrar: Beber água.');
+  });
+
+  it('lembrete sem título não gera frase quebrada', () => {
+    expect(reengageReasonForReminder({ type: 'medication', title: null }, null))
+      .toContain('seu lembrete de saúde');
   });
 });

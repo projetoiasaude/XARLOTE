@@ -85,7 +85,12 @@ interface ToolContext {
    * desambiguação "qual farmácia?"), ele seta suppressLlmText=true — senão o texto do
    * LLM sai JUNTO e contradiz ("Não tenho certeza…" + "Deixa eu mandar mensagem 💙").
    */
-  turnFlags?: { suppressLlmText: boolean };
+  /**
+   * Sinais REAIS do turno (resultado, não intenção). `supplierMessaged` só vira true no
+   * ponto de envio de verdade a uma farmácia — é o que o guard anti-mentira consulta, no
+   * lugar de "o nome da tool apareceu na lista" (que dava true mesmo em 10 dead-ends).
+   */
+  turnFlags?: { suppressLlmText: boolean; supplierMessaged?: boolean };
 }
 
 export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<void> {
@@ -1584,9 +1589,14 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
   // porque a repetição vem de insistência humana. NÃO dedupa os `say()` de SUCESSO/re-cobra
   // (default): lá um side-effect REAL aconteceu (mandei à farmácia) e dois follow-ups distintos
   // podem gerar a MESMA confirmação — suprimir deixaria o paciente no escuro (review Leva 1 #3).
+  // ⚠️ Só cala o texto do LLM se a mensagem REALMENTE saiu. Quando o dedup engole (o
+  // paciente insistiu e o enlatado é idêntico), suprimir deixava o turno MUDO — e o turno
+  // mudo destrava o narrador de follow-up, que INVENTAVA a ação ("Falei com as 5 redes",
+  // incidente Vadivino 17/07). Engolida → deixa o LLM falar: uma voz é melhor que nenhuma.
   const say = async (text: string, opts: { dedup?: boolean } = {}) => {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164, text, ctx.traceId, {}, opts.dedup ? { dedup: true, dedupWindowMs: 180_000 } : {});
-    if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
+    const sent = await sendOutbound(ctx.conversationId, ctx.phoneE164, text, ctx.traceId, {}, opts.dedup ? { dedup: true, dedupWindowMs: 180_000 } : {});
+    if (sent && ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
+    return sent;
   };
   // Kill-switch de disparo (a msg vai pra uma farmácia) — freio de emergência.
   if (!loadPrompts().pharmacy_outbound_enabled) {
@@ -1653,8 +1663,13 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
       await writeLog('warn', 'platform', `Cotação por nome (${namedNet.label}) falhou: ${String(err).slice(0, 120)}`, { traceId: ctx.traceId, orderId: state.orderId });
       return { networksPresented: 0, itemsCovered: 0 };
     });
-    if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true; // presentPlatformQuotes já falou (ou vamos falar abaixo)
-    if (pres.networksPresented === 0) {
+    if (pres.networksPresented > 0) {
+      // presentPlatformQuotes já falou com o paciente → o texto do LLM seria 2ª voz.
+      if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
+    } else {
+      // Nada apresentado: quem cala o turno é o próprio `say` — e SÓ se a mensagem sair.
+      // Suprimir aqui de forma incondicional deixaria o turno mudo quando o dedup engolisse
+      // (paciente insistindo), reabrindo a porta do narrador inventar (review).
       await say(`Procurei ${itensTxt} na ${namedNet.label} agora e não achei disponível no site dela 😕 Quer que eu veja em outras redes ou em farmácias perto de você?`, { dedup: true });
     }
     return;
@@ -1717,6 +1732,10 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
 
   // Envia pela FILA do agente (ban-safe). A `message` pode conter PII (endereço) → NÃO logar.
   await sendOutboundToSupplier(target.conversationId, target.phoneE164, message, ctx.traceId);
+  // ✅ ÚNICO ponto onde uma mensagem REALMENTE sai pra farmácia. É este sinal (não o nome da
+  // tool) que autoriza a Xarlote a dizer "falei com a farmácia" — incidente Vadivino 17/07:
+  // 15 message_supplier, 0 envios, e ela afirmou "Falei com as 5 redes".
+  if (ctx.turnFlags) ctx.turnFlags.supplierMessaged = true;
 
   await writeLog('info', 'order', `message_supplier → ${target.supplierName} (re-engajamento dirigido)`, {
     traceId: ctx.traceId, orderId: state.orderId, quoteId: target.quoteId, revived: revivedTerminal,

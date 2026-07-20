@@ -43,6 +43,12 @@ export async function isDuplicateRecentOutbound(
   return (data?.length ?? 0) > 0;
 }
 
+/**
+ * Envia texto ao usuário. **Devolve `false` quando a mensagem NÃO saiu** (suprimida pelo
+ * dedup) — o chamador precisa saber disso: um `say()` engolido deixava o turno MUDO e
+ * destravava o narrador de follow-up, que então INVENTAVA a ação ("Falei com as 5 redes",
+ * incidente Vadivino 17/07 — nenhuma mensagem tinha saído). Sinal = resultado, não intenção.
+ */
 export async function sendOutbound(
   conversationId: string,
   phoneE164: string,
@@ -50,7 +56,7 @@ export async function sendOutbound(
   traceId: string,
   llmMeta: LlmMeta = {},
   opts: { dedup?: boolean; dedupWindowMs?: number } = {},
-): Promise<void> {
+): Promise<boolean> {
   // Anti double-send OPT-IN (Fix #4): SÓ os call-sites que passam dedup:true deduplicam
   // (resposta conversacional da Xarlote e relays estabelecimento→usuário). Workers/lembretes
   // NÃO passam dedup (senão suprimiam notificação legítima). Janela default 12s (corrida de
@@ -58,11 +64,11 @@ export async function sendOutbound(
   // deve repetir em ~1min).
   if (opts.dedup && await isDuplicateRecentOutbound(conversationId, text, opts.dedupWindowMs ?? 12_000)) {
     await writeLog('warn', 'outbound', `Mensagem duplicada suprimida: "${(text ?? '').slice(0, 60)}"`, { traceId, conversationId });
-    return;
+    return false;
   }
 
   // Persist outbound message first (realtime will push to dashboard)
-  await db.from('messages').insert({
+  const { data: inserted } = await db.from('messages').insert({
     conversation_id: conversationId,
     direction: 'out',
     sender_role: 'assistant',
@@ -73,16 +79,23 @@ export async function sendOutbound(
     llm_tokens_in: llmMeta.tokensIn ?? null,
     llm_tokens_out: llmMeta.tokensOut ?? null,
     llm_latency_ms: llmMeta.latencyMs ?? null,
-  });
+  }).select('id').single();
 
   // Update last_message_at
   await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversationId);
 
   // In simulator mode, do not call uazapi
-  if (isSimulatorMode()) return;
+  if (isSimulatorMode()) {
+    if (inserted?.id) await db.from('messages').update({ delivery_status: 'suppressed' }).eq('id', inserted.id);
+    return true;
+  }
 
+  // 'queued' = entrou na fila; quem carimba 'delivered'/'failed' é o WORKER, que é o único
+  // que sabe o resultado real (dispatchOutbound engole exceção e nunca lança — review).
+  if (inserted?.id) await db.from('messages').update({ delivery_status: 'queued' }).eq('id', inserted.id);
   // F0.7: envio via fila com rate-limit (evita ban). Fallback direto se a fila cair.
-  await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164, text, traceId });
+  await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164, text, traceId, messageId: inserted?.id as string | undefined });
+  return true;
 }
 
 /**

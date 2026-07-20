@@ -80,22 +80,68 @@ export function templatesEnabled(): boolean {
 }
 
 // ─── Re-engajamento do USUÁRIO fora da janela 24h (incidente Elizabet 13/07) ──
-// Na perna oficial, texto livre fora de 24h é rejeitado pela Meta → lembrete a usuário
-// mudo nunca chega. Este HSM (patient-facing) reabre a conversa. ⚠️ PRECISA SER APROVADO
-// NA META e ligado via ZPRO_TEMPLATE_REENGAGE_APPROVED=true. Corpo a submeter (pt_BR, 1 var):
-//   "Oi {{1}}! Aqui é a Xarlote, sua assistente de saúde. Tenho um lembrete de saúde
-//    importante pra te passar. É só me responder por aqui que eu te envio na hora. Cuida bem! 💙"
+// Na perna oficial, texto livre fora de 24h é rejeitado pela Meta → lembrete a usuário mudo
+// nunca chega. Este HSM (patient-facing, no número da XARLOTE) reabre a conversa.
+// Ligado por ZPRO_TEMPLATE_REENGAGE_APPROVED=true.
+//
+// CORPO APROVADO NA META (pt_BR, **2 variáveis**) — cópia EXATA, não alterar sem reaprovar:
+//   Oi, {{1}}! Aqui é a Xarlote,
+//
+//   {{2}}
+//
+//   Tô por aqui com você pro que precisar, é só me responder nesta conversa.
+//
+// {{1}} = como chamar a pessoa ("Dona Maria"). {{2}} = o MOTIVO, em 1 frase, que muda por
+// situação (medicação, consulta, pós-consulta, renovação, sumiço) — ver reengageReason*().
 export function reengageTemplateEnabled(): boolean {
   return process.env['ZPRO_TEMPLATE_REENGAGE_APPROVED'] === 'true';
 }
 
-export function buildReengageTemplate(firstName: string): { name: string; language: string; variables: string[]; text: string } {
-  const nome = (firstName || 'tudo bem').replace(/\s+/g, ' ').trim().slice(0, 60) || 'tudo bem';
-  const text = `Oi ${nome}! Aqui é a Xarlote, sua assistente de saúde. Tenho um lembrete de saúde importante pra te passar. É só me responder por aqui que eu te envio na hora. Cuida bem! 💙`;
+/**
+ * Sanitiza um valor pra variável de template da Meta: sem quebra de linha/tab e sem
+ * espaços múltiplos (a API REJEITA o parâmetro com esses caracteres) + teto de tamanho.
+ */
+function templateVar(s: string, max = 300): string {
+  return (s ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, max);
+}
+
+/** Motivo ({{2}}) quando a pessoa some sem contexto específico (reativação pura). */
+export const REENGAGE_REASON_SILENT =
+  'Faz uns dias que a gente não conversa e você ficou na minha cabeça. Está tudo bem por aí?';
+
+/**
+ * Motivo ({{2}}) a partir de um LEMBRETE que não pôde ser entregue. Frase única, sem
+ * saudação (a saudação já está no {{1}}) e sem quebra de linha — no estilo aprovado.
+ * `whenLabel` ex.: "hoje às 7h", "amanhã às 16h30".
+ */
+export function reengageReasonForReminder(
+  reminder: { type?: string | null; title?: string | null },
+  whenLabel?: string | null,
+): string {
+  const titulo = templateVar(reminder.title ?? '', 90) || 'seu lembrete de saúde';
+  const quando = whenLabel ? ` ${templateVar(whenLabel, 40)}` : '';
+  switch (reminder.type) {
+    case 'medication':
+      return templateVar(`Passei só pra te lembrar de tomar o seu ${titulo}${quando}. Não vale esquecer, tá?`);
+    case 'appointment':
+      return templateVar(`Passando pra lembrar do seu compromisso: ${titulo}${quando}.`);
+    default:
+      return templateVar(`Passei só pra te lembrar: ${titulo}${quando}.`);
+  }
+}
+
+export function buildReengageTemplate(
+  firstName: string,
+  reason: string,
+): { name: string; language: string; variables: string[]; text: string } {
+  const nome = templateVar(firstName || 'tudo bem', 60) || 'tudo bem';
+  const motivo = templateVar(reason) || REENGAGE_REASON_SILENT;
+  // Espelho local (o que fica no app/dashboard) = o corpo aprovado já montado.
+  const text = `Oi, ${nome}! Aqui é a Xarlote,\n\n${motivo}\n\nTô por aqui com você pro que precisar, é só me responder nesta conversa.`;
   return {
     name: process.env['ZPRO_TEMPLATE_REENGAGE']?.trim() || 'reengajamento_lembrete',
     language: templateLanguage(),
-    variables: [nome],
+    variables: [nome, motivo],
     text,
   };
 }

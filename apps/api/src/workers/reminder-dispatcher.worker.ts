@@ -19,7 +19,7 @@ import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBod
 import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
-import { reengageTemplateEnabled, buildReengageTemplate } from '../config/template-registry.js';
+import { reengageTemplateEnabled, buildReengageTemplate, reengageReasonForReminder, REENGAGE_REASON_SILENT } from '../config/template-registry.js';
 
 /** A perna do usuário (SARA) é WhatsApp oficial (zpro) → a janela de 24h se aplica? */
 function saraNeedsWabaWindow(): boolean {
@@ -261,14 +261,20 @@ export async function dispatchReminders(): Promise<void> {
       .limit(1)
       .maybeSingle();
 
+    // O espelho é gravado ANTES de sabermos se o canal aceita (a janela é testada abaixo).
+    // Guardamos o id pra carimbar o RESULTADO REAL no fim — sem isso, 30 lembretes não
+    // entregues em 17–19/07 (incl. o anti-hipertensivo do Arthur) apareciam no dashboard
+    // como se tivessem sido enviados, e ninguém tinha como ver.
+    let mirroredMessageId: string | null = null;
     if (conv) {
-      await db.from('messages').insert({
+      const { data: mirrored } = await db.from('messages').insert({
         conversation_id: conv.id,
         direction: 'out',
         sender_role: 'assistant',
         content_type: 'text',
         content: msg,
-      });
+      }).select('id').single();
+      mirroredMessageId = (mirrored?.id as string | undefined) ?? null;
       await db.from('conversations').update({ last_message_at: now.toISOString() }).eq('id', conv.id);
     }
 
@@ -293,21 +299,34 @@ export async function dispatchReminders(): Promise<void> {
 
     // 3. WhatsApp real, SEMPRE pela fila (rate-limit anti-ban).
     let whatsappDelivered = false;
+    let deliveryStatus: 'delivered' | 'window_blocked' | 'suppressed' = 'suppressed';
     if (!isSimulatorMode()) {
       if (windowOpen) {
         await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: msg });
         whatsappDelivered = true;
+        deliveryStatus = 'delivered';
       } else if (reengageTemplateEnabled()) {
         // Fora da janela + template de re-engajamento aprovado: abre a conversa com um HSM
         // (Meta aceita template fora de 24h). O corpo do lembrete continua no espelho/app;
         // quando o usuário responder, a janela reabre.
-        const tpl = buildReengageTemplate(name.split(' ')[0] ?? name);
+        // {{2}} = o MOTIVO real deste lembrete ("Passei só pra te lembrar de tomar o seu
+        // Neblock 5mg hoje às 7h…") — o template é o mesmo pra todos os casos, só muda a frase.
+        const hhmm = new Intl.DateTimeFormat('pt-BR', { timeZone: userTz || 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' }).format(now);
+        const [hh, mm] = hhmm.split(':');
+        const whenLabel = `hoje às ${mm === '00' ? `${Number(hh)}h` : `${Number(hh)}h${mm}`}`;
+        const tpl = buildReengageTemplate(name.split(' ')[0] ?? name, reengageReasonForReminder(reminder, whenLabel));
         await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text });
         whatsappDelivered = true;
+        deliveryStatus = 'delivered';
+        // O paciente recebe o TEMPLATE, não o corpo do lembrete → o espelho tem que mostrar
+        // o template (senão o dashboard exibe um texto e a pessoa leu outro — mesmo bug já
+        // corrigido no check-in mais abaixo).
+        if (mirroredMessageId) await db.from('messages').update({ content: tpl.text }).eq('id', mirroredMessageId);
         await writeLog('info', 'reminder', `fora da janela 24h → template de re-engajamento enviado ("${reminder.title}")`, {});
       } else {
         // Fora da janela e sem template aprovado: NÃO queima texto livre (a Meta rejeitaria).
         // Honestidade: registra o não-entregue por WhatsApp — visível pro fundador agir.
+        deliveryStatus = 'window_blocked';
         await writeLog('warn', 'reminder', `lembrete "${reminder.title}" NÃO entregue por WhatsApp — janela de 24h fechada (usuário mudo) e sem template de re-engajamento aprovado`, {});
         void writeEvent({
           eventName: 'reminder.wa_window_closed',
@@ -316,6 +335,16 @@ export async function dispatchReminders(): Promise<void> {
           payload: { reminder_id: reminder.id, type: reminder.type },
         });
       }
+    }
+
+    // Carimba no espelho o que REALMENTE aconteceu no canal. `delivered_at` null +
+    // delivery_status='window_blocked' = a linha existe no dashboard mas o paciente NUNCA
+    // recebeu — a diferença que faltava pra enxergar o Arthur sem o remédio de pressão.
+    if (mirroredMessageId) {
+      await db.from('messages').update({
+        delivered_at: whatsappDelivered ? new Date().toISOString() : null,
+        delivery_status: isSimulatorMode() ? 'suppressed' : deliveryStatus,
+      }).eq('id', mirroredMessageId);
     }
 
     // 4. Push pro app nativo (acorda mesmo com o app fechado). No-op se FCM
@@ -386,17 +415,22 @@ export async function dispatchReminders(): Promise<void> {
             const checkin = firstName
               ? `${firstName}, tô te mandando esses lembretes todo dia e queria saber: tão te ajudando de verdade? Se quiser mudar horário, diminuir ou parar algum, é só me falar aqui 💙`
               : `Oi! Tô te mandando esses lembretes todo dia e queria saber: tão te ajudando de verdade? Se quiser mudar horário, diminuir ou parar algum, é só me falar aqui 💙`;
-            await db.from('messages').insert({
-              conversation_id: conv.id, direction: 'out', sender_role: 'assistant', content_type: 'text', content: checkin,
-            });
             // IRONIA da janela (incidente Elizabet): o check-in é EXATAMENTE pra quem está
             // mudo 5+ dias → SEMPRE fora da janela de 24h. Texto livre não chega. Fora da
             // janela usa o template de re-engajamento (se aprovado); senão só espelha no app.
+            // {{2}} aqui é a reativação PURA ("faz uns dias que a gente não conversa…").
+            const useTemplate = !isSimulatorMode() && needsWindow && !windowOpen && reengageTemplateEnabled();
+            const tpl = useTemplate ? buildReengageTemplate(firstName ?? '', REENGAGE_REASON_SILENT) : null;
+            // Espelha o que o paciente REALMENTE recebe (antes gravava o check-in e mandava o
+            // template — dashboard mostrava um texto e a pessoa lia outro).
+            await db.from('messages').insert({
+              conversation_id: conv.id, direction: 'out', sender_role: 'assistant', content_type: 'text',
+              content: tpl ? tpl.text : checkin,
+            });
             if (!isSimulatorMode()) {
               if (!needsWindow || windowOpen) {
                 await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: checkin });
-              } else if (reengageTemplateEnabled()) {
-                const tpl = buildReengageTemplate(firstName ?? '');
+              } else if (tpl) {
                 await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text });
               }
             }

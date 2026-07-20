@@ -5,6 +5,7 @@ import {
   parseUnitCount,
   isOrderAcceptance,
   resolveQuotePick,
+  resolveSpecificPick,
   sameMedication,
   shortSupplierAddress,
   mentionsFreeShipping,
@@ -186,6 +187,28 @@ describe('resolveQuotePick (Fix #1 — resolve escolha → quote_id)', () => {
   it('opções vazias / texto vazio → null', () => {
     expect(resolveQuotePick([], 'a 1')).toBe(null);
     expect(resolveQuotePick(OPTS, '')).toBe(null);
+  });
+
+  // ── CONSENTIMENTO: específico (auto-identificável) vs genérico (contextual) ──
+  // Incidente Vadivino 17/07: "Ok" respondendo "salvei o contato da Célia" fechou um pedido
+  // apresentado 3,5 dias antes. A distinção abaixo é o que o backstop usa pra exigir
+  // adjacência/recência só do aceite genérico.
+  it('resolveSpecificPick: número/nome/superlativo continuam resolvendo', () => {
+    expect(resolveSpecificPick(OPTS, 'quero a 2')).toBe('q-raia');
+    expect(resolveSpecificPick(OPTS, 'prefiro a SeteFarma')).toBe('q-sete');
+    expect(resolveSpecificPick(OPTS, 'a mais barata')).toBe('q-sete');
+  });
+  it('resolveSpecificPick: aceite GENÉRICO nunca é escolha específica — nem com 1 opção', () => {
+    const one: QuoteOption[] = [{ option: 1, quote_id: 'q-only', supplier_name: 'Droga Fácil', total: 67.5 }];
+    for (const yes of ['ok', 'Ok', 'sim', 'blz', 'aceito', 'pode ser', '👍']) {
+      expect(resolveSpecificPick(one, yes)).toBe(null);
+      expect(resolveSpecificPick(OPTS, yes)).toBe(null);
+    }
+  });
+  it('resolveQuotePick mantém o comportamento antigo (genérico + 1 opção resolve)', () => {
+    const one: QuoteOption[] = [{ option: 1, quote_id: 'q-only', supplier_name: 'Droga Fácil', total: 67.5 }];
+    expect(resolveQuotePick(one, 'ok')).toBe('q-only');       // resolve QUAL opção…
+    expect(resolveSpecificPick(one, 'ok')).toBe(null);        // …mas NÃO autoriza fechar sozinho
   });
 
   // ── Guardas de segurança do review (não fechar compra errada/recusada) ──

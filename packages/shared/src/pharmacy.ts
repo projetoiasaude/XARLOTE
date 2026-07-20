@@ -433,7 +433,15 @@ function distinctiveWords(name: string): string[] {
  *
  * Ordem: número da opção → nome da farmácia → superlativo → aceite verbal c/ 1 opção.
  */
-export function resolveQuotePick(options: QuoteOption[], text: string | null | undefined): string | null {
+/**
+ * Escolha ESPECÍFICA — a que se AUTO-IDENTIFICA: número da opção ("a 2"), nome da farmácia
+ * ("fecha com a São Benedito") ou superlativo ("a mais barata"). NÃO inclui aceite genérico
+ * ("ok"/"sim"/"👍"), que é CONTEXTUAL: só quer dizer "sim" pra última coisa que a Xarlote
+ * falou. Essa distinção é o coração do consentimento — ver backstop 11b em inbound-user.ts
+ * (incidente Vadivino 17/07: "Ok" respondendo "salvei o contato da Célia" fechou um pedido
+ * de 3,5 dias antes, porque o aceite genérico era tratado como escolha).
+ */
+export function resolveSpecificPick(options: QuoteOption[], text: string | null | undefined): string | null {
   if (!options?.length || !text) return null;
   const t = fold(text);
   if (NEGATION_RE.test(t)) return null;
@@ -482,10 +490,28 @@ export function resolveQuotePick(options: QuoteOption[], text: string | null | u
     if (withEta.length) return withEta.reduce((a, b) => ((a.eta_minutes as number) <= (b.eta_minutes as number) ? a : b)).quote_id;
   }
 
-  // 4) ACEITE VERBAL ("aceito", "pode ser", "sim") com UMA opção só → ela. `!hasQtyNoun`
-  // barra "pode entregar 2 caixas" e afins (número de quantidade não é escolha).
-  if (options.length === 1 && !hasQtyNoun && isOrderAcceptance(text)) return (options[0] as QuoteOption).quote_id;
+  return null;
+}
 
+/**
+ * Resolve a opção escolhida: primeiro a ESPECÍFICA (número/nome/superlativo); se não houver,
+ * aceita o ACEITE VERBAL genérico ("aceito", "pode ser", "sim") **quando há UMA opção só**.
+ * `!hasQtyNoun` barra "pode entregar 2 caixas" e afins (quantidade não é escolha).
+ *
+ * ⚠️ O ramo genérico é CONTEXTUAL e perigoso fora de contexto: quem chama pra FECHAR compra
+ * deve checar, além disso, se o paciente estava respondendo à apresentação (ver
+ * `resolveSpecificPick` e o backstop 11b). Aqui a função só diz "a qual opção este texto se
+ * refere", não "pode fechar".
+ */
+export function resolveQuotePick(options: QuoteOption[], text: string | null | undefined): string | null {
+  const specific = resolveSpecificPick(options, text);
+  if (specific) return specific;
+  if (!options?.length || !text) return null;
+  const t = fold(text);
+  if (NEGATION_RE.test(t)) return null;
+  if (options.length === 1 && !QTY_UNIT_RE.test(t) && isOrderAcceptance(text)) {
+    return (options[0] as QuoteOption).quote_id;
+  }
   return null;
 }
 

@@ -16,7 +16,7 @@
  */
 import { Queue, Worker, type Job } from 'bullmq';
 import { sendText, sendAudio, sendMenu, sendTemplate } from '@iasaude/whatsapp';
-import { writeLog } from '@iasaude/db';
+import { writeLog, db } from '@iasaude/db';
 import { AGENT_INSTANCE, QUEUE_NAMES, isPlaceholderPhone } from '@iasaude/shared';
 import { getRedisConnection } from '../queue-config.js';
 
@@ -37,6 +37,8 @@ export interface OutboundJob {
   templateLanguage?: string;
   templateVariables?: string[];
   traceId?: string;
+  /** Linha em `messages` a carimbar com o veredito REAL do canal (ver 0022). */
+  messageId?: string;
 }
 
 const connection = getRedisConnection();
@@ -151,6 +153,22 @@ async function rawSend(job: OutboundJob): Promise<void> {
 }
 
 /**
+ * Carimba no espelho (`messages`) o veredito REAL do canal. Só o WORKER sabe se o envio
+ * deu certo: `dispatchOutbound` NUNCA lança (engole exceção e cai no fallback), então
+ * carimbar "delivered" ali seria afirmar entrega que pode não ter acontecido — a mesma
+ * classe do incidente dos 30 lembretes, só que com uma mentira POSITIVA (review).
+ */
+async function stampDelivery(messageId: string | undefined, status: 'delivered' | 'failed'): Promise<void> {
+  if (!messageId) return;
+  try {
+    await db.from('messages').update({
+      delivered_at: status === 'delivered' ? new Date().toISOString() : null,
+      delivery_status: status,
+    }).eq('id', messageId);
+  } catch { /* carimbo é observabilidade — nunca derruba o envio */ }
+}
+
+/**
  * Enfileira um envio. Se a fila estiver indisponível, envia direto (fallback)
  * pra nunca deixar a Xarlote muda por causa de um Redis fora do ar.
  */
@@ -172,7 +190,9 @@ export async function dispatchOutbound(job: OutboundJob): Promise<void> {
     });
     try {
       await rawSend(job);
+      await stampDelivery(job.messageId, 'delivered');
     } catch (e2) {
+      await stampDelivery(job.messageId, 'failed');
       await writeLog('error', 'outbound', `Envio direto (fallback) falhou: ${String(e2).slice(0, 200)}`, {
         traceId: job.traceId, instance: job.instance,
       });
@@ -194,7 +214,7 @@ export function startOutboundWorkers(): void {
   for (const name of [QUEUE_NAMES.OUTBOUND_SARA, QUEUE_NAMES.OUTBOUND_AGENT]) {
     const worker = new Worker(
       name,
-      async (job: Job<OutboundJob>) => { await rawSend(job.data); },
+      async (job: Job<OutboundJob>) => { await rawSend(job.data); await stampDelivery(job.data.messageId, 'delivered'); },
       { connection, concurrency: 1, limiter: { max, duration } },
     );
     worker.on('failed', (job, err) => {
@@ -202,6 +222,7 @@ export function startOutboundWorkers(): void {
       // (e alimenta o alerta de "possível ban"); tentativas intermediárias viram
       // 'warn' — senão UM número morto gera 5 erros e dispara alarme falso.
       const terminal = (job?.attemptsMade ?? 0) >= (job?.opts?.attempts ?? 1);
+      if (terminal) void stampDelivery((job?.data as OutboundJob | undefined)?.messageId, 'failed');
       void writeLog(terminal ? 'error' : 'warn', 'outbound', `Job ${name} ${terminal ? 'FALHOU (final)' : 'falhou'} (tentativa ${job?.attemptsMade ?? '?'}/${job?.opts?.attempts ?? '?'}): ${String(err).slice(0, 500)}`, {
         traceId: (job?.data as OutboundJob | undefined)?.traceId,
       });
