@@ -36,8 +36,12 @@ update orders set presented_at = updated_at
 -- Achar "medicação não entregue" sem varrer a tabela. Só linhas COM veredito do canal
 -- (delivery_status not null) — senão o índice cobriria todo o histórico pré-0022, que tem
 -- delivered_at NULL por não existir a coluna, e não seria seletivo pra nada.
--- ⚠️ CONCURRENTLY: sem isso o CREATE INDEX pega SHARE e BLOQUEIA toda escrita em `messages`
--- durante o build — webhook de entrada e envios travariam. Precisa rodar FORA de transação.
-create index concurrently if not exists messages_undelivered_idx
+--
+-- Sem CONCURRENTLY DE PROPÓSITO: numa tabela grande ele seria obrigatório (o CREATE INDEX
+-- comum pega SHARE e bloqueia escrita durante o build), mas `messages` tinha ~2.4k linhas /
+-- 2.7 MB quando isto foi aplicado (20/07) → build em milissegundos. E CONCURRENTLY não pode
+-- rodar dentro de transação, que é como a migration é aplicada. Se `messages` crescer pra
+-- centenas de milhares, um índice novo aqui deve ir de CONCURRENTLY, fora de transação.
+create index if not exists messages_undelivered_idx
   on messages (created_at desc)
   where direction = 'out' and delivered_at is null and delivery_status is not null;
