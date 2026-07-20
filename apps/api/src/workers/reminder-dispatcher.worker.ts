@@ -89,6 +89,12 @@ export async function dispatchReminders(): Promise<void> {
   if (!due?.length) return;
 
   const STALE_MS = 45 * 60_000; // recorrente atrasado > 45min = pula (espera a próxima)
+  // Teto de templates de RE-ENGAJAMENTO por paciente (~1x/dia). Um template já REABRE a
+  // janela — depois que a pessoa responde, todo o resto vai como texto livre. Mandar um por
+  // lembrete bloqueado seria inútil, CUSTA por envio (a Meta cobra) e é caminho direto pro
+  // paciente bloquear o número (risco de ban). Caso real: Antônia, muda há 5 dias, tem 10
+  // lembretes/dia — receberia ~6 templates/dia.
+  const REENGAGE_TPL_MIN_INTERVAL_MS = 20 * 60 * 60_000;
   const reengagedThisTick = new Set<string>(); // no máx 1 check-in de re-engajamento por usuário por tick
 
   for (const reminder of due as unknown as DueReminder[]) {
@@ -297,6 +303,11 @@ export async function dispatchReminders(): Promise<void> {
       }
     }
 
+    // Já mandei template de re-engajamento pra esta pessoa nas últimas ~20h?
+    const uMeta = (user.metadata ?? {}) as Record<string, unknown> & { reengage_template_at?: string };
+    const lastTplMs = uMeta.reengage_template_at ? new Date(uMeta.reengage_template_at).getTime() : 0;
+    const reengageTplAllowed = now.getTime() - lastTplMs >= REENGAGE_TPL_MIN_INTERVAL_MS;
+
     // 3. WhatsApp real, SEMPRE pela fila (rate-limit anti-ban).
     let whatsappDelivered = false;
     let deliveryStatus: 'delivered' | 'window_blocked' | 'suppressed' = 'suppressed';
@@ -305,7 +316,7 @@ export async function dispatchReminders(): Promise<void> {
         await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: msg });
         whatsappDelivered = true;
         deliveryStatus = 'delivered';
-      } else if (reengageTemplateEnabled()) {
+      } else if (reengageTemplateEnabled() && reengageTplAllowed) {
         // Fora da janela + template de re-engajamento aprovado: abre a conversa com um HSM
         // (Meta aceita template fora de 24h). O corpo do lembrete continua no espelho/app;
         // quando o usuário responder, a janela reabre.
@@ -322,12 +333,13 @@ export async function dispatchReminders(): Promise<void> {
         // o template (senão o dashboard exibe um texto e a pessoa leu outro — mesmo bug já
         // corrigido no check-in mais abaixo).
         if (mirroredMessageId) await db.from('messages').update({ content: tpl.text }).eq('id', mirroredMessageId);
+        await db.from('users').update({ metadata: { ...uMeta, reengage_template_at: now.toISOString() } }).eq('id', reminder.user_id);
         await writeLog('info', 'reminder', `fora da janela 24h → template de re-engajamento enviado ("${reminder.title}")`, {});
       } else {
         // Fora da janela e sem template aprovado: NÃO queima texto livre (a Meta rejeitaria).
         // Honestidade: registra o não-entregue por WhatsApp — visível pro fundador agir.
         deliveryStatus = 'window_blocked';
-        await writeLog('warn', 'reminder', `lembrete "${reminder.title}" NÃO entregue por WhatsApp — janela de 24h fechada (usuário mudo) e sem template de re-engajamento aprovado`, {});
+        await writeLog('warn', 'reminder', `lembrete "${reminder.title}" NÃO entregue por WhatsApp — janela de 24h fechada (usuário mudo) e ${reengageTemplateEnabled() ? 'template de re-engajamento já enviado nas últimas 20h (cooldown anti-spam)' : 'sem template de re-engajamento aprovado'}`, {});
         void writeEvent({
           eventName: 'reminder.wa_window_closed',
           userId: reminder.user_id,
