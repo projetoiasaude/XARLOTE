@@ -165,13 +165,20 @@ describe('reengajamento_lembrete (patient-facing, 2 vars)', () => {
     expect(t.variables[1]).toBe(REENGAGE_REASON_SILENT);
   });
 
-  it('motivo por tipo de lembrete segue o estilo aprovado', () => {
+  it('motivo por tipo de lembrete segue o estilo aprovado (formato de rótulo)', () => {
     expect(reengageReasonForReminder({ type: 'medication', title: 'Neblock 5mg' }, 'hoje às 7h'))
-      .toBe('Passei só pra te lembrar de tomar o seu Neblock 5mg hoje às 7h. Não vale esquecer, tá?');
+      .toBe('Passei pra te lembrar do seu remédio hoje às 7h: Neblock 5mg. Não vale esquecer, tá?');
     expect(reengageReasonForReminder({ type: 'appointment', title: 'Consulta Dr. Ferdinando' }, 'amanhã às 16h30'))
-      .toBe('Passando pra lembrar do seu compromisso: Consulta Dr. Ferdinando amanhã às 16h30.');
+      .toBe('Passando pra lembrar do seu compromisso amanhã às 16h30: Consulta Dr. Ferdinando.');
     expect(reengageReasonForReminder({ type: 'custom', title: 'Beber água' }, null))
-      .toBe('Passei só pra te lembrar: Beber água.');
+      .toBe('Passei pra te lembrar: Beber água.');
+  });
+
+  it('título que é FRASE DE AÇÃO não vira "tomar o seu {frase}" robótico (Antônia 20/07)', () => {
+    // Incidente ao vivo: "de tomar o seu Passar remédio nas sobrancelhas" — o dois-pontos resolve.
+    const r = reengageReasonForReminder({ type: 'medication', title: 'Passar remédio nas sobrancelhas' }, 'hoje às 15h');
+    expect(r).toBe('Passei pra te lembrar do seu remédio hoje às 15h: Passar remédio nas sobrancelhas. Não vale esquecer, tá?');
+    expect(r).not.toContain('tomar o seu Passar');
   });
 
   it('lembrete sem título não gera frase quebrada', () => {

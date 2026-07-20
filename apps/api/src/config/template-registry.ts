@@ -120,13 +120,17 @@ export function reengageReasonForReminder(
 ): string {
   const titulo = templateVar(reminder.title ?? '', 90) || 'seu lembrete de saúde';
   const quando = whenLabel ? ` ${templateVar(whenLabel, 40)}` : '';
+  // Formato de RÓTULO (com dois-pontos), NÃO "tomar o seu {título}": o título pode ser um
+  // NOME ("Neblock 5mg") OU uma FRASE DE AÇÃO ("Passar remédio nas sobrancelhas") — e
+  // "tomar o seu Passar remédio nas sobrancelhas" soa robótico (visto ao vivo 20/07, Antônia).
+  // O dois-pontos funciona pros dois casos.
   switch (reminder.type) {
     case 'medication':
-      return templateVar(`Passei só pra te lembrar de tomar o seu ${titulo}${quando}. Não vale esquecer, tá?`);
+      return templateVar(`Passei pra te lembrar do seu remédio${quando}: ${titulo}. Não vale esquecer, tá?`);
     case 'appointment':
-      return templateVar(`Passando pra lembrar do seu compromisso: ${titulo}${quando}.`);
+      return templateVar(`Passando pra lembrar do seu compromisso${quando}: ${titulo}.`);
     default:
-      return templateVar(`Passei só pra te lembrar: ${titulo}${quando}.`);
+      return templateVar(`Passei pra te lembrar${quando}: ${titulo}.`);
   }
 }
 
