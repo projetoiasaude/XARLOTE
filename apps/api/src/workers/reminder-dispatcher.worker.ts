@@ -205,16 +205,19 @@ export async function dispatchReminders(): Promise<void> {
     const isConditionalBackup = (reminder.payload as { condition?: string } | null)?.condition === 'if_not_confirmed';
     if (reminder.rrule && !isConditionalBackup) {
       const cap = user.reminder_max_per_day ?? 6;
-      // Conta ENVIOS reais (event_log reminder.dispatched) — last_run_at não serve de proxy
-      // porque o claim carimba também ocorrências PULADAS (staleness/condicional/cap).
-      // ⚠️ Coluna é occurred_at (migration 0002), NÃO created_at — o review pegou a query
-      // com coluna errada que fazia o PostgREST devolver {error, count:null} e o cap virar
-      // no-op silencioso. Erro de query agora é logado e decide fail-open EXPLICITAMENTE.
+      // Conta só o que REALMENTE CHEGOU no WhatsApp (payload.window_open=true = texto livre
+      // entregue). Lembrete BLOQUEADO pela janela de 24h (paciente mudo) não conta — senão o
+      // cap enche de mensagens-fantasma que a pessoa nunca recebeu e passa a BLOQUEAR até o
+      // único template de re-engajamento que a traria de volta (caso Antônia 20/07: 6/6 no cap,
+      // 0 entregas reais). window_open é o sinal certo: intacto no payload (o `whatsapp_delivered`
+      // era REDIGIDO pelo redactPII — a chave contém "whatsapp"), e reflete entrega de texto livre.
+      // ⚠️ occurred_at (migration 0002), NÃO created_at. Erro de query → fail-open EXPLÍCITO.
       const { count: sent24h, error: capErr } = await db
         .from('event_log')
         .select('id', { count: 'exact', head: true })
         .eq('event_name', 'reminder.dispatched')
         .eq('user_id', reminder.user_id)
+        .eq('payload->>window_open', 'true')
         .gte('occurred_at', new Date(now.getTime() - 24 * 60 * 60_000).toISOString());
       if (capErr) {
         // fail-open deliberado (melhor lembrar demais que calar remédio) — mas NUNCA mudo.
@@ -388,7 +391,9 @@ export async function dispatchReminders(): Promise<void> {
         recurring: Boolean(reminder.rrule),
         next_run_at: next?.toISOString() ?? null,
         mirrored_to_app: Boolean(conv),
-        whatsapp_delivered: whatsappDelivered,
+        // NÃO chamar de "whatsapp_*": o redactPII redige qualquer chave com "whatsapp" → virava
+        // "[redacted]" e ficava inútil (bug descoberto no cap 20/07). Nome neutro = valor real.
+        channel_delivered: whatsappDelivered,
         window_open: windowOpen,
       },
     });
