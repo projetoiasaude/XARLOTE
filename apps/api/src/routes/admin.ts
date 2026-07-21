@@ -8,6 +8,8 @@ import { buildXarloteSystemPrompt, buildAgentPharmacySystemPrompt } from '@iasau
 import { initiatePharmacyNegotiation } from '../handlers/inbound-supplier.js';
 import { initiateClinicNegotiation } from '../handlers/agent-clinic.js';
 import { requireAdminToken } from '../middleware/auth.js';
+import { buildReengageTemplate, reengageTemplateEnabled } from '../config/template-registry.js';
+import { dispatchOutbound } from '../queues/outbound.queue.js';
 
 /** Redacta valores sensíveis em config — não loga keys cruas no audit_log */
 function redactConfig(cfg: Record<string, unknown>): Record<string, unknown> {
@@ -26,6 +28,36 @@ function redactConfig(cfg: Record<string, unknown>): Record<string, unknown> {
 export async function adminRoute(app: FastifyInstance) {
   // 🔒 Toda rota /admin exige token de admin (F0.2). Escopado a este plugin.
   app.addHook('preHandler', requireAdminToken);
+
+  // ─── REATIVAÇÃO: dispara o template reengajamento_lembrete pra UM paciente mudo ──────
+  // Campanha 21/07 (churn por erro já corrigido). {{2}} = `reason` (frase personalizada,
+  // sem quebra de linha — o buildReengageTemplate sanitiza). Espelha em `messages` e o
+  // WORKER da fila carimba delivered/failed via messageId (verdade de entrega, 0022).
+  app.post<{ Body: { phone?: string; firstName?: string; reason?: string } }>('/reengage/send', async (req, reply) => {
+    const { phone, firstName, reason } = req.body ?? {};
+    if (!phone || !reason) return reply.code(400).send({ error: 'phone e reason são obrigatórios' });
+    if (!reengageTemplateEnabled()) return reply.code(409).send({ error: 'reengajamento_lembrete não está aprovado/ligado (ZPRO_TEMPLATE_REENGAGE_APPROVED)' });
+    const phoneE164 = phone.startsWith('+') ? phone : `+${phone.replace(/\D/g, '')}`;
+    const { data: user } = await db.from('users').select('id, preferred_name').eq('phone_e164', phoneE164).maybeSingle();
+    if (!user) return reply.code(404).send({ error: `usuário não encontrado: ${phoneE164}` });
+    const { data: conv } = await db.from('conversations').select('id')
+      .eq('party_type', 'user').eq('user_id', user.id).eq('whatsapp_instance', SARA_INSTANCE)
+      .order('last_message_at', { ascending: false, nullsFirst: false }).limit(1).maybeSingle();
+    if (!conv) return reply.code(404).send({ error: 'conversa SARA não encontrada pra este usuário' });
+    const first = (firstName ?? user.preferred_name ?? '').trim() || 'tudo bem';
+    const tpl = buildReengageTemplate(first, reason);
+    const { data: mirror } = await db.from('messages').insert({
+      conversation_id: conv.id, direction: 'out', sender_role: 'assistant', content_type: 'text',
+      content: tpl.text, delivery_status: 'queued',
+    }).select('id').single();
+    await dispatchOutbound({
+      kind: 'template', instance: SARA_INSTANCE, phoneE164,
+      templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables,
+      text: tpl.text, messageId: mirror?.id,
+    });
+    await writeAudit({ actorType: 'system', actorId: 'admin-reengage', action: 'reengage.template.sent', targetTable: 'messages', targetId: mirror?.id ?? '', traceId: `reengage-${user.id.slice(0, 8)}`, metadata: { phone: phoneE164.slice(0, 6) + '***', name: first } });
+    return reply.send({ ok: true, messageId: mirror?.id, to: phoneE164, name: first, template: tpl.name, text: tpl.text });
+  });
 
   // List conversations with pagination
   app.get('/conversations', async (req, reply) => {
