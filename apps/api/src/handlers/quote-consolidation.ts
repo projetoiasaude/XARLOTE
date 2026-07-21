@@ -480,7 +480,13 @@ export async function consolidateQuotes(
     const nameOf = new Map<string, string>((sups ?? []).map((s: SupplierRow) => [s.id, s.name]));
 
     await sendOutbound(userConversationId, userPhoneE164, buildFailureReport(allQuotes, nameOf), traceId);
-    await db.from('orders').update({ status: 'failed' }).eq('id', orderId);
+    // MOTIVO gravado (auditoria 20/07: todo pedido 'failed' tinha cancelled_reason NULL — quando
+    // um pedido morria, ninguém sabia por quê). Conta quantas farmácias entraram e nenhuma fechou.
+    const failReason =
+      allQuotes.length === 0
+        ? 'sem cotação viável — nenhuma farmácia contatada/disponível na região'
+        : `sem cotação viável — nenhuma das ${allQuotes.length} farmácia(s) contatada(s) fechou preço`;
+    await db.from('orders').update({ status: 'failed', cancelled_reason: failReason }).eq('id', orderId);
     await writeLog('warn', 'order', 'No successful quotes for order', { traceId, orderId, total: allQuotes.length });
     return;
   }

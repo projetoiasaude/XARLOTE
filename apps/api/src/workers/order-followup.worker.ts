@@ -18,7 +18,7 @@
  *   - máx 5 ações por tick; kill-switches: pharmacy_outbound_enabled (farmácia),
  *     NUDGE_ENABLED (alerta ao cliente)
  */
-import { db, writeLog } from '@iasaude/db';
+import { db, writeLog, writeEvent } from '@iasaude/db';
 import { sendOutbound } from '../handlers/outbound.js';
 import { sendOutboundToSupplier } from '../handlers/outbound-agent.js';
 import { withCronLock } from '../middleware/cron-lock.js';
@@ -30,6 +30,7 @@ const SILENT_NUDGE_MS = 20 * 60 * 1000;      // 20min de silêncio da farmácia 
 const DEADLINE_MARGIN_MS = 10 * 60 * 1000;   // alerta a partir de 10min antes do prazo
 const WABA_SAFE_MS = 22 * 60 * 60 * 1000;    // margem antes da janela de 24h fechar
 const MAX_ACTIONS_PER_TICK = 5;
+const ABANDONED_QUOTE_MS = 7 * 24 * 60 * 60 * 1000; // 'quoted' sem escolha há 7+ dias = cotação vencida
 
 // Cobrança à farmácia: humana e VARIADA (nunca a mesma frase sempre — tell de robô).
 const SUPPLIER_NUDGES = [
@@ -88,6 +89,44 @@ async function lastUserInboundAt(conversationId: string): Promise<number | null>
     .limit(1)
     .maybeSingle();
   return data?.created_at ? new Date(data.created_at).getTime() : null;
+}
+
+/**
+ * EXPIRA cotações abandonadas (auditoria 20/07). Um pedido 'quoted' é opções apresentadas
+ * aguardando a ESCOLHA do paciente. O nudge-stalled-flows cutuca UMA vez entre 3–20h e depois
+ * deixa quieto — então o pedido fica 'quoted' PARA SEMPRE quando a pessoa não responde (Marina
+ * desde 10/06 = 40 dias; vários outros). Depois de 7 dias a cotação está VENCIDA de qualquer
+ * forma (preço/estoque de farmácia mudam numa semana). Marca 'failed' com MOTIVO + evento.
+ *
+ * NÃO é destrutivo: 'failed' é revivível (inbound-supplier revive failed→quoting quando a
+ * farmácia responde) e o paciente pode recomeçar com cotação FRESCA (melhor que uma de 1 semana).
+ * Não mexe em pedido com escolha já feita (selected_quote_id) nem em pós-fechamento (handed_off).
+ */
+export async function expireAbandonedQuotes(): Promise<void> {
+  try {
+    const cutoff = new Date(Date.now() - ABANDONED_QUOTE_MS).toISOString();
+    // created_at (não updated_at): a migration 0022 bumpou updated_at de todos os antigos; e a
+    // revivência (inbound-supplier) reseta created_at → ele reflete o ciclo de cotação atual.
+    const { data: stale } = await db.from('orders')
+      .select('id, user_id, created_at')
+      .eq('status', 'quoted')
+      .is('selected_quote_id', null)
+      .lt('created_at', cutoff)
+      .limit(20);
+    if (!stale?.length) return;
+    for (const o of stale) {
+      // Claim atômico (.eq('status','quoted')) — se outro processo/fechamento mexeu, não pisa.
+      const { data: claimed } = await db.from('orders')
+        .update({ status: 'failed', cancelled_reason: 'cotação expirada — 7+ dias sem escolha do paciente (preços/estoque desatualizados)' })
+        .eq('id', o.id).eq('status', 'quoted').is('selected_quote_id', null).select('id');
+      if (claimed?.length) {
+        await writeLog('info', 'order', `cotação abandonada expirada (>7d sem escolha) — pedido ${o.id.slice(0, 8)} → failed`, { orderId: o.id });
+        void writeEvent({ eventName: 'order.quote_expired', userId: (o.user_id as string | null) ?? undefined, payload: { order_id: o.id } });
+      }
+    }
+  } catch (err) {
+    await writeLog('error', 'order', `expire-abandoned-quotes falhou: ${String(err).slice(0, 160)}`, {});
+  }
 }
 
 export async function followUpHandedOffOrders(): Promise<void> {
@@ -195,11 +234,18 @@ export async function followUpHandedOffOrders(): Promise<void> {
 
 let interval: ReturnType<typeof setInterval> | null = null;
 
+/** Tick do worker: cobra pós-fechamento + expira cotação abandonada. Cada um tem seu try/catch
+ *  interno — uma falha não impede a outra tarefa (nem derruba o processo ROLE=all). */
+async function orderFollowupTick(): Promise<void> {
+  await followUpHandedOffOrders();
+  await expireAbandonedQuotes();
+}
+
 export function startOrderFollowupWorker(): void {
   if (interval) return;
   setTimeout(() => {
-    void withCronLock('order-followup', POLL_MS, followUpHandedOffOrders);
-    interval = setInterval(() => void withCronLock('order-followup', POLL_MS, followUpHandedOffOrders), POLL_MS);
+    void withCronLock('order-followup', POLL_MS, orderFollowupTick);
+    interval = setInterval(() => void withCronLock('order-followup', POLL_MS, orderFollowupTick), POLL_MS);
   }, 60 * 1000); // 1ª run 60s após boot
   void writeLog('info', 'order', 'order-followup worker iniciado (cada 2min)', {});
 }

@@ -98,6 +98,33 @@ export function reengageTemplateEnabled(): boolean {
 }
 
 /**
+ * BACK-OFF do template de re-engajamento por tempo de silêncio (auditoria 20/07).
+ *
+ * O template de re-engajamento é um HSM PAGO e cada disparo é um convite a bloquear o número.
+ * Antes o intervalo mínimo era fixo (~1x/dia) — então um paciente mudo há semanas recebia o
+ * mesmo "Aqui é a Xarlote… tô por aqui" TODO santo dia, no vazio, custando por envio e sem
+ * ninguém pra receber. Caso Antônia (muda 5+ dias, 10 lembretes/dia): template diário perpétuo.
+ *
+ * Regra: quanto mais tempo mudo, MENOS frequente o toque (a pessoa claramente não está lá):
+ *   silêncio  < 3 dias → 20h  (≈ diário — ainda "quente", vale tentar todo dia trazer de volta)
+ *   silêncio 3–7 dias  → 48h  (a cada 2 dias)
+ *   silêncio 7–14 dias → 72h  (a cada 3 dias)
+ *   silêncio > 14 dias → 7 dias (semanal — desengajamento profundo, para de queimar template)
+ *
+ * NÃO pausa o LEMBRETE em si (remédio de paciente silencioso é o que NÃO se auto-pausa —
+ * fail-safe pró-cuidado): o espelho no app/dashboard continua; só o HSM pago recua.
+ */
+export function reengageIntervalMs(silentMs: number): number {
+  const HOUR = 60 * 60_000;
+  const DAY = 24 * HOUR;
+  const days = silentMs / DAY;
+  if (days < 3) return 20 * HOUR;
+  if (days < 7) return 48 * HOUR;
+  if (days < 14) return 72 * HOUR;
+  return 7 * DAY;
+}
+
+/**
  * Sanitiza um valor pra variável de template da Meta: sem quebra de linha/tab e sem
  * espaços múltiplos (a API REJEITA o parâmetro com esses caracteres) + teto de tamanho.
  */

@@ -8,6 +8,7 @@ import {
   buildReengageTemplate,
   reengageReasonForReminder,
   REENGAGE_REASON_SILENT,
+  reengageIntervalMs,
 } from '../apps/api/src/config/template-registry.js';
 
 // Limpa as envs que o registry lê, pra cada teste partir de estado conhecido.
@@ -184,5 +185,42 @@ describe('reengajamento_lembrete (patient-facing, 2 vars)', () => {
   it('lembrete sem título não gera frase quebrada', () => {
     expect(reengageReasonForReminder({ type: 'medication', title: null }, null))
       .toContain('seu lembrete de saúde');
+  });
+});
+
+// ─── Back-off do template de re-engajamento por tempo de silêncio (auditoria 20/07) ─────────
+describe('reengageIntervalMs (back-off do HSM pago por silêncio)', () => {
+  const HOUR = 60 * 60_000;
+  const DAY = 24 * HOUR;
+
+  it('silêncio < 3 dias → 20h (≈ diário, ainda vale tentar todo dia)', () => {
+    expect(reengageIntervalMs(0)).toBe(20 * HOUR);
+    expect(reengageIntervalMs(1 * DAY)).toBe(20 * HOUR);
+    expect(reengageIntervalMs(2.9 * DAY)).toBe(20 * HOUR);
+  });
+
+  it('silêncio 3–7 dias → 48h (a cada 2 dias)', () => {
+    expect(reengageIntervalMs(3 * DAY)).toBe(48 * HOUR);
+    expect(reengageIntervalMs(6.9 * DAY)).toBe(48 * HOUR);
+  });
+
+  it('silêncio 7–14 dias → 72h (a cada 3 dias)', () => {
+    expect(reengageIntervalMs(7 * DAY)).toBe(72 * HOUR);
+    expect(reengageIntervalMs(13.9 * DAY)).toBe(72 * HOUR);
+  });
+
+  it('silêncio > 14 dias → 7 dias (semanal — para de queimar template no vazio)', () => {
+    expect(reengageIntervalMs(14 * DAY)).toBe(7 * DAY);
+    expect(reengageIntervalMs(40 * DAY)).toBe(7 * DAY);
+    expect(reengageIntervalMs(Infinity)).toBe(7 * DAY); // nunca falou por WhatsApp
+  });
+
+  it('é monotônico — nunca fica MAIS frequente quanto mais tempo mudo', () => {
+    let prev = 0;
+    for (const d of [0, 2, 3, 5, 7, 10, 14, 30]) {
+      const v = reengageIntervalMs(d * DAY);
+      expect(v).toBeGreaterThanOrEqual(prev);
+      prev = v;
+    }
   });
 });

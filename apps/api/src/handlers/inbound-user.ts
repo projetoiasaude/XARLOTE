@@ -109,6 +109,10 @@ async function processInboundUserInner(
       trace_id: traceId,
     }),
     db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversation.id),
+    // last_active_at: o paciente ACABOU de falar. A coluna existia mas NUNCA era escrita
+    // (auditoria 20/07) → o sistema ficava cego pra silêncio e não sabia fazer back-off de
+    // quem sumiu. Agora todo inbound carimba "ativo agora" (dashboard + sinais de engajamento).
+    db.from('users').update({ last_active_at: new Date().toISOString() }).eq('id', user.id),
   ]);
 
   // 5a. Comando especial @teste — zera tudo e reinicia Xarlote.

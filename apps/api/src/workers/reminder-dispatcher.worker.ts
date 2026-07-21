@@ -19,7 +19,7 @@ import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBod
 import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
-import { reengageTemplateEnabled, buildReengageTemplate, reengageReasonForReminder, REENGAGE_REASON_SILENT } from '../config/template-registry.js';
+import { reengageTemplateEnabled, buildReengageTemplate, reengageReasonForReminder, REENGAGE_REASON_SILENT, reengageIntervalMs } from '../config/template-registry.js';
 
 /** A perna do usuário (SARA) é WhatsApp oficial (zpro) → a janela de 24h se aplica? */
 function saraNeedsWabaWindow(): boolean {
@@ -94,8 +94,13 @@ export async function dispatchReminders(): Promise<void> {
   // lembrete bloqueado seria inútil, CUSTA por envio (a Meta cobra) e é caminho direto pro
   // paciente bloquear o número (risco de ban). Caso real: Antônia, muda há 5 dias, tem 10
   // lembretes/dia — receberia ~6 templates/dia.
-  const REENGAGE_TPL_MIN_INTERVAL_MS = 20 * 60 * 60_000;
   const reengagedThisTick = new Set<string>(); // no máx 1 check-in de re-engajamento por usuário por tick
+  // GUARD DE TICK (auditoria 20/07): no máx 1 template de re-engajamento por usuário por tick.
+  // Sem isto, dois lembretes do MESMO usuário vencidos no mesmo tick (ex.: 8h + 8h30 no backlog)
+  // — ambos com snapshot STALE de reengage_template_at — disparariam DOIS templates. É o mesmo
+  // furo que deixou a Antônia levar 2 templates em 20/07 (o check-in silencioso, separado,
+  // ignorava o cooldown). Agora os DOIS caminhos compartilham este set + o cooldown por-tempo.
+  const templateSentThisTick = new Set<string>();
 
   for (const reminder of due as unknown as DueReminder[]) {
     const user = reminder.users;
@@ -295,21 +300,19 @@ export async function dispatchReminders(): Promise<void> {
     // registrado com HONESTIDADE (evento + warn) pra ser visível/acionável.
     const needsWindow = !isSimulatorMode() && saraNeedsWabaWindow();
     let windowOpen = !needsWindow; // uazapi/simulador: canal sem restrição de janela
-    if (needsWindow) {
-      if (!conv) {
-        // Sem conversa WhatsApp localizada → o usuário nunca falou por lá → janela FECHADA
-        // (fail-safe: melhor template/suppress do que texto livre que a Meta rejeita).
-        windowOpen = false;
-      } else {
-        const lastIn = await lastUserInboundMs(conv.id);
-        windowOpen = isWabaWindowOpen(lastIn, now.getTime());
-      }
-    }
+    // Último inbound REAL do WhatsApp (null = nunca falou por lá → janela FECHADA, fail-safe).
+    // Guardado pra medir HÁ QUANTO TEMPO o paciente está mudo (back-off do template pago).
+    const lastInMs = needsWindow ? (conv ? await lastUserInboundMs(conv.id) : null) : null;
+    if (needsWindow) windowOpen = isWabaWindowOpen(lastInMs, now.getTime());
+    const windowSilentMs = lastInMs != null ? now.getTime() - lastInMs : Infinity;
 
-    // Já mandei template de re-engajamento pra esta pessoa nas últimas ~20h?
+    // Já mandei template de re-engajamento pra esta pessoa DENTRO do intervalo de back-off?
+    // O intervalo CRESCE com o silêncio (reengageIntervalMs): mudo há 1 dia → ~diário; mudo há
+    // 2 semanas → semanal. + guard de tick (não 2 templates no mesmo tick pro mesmo user).
     const uMeta = (user.metadata ?? {}) as Record<string, unknown> & { reengage_template_at?: string };
     const lastTplMs = uMeta.reengage_template_at ? new Date(uMeta.reengage_template_at).getTime() : 0;
-    const reengageTplAllowed = now.getTime() - lastTplMs >= REENGAGE_TPL_MIN_INTERVAL_MS;
+    const reengageTplAllowed =
+      now.getTime() - lastTplMs >= reengageIntervalMs(windowSilentMs) && !templateSentThisTick.has(reminder.user_id);
 
     // 3. WhatsApp real, SEMPRE pela fila (rate-limit anti-ban).
     let whatsappDelivered = false;
@@ -332,6 +335,7 @@ export async function dispatchReminders(): Promise<void> {
         await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text });
         whatsappDelivered = true;
         deliveryStatus = 'delivered';
+        templateSentThisTick.add(reminder.user_id); // trava o 2º template do mesmo user neste tick
         // O paciente recebe o TEMPLATE, não o corpo do lembrete → o espelho tem que mostrar
         // o template (senão o dashboard exibe um texto e a pessoa leu outro — mesmo bug já
         // corrigido no check-in mais abaixo).
@@ -342,7 +346,7 @@ export async function dispatchReminders(): Promise<void> {
         // Fora da janela e sem template aprovado: NÃO queima texto livre (a Meta rejeitaria).
         // Honestidade: registra o não-entregue por WhatsApp — visível pro fundador agir.
         deliveryStatus = 'window_blocked';
-        await writeLog('warn', 'reminder', `lembrete "${reminder.title}" NÃO entregue por WhatsApp — janela de 24h fechada (usuário mudo) e ${reengageTemplateEnabled() ? 'template de re-engajamento já enviado nas últimas 20h (cooldown anti-spam)' : 'sem template de re-engajamento aprovado'}`, {});
+        await writeLog('warn', 'reminder', `lembrete "${reminder.title}" NÃO entregue por WhatsApp — janela de 24h fechada (usuário mudo) e ${reengageTemplateEnabled() ? 'template em cooldown de re-engajamento (back-off por silêncio)' : 'sem template de re-engajamento aprovado'}`, {});
         void writeEvent({
           eventName: 'reminder.wa_window_closed',
           userId: reminder.user_id,
@@ -412,7 +416,7 @@ export async function dispatchReminders(): Promise<void> {
         // update (elimina corrida entre rows e minimiza a janela contra outros RMW de
         // metadata — audio_intro/update_profile).
         const { data: freshUser } = await db.from('users').select('metadata').eq('id', reminder.user_id).maybeSingle();
-        const meta = (freshUser?.metadata ?? {}) as Record<string, unknown> & { reminder_reengage_at?: string };
+        const meta = (freshUser?.metadata ?? {}) as Record<string, unknown> & { reminder_reengage_at?: string; reengage_template_at?: string };
         const askedAgo = meta.reminder_reengage_at ? now.getTime() - new Date(meta.reminder_reengage_at).getTime() : Infinity;
         if (askedAgo > 7 * 24 * 60 * 60_000) {
           const { data: lastIn } = await db
@@ -425,34 +429,56 @@ export async function dispatchReminders(): Promise<void> {
             .maybeSingle();
           const silentMs = lastIn?.created_at ? now.getTime() - new Date(lastIn.created_at as string).getTime() : Infinity;
           if (silentMs > 5 * 24 * 60 * 60_000) {
-            reengagedThisTick.add(reminder.user_id);
-            await db.from('users').update({ metadata: { ...meta, reminder_reengage_at: now.toISOString() } }).eq('id', reminder.user_id);
             // Vocativo só com nome REAL — "você, tô te mandando..." não existe em PT-BR.
             const firstName = user.preferred_name?.trim() ? user.preferred_name.trim().split(' ')[0] : null;
             const checkin = firstName
               ? `${firstName}, tô te mandando esses lembretes todo dia e queria saber: tão te ajudando de verdade? Se quiser mudar horário, diminuir ou parar algum, é só me falar aqui 💙`
               : `Oi! Tô te mandando esses lembretes todo dia e queria saber: tão te ajudando de verdade? Se quiser mudar horário, diminuir ou parar algum, é só me falar aqui 💙`;
-            // IRONIA da janela (incidente Elizabet): o check-in é EXATAMENTE pra quem está
-            // mudo 5+ dias → SEMPRE fora da janela de 24h. Texto livre não chega. Fora da
-            // janela usa o template de re-engajamento (se aprovado); senão só espelha no app.
-            // {{2}} aqui é a reativação PURA ("faz uns dias que a gente não conversa…").
-            const useTemplate = !isSimulatorMode() && needsWindow && !windowOpen && reengageTemplateEnabled();
-            const tpl = useTemplate ? buildReengageTemplate(firstName ?? '', REENGAGE_REASON_SILENT) : null;
-            // Espelha o que o paciente REALMENTE recebe (antes gravava o check-in e mandava o
-            // template — dashboard mostrava um texto e a pessoa lia outro).
-            await db.from('messages').insert({
-              conversation_id: conv.id, direction: 'out', sender_role: 'assistant', content_type: 'text',
-              content: tpl ? tpl.text : checkin,
-            });
-            if (!isSimulatorMode()) {
-              if (!needsWindow || windowOpen) {
-                await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: checkin });
-              } else if (tpl) {
-                await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text });
+            // CANAL: dentro da janela → texto livre; fora → template de reativação PURA, MAS só
+            // se o cooldown POR-TEMPO permitir E nenhum template já saiu neste tick pro user.
+            // (auditoria 20/07: este check-in ignorava o cooldown de 20h → 2º template no mesmo
+            // dia + linha-fantasma NULL que o paciente nunca recebeu. Agora divide o MESMO
+            // cooldown/guard do caminho por-lembrete.)
+            const canFreeText = !needsWindow || windowOpen;
+            const lastTplMsFresh = meta.reengage_template_at ? new Date(meta.reengage_template_at).getTime() : 0;
+            const tplAllowed = !isSimulatorMode() && !canFreeText && reengageTemplateEnabled()
+              && now.getTime() - lastTplMsFresh >= reengageIntervalMs(silentMs)
+              && !templateSentThisTick.has(reminder.user_id);
+
+            if (!isSimulatorMode() && !canFreeText && !tplAllowed) {
+              // Não dá pra entregar nada novo (fora da janela + template em cooldown): ADIA —
+              // sem envio, sem linha-fantasma, e SEM queimar o cooldown de 7d do check-in (ele
+              // tenta de novo quando a janela abrir ou o template liberar). O caminho por-lembrete
+              // acima já é quem reabre a janela com o template do dia.
+              await writeLog('info', 'reminder', `check-in de re-engajamento adiado (mudo há ${Math.round(silentMs / 86_400_000)}d) — template em cooldown/janela fechada`, {});
+            } else {
+              reengagedThisTick.add(reminder.user_id);
+              const tpl = tplAllowed ? buildReengageTemplate(firstName ?? '', REENGAGE_REASON_SILENT) : null;
+              // Claim ANTES do envio (só quem GANHA o update segue — anti-corrida entre rows/
+              // réplicas). Grava o cooldown de template JUNTO quando manda template, pra o
+              // caminho por-lembrete do próximo tick já enxergar e não duplicar.
+              const claimMeta: Record<string, unknown> = { ...meta, reminder_reengage_at: now.toISOString() };
+              if (tpl) claimMeta['reengage_template_at'] = now.toISOString();
+              await db.from('users').update({ metadata: claimMeta }).eq('id', reminder.user_id);
+              if (tpl) templateSentThisTick.add(reminder.user_id);
+              // Espelha SÓ o que o paciente REALMENTE recebe, JÁ com o veredito do canal — nunca
+              // mais linha-fantasma (se não entrega, nem grava, pois caímos no ramo de adiar).
+              await db.from('messages').insert({
+                conversation_id: conv.id, direction: 'out', sender_role: 'assistant', content_type: 'text',
+                content: tpl ? tpl.text : checkin,
+                delivered_at: isSimulatorMode() ? null : new Date().toISOString(),
+                delivery_status: isSimulatorMode() ? 'suppressed' : 'delivered',
+              });
+              if (!isSimulatorMode()) {
+                if (canFreeText) {
+                  await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: checkin });
+                } else if (tpl) {
+                  await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text });
+                }
               }
+              await writeLog('info', 'reminder', `check-in de re-engajamento (mudo há ${Math.round(silentMs / 86_400_000)}d) — ${canFreeText ? 'texto livre' : 'template'}`, {});
+              void writeEvent({ eventName: 'reminder.reengage_checkin', userId: reminder.user_id, conversationId: conv.id, payload: { silent_days: Math.round(silentMs / 86_400_000) } });
             }
-            await writeLog('info', 'reminder', `check-in de re-engajamento (mudo há ${Math.round(silentMs / 86_400_000)}d) — ${(!needsWindow || windowOpen) ? 'texto livre' : reengageTemplateEnabled() ? 'template' : 'só app (janela fechada, sem template)'}`, {});
-            void writeEvent({ eventName: 'reminder.reengage_checkin', userId: reminder.user_id, conversationId: conv.id, payload: { silent_days: Math.round(silentMs / 86_400_000) } });
           }
         }
       } catch (err) {
