@@ -138,14 +138,14 @@ describe('reengajamento_lembrete (patient-facing, 2 vars)', () => {
 
   it('monta 2 variáveis (nome + motivo) e o corpo aprovado', () => {
     const t = buildReengageTemplate('Dona Maria', 'Passei só pra te lembrar de tomar o seu Puran T4 hoje às 8h, em jejum. Não vale esquecer, tá?');
-    expect(t.name).toBe('reengajamento_lembrete');
+    expect(t.name).toBe('lembrete_compromisso'); // template ATIVO na Meta (não reengajamento_lembrete)
     expect(t.variables).toHaveLength(2);
     expect(t.variables[0]).toBe('Dona Maria');
     expect(t.variables[1]).toContain('Puran T4');
     expect(t.text).toBe(
-      'Oi, Dona Maria! Aqui é a Xarlote,\n\n' +
+      'Oii, Dona Maria! Aqui é a Xarlote,\n\n' +
       'Passei só pra te lembrar de tomar o seu Puran T4 hoje às 8h, em jejum. Não vale esquecer, tá?\n\n' +
-      'Tô por aqui com você pro que precisar, é só me responder nesta conversa.',
+      'Tô por aqui com você pro que precisar, é só me responder nesta conversa. 💜',
     );
   });
 

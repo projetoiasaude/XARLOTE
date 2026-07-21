@@ -251,6 +251,7 @@ export async function zproSendTemplate(
 
   const body = {
     number,
+    externalKey: randomUUID(), // obrigatório em todo envio zpro (gotcha #1); faltava aqui
     isClosed: false,
     templateData: {
       messaging_product: 'whatsapp',

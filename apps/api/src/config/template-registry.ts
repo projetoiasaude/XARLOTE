@@ -84,12 +84,15 @@ export function templatesEnabled(): boolean {
 // nunca chega. Este HSM (patient-facing, no número da XARLOTE) reabre a conversa.
 // Ligado por ZPRO_TEMPLATE_REENGAGE_APPROVED=true.
 //
-// CORPO APROVADO NA META (pt_BR, **2 variáveis**) — cópia EXATA, não alterar sem reaprovar:
-//   Oi, {{1}}! Aqui é a Xarlote,
+// TEMPLATE ATIVO NA META = `lembrete_compromisso` (Utilidade, pt_BR). ⚠️ NÃO é o
+// `reengajamento_lembrete` (esse nunca ficou ativo → `ERR_SEND_TEMPLATE` em TODO envio, o que
+// deixou reativação e lembrete-fora-de-janela mudos até 21/07). Sobreponível por ZPRO_TEMPLATE_REENGAGE.
+// CORPO APROVADO (pt_BR, **2 variáveis**) — cópia EXATA, não alterar sem reaprovar:
+//   Oii, {{1}}! Aqui é a Xarlote,
 //
 //   {{2}}
 //
-//   Tô por aqui com você pro que precisar, é só me responder nesta conversa.
+//   Tô por aqui com você pro que precisar, é só me responder nesta conversa. 💜
 //
 // {{1}} = como chamar a pessoa ("Dona Maria"). {{2}} = o MOTIVO, em 1 frase, que muda por
 // situação (medicação, consulta, pós-consulta, renovação, sumiço) — ver reengageReason*().
@@ -167,10 +170,13 @@ export function buildReengageTemplate(
 ): { name: string; language: string; variables: string[]; text: string } {
   const nome = templateVar(firstName || 'tudo bem', 60) || 'tudo bem';
   const motivo = templateVar(reason) || REENGAGE_REASON_SILENT;
-  // Espelho local (o que fica no app/dashboard) = o corpo aprovado já montado.
-  const text = `Oi, ${nome}! Aqui é a Xarlote,\n\n${motivo}\n\nTô por aqui com você pro que precisar, é só me responder nesta conversa.`;
+  // Espelho local (o que fica no app/dashboard) = o corpo aprovado já montado, BYTE-A-BYTE
+  // igual ao que a Meta renderiza (senão o dashboard mostra um texto e o paciente lê outro).
+  // Template ATIVO na Meta = `lembrete_compromisso` (o `reengajamento_lembrete` nunca esteve
+  // ativo → ERR_SEND_TEMPLATE em todo envio, achado 21/07). Corpo aprovado: "Oii," + 💜 no fim.
+  const text = `Oii, ${nome}! Aqui é a Xarlote,\n\n${motivo}\n\nTô por aqui com você pro que precisar, é só me responder nesta conversa. 💜`;
   return {
-    name: process.env['ZPRO_TEMPLATE_REENGAGE']?.trim() || 'reengajamento_lembrete',
+    name: process.env['ZPRO_TEMPLATE_REENGAGE']?.trim() || 'lembrete_compromisso',
     language: templateLanguage(),
     variables: [nome, motivo],
     text,
