@@ -338,8 +338,21 @@ export async function getPlacePhone(placeId: string): Promise<string | null> {
       },
       timeout: 5_000,
     });
+    // A API legada devolve HTTP 200 mesmo com status de ERRO no corpo (OVER_QUERY_LIMIT,
+    // REQUEST_DENIED, etc.). Antes o código lia direto `result.phone` → em throttle vinha
+    // undefined e a função devolvia null EM SILÊNCIO. Foi o que cegou o fluxo de consulta em
+    // 14–15/07: Place Details throttled → 0 telefones → clínica sem canal → "não encontrei"
+    // 8× sem ninguém saber por quê. Agora o status ruim VAZA pro log (Railway) pra ser acionável.
+    const status = res.data?.status as string | undefined;
+    if (status && status !== 'OK') {
+      if (status !== 'NOT_FOUND' && status !== 'ZERO_RESULTS') {
+        console.warn(`[google-places] Place Details status=${status} (placeId=${placeId.slice(0, 16)}…) — telefone indisponível; verificar quota/billing da chave Places`);
+      }
+      return null;
+    }
     return (res.data?.result?.international_phone_number as string) ?? null;
-  } catch {
+  } catch (err) {
+    console.warn(`[google-places] Place Details EXCEÇÃO (placeId=${placeId.slice(0, 16)}…): ${String(err).slice(0, 120)}`);
     return null;
   }
 }

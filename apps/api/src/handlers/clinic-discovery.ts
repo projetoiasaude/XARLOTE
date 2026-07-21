@@ -146,6 +146,7 @@ export async function discoverClinics(opts: {
 
   // Busca telefone só das top-N (Place Details custa 1 request cada) — limita a 8 pra controlar custo.
   const topPlaces = places.slice(0, 8);
+  let phoneHits = 0; // quantas clínicas devolveram telefone (detecta throttle do Place Details)
 
   for (const p of topPlaces) {
     try {
@@ -154,6 +155,7 @@ export async function discoverClinics(opts: {
       try {
         const phone = await getPlacePhone(p.placeId);
         phoneE164 = toE164BR(phone);
+        if (phoneE164) phoneHits++;
       } catch { /* telefone opcional — sem ele, clínica fica no diretório mas não vira candidata */ }
 
       const { data: row } = await db.from('clinics').upsert({
@@ -200,7 +202,14 @@ export async function discoverClinics(opts: {
   }
 
   upserted.sort((a, b) => (a.distance_km ?? 999) - (b.distance_km ?? 999));
-  await writeLog('info', 'clinic-discovery', `${upserted.length} clínica(s) com canal de contato pra "${specialty}"`, { traceId });
+  // ALERTA acionável (incidente consulta 14–15/07): o Places ACHOU clínicas mas NENHUMA
+  // devolveu telefone (Place Details throttled/quota) → cache não popula, paciente vê "não
+  // encontrei" e ninguém sabe por quê. Antes isso era um `info` mudo ("0 com canal"); agora é
+  // um WARN explícito com a causa provável, pra virar alerta e não churn silencioso.
+  if (topPlaces.length > 0 && phoneHits === 0) {
+    await writeLog('warn', 'clinic-discovery', `⚠️ ${topPlaces.length} clínica(s) de "${specialty}" encontradas mas NENHUMA retornou telefone (Google Place Details) — provável throttle/quota/billing da chave Places. Cache NÃO populado; paciente vê "não encontrei". Verificar Google Cloud.`, { traceId });
+  }
+  await writeLog('info', 'clinic-discovery', `${upserted.length} clínica(s) com canal de contato pra "${specialty}" (${phoneHits}/${topPlaces.length} com telefone)`, { traceId });
   return upserted.slice(0, limit);
 }
 
