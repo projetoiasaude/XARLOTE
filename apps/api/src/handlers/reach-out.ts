@@ -202,12 +202,24 @@ async function contactClinic(phone: string, clinicName: string, specialty: strin
   // Idempotência (paridade com handleStartConsultationSearch): não abre uma 2ª busca
   // se já há consulta ativa — senão viram consultas paralelas e a rescue de 45min
   // manda "nenhuma clínica respondeu" pra uma que o usuário nem lembra (review).
-  const { data: activeC } = await db.from('consultations').select('id')
-    .eq('user_id', ctx.userId).in('status', ['searching', 'quoting', 'quoted', 'confirming']).limit(1).maybeSingle();
+  const { data: activeC } = await db.from('consultations').select('id, status')
+    .eq('user_id', ctx.userId).in('status', ['searching', 'quoting', 'quoted', 'confirming'])
+    .order('created_at', { ascending: false }).limit(1).maybeSingle();
   if (activeC) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      `Você já tem uma busca de consulta em andamento 💙 Deixa eu terminar essa aqui antes de começar outra, tá?`, ctx.traceId);
-    return;
+    if (['quoted', 'confirming'].includes(activeC.status as string)) {
+      // Já tem OPÇÕES apresentadas / escolha em curso — aí sim pede pra terminar essa antes.
+      await sendOutbound(ctx.conversationId, ctx.phoneE164,
+        `Você já tem uma consulta em andamento com opções pra escolher 💙 Deixa eu terminar essa aqui antes, tá?`, ctx.traceId);
+      return;
+    }
+    // 'searching'/'quoting' + o paciente está te dando um CONTATO ESPECÍFICO da clínica = é
+    // REDIRECIONAMENTO da MESMA necessidade, não uma 2ª busca. A busca anterior pode estar TRAVADA
+    // (clínica que não responde). Cancela a velha e fala com o número que ele deu — em vez de repetir
+    // "já tem busca em andamento" no vazio (incidente Vadivino 22/07: preso 40min dando o WhatsApp
+    // real do consultório enquanto o guard barrava).
+    await db.from('consultations')
+      .update({ status: 'cancelled', cancelled_reason: 'redirecionado — paciente forneceu contato direto da clínica' })
+      .eq('id', activeC.id).in('status', ['searching', 'quoting']);
   }
 
   const { data: profile } = await db.from('users').select('home_city, home_state, preferred_name, full_name').eq('id', ctx.userId).maybeSingle();
