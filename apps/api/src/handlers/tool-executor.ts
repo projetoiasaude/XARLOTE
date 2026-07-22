@@ -1676,8 +1676,16 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
   }
 
   if (!target) {
-    const nomes = state.suppliers.map((s) => s.supplierName).slice(0, 6).join(', ');
-    await say(`Não tenho certeza de qual farmácia você quer que eu fale 🤔 As do seu pedido são: ${nomes}. Me diz o nome que eu mando na hora.`, { dedup: true });
+    if (hint) {
+      // O usuário NOMEOU uma farmácia/rede que não está no pedido NEM no registro de redes que
+      // eu coto (ex.: "Drogamaris"). Honestidade: não fingir que "não entendi" (incidente Vadivino
+      // 21/07: "tenta na Drogamarys" → "não sei qual você quer") — dizer que não a cubro e oferecer
+      // o que dá. `hint` já é o que ele digitou, então ecoa o nome dele.
+      await say(`Não consegui cotar na ${hint} 😕 não tenho ela no meu sistema. Mas posso ver nas grandes redes que eu cubro (Drogasil, Pacheco, Raia, Pague Menos, Ultrafarma…) ou em farmácias perto de você. O que você prefere?`, { dedup: true });
+    } else {
+      const nomes = state.suppliers.map((s) => s.supplierName).slice(0, 6).join(', ');
+      await say(`Não tenho certeza de qual farmácia você quer que eu fale 🤔 As do seu pedido são: ${nomes}. Me diz o nome que eu mando na hora.`, { dedup: true });
+    }
     return;
   }
 

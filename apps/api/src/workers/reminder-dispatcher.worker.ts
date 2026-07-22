@@ -319,7 +319,10 @@ export async function dispatchReminders(): Promise<void> {
     let deliveryStatus: 'delivered' | 'window_blocked' | 'suppressed' = 'suppressed';
     if (!isSimulatorMode()) {
       if (windowOpen) {
-        await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: msg });
+        // messageId → o WORKER da fila re-carimba o RESULTADO REAL (delivered/failed) por cima
+        // do 'delivered' otimista. Sem isto, um envio que falha (ex.: HTTP 500) ficava 'delivered'
+        // mentiroso — foi o phantom dos 5 lembretes-template da manhã de 21/07.
+        await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: msg, messageId: mirroredMessageId ?? undefined });
         whatsappDelivered = true;
         deliveryStatus = 'delivered';
       } else if (reengageTemplateEnabled() && reengageTplAllowed) {
@@ -332,7 +335,7 @@ export async function dispatchReminders(): Promise<void> {
         const [hh, mm] = hhmm.split(':');
         const whenLabel = `hoje às ${mm === '00' ? `${Number(hh)}h` : `${Number(hh)}h${mm}`}`;
         const tpl = buildReengageTemplate(name.split(' ')[0] ?? name, reengageReasonForReminder(reminder, whenLabel));
-        await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text });
+        await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text, messageId: mirroredMessageId ?? undefined });
         whatsappDelivered = true;
         deliveryStatus = 'delivered';
         templateSentThisTick.add(reminder.user_id); // trava o 2º template do mesmo user neste tick
@@ -463,17 +466,18 @@ export async function dispatchReminders(): Promise<void> {
               if (tpl) templateSentThisTick.add(reminder.user_id);
               // Espelha SÓ o que o paciente REALMENTE recebe, JÁ com o veredito do canal — nunca
               // mais linha-fantasma (se não entrega, nem grava, pois caímos no ramo de adiar).
-              await db.from('messages').insert({
+              const { data: checkinMsg } = await db.from('messages').insert({
                 conversation_id: conv.id, direction: 'out', sender_role: 'assistant', content_type: 'text',
                 content: tpl ? tpl.text : checkin,
                 delivered_at: isSimulatorMode() ? null : new Date().toISOString(),
                 delivery_status: isSimulatorMode() ? 'suppressed' : 'delivered',
-              });
+              }).select('id').single();
+              const checkinMsgId = (checkinMsg?.id as string | undefined) ?? undefined;
               if (!isSimulatorMode()) {
                 if (canFreeText) {
-                  await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: checkin });
+                  await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: user.phone_e164, text: checkin, messageId: checkinMsgId });
                 } else if (tpl) {
-                  await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text });
+                  await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text, messageId: checkinMsgId });
                 }
               }
               await writeLog('info', 'reminder', `check-in de re-engajamento (mudo há ${Math.round(silentMs / 86_400_000)}d) — ${canFreeText ? 'texto livre' : 'template'}`, {});
