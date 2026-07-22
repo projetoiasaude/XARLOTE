@@ -26,6 +26,7 @@ import { templatesEnabled } from '../config/template-registry.js';
 import {
   consolidateConsultationQuotes,
   notifyUserConsultationQuoteArrived,
+  notifyUserSingleTargetDeadEnd,
 } from './consultation-consolidation.js';
 import { relayClinicQuestionToUser } from './clarification.js';
 
@@ -143,6 +144,10 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   // (o passo 5 marca 'offered') e consulta 'failed' flipa atomicamente pra 'searching'
   // — a consolidação/rescue apresenta a boa notícia quando a oferta for registrada.
   if (!quote) {
+    // SÓ 'timeout' (não 'unavailable'): revive a clínica LENTA que respondeu tarde. NÃO revive
+    // 'unavailable' — um beco sem saída (alvo único encerrado, "não atende") reabriria em qualquer
+    // "de nada/tchau" da clínica, ressuscitando uma consulta que o paciente já abandonou → duas
+    // consultas ativas + trava a próxima busca (regressão que o review pegou).
     const { data: late } = await db
       .from('consultation_quotes')
       .select('*, consultations!consultation_quotes_consultation_id_fkey(*), clinics(*)')
@@ -207,24 +212,70 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     return;
   }
 
-  // Acha primeiro nome do paciente sem expor sobrenome
+  // Primeiro nome (sem expor sobrenome à clínica) + dados que a recepção pode pedir
+  // (convênio/carteirinha/CPF/nascimento/telefone) — a clínica-agent responde DIRETO, sem
+  // re-perguntar (incidente Vadivino: re-pediu CPF/nascimento já dados; ecoou "Ipasgo").
   let patientFirstName: string | null = null;
+  let patientFullName: string | null = null;
+  let knownCpf: string | null = null;
+  let knownBirth: string | null = null;
+  let knownPhone: string | null = null;
   {
-    const { data: u } = await db.from('users').select('preferred_name, full_name').eq('id', consultation.user_id).single();
+    const { data: u } = await db.from('users')
+      .select('preferred_name, full_name, document_cpf, birth_date, phone_e164')
+      .eq('id', consultation.user_id).single();
     const name = u?.preferred_name || u?.full_name;
     if (name) patientFirstName = String(name).split(/\s+/)[0] ?? null;
+    patientFullName = (u?.full_name as string | null) ?? null;
+    knownCpf = fmtCpfBR((u?.document_cpf as string | null) ?? null);
+    knownBirth = fmtBirthBR((u?.birth_date as string | null) ?? null);
+    knownPhone = (u?.phone_e164 as string | null) ?? null;
   }
 
   const prefs = consultation.preferences ?? {};
+  const isSingleTarget = (prefs as any)['single_target'] === true;
+  // Dados acumulados do paciente (convênio/carteirinha vindos das respostas de clarificação).
+  const pdata = ((prefs as any)['patient_data'] ?? {}) as Record<string, string>;
+  const planKnown = (pdata['health_plan'] ?? (prefs as any)['plan'] ?? null) as string | null;
+
+  // O QUE O PACIENTE JÁ RESPONDEU nesta consulta — pares pergunta→resposta das cotações desta
+  // consulta (espelha inbound-supplier): a clínica-agent aplica sozinha, não re-pergunta.
+  const clientAnswers: string[] = [];
+  {
+    const { data: ans } = await db.from('consultation_quotes')
+      .select('clarification_question, clarification_answer, clarification_answered_at')
+      .eq('consultation_id', quote.consultation_id)
+      .not('clarification_answer', 'is', null)
+      .order('clarification_answered_at', { ascending: true });
+    const seen = new Set<string>();
+    for (const r of ans ?? []) {
+      const a = (r.clarification_answer as string | null)?.trim();
+      if (!a) continue;
+      const qn = (r.clarification_question as string | null)?.trim();
+      const line = qn ? `${qn} → ${a}` : a;
+      if (!seen.has(line)) { seen.add(line); clientAnswers.push(line); }
+    }
+  }
+
   const ctxPrompt: AgentClinicContext = {
     specialty: consultation.specialty,
     urgency: consultation.urgency,
     modality: consultation.modality ?? 'indiferente',
     patientCity: consultation.city,
-    plan: (prefs as any)['plan'] ?? null,
+    plan: planKnown,
     patientName: patientFirstName,
     preferredTime: (prefs as any)['horario_pref'] ?? null,
     requestedProfessional: (prefs as any)['requested_doctor'] ?? null,
+    singleTarget: isSingleTarget,
+    knownData: {
+      cpf: knownCpf,
+      birthDate: knownBirth,
+      phone: knownPhone,
+      healthPlan: planKnown,
+      planCardNumber: pdata['plan_card_number'] ?? null,
+      fullName: patientFullName,
+    },
+    clientAnswers,
     isAppointmentConfirmation,
   };
 
@@ -274,6 +325,7 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   let quoteRecorded = false;         // record_consultation_quote
   let appointmentConfirmed = false;  // record_appointment_confirmation
   let clarificationRequested = false; // request_clarification (levou pergunta ao paciente)
+  let singleTargetDeadEnd = false;   // alvo único deu beco sem saída → paciente avisado, clínica recebe cortesia
 
   for (const tc of llmResponse.toolCalls) {
     switch (tc.name) {
@@ -400,6 +452,22 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
           reason: a.reason,
         });
 
+        // ALVO ÚNICO (incidente Vadivino 22/07): não há outra clínica pra procurar. Um "unavailable"
+        // aqui só acontece num beco REAL sem saída (número errado / médico não atende ali) — a agenda
+        // distante já foi roteada pra request_clarification (não cai aqui). NUNCA fica em silêncio nem
+        // some: avisa o paciente com HONESTIDADE (sem sugerir outro médico) e encerra. A clínica recebe
+        // uma cortesia (silentOutcome desligado abaixo), não o vácuo.
+        if (isSingleTarget) {
+          const clinicNm = (quote.clinics as { name?: string } | null)?.name ?? 'o consultório';
+          const prof = (prefs as any)['requested_doctor'] as string | null;
+          await notifyUserSingleTargetDeadEnd(quote.consultation_id, clinicNm, prof, a.reason ?? null, traceId)
+            .catch((e) => writeLog('warn', 'consultation', `Falha ao avisar paciente (alvo único): ${String(e)}`, { traceId }));
+          singleTargetDeadEnd = true;
+          shouldFinalize = false; // pula o finalize genérico (que reverteria pra 'searching' em silêncio)
+          outcome = 'unavailable';
+          break;
+        }
+
         shouldFinalize = true;
         outcome = 'unavailable';
         break;
@@ -490,16 +558,20 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   // 9. Envia o texto pra clínica. Manda SEMPRE que houver texto, EXCETO nos outcomes
   // silenciosos (unavailable/timeout). Antes suprimia em qualquer finalize → a clínica
   // dava o horário e ouvia silêncio (a cortesia "anotei, vou confirmar" não saía).
-  const silentOutcome = outcome === 'unavailable' || outcome === 'timeout';
+  // ALVO ÚNICO num beco sem saída: a clínica ENGAJOU — não a deixa no vácuo. Manda cortesia
+  // de encerramento (o paciente já foi avisado com honestidade em outro canal).
+  const silentOutcome = (outcome === 'unavailable' || outcome === 'timeout') && !singleTargetDeadEnd;
   if (llmResponse.text.trim() && !silentOutcome) {
     await sendOutboundToClinic(conversationId, clinicPhone, llmResponse.text.trim(), traceId);
-  } else if (!llmResponse.text.trim() && !silentOutcome && (quoteRecorded || appointmentConfirmed || clarificationRequested)) {
+  } else if (!llmResponse.text.trim() && !silentOutcome && (quoteRecorded || appointmentConfirmed || clarificationRequested || singleTargetDeadEnd)) {
     // FALLBACK DETERMINÍSTICO (paridade c/ farmácia): o gpt-4.1-mini às vezes chama
     // a tool (registrou horário / confirmou / mandou pergunta ao paciente) SEM gerar
     // texto → a clínica ouvia silêncio. Aqui garantimos uma cortesia sem depender do LLM.
-    const fallbackMsg = pickClinicFallbackMessage({ appointmentConfirmed, clarificationRequested });
+    const fallbackMsg = singleTargetDeadEnd
+      ? 'Entendi, agradeço demais pela atenção! 🙏'
+      : pickClinicFallbackMessage({ appointmentConfirmed, clarificationRequested });
     await sendOutboundToClinic(conversationId, clinicPhone, fallbackMsg, traceId);
-    await writeLog('info', 'agent-clinic', 'Resposta determinística à clínica (LLM não gerou texto)', { traceId, conversationId, quoteRecorded, appointmentConfirmed, clarificationRequested });
+    await writeLog('info', 'agent-clinic', 'Resposta determinística à clínica (LLM não gerou texto)', { traceId, conversationId, quoteRecorded, appointmentConfirmed, clarificationRequested, singleTargetDeadEnd });
   } else if (!llmResponse.text.trim() && !shouldFinalize && llmResponse.toolCalls.length === 0) {
     await writeLog('warn', 'agent-clinic', 'Agente clínica retornou resposta vazia', { traceId, conversationId });
   }
@@ -599,10 +671,13 @@ export async function initiateClinicNegotiation(opts: {
       ? ``
       : ``;
   // Alvo da consulta: se o paciente pediu um MÉDICO específico, a recepção precisa ouvir o NOME
-  // dele (senão vira consulta genérica — incidente Vadivino/São Silvestre).
+  // dele (senão vira consulta genérica — incidente Vadivino/São Silvestre). Especialidade
+  // genérica/vazia ("consulta"/"médico") NÃO pode gerar "consulta de consulta".
+  const specOpen = (ctx.specialty ?? '').trim();
+  const specOpenGeneric = !specOpen || /^consultas?$/i.test(specOpen) || /^m[eé]dic[ao]s?$/i.test(specOpen);
   const alvoConsulta = ctx.requestedProfessional
     ? `uma consulta com ${ctx.requestedProfessional}`
-    : `uma consulta de ${ctx.specialty}`;
+    : specOpenGeneric ? `uma consulta médica` : `uma consulta de ${specOpen}`;
   const fallbackOpening = `Boa tarde! Aqui é a Xarlote, estou ajudando um paciente a marcar ${alvoConsulta}. ${planClause}${urgencyClause}${modalityClause}Qual o primeiro horário disponível? Obrigada!`;
 
   let opening: string;
@@ -612,7 +687,7 @@ export async function initiateClinicNegotiation(opts: {
       apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'],
       systemInstruction:
         systemPrompt +
-        '\n\nEsta é a primeira mensagem. Escreva apenas a mensagem de abertura para a clínica — apresentando-se como Xarlote, dizendo que está ajudando um paciente a marcar consulta de ' + ctx.specialty + ', e perguntando plano + horário. Sem emojis. Sem mencionar IA/agente/sistema. Não use tools ainda.',
+        '\n\nEsta é a primeira mensagem. Escreva apenas a mensagem de abertura para a clínica — apresentando-se como Xarlote, dizendo que está ajudando um paciente a marcar ' + alvoConsulta + ', e perguntando plano + horário' + (ctx.requestedProfessional ? ' (pergunte pela agenda DELE(A) pelo nome)' : '') + '. Sem emojis. Sem mencionar IA/agente/sistema. Não use tools ainda.',
       history: [],
       tools: [],
       temperature: 0.4,
@@ -690,6 +765,21 @@ async function finalizeConsultationQuote(
 
     await consolidateConsultationQuotes(consultationId, c.conversation_id, `+${userPhone}`, traceId);
   }
+}
+
+/** Formata CPF pra exibição no prompt (NÃO loga — PII). "12345678901" → "123.456.789-01". */
+function fmtCpfBR(cpf: string | null): string | null {
+  if (!cpf) return null;
+  const d = cpf.replace(/\D/g, '');
+  return d.length === 11 ? `${d.slice(0, 3)}.${d.slice(3, 6)}.${d.slice(6, 9)}-${d.slice(9)}` : null;
+}
+
+/** Formata nascimento ISO/date → "DD/MM/AAAA" (BR). */
+function fmtBirthBR(b: string | null): string | null {
+  if (!b) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(b.trim());
+  if (m) return `${m[3]}/${m[2]}/${m[1]}`;
+  return b.trim() || null;
 }
 
 /** Parse defensivo de ISO 8601. Aceita "2026-06-02 14:30" também. */

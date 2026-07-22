@@ -269,10 +269,11 @@ export async function notifyUserConsultationQuoteArrived(
   if (!userPhone) return;
   const userPhoneE164 = `+${userPhone}`;
 
-  // Modo eager?
+  // Modo eager OU ALVO ÚNICO: uma clínica só — não há "mais umas" pra esperar, então consolida/
+  // apresenta a oferta na hora (nunca diz "vou aguardar mais umas", que pressupõe várias clínicas).
   const prefs = (c.preferences as Record<string, unknown> | null) ?? {};
-  if (prefs['eager_consolidate']) {
-    await writeLog('info', 'consultation', `Modo eager — consolidando após resposta de ${clinicName}`, { traceId, consultationId });
+  if (prefs['eager_consolidate'] || prefs['single_target'] === true) {
+    await writeLog('info', 'consultation', `${prefs['single_target'] === true ? 'Alvo único' : 'Modo eager'} — consolidando após resposta de ${clinicName}`, { traceId, consultationId });
     await consolidateConsultationQuotesEarly(consultationId, userConvId, userPhoneE164, traceId);
     return;
   }
@@ -287,6 +288,39 @@ export async function notifyUserConsultationQuoteArrived(
     : `Mais uma proposta de consulta chegando (${clinicName}) — ${offered} de ${total} ✨`;
 
   await sendOutbound(userConvId, userPhoneE164, msg, traceId);
+}
+
+/**
+ * ALVO ÚNICO — beco sem saída HONESTO (incidente Vadivino 22/07): a ÚNICA clínica que o paciente
+ * escolheu não pode atender de jeito nenhum (número errado, médico não atende ali). Não há outra
+ * clínica pra procurar e **NÃO se sugere outro médico**. Avisa o paciente com honestidade, deixa a
+ * porta aberta (outro contato / insistir) e encerra a consulta (failed) — nunca fica em silêncio.
+ * Idempotente: só encerra/avisa se a consulta ainda estava em andamento.
+ */
+export async function notifyUserSingleTargetDeadEnd(
+  consultationId: string,
+  clinicName: string,
+  professional: string | null,
+  reason: string | null,
+  traceId: string,
+): Promise<void> {
+  // NÃO sobrescreve 'quoted' (uma opção JÁ foi apresentada ao paciente — ele pode escolhê-la):
+  // só encerra se ainda estava buscando. Evita o "Consegui um horário 🎉" seguido de "não consegui 😕"
+  // caso o LLM emita record_consultation_quote E record_clinic_unavailable no mesmo turno.
+  const { data: flipped } = await db.from('consultations')
+    .update({ status: 'failed', cancelled_reason: `alvo único indisponível: ${reason ?? 'sem vaga'}`.slice(0, 200) })
+    .eq('id', consultationId).in('status', ['searching', 'quoting']).select('conversation_id, specialty');
+  const row = flipped?.[0];
+  if (!row?.conversation_id) return; // já resolvida/encerrada/apresentada por outro caminho — não duplica aviso
+  const { data: conv } = await db.from('conversations').select('whatsapp_jid').eq('id', row.conversation_id).single();
+  const phone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
+  if (!phone) return;
+  const alvo = professional ? `com ${professional}` : 'nesse consultório';
+  const motivo = reason ? ` (me disseram: ${reason})` : '';
+  await sendOutbound(row.conversation_id, `+${phone}`,
+    `Falei com *${clinicName}* pra marcar sua consulta ${alvo}, mas não consegui encaixar dessa vez${motivo} 😕 Se você tiver outro contato dele(a) — ou quiser que eu insista com eles — é só me falar que eu sigo na hora 💙`,
+    traceId);
+  await writeLog('info', 'consultation', 'Alvo único encerrado com honestidade (paciente avisado, sem sugerir outro médico)', { traceId, consultationId });
 }
 
 /** Fecha quotes ainda pendentes e consolida. */
@@ -385,6 +419,22 @@ export async function consolidateConsultationQuotes(
       await writeLog('info', 'consultation', 'Sem horário de clínica ainda — mantém aguardando (não falha)', { traceId, consultationId });
       return;
     }
+    // ALVO ÚNICO: uma clínica só, escolhida pelo paciente — NÃO sugere outra região/telemedicina/
+    // outro médico (proibido). Honesto + porta aberta (insistir / outro contato do mesmo médico).
+    const singleTarget = ((c as { preferences?: Record<string, unknown> | null }).preferences?.['single_target']) === true;
+    if (singleTarget) {
+      await sendOutbound(
+        userConversationId,
+        userPhoneE164,
+        // Neutro de propósito: às vezes a espera é no consultório, às vezes é no paciente (ficou
+        // uma pergunta/oferta pendente). "não consegui FECHAR" é verdade nos dois casos.
+        `Sobre sua consulta de ${c.specialty}: ainda não consegui fechar com o consultório 😕 Não vou te deixar no vácuo — quer que eu insista com eles, ou você tem outro contato/jeito de falar com o médico? Me diz que eu sigo.`,
+        traceId,
+      );
+      await db.from('consultations').update({ status: 'failed' }).eq('id', consultationId);
+      await writeLog('warn', 'consultation', 'Alvo único sem retorno (horizonte longo) — paciente avisado, sem sugerir alternativa', { traceId, consultationId });
+      return;
+    }
     await sendOutbound(
       userConversationId,
       userPhoneE164,
@@ -435,7 +485,10 @@ export async function consolidateConsultationQuotes(
   }
 
   const NUMBERS = ['1️⃣', '2️⃣', '3️⃣'];
-  const lines: string[] = [`Achei algumas opções pra sua consulta de ${c.specialty} 🎉\n`];
+  const singleOpt = ranked.length === 1;
+  const lines: string[] = [singleOpt
+    ? `Consegui um horário pra sua consulta de ${c.specialty} 🎉\n`
+    : `Achei algumas opções pra sua consulta de ${c.specialty} 🎉\n`];
 
   for (let i = 0; i < ranked.length; i++) {
     const { q } = ranked[i] as { q: QuoteRow };
@@ -458,7 +511,9 @@ export async function consolidateConsultationQuotes(
     lines.push(`\n_(${unavail} clínica${unavail > 1 ? 's' : ''} não pôde encaixar dessa vez)_`);
   }
 
-  lines.push('\nQual te atende melhor? Pode me dizer o número ou o nome da clínica 💙');
+  lines.push(singleOpt
+    ? '\nQuer que eu confirme esse horário? É só me dizer "pode ser" 💙'
+    : '\nQual te atende melhor? Pode me dizer o número ou o nome da clínica 💙');
 
   await sendOutbound(userConversationId, userPhoneE164, lines.join('\n'), traceId);
 

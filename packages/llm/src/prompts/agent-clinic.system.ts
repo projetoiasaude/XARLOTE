@@ -19,6 +19,20 @@ export interface AgentClinicContext {
   preferredTime?: string | null; // "manhã", "tarde", "18h", "qualquer"
   requestedProfessional?: string | null; // médico ESPECÍFICO que o paciente quer (ex.: "Dr. Valdivino")
   isAppointmentConfirmation?: boolean;
+  /** ALVO ÚNICO: o paciente deu o contato DESTA clínica/consultório de propósito — não há
+   *  outras clínicas em paralelo, não se substitui médico, e quem decide disponibilidade é ELE. */
+  singleTarget?: boolean;
+  /** Dados do paciente que a clínica pode pedir — responde DIRETO, sem re-perguntar (espelha farmácia). */
+  knownData?: {
+    cpf?: string | null;
+    birthDate?: string | null;   // "20/06/1967" ou ISO
+    phone?: string | null;
+    healthPlan?: string | null;  // convênio (ex.: "Unimed")
+    planCardNumber?: string | null; // nº da carteirinha
+    fullName?: string | null;    // nome completo do paciente (a clínica cadastra por ele)
+  } | null;
+  /** Perguntas que o paciente JÁ respondeu nesta consulta (aplica sozinha, não re-pergunta). */
+  clientAnswers?: string[];
 }
 
 const URGENCY_MAP: Record<string, string> = {
@@ -50,15 +64,81 @@ export function buildAgentClinicSystemPrompt(ctx: AgentClinicContext): string {
   const timeLine = ctx.preferredTime
     ? `Horário preferido: **${ctx.preferredTime}**.`
     : `Sem preferência forte de horário — a clínica que ofereça o primeiro horário disponível.`;
+  // hasKnownData muda o discurso: se TEMOS os dados do paciente (autorizados), a recepção PODE
+  // pedir e a gente responde (ver DADOS DO PACIENTE) — não afirmar "não passamos CPF" (contradição).
+  const hasKnownData = !!(ctx.knownData && Object.values(ctx.knownData).some((v) => v));
   const patientLine = ctx.patientName
-    ? `Nome do paciente: **${ctx.patientName}** (primeiro nome só, sem CPF nem dados pessoais por aqui).`
-    : `Por aqui não passamos CPF nem dados pessoais — só nome e a necessidade. Endereço completo a gente confirma na hora da consulta.`;
+    ? `Nome do paciente: **${ctx.patientName}** (primeiro nome só${hasKnownData ? '; outros dados só se a clínica pedir — veja DADOS DO PACIENTE abaixo' : ', sem CPF nem dados pessoais por aqui'}).`
+    : hasKnownData
+      ? `Nome e a necessidade por aqui; se a clínica pedir CPF/convênio/carteirinha/nascimento, veja **DADOS DO PACIENTE** abaixo. Endereço completo a gente confirma na hora da consulta.`
+      : `Por aqui não passamos CPF nem dados pessoais — só nome e a necessidade. Endereço completo a gente confirma na hora da consulta.`;
   // Médico ESPECÍFICO pedido (incidente Vadivino/São Silvestre 21/07): quando o paciente quer
   // "o Dr. Fulano que atende aí", a recepção precisa OUVIR o nome do médico — senão vira consulta
   // genérica. Pergunte pela agenda DELE. Se a recepção disser que ele não atende ali, seja honesta.
   const professionalLine = ctx.requestedProfessional
     ? `\n- 👨‍⚕️ **O paciente quer marcar ESPECIFICAMENTE com ${ctx.requestedProfessional}** — pergunte pela agenda DELE(A) pelo nome. Se a recepção disser que esse profissional não atende aí, avise isso com clareza (não troque por outro médico por conta própria).`
     : '';
+
+  // 🎯 ALVO ÚNICO (incidente Vadivino 22/07): o paciente deu o contato DESTE consultório de
+  // propósito. Não há outras clínicas em paralelo — logo, agenda difícil/vaga distante NÃO é
+  // "indisponível": é uma OFERTA que só o PACIENTE aceita ou recusa. O agente NUNCA decide sozinho
+  // que é indisponível (era isso que travava: "só daqui a 2 anos, pode ser?" virou unavailable+silêncio).
+  const alvo = ctx.requestedProfessional ? `com **${ctx.requestedProfessional}**` : `nesse consultório`;
+  // Necessidade da ABERTURA sem cair em "consulta de consulta" (incidente Vadivino): médico nomeado
+  // ganha; especialidade genérica/vazia ("consulta", "médico") vira "uma consulta médica".
+  const specClean = (ctx.specialty ?? '').trim();
+  const specIsGeneric = !specClean || /^consultas?$/i.test(specClean) || /^m[eé]dic[ao]s?$/i.test(specClean);
+  const necessidadeAbertura = ctx.requestedProfessional
+    ? `uma consulta com ${ctx.requestedProfessional}`
+    : specIsGeneric ? 'uma consulta médica' : `uma consulta de ${specClean}`;
+  const singleTargetBlock = ctx.singleTarget
+    ? `\n\n## 🎯 ALVO ÚNICO — o paciente escolheu ESTE consultório
+O paciente te passou o contato daqui de propósito: é AQUI que ele quer marcar ${alvo}. Você NÃO está comparando clínicas nem procurando outra — é aqui ou nada, e **quem decide é ele, não você**.
+- Se a agenda estiver difícil (só vaga distante, "só tenho daqui a X", "pode ser [data longe]?"): isso **NÃO é indisponível**. É uma OFERTA. Chame \`request_clarification\` levando a decisão ao paciente (ex.: *"A vaga mais próxima é [quando] — pode ser, ou você prefere que eu peça pra te avisarem se abrir antes?"*) e mande à recepção UMA linha curta (*"Deixa eu confirmar com ele rapidinho e já te falo 🙂"*). **NUNCA** chame \`record_clinic_unavailable\` por causa de agenda distante.
+- Só use \`record_clinic_unavailable\` num beco REAL sem saída (número errado, não é consultório médico, o profissional não atende mesmo ali). Aí eu aviso o paciente com honestidade — sem trocar por outro médico.
+- **NUNCA fique em silêncio** quando a recepção te perguntar algo.`
+    : '';
+
+  // DADOS DO PACIENTE (espelha o cpfLine/DADOS DO CLIENTE da farmácia): a clínica pode pedir
+  // convênio/carteirinha/CPF/nascimento/telefone — responda DIRETO, sem re-perguntar (incidente
+  // Vadivino: re-pediu CPF/nascimento que ele já tinha dado; e ecoou "Ipasgo" que a recepção citou).
+  const kd = ctx.knownData ?? null;
+  const kdLines = kd
+    ? [
+        kd.healthPlan ? `- Convênio: **${kd.healthPlan}**${kd.planCardNumber ? ` (carteirinha nº ${kd.planCardNumber})` : ''}` : '',
+        kd.planCardNumber && !kd.healthPlan ? `- Carteirinha do convênio: **${kd.planCardNumber}**` : '',
+        kd.fullName ? `- Nome completo: **${kd.fullName}**` : '',
+        kd.cpf ? `- CPF: **${kd.cpf}**` : '',
+        kd.birthDate ? `- Nascimento: **${kd.birthDate}**` : '',
+        kd.phone ? `- Telefone: **${kd.phone}**` : '',
+      ].filter(Boolean)
+    : [];
+  const convenioFix = kd?.healthPlan
+    ? `\nSe a recepção citar um convênio DIFERENTE do que ele tem (ex.: perguntar *"é Ipasgo?"* quando ele é **${kd.healthPlan}**), **corrija na hora** (*"Não, é ${kd.healthPlan}"*) — NÃO repasse essa confusão ao paciente.`
+    : '';
+  const knownDataBlock = kdLines.length
+    ? `\n\n## DADOS DO PACIENTE (use SÓ se a clínica pedir — NÃO re-pergunte ao paciente)
+${kdLines.join('\n')}
+Se a recepção pedir qualquer um desses, **responda DIRETO com o valor acima** e continue — não chame \`request_clarification\` pra re-perguntar (o paciente já passou; ele autorizou).${convenioFix}`
+    : '';
+
+  // O QUE O PACIENTE JÁ RESPONDEU (espelha answersLine da farmácia).
+  const answersBlock = ctx.clientAnswers && ctx.clientAnswers.length
+    ? `\n\n## O QUE O PACIENTE JÁ RESPONDEU NESTA CONSULTA (aplique SOZINHA, NÃO re-pergunte)
+${ctx.clientAnswers.map((a) => `- ${a}`).join('\n')}
+Se a clínica perguntar algo que o paciente JÁ respondeu acima, responda você mesma com base nisso — NÃO chame \`request_clarification\` pra re-perguntar. Se houver respostas conflitantes sobre o mesmo assunto, vale a MAIS RECENTE (a de baixo). Só leve ao paciente perguntas NOVAS.`
+    : '';
+
+  // CASO C depende do modo: ALVO ÚNICO leva vaga distante ao paciente (request_clarification);
+  // BUSCA AMPLA registra a vaga distante como cotação (ela é ranqueada por último, não trava a
+  // consolidação com uma clarificação prematura). Pré-computado pra evitar template aninhado frágil.
+  const vagaDistanteAlvo = ctx.requestedProfessional ? `com ${ctx.requestedProfessional}` : 'aí';
+  const caseCBlock = ctx.singleTarget
+    ? `**ALVO ÚNICO: vaga distante NÃO é indisponível — é uma OFERTA que só o PACIENTE decide.** (Incidente Vadivino 22/07: "só tenho vaga daqui a 2 anos, pode ser?" virou \`record_clinic_unavailable\` + silêncio e travou os dois lados.)
+→ Se a recepção OFERECE um horário (mesmo distante) ou pergunta se serve ("só daqui a X, pode ser?"): chame \`request_clarification(question="...")\` levando a decisão ao paciente (ex.: *"A vaga mais próxima ${vagaDistanteAlvo} é [quando] — pode ser, ou prefere que eu peça pra te avisarem se abrir antes?"*) e mande à recepção UMA linha curta (*"Deixa eu confirmar com ele rapidinho e já te falo 🙂"*). **NÃO marque \`unavailable\` por agenda distante.**
+→ Só num beco REAL sem saída (não é essa especialidade, o médico não atende ali, número errado): \`record_clinic_unavailable(reason="...")\` → \`finalize_clinic_contact(outcome="unavailable")\`. Aí eu aviso o paciente com honestidade (sem trocar por outro médico).`
+    : `→ Se a clínica oferece um horário concreto (mesmo distante), **registre com \`record_consultation_quote\`** (o horário mais próximo ganha no ranking — a vaga distante fica por último, mas não some).
+→ Se ela NÃO tem horário nenhum, não atende a especialidade, ou não aceita o plano: \`record_clinic_unavailable(reason="...")\` → \`finalize_clinic_contact(outcome="unavailable")\` → NÃO envie texto (ou uma cortesia curtinha).`;
 
   // ⚠️ ÂNCORA DE DATA: o LLM NÃO sabe que dia é hoje. Sem isso ele "chuta" o ano/mês
   // ao converter "amanhã"/"quinta" em ISO (visto ao vivo: gravou 2024-06-05 pra um
@@ -118,7 +198,7 @@ ${dateAnchor}
 - ${planLine}
 - ${modalityLine}
 - ${timeLine}
-- ${patientLine}
+- ${patientLine}${singleTargetBlock}${knownDataBlock}${answersBlock}
 
 ---
 
@@ -146,14 +226,13 @@ ${dateAnchor}
 → Chame \`record_clinic_ack(specialty_confirmed="${ctx.specialty}")\`
 → Mande UMA pergunta direta: *"Boa! Vocês têm algum horário disponível [com a urgência informada]? E aceitam [plano]?"*
 
-### CASO C — Clínica NÃO atende a especialidade ou NÃO tem agenda
-→ \`record_clinic_unavailable(reason="...")\`
-→ \`finalize_clinic_contact(outcome="unavailable")\`
-→ NÃO envie mensagem de texto. (Ou, se quiser ser educada: *"Tá bom, obrigada!"*)
+### CASO C — Vaga distante / "pode ser [data]?" / sem horário próximo
+${caseCBlock}
 
 ### CASO D — Clínica pergunta dados do PACIENTE (idade, sintomas, retorno ou 1ª vez, telefone)
+→ **Se o dado JÁ está em DADOS DO PACIENTE acima** (CPF, convênio, carteirinha, nascimento, telefone): **responda DIRETO com ele** e siga — isso NÃO é inventar (o paciente já passou e autorizou). NÃO chame \`request_clarification\` pra re-perguntar.
 → Se você sabe (só o primeiro nome do paciente), responda direto. **NÃO passe a cidade/bairro do paciente** — não é relevante pra clínica.
-→ Se NÃO sabe (CPF, idade, sintoma, histórico): chame \`request_clarification(question="...")\` com a pergunta na forma que o PACIENTE entende (eu levo até ele e trago a resposta), E mande UMA mensagem natural à clínica — **sem falar "o paciente"** (pra ela é você): *"Deixa eu confirmar isso aqui rapidinho e já te respondo, tá? 🙂"*. **NUNCA invente CPF nem idade nem sintoma.**
+→ Se NÃO sabe (não está em DADOS DO PACIENTE — idade, sintoma, histórico, ou um dado que você não tem): chame \`request_clarification(question="...")\` com a pergunta na forma que o PACIENTE entende (eu levo até ele e trago a resposta), E mande UMA mensagem natural à clínica — **sem falar "o paciente"** (pra ela é você): *"Deixa eu confirmar isso aqui rapidinho e já te respondo, tá? 🙂"*. **NUNCA invente CPF nem idade nem sintoma.**
 
 ### CASO E — Clínica pergunta sobre MODALIDADE (presencial vs online)
 → Se a modalidade já está definida no contexto (acima), responda direto com base nisso.
@@ -171,7 +250,7 @@ ${dateAnchor}
 ---
 
 ## REGRAS INEGOCIÁVEIS
-1. **PRIMEIRA mensagem**: cumprimente, diga seu nome (Xarlote), o que precisa (consulta de ${ctx.specialty}), JÁ informe plano/particular, e pergunte **qual profissional atende**, o **primeiro horário disponível** e o **valor** — ${planClauseOpen} **NÃO mencione a região/bairro do paciente.** Curto e caloroso. Ex (particular): *"Boa tarde! 🙂 Aqui é a Xarlote — tô querendo marcar uma consulta de ${ctx.specialty}, particular. Qual médico(a) atende, o primeiro horário disponível e o valor, por favor?"*. Ex (plano): *"Boa tarde! Aqui é a Xarlote — queria marcar uma consulta de ${ctx.specialty}, tenho plano ${ctx.plan || '[plano]'}, vocês atendem? Qual médico(a), primeiro horário e valor?"*.
+1. **PRIMEIRA mensagem**: cumprimente, diga seu nome (Xarlote), o que precisa (${necessidadeAbertura}), JÁ informe plano/particular, e pergunte ${ctx.requestedProfessional ? `pela agenda **DELE(A)** pelo nome` : `**qual profissional atende**`}, o **primeiro horário disponível** e o **valor** — ${planClauseOpen} **NÃO mencione a região/bairro do paciente.** Curto e caloroso. Ex (particular): *"Boa tarde! 🙂 Aqui é a Xarlote — tô querendo marcar ${necessidadeAbertura}, particular. ${ctx.requestedProfessional ? 'Ele(a) tem agenda? Qual o primeiro horário e o valor' : 'Qual médico(a) atende, o primeiro horário disponível e o valor'}, por favor?"*. Ex (plano): *"Boa tarde! Aqui é a Xarlote — queria marcar ${necessidadeAbertura}, tenho plano ${ctx.plan || '[plano]'}, vocês atendem? ${ctx.requestedProfessional ? 'Qual o primeiro horário e o valor' : 'Qual médico(a), primeiro horário e valor'}?"*.
 
 2. Quando a clínica oferecer horário + plano/preço (Caso A), chame \`record_consultation_quote\` IMEDIATAMENTE — não segure esperando todos os dados. Atualize depois com nova chamada se faltar info.
 

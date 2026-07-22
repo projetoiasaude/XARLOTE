@@ -24,6 +24,25 @@ import { loadLatestOrderState, buildOrderStateBlock } from './order-state.js';
 import { consolidateQuotes } from './quote-consolidation.js';
 import { withUserLock } from '../concurrency/user-lock.js';
 
+/**
+ * Valida magic bytes de imagem (JPEG/PNG/GIF/WEBP/BMP/HEIC). Evita mandar corpo-LIXO ao modelo
+ * de visão como se fosse imagem — um lookaside da Meta pode responder 200 com HTML/JSON de erro
+ * (token expirado) em vez de bytes de imagem, e aí o modelo "vê" e ALUCINA ("vi seu cartão").
+ * Incidente Vadivino 22/07: visão intermitente + afirmação de ter visto o cartão. Ler ≠ inventar.
+ */
+export function looksLikeImage(buf: Buffer | null | undefined): boolean {
+  if (!buf || buf.length < 12) return false;
+  const b = buf;
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return true;                       // JPEG
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) return true;       // PNG
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return true;       // GIF8
+  if (b[0] === 0x42 && b[1] === 0x4d) return true;                                          // BMP
+  if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&                   // RIFF….WEBP
+      b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return true;
+  if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) return true;        // ISO-BMFF 'ftyp' (HEIC/HEIF)
+  return false;
+}
+
 // Serialização de turno (review H3): 2 mensagens rápidas do MESMO telefone geram 2 turnos
 // concorrentes → dupla execução de tools + estado stale + vozes contraditórias. Espera generosa
 // pra NÃO dropar a 2ª msg; se o turno anterior demorar mais que isso (raro), processa mesmo assim.
@@ -643,12 +662,22 @@ async function processInboundUserInner(
     let dataUrlValue: string | null = null;
     try {
       if (inbound.mediaBase64) {
-        dataUrlValue = dataUrl(inbound.mediaBase64, inbound.mediaMime ?? 'image/jpeg');
+        // Valida magic bytes ANTES de mandar ao modelo (corpo pode vir corrompido/não-imagem).
+        const probe = Buffer.from(inbound.mediaBase64.slice(0, 64), 'base64');
+        if (looksLikeImage(probe)) {
+          dataUrlValue = dataUrl(inbound.mediaBase64, inbound.mediaMime ?? 'image/jpeg');
+        } else {
+          await writeLog('warn', 'vision', `mediaBase64 não parece imagem válida — tratando como falha (id=${longId})`, { traceId, longId });
+        }
       } else {
         const media = await fetchInboundMedia(inbound, SARA_INSTANCE);
-        if (media) {
+        if (media && looksLikeImage(media.buffer)) {
           await writeLog('info', 'vision', `Imagem baixada (${media.buffer.length} bytes, ${media.mime})`, { traceId });
           dataUrlValue = dataUrl(media.buffer.toString('base64'), media.mime || 'image/jpeg');
+        } else if (media) {
+          // 200 com corpo que NÃO é imagem (ex.: lookaside da Meta devolvendo erro HTML/JSON com
+          // token expirado) → NÃO manda ao modelo (senão ele alucina que "viu"). Trata como falha.
+          await writeLog('warn', 'vision', `Mídia baixada não parece imagem válida (${media.buffer.length} bytes, ${media.mime}) — tratando como falha (id=${longId})`, { traceId, longId });
         } else {
           await writeLog('warn', 'vision', `downloadMedia retornou null pra imagem (id=${longId})`, { traceId, longId });
         }

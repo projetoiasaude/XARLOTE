@@ -30,6 +30,22 @@ const CLARIFICATION_WAIT_MIN = 8;
 
 export type EstablishmentKind = 'pharmacy' | 'clinic';
 
+/** Convênios BR comuns → nome canônico. Detecta na resposta/pergunta pra persistir o plano certo
+ *  (evita ecoar convênio errado, tipo "Ipasgo" que a recepção citou quando o paciente é Unimed). */
+const HEALTH_PLANS: Array<[RegExp, string]> = [
+  [/unimed/i, 'Unimed'], [/\bamil\b/i, 'Amil'], [/bradesco/i, 'Bradesco Saúde'],
+  [/hapvida/i, 'Hapvida'], [/sul\s?am[eé]rica/i, 'SulAmérica'], [/notre\s?dame|intermédica|intermedica/i, 'NotreDame Intermédica'],
+  [/porto\s?seguro/i, 'Porto Seguro Saúde'], [/\bipasgo\b/i, 'Ipasgo'], [/\bcassi\b/i, 'CASSI'],
+  [/\bgeap\b/i, 'GEAP'], [/golden\s?cross/i, 'Golden Cross'], [/prevent\s?senior/i, 'Prevent Senior'],
+  [/são\s?crist[oó]v[aã]o|sao\s?cristovao/i, 'São Cristóvão'], [/assefaz/i, 'Assefaz'],
+  [/\bmedise|mediservice\b/i, 'Mediservice'], [/\bcaberj\b/i, 'Caberj'],
+];
+export function matchHealthPlan(text: string): string | null {
+  const t = text ?? '';
+  for (const [re, name] of HEALTH_PLANS) if (re.test(t)) return name;
+  return null;
+}
+
 export interface PendingClarification {
   kind: EstablishmentKind;
   /** id da cotação (quotes.id ou consultation_quotes.id, conforme `kind`) */
@@ -280,16 +296,58 @@ export async function relayUserAnswerToEstablishment(
     await db.from('quotes').update(answeredPatch).eq('id', pending.quoteId);
   }
 
-  // REUSO DO CPF (política do fundador): se o cliente respondeu um CPF a uma pergunta de
-  // CPF, salva no perfil pra a Xarlote responder as OUTRAS farmácias sozinha (sem re-perguntar
-  // nem deixar a farmácia no vácuo). NUNCA loga o CPF (PII — CLAUDE.md #3).
-  const cpfDigits = (answer ?? '').replace(/\D/g, '');
-  if (cpfDigits.length === 11 && /\bcpf\b/i.test(pending.question ?? '')) {
+  // REUSO DE DADOS DO PACIENTE (política do fundador — NÃO re-perguntar o que ele já deu). NUNCA
+  // loga o VALOR (PII — CLAUDE.md #3): só a categoria. Incidente Vadivino 22/07: re-pediu CPF/
+  // nascimento já dados e ecoou "Ipasgo" (convênio errado) porque nada era persistido além do CPF.
+  {
+    const ans = (answer ?? '').trim();
+    const q = (pending.question ?? '').toLowerCase();
     const { data: convRow } = await db.from('conversations').select('user_id').eq('id', userConversationId).maybeSingle();
     const uid = convRow?.user_id as string | null;
-    if (uid) {
+
+    // CPF → perfil global (users.document_cpf) — pergunta de CPF + resposta de 11 dígitos.
+    const cpfDigits = ans.replace(/\D/g, '');
+    if (cpfDigits.length === 11 && /\bcpf\b/i.test(pending.question ?? '') && uid) {
       await db.from('users').update({ document_cpf: cpfDigits }).eq('id', uid);
-      await writeLog('info', 'clarification', 'CPF do cliente salvo no perfil (reuso automático nas próximas farmácias)', { traceId });
+      await writeLog('info', 'clarification', 'CPF do cliente salvo no perfil (reuso automático)', { traceId });
+    }
+
+    // Nascimento → perfil global (users.birth_date) se ainda vazio.
+    const dobM = ans.match(/\b(\d{2})\/(\d{2})\/(\d{4})\b/);
+    if (dobM && /nascimento|nasceu|nasc\.|\bidade\b|data de nasc/.test(q) && uid) {
+      const iso = `${dobM[3]}-${dobM[2]}-${dobM[1]}`;
+      await db.from('users').update({ birth_date: iso }).eq('id', uid).is('birth_date', null);
+      await writeLog('info', 'clarification', 'Nascimento do paciente salvo no perfil (reuso automático)', { traceId });
+    }
+
+    // CLÍNICA: convênio + nº da carteirinha → consultation.preferences.patient_data (a clínica-agent
+    // responde direto na próxima pergunta, sem re-perguntar nem ecoar convênio errado).
+    if (pending.kind === 'clinic' && /carteir|conv[eê]nio|plano|benefici/.test(q)) {
+      const patch: Record<string, string> = {};
+      // Carteirinha SÓ quando a pergunta é especificamente sobre o número da carteira, e só
+      // sequências LONGAS (≥12 díg) — não capturar telefone (10-11) nem CPF (11) como nº do convênio.
+      if (/carteir/.test(q)) {
+        const card = (ans.match(/\d[\d.\- ]{8,}\d/g) ?? [])
+          .map((s) => s.replace(/\D/g, '')).find((s) => s.length >= 12 && s.length <= 25);
+        if (card) patch['plan_card_number'] = card;
+      }
+      // Convênio: extrai SÓ do que o paciente AFIRMOU. Se ele NEGOU ("não"/"não é"), NÃO herda o
+      // plano citado na pergunta nem um plano só-mencionado-pra-negar — senão "é Ipasgo?"+"não é
+      // Ipasgo" gravaria Ipasgo (o exato bug do echo que estamos matando).
+      const negou = /\bn[ãa]o\b|\bnem\b|\bnenhum/i.test(ans);
+      const plan = negou ? null : (matchHealthPlan(ans) ?? matchHealthPlan(q));
+      if (plan) patch['health_plan'] = plan;
+      if (Object.keys(patch).length) {
+        const { data: cq } = await db.from('consultation_quotes').select('consultation_id').eq('id', pending.quoteId).maybeSingle();
+        const cid = cq?.consultation_id as string | null;
+        if (cid) {
+          const { data: con } = await db.from('consultations').select('preferences').eq('id', cid).single();
+          const prefs = (con?.preferences as Record<string, unknown> | null) ?? {};
+          const pdata = { ...((prefs['patient_data'] as Record<string, string> | undefined) ?? {}), ...patch };
+          await db.from('consultations').update({ preferences: { ...prefs, patient_data: pdata } }).eq('id', cid);
+          await writeLog('info', 'clarification', 'Dado do paciente persistido na consulta (convênio/carteirinha) — não re-pergunta', { traceId });
+        }
+      }
     }
   }
 

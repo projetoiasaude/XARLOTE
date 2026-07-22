@@ -254,7 +254,7 @@ export const xarloteTools: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'contact_establishment',
-      description: 'Entra em contato com um número ESPECÍFICO pra resolver algo — use em 2 situações: (1) o paciente CONFIRMOU a clínica/médico que você achou com find_clinic_by_name ("sim, é essa") → chame SEM phone (eu uso o contato pendente); (2) o paciente COMPARTILHOU um contato do WhatsApp ou DIGITOU um número e quer que você fale com ele → passe o phone. Diga o kind (clinic pra marcar consulta, pharmacy pra pedir remédio). Pra pharmacy, passe os items. Eu salvo o contato na memória automaticamente.',
+      description: 'Entra em contato com um número ESPECÍFICO pra resolver algo — use em 2 situações: (1) o paciente CONFIRMOU a clínica/médico que você achou com find_clinic_by_name ("sim, é essa") → chame SEM phone (eu uso o contato pendente); (2) o paciente COMPARTILHOU um contato do WhatsApp ou DIGITOU um número NOVO e quer que você fale com ele → passe o phone. Diga o kind (clinic pra marcar consulta, pharmacy pra pedir remédio). Pra pharmacy, passe os items. Eu salvo o contato na memória automaticamente. ⚠️ NÃO use quando o paciente só PERGUNTA/COMENTA sobre um contato que VOCÊ JÁ ESTÁ tocando ("qual telefone você usou?", "já falou com eles?", "e aí, responderam?", "manda de novo") — isso NÃO é contato novo; responda pela conversa (você já está falando com eles, é só tranquilizar/informar). Um novo disparo aqui DUPLICA a consulta e perde o contexto.',
       parameters: {
         type: 'object',
         properties: {
