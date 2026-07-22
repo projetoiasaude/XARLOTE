@@ -17,6 +17,7 @@ export interface AgentClinicContext {
   plan: string | null; // "Unimed", "Amil", "particular", ou null se desconhecido
   patientName?: string | null; // primeiro nome só
   preferredTime?: string | null; // "manhã", "tarde", "18h", "qualquer"
+  requestedProfessional?: string | null; // médico ESPECÍFICO que o paciente quer (ex.: "Dr. Valdivino")
   isAppointmentConfirmation?: boolean;
 }
 
@@ -52,6 +53,12 @@ export function buildAgentClinicSystemPrompt(ctx: AgentClinicContext): string {
   const patientLine = ctx.patientName
     ? `Nome do paciente: **${ctx.patientName}** (primeiro nome só, sem CPF nem dados pessoais por aqui).`
     : `Por aqui não passamos CPF nem dados pessoais — só nome e a necessidade. Endereço completo a gente confirma na hora da consulta.`;
+  // Médico ESPECÍFICO pedido (incidente Vadivino/São Silvestre 21/07): quando o paciente quer
+  // "o Dr. Fulano que atende aí", a recepção precisa OUVIR o nome do médico — senão vira consulta
+  // genérica. Pergunte pela agenda DELE. Se a recepção disser que ele não atende ali, seja honesta.
+  const professionalLine = ctx.requestedProfessional
+    ? `\n- 👨‍⚕️ **O paciente quer marcar ESPECIFICAMENTE com ${ctx.requestedProfessional}** — pergunte pela agenda DELE(A) pelo nome. Se a recepção disser que esse profissional não atende aí, avise isso com clareza (não troque por outro médico por conta própria).`
+    : '';
 
   // ⚠️ ÂNCORA DE DATA: o LLM NÃO sabe que dia é hoje. Sem isso ele "chuta" o ano/mês
   // ao converter "amanhã"/"quinta" em ISO (visto ao vivo: gravou 2024-06-05 pra um
@@ -98,7 +105,7 @@ ${dateAnchor}
 
 ## O QUE PRECISO COTAR
 - Especialidade: **${ctx.specialty}**
-- Urgência: ${urgencyHuman}
+- Urgência: ${urgencyHuman}${professionalLine}
 
 ## FOCO — descubra e traga pro paciente (é isso que importa)
 1. **Profissional** — qual médico(a) atende (nome; CRM se der). Capture em \`doctor_name\`/\`crm\`.

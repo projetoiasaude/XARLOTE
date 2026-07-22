@@ -224,6 +224,7 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     plan: (prefs as any)['plan'] ?? null,
     patientName: patientFirstName,
     preferredTime: (prefs as any)['horario_pref'] ?? null,
+    requestedProfessional: (prefs as any)['requested_doctor'] ?? null,
     isAppointmentConfirmation,
   };
 
@@ -597,7 +598,12 @@ export async function initiateClinicNegotiation(opts: {
     : ctx.modality === 'presencial'
       ? ``
       : ``;
-  const fallbackOpening = `Boa tarde! Aqui é a Xarlote, estou ajudando um paciente a marcar uma consulta de ${ctx.specialty}. ${planClause}${urgencyClause}${modalityClause}Qual o primeiro horário disponível? Obrigada!`;
+  // Alvo da consulta: se o paciente pediu um MÉDICO específico, a recepção precisa ouvir o NOME
+  // dele (senão vira consulta genérica — incidente Vadivino/São Silvestre).
+  const alvoConsulta = ctx.requestedProfessional
+    ? `uma consulta com ${ctx.requestedProfessional}`
+    : `uma consulta de ${ctx.specialty}`;
+  const fallbackOpening = `Boa tarde! Aqui é a Xarlote, estou ajudando um paciente a marcar ${alvoConsulta}. ${planClause}${urgencyClause}${modalityClause}Qual o primeiro horário disponível? Obrigada!`;
 
   let opening: string;
   try {

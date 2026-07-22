@@ -261,7 +261,8 @@ export const xarloteTools: ToolDefinition[] = [
           kind: { type: 'string', enum: ['clinic', 'pharmacy'], description: 'clinic = marcar consulta; pharmacy = pedir/cotar remédio.' },
           phone: { type: 'string', description: 'Telefone/WhatsApp do contato (com DDD), quando o paciente compartilhou/digitou. Omita se for confirmação de um find_clinic_by_name (uso o pendente).' },
           name: { type: 'string', description: 'Nome do contato/estabelecimento, se souber.' },
-          specialty: { type: 'string', description: 'Especialidade da consulta (kind=clinic). Opcional.' },
+          specialty: { type: 'string', description: 'Especialidade da consulta (kind=clinic). Opcional. NÃO invente — se não souber, omita.' },
+          professional: { type: 'string', description: 'Nome do MÉDICO específico que o paciente quer marcar, quando ele nomeou um (ex.: "Dr. Valdivino José Vieira Júnior"). kind=clinic. Eu peço pela agenda DELE na recepção. Omita se o paciente não citou um médico específico.' },
           items: {
             type: 'array', description: 'Medicamentos a cotar (kind=pharmacy).',
             items: { type: 'object', properties: { name: { type: 'string' }, dosage: { type: 'string' }, quantity: { type: 'string' }, substitutes_ok: { type: 'boolean' } }, required: ['name', 'substitutes_ok'] },

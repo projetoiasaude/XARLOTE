@@ -152,7 +152,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         await handleFindByName(tc.args as { name: string; city?: string; specialty?: string }, ctx);
         break;
       case 'contact_establishment':
-        await handleContactEstablishment(tc.args as { phone?: string; name?: string; kind?: 'clinic' | 'pharmacy'; specialty?: string; items?: OrderItem[] }, ctx);
+        await handleContactEstablishment(tc.args as { phone?: string; name?: string; kind?: 'clinic' | 'pharmacy'; specialty?: string; professional?: string; items?: OrderItem[] }, ctx);
         break;
       case 'relay_answer_to_establishment':
         // Loop agêntico: o cliente respondeu a uma pergunta de farmácia/clínica.

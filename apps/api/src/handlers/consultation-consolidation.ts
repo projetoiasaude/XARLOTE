@@ -16,11 +16,23 @@ import { hasPendingClinicClarification } from './clarification.js';
 
 const CHECK_5MIN_MS = 5 * 60 * 1000;
 const CHECK_10MIN_MS = 10 * 60 * 1000;
-// JANELA REAL de resposta da clínica (recalibrada c/ dados do 1º dia real: recepção
-// demora — o muro de 12min matava a consulta antes da 1ª resposta). O check de 10min
-// só ativa modo eager (não falha); quem encerra de verdade é o rescue nesta janela.
+// LATÊNCIA DE CLÍNICA ≠ FARMÁCIA (incidente Vadivino/São Silvestre 21/07): farmácia responde em
+// minutos, clínica em HORAS (recepção, secretária). O erro era o check de 10min tratar clínica
+// CONTATADA (status 'offered') como se tivesse RESPONDIDO → consolidava sem horário → "nenhuma
+// clínica respondeu" + failed, matando um caso que a clínica responderia em 1-2h.
+//   RESCUE_WINDOW_MIN: só um NUDGE ("ainda aguardando, te aviso"), NÃO falha.
+//   CLINIC_FAIL_MIN: horizonte LONGO — só aqui desiste, com honestidade e oferecendo alternativa.
+// Rede de segurança: agent-clinic revive consulta 'failed'/'searching' quando a clínica responde
+// tarde → mesmo após desistir, um retorno da clínica reabre e apresenta.
 const RESCUE_WINDOW_MIN = Number(process.env['CLINIC_QUOTE_WINDOW_MIN'] ?? 45);
+const CLINIC_FAIL_MIN = Number(process.env['CLINIC_FAIL_MIN'] ?? 360); // 6h antes de desistir
 const scheduledTimeouts = new Set<string>();
+
+/** Resposta REAL da clínica = contatada (status 'offered') E retornou com HORÁRIO (proposed_datetime).
+ *  Só isso conta pra consolidar/apresentar — "offered" sozinho é só "mandei mensagem, aguardando". */
+function countRealReplies(quotes: Array<{ status: string; proposed_datetime: string | null }> | null): number {
+  return (quotes ?? []).filter((q) => q.status === 'offered' && q.proposed_datetime).length;
+}
 
 /**
  * RESGATE DURÁVEL de consultas (espelho de rescueOrphanedPharmacyQuotes).
@@ -39,7 +51,7 @@ export async function rescueStalledConsultations(): Promise<void> {
     const cutoff = new Date(Date.now() - RESCUE_WINDOW_MIN * 60_000).toISOString();
     const { data: rows, error } = await db
       .from('consultations')
-      .select('id, conversation_id, created_at')
+      .select('id, conversation_id, created_at, specialty, preferences')
       .eq('status', 'searching')
       .lt('created_at', cutoff)
       .limit(50);
@@ -48,15 +60,41 @@ export async function rescueStalledConsultations(): Promise<void> {
       await writeLog('warn', 'consultation', `rescue query falhou: ${error.message}`, {});
       return;
     }
+    const now = Date.now();
     for (const c of rows ?? []) {
       try {
         if (!c.conversation_id) continue;
         const { data: conv } = await db.from('conversations').select('whatsapp_jid').eq('id', c.conversation_id).single();
         const phone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
         if (!phone) continue;
+        const phoneE164 = `+${phone}`;
         const traceId = `rescue-consult-${c.id}`;
-        await writeLog('warn', 'consultation', `Resgatando consulta presa em 'searching' (>${RESCUE_WINDOW_MIN}min)`, { traceId, consultationId: c.id });
-        await consolidateConsultationQuotes(c.id, c.conversation_id, `+${phone}`, traceId);
+
+        // 1) Já tem resposta REAL (horário) esperando? Apresenta AGORA.
+        const { data: qs } = await db.from('consultation_quotes').select('status, proposed_datetime').eq('consultation_id', c.id);
+        if (countRealReplies(qs) >= 1) {
+          await writeLog('info', 'consultation', `Rescue: clínica respondeu com horário — consolidando`, { traceId, consultationId: c.id });
+          await consolidateConsultationQuotes(c.id, c.conversation_id, phoneE164, traceId);
+          continue;
+        }
+
+        // 2) Sem horário ainda. Horizonte LONGO estourou → desiste com honestidade (allowFail).
+        const ageMin = (now - new Date(c.created_at as string).getTime()) / 60_000;
+        if (ageMin >= CLINIC_FAIL_MIN) {
+          await writeLog('warn', 'consultation', `Rescue: ${Math.round(ageMin)}min sem retorno de clínica — desistindo (honesto)`, { traceId, consultationId: c.id });
+          await consolidateConsultationQuotes(c.id, c.conversation_id, phoneE164, traceId, true);
+          continue;
+        }
+
+        // 3) Entre o nudge e o fail: tranquiliza UMA vez (não repete o do check de 10min).
+        const prefs = (c.preferences as Record<string, unknown> | null) ?? {};
+        if (!prefs['waiting_nudged']) {
+          await db.from('consultations').update({ preferences: { ...prefs, waiting_nudged: true } }).eq('id', c.id);
+          await sendOutbound(c.conversation_id, phoneE164,
+            `Ainda tô aguardando o retorno da clínica sobre sua consulta de ${c.specialty} 🙏 Elas às vezes demoram um pouco pra responder. Assim que tiver horário, te aviso na hora!`,
+            traceId);
+          await writeLog('info', 'consultation', `Rescue: paciente tranquilizado (aguardando clínica, ${Math.round(ageMin)}min)`, { traceId, consultationId: c.id });
+        }
       } catch (err) {
         await writeLog('error', 'consultation', `rescue de consulta falhou: ${String(err).slice(0, 160)}`, { consultationId: c.id });
       }
@@ -161,14 +199,14 @@ async function check5min(
   const { data: c } = await db.from('consultations').select('status').eq('id', consultationId).single();
   if (!c || c.status !== 'searching') return;
 
-  const { data: quotes } = await db.from('consultation_quotes').select('status').eq('consultation_id', consultationId);
-  const offered = (quotes ?? []).filter((q) => q.status === 'offered').length;
+  const { data: quotes } = await db.from('consultation_quotes').select('status, proposed_datetime').eq('consultation_id', consultationId);
+  const replies = countRealReplies(quotes);
 
-  if (offered >= 3) {
-    await writeLog('info', 'consultation', `5min: ${offered} cotações de consulta — consolidando`, { traceId, consultationId });
+  if (replies >= 2) {
+    await writeLog('info', 'consultation', `5min: ${replies} clínica(s) responderam com horário — consolidando`, { traceId, consultationId });
     await consolidateConsultationQuotesEarly(consultationId, userConversationId, userPhoneE164, traceId);
   } else {
-    await writeLog('info', 'consultation', `5min: ${offered} cotação(ões) de consulta — aguardando`, { traceId, consultationId });
+    await writeLog('info', 'consultation', `5min: ${replies} resposta(s) com horário — aguardando`, { traceId, consultationId });
   }
 }
 
@@ -181,22 +219,31 @@ async function check10min(
   const { data: c } = await db.from('consultations').select('status').eq('id', consultationId).single();
   if (!c || c.status !== 'searching') return;
 
-  const { data: quotes } = await db.from('consultation_quotes').select('status').eq('consultation_id', consultationId);
-  const offered = (quotes ?? []).filter((q) => q.status === 'offered').length;
+  const { data: quotes } = await db.from('consultation_quotes').select('status, proposed_datetime').eq('consultation_id', consultationId);
+  const replies = countRealReplies(quotes);
+  const contacted = (quotes ?? []).filter((q) => q.status === 'offered').length;
 
-  if (offered >= 1) {
-    await writeLog('info', 'consultation', `10min: ${offered} cotação(ões) — consolidando`, { traceId, consultationId });
+  if (replies >= 1) {
+    await writeLog('info', 'consultation', `10min: ${replies} resposta(s) com horário — consolidando`, { traceId, consultationId });
     await consolidateConsultationQuotesEarly(consultationId, userConversationId, userPhoneE164, traceId);
-  } else {
-    // Sem ofertas — entra em modo eager via preferences. MERGE (não sobrescreve):
-    // preserva plan/horario_pref que a negociação com a clínica usa. Antes o objeto
-    // inteiro era substituído por { eager_consolidate:true }, apagando o contexto.
-    const { data: cur } = await db.from('consultations').select('preferences').eq('id', consultationId).single();
-    await db.from('consultations').update({
-      preferences: { ...((cur?.preferences as Record<string, unknown> | null) ?? {}), eager_consolidate: true },
-    }).eq('id', consultationId);
-    await writeLog('info', 'consultation', `10min: 0 ofertas — modo eager ativado`, { traceId, consultationId });
+    return;
   }
+
+  // Nenhuma clínica RESPONDEU com horário ainda (clínica demora horas). NÃO falha: ativa modo eager
+  // (a próxima resposta consolida) e TRANQUILIZA o paciente UMA vez, em vez de dizer "ninguém
+  // respondeu" (o erro do caso Vadivino). MERGE nas preferences (preserva plan/horario_pref).
+  const { data: cur } = await db.from('consultations').select('preferences').eq('id', consultationId).single();
+  const prefs = (cur?.preferences as Record<string, unknown> | null) ?? {};
+  const willNudge = contacted >= 1 && !prefs['waiting_nudged'];
+  await db.from('consultations').update({
+    preferences: { ...prefs, eager_consolidate: true, ...(willNudge ? { waiting_nudged: true } : {}) },
+  }).eq('id', consultationId);
+  if (willNudge) {
+    await sendOutbound(userConversationId, userPhoneE164,
+      `Já falei com ${contacted === 1 ? 'a clínica' : 'as clínicas'} e tô aguardando o retorno com horário 💙 Clínica às vezes demora um pouquinho (recepção, secretária), mas assim que responderem eu te aviso na hora, tá?`,
+      traceId);
+  }
+  await writeLog('info', 'consultation', `10min: 0 respostas com horário (${contacted} contatada(s)) — eager${willNudge ? ' + paciente tranquilizado' : ''}`, { traceId, consultationId });
 }
 
 /**
@@ -297,6 +344,7 @@ export async function consolidateConsultationQuotes(
   userConversationId: string,
   userPhoneE164: string,
   traceId: string,
+  allowFail = false,
 ): Promise<void> {
   // Loop agêntico (Fase 4): gate de clarificação — não apresenta opções enquanto
   // uma clínica aguarda um dado do paciente (mesma proteção da consolidação de farmácia).
@@ -328,14 +376,23 @@ export async function consolidateConsultationQuotes(
   const successful = (quotes ?? []).filter((q) => q.status === 'offered' && q.proposed_datetime) as QuoteRow[];
 
   if (successful.length === 0) {
+    if (!allowFail) {
+      // Timers/eager: NENHUM horário ainda ≠ falha (clínica demora horas). Desfaz a transição
+      // pra 'quoted' e volta pra 'searching' — a próxima resposta da clínica (eager/rescue)
+      // consolida. Só o rescue de horizonte longo (allowFail) desiste de verdade. Era AQUI que o
+      // "nas próximas 10 min" matava a consulta do Vadivino antes do São Silvestre responder.
+      await db.from('consultations').update({ status: 'searching' }).eq('id', consultationId).eq('status', 'quoted');
+      await writeLog('info', 'consultation', 'Sem horário de clínica ainda — mantém aguardando (não falha)', { traceId, consultationId });
+      return;
+    }
     await sendOutbound(
       userConversationId,
       userPhoneE164,
-      `Infelizmente nenhuma clínica respondeu com horário pra ${c.specialty} nas próximas 10 min 😔 Quer que eu tente em outra região, ou prefere telemedicina? Posso buscar de novo se mudar algum critério.`,
+      `Sobre sua consulta de ${c.specialty}: as clínicas ainda não me retornaram com horário 😕 Não quero te deixar no vácuo. Quer que eu tente em outra região, procure por telemedicina, ou prefere aguardar mais um pouco? Me diz que eu sigo daqui.`,
       traceId,
     );
     await db.from('consultations').update({ status: 'failed' }).eq('id', consultationId);
-    await writeLog('warn', 'consultation', 'Nenhuma cotação obtida pra consulta', { traceId, consultationId });
+    await writeLog('warn', 'consultation', 'Nenhuma cotação obtida pra consulta (horizonte longo)', { traceId, consultationId });
     return;
   }
 

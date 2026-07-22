@@ -134,7 +134,7 @@ export async function handleFindByName(
 export async function handleContactEstablishment(
   args: {
     phone?: string; name?: string; kind?: 'clinic' | 'pharmacy';
-    specialty?: string; items?: OrderItem[]; note?: string;
+    specialty?: string; professional?: string; items?: OrderItem[]; note?: string;
   },
   ctx: ReachCtx,
 ): Promise<void> {
@@ -165,6 +165,7 @@ export async function handleContactEstablishment(
   const name = (args.name ?? pending?.name ?? 'contato').toString().slice(0, 80);
   const kind = (args.kind ?? (pending?.kind as 'clinic' | 'pharmacy' | undefined) ?? 'clinic');
   const specialty = (args.specialty ?? pending?.specialty ?? undefined) || undefined;
+  const professional = (args.professional ?? undefined) || undefined; // médico específico pedido (kind=clinic)
 
   if (!phone || isPlaceholderPhone(phone)) {
     await sendOutbound(ctx.conversationId, ctx.phoneE164,
@@ -192,12 +193,12 @@ export async function handleContactEstablishment(
   if (kind === 'pharmacy') {
     await contactPharmacy(phone, name, args.items ?? [], ctx);
   } else {
-    await contactClinic(phone, name, specialty, ctx);
+    await contactClinic(phone, name, specialty, ctx, professional);
   }
 }
 
 /** Consulta DIRECIONADA a uma clínica específica (reusa o fluxo de clínica). */
-async function contactClinic(phone: string, clinicName: string, specialty: string | undefined, ctx: ReachCtx): Promise<void> {
+async function contactClinic(phone: string, clinicName: string, specialty: string | undefined, ctx: ReachCtx, professional?: string | null): Promise<void> {
   // Idempotência (paridade com handleStartConsultationSearch): não abre uma 2ª busca
   // se já há consulta ativa — senão viram consultas paralelas e a rescue de 45min
   // manda "nenhuma clínica respondeu" pra uma que o usuário nem lembra (review).
@@ -225,6 +226,8 @@ async function contactClinic(phone: string, clinicName: string, specialty: strin
   const { data: consult, error: coErr } = await db.from('consultations').insert({
     user_id: ctx.userId, conversation_id: ctx.conversationId, status: 'searching',
     specialty: specialty ?? 'consulta', urgency: 'rotina', modality: 'indiferente', city,
+    // guarda o médico pedido → a abertura pra clínica pergunta por ELE pelo nome (não vira genérico)
+    preferences: (professional ? { requested_doctor: professional } : {}) as never,
   }).select('id').single();
   const { data: q, error: qErr } = consult?.id
     ? await db.from('consultation_quotes').insert({ consultation_id: consult.id, clinic_id: clinic.id, status: 'pending' }).select('id').single()
@@ -236,7 +239,7 @@ async function contactClinic(phone: string, clinicName: string, specialty: strin
   }
 
   await sendOutbound(ctx.conversationId, ctx.phoneE164,
-    `Show! Já tô falando com *${clinicName}*${specialty ? ` pra ver ${specialty}` : ''} 🔍 Assim que eles responderem com horário e valor, te aviso 💙`,
+    `Show! Já tô falando com *${clinicName}*${professional ? ` pra marcar com ${professional}` : specialty ? ` pra ver ${specialty}` : ''} 🔍 Assim que eles responderem com horário e valor, te aviso 💙`,
     ctx.traceId);
   await writeAudit({
     actorType: 'xarlote', action: 'consultation.targeted_contact', userId: ctx.userId,
@@ -248,7 +251,7 @@ async function contactClinic(phone: string, clinicName: string, specialty: strin
   setImmediate(() => {
     initiateClinicNegotiation({
       quoteId: q.id, consultationId: consult.id, clinicId: clinic.id, clinicName, clinicWhatsApp: phone,
-      ctx: { specialty: specialty ?? 'consulta', urgency: 'rotina', modality: 'indiferente', patientCity: city, plan: null, patientName },
+      ctx: { specialty: specialty ?? 'consulta', urgency: 'rotina', modality: 'indiferente', patientCity: city, plan: null, patientName, requestedProfessional: professional ?? null },
       userConversationId: ctx.conversationId, userPhoneE164: ctx.phoneE164, traceId: ctx.traceId,
     }).catch((err) => writeLog('error', 'lookup', `Contato clínica falhou: ${String(err).slice(0, 160)}`, { traceId: ctx.traceId }));
   });
