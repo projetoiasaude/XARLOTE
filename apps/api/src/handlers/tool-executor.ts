@@ -13,7 +13,7 @@ import { loadPrompts } from '../config/prompts.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
 import { relayUserAnswerToEstablishment } from './clarification.js';
-import { handleFindByName, handleContactEstablishment } from './reach-out.js';
+import { handleFindByName, handleContactEstablishment, handleNudgeConsultation } from './reach-out.js';
 import { loadLatestOrderState, resolveTargetSupplier } from './order-state.js';
 import {
   handleStartTreatmentFromOrder, handleLogMedicationTaken, handleUpdateTreatmentStatus,
@@ -191,6 +191,9 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
         break;
       case 'cancel_consultation':
         await handleCancelConsultation(tc.args as unknown as { consultation_id: string; reason: string }, ctx);
+        break;
+      case 'nudge_consultation':
+        await handleNudgeConsultation(ctx);
         break;
       case 'red_flag_check': {
         // Handler envia BOTÕES diretos pra uazapi + agenda escalation 60s.

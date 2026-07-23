@@ -164,6 +164,12 @@ export async function nudgeStalledFlows(): Promise<void> {
   if (process.env['NUDGE_ENABLED'] === 'false') return; // kill-switch (env, legado)
   if (!loadPrompts().nudges_enabled) return;            // kill-switch (hot-reload via /prompts)
 
+  // 🌙 QUIET HOURS (incidente Vadivino 22/07: nudge "ficou faltando respostinha" às 23:32): nudge é
+  // re-engajamento NÃO-urgente — nada de madrugada. Gate em Brasília (base de usuários BR); o próximo
+  // tick diurno retoma. NÃO afeta lembretes de remédio (outro worker, com sua própria regra).
+  const hourBrt = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'America/Sao_Paulo', hour: '2-digit', hour12: false }).format(new Date()));
+  if (hourBrt >= 22 || hourBrt < 7) return;
+
   try {
     const targets = await collectTargets();
     if (!targets.length) return;

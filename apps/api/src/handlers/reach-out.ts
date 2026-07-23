@@ -16,8 +16,20 @@ import { findPlacesByTextSearch, getPlacePhone } from '@iasaude/integrations';
 import { toE164BR, isPlaceholderPhone, brPhoneVariants, isServiceNumber, sameMedication, itemDisplayName, type OrderItem } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
+import { sendOutboundToClinic } from './outbound-agent.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
-import { scheduleConsultationTimeout } from './consultation-consolidation.js';
+import { scheduleConsultationTimeout, closeConsultationQuotes } from './consultation-consolidation.js';
+
+/** Mesmo médico? Compara TOKENS de nome ≥4 letras (não substring solto: "Ana" ⊄ "Mariana"). */
+function doctorMatch(a: string | null | undefined, b: string | null | undefined): boolean {
+  const A = String(a ?? '').trim().toLowerCase();
+  const B = String(b ?? '').trim().toLowerCase();
+  if (!A || !B) return false;
+  if (A === B) return true;
+  const toks = (s: string) => s.split(/\s+/).filter((t) => t.replace(/[^a-zà-ú]/gi, '').length >= 4);
+  const aT = toks(A), bT = toks(B);
+  return aT.length > 0 && bT.length > 0 && aT.some((t) => bT.includes(t));
+}
 
 interface ReachCtx {
   userId: string;
@@ -197,6 +209,86 @@ export async function handleContactEstablishment(
   }
 }
 
+/**
+ * INSISTIR/CONTINUAR uma consulta em andamento (incidente Vadivino 22/07: "insiste em marcar" caía
+ * no fluxo de FARMÁCIA). Dá ao LLM uma ação de CONSULTA de verdade: re-cutuca o consultório e
+ * tranquiliza o paciente; retoma uma consulta recém-encerrada sem duplicar. Auto-contido (uma voz).
+ */
+export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
+  if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
+  const { data: c } = await db.from('consultations')
+    .select('id, status, specialty, preferences, created_at')
+    .eq('user_id', ctx.userId)
+    .in('status', ['searching', 'quoting', 'quoted', 'confirming', 'failed'])
+    .order('created_at', { ascending: false }).limit(1).maybeSingle();
+  if (!c || (c.status === 'failed' && Date.now() - new Date(c.created_at as string).getTime() > 24 * 60 * 60_000)) {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      'Não achei nenhuma consulta em andamento pra retomar 💙 Quer que eu comece a marcar uma? Me diz o médico ou a especialidade.', ctx.traceId);
+    return;
+  }
+  const prefs = (c.preferences as Record<string, unknown> | null) ?? {};
+  const doctor = prefs['requested_doctor'] as string | null;
+  const alvo = doctor ? `com ${doctor}` : (c.specialty && c.specialty !== 'consulta' ? `de ${c.specialty}` : '');
+
+  if (c.status === 'quoted') {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      `As opções de horário ${alvo} que te mandei ainda estão de pé 💙 Quer confirmar alguma? Se preferir, me diz que eu procuro mais.`, ctx.traceId);
+    return;
+  }
+  if (c.status === 'confirming') {
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      `Tô confirmando a reserva ${alvo} com a clínica 💙 assim que baterem o martelo, te aviso na hora!`, ctx.traceId);
+    return;
+  }
+
+  // searching/quoting/failed → dá um alô no consultório e (se falhou) retoma a MESMA consulta.
+  const { data: q } = await db.from('consultation_quotes')
+    .select('id, clinic_id, conversation_id, clinics(name, whatsapp_e164, phone_e164)')
+    .eq('consultation_id', c.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+  const clinic = q?.clinics as { name?: string; whatsapp_e164?: string; phone_e164?: string } | null;
+  const clinicPhone = clinic?.whatsapp_e164 ?? clinic?.phone_e164 ?? null;
+
+  if (c.status === 'failed') {
+    if (clinicPhone && q?.id) {
+      // Revive a MESMA consulta (não duplica). **created_at = agora** é OBRIGATÓRIO: o rescue de 6h
+      // decide falhar pela IDADE (created_at); sem resetar, uma consulta que falhou POR ter 6h+
+      // seria re-morta no próximo tick de 30s (o "retomando 💙" seguido de "não consegui fechar 😕"
+      // que essa frente existe pra matar — pego no review). O .select() torna idempotente: 2 turnos
+      // concorrentes (lock fail-open) não re-iniciam a negociação 2×.
+      const { data: revived } = await db.from('consultations')
+        .update({ status: 'searching', cancelled_reason: null, created_at: new Date().toISOString() })
+        .eq('id', c.id).eq('status', 'failed').select('id');
+      if (!revived?.length) {
+        await sendOutbound(ctx.conversationId, ctx.phoneE164, `Já tô retomando com o consultório ${alvo} 💙 assim que responderem, te aviso!`, ctx.traceId);
+        return;
+      }
+      await db.from('consultation_quotes').update({ status: 'pending', clarification_status: null }).eq('id', q.id);
+      const patientName = (await db.from('users').select('preferred_name, full_name').eq('id', ctx.userId).maybeSingle())
+        .data as { preferred_name?: string | null; full_name?: string | null } | null;
+      const pn = ((patientName?.preferred_name || patientName?.full_name) ?? '').split(' ')[0] || null;
+      setImmediate(() => {
+        initiateClinicNegotiation({
+          quoteId: q.id as string, consultationId: c.id, clinicId: q.clinic_id as string, clinicName: clinic?.name ?? 'consultório',
+          clinicWhatsApp: clinicPhone, ctx: { specialty: (c.specialty as string) || 'consulta', urgency: 'rotina', modality: 'indiferente', patientCity: null, plan: (prefs['patient_data'] as { health_plan?: string } | undefined)?.health_plan ?? null, patientName: pn, requestedProfessional: doctor, singleTarget: prefs['single_target'] === true },
+          userConversationId: ctx.conversationId, userPhoneE164: ctx.phoneE164, traceId: ctx.traceId,
+        }).catch((err) => writeLog('error', 'lookup', `nudge_consultation revive falhou: ${String(err).slice(0, 160)}`, { traceId: ctx.traceId }));
+      });
+      scheduleConsultationTimeout(c.id, ctx.conversationId, ctx.phoneE164, ctx.traceId);
+      await sendOutbound(ctx.conversationId, ctx.phoneE164, `Tô retomando com o consultório ${alvo} 💙 dei um alô lá agora — assim que responderem com horário, te aviso!`, ctx.traceId);
+    } else {
+      await sendOutbound(ctx.conversationId, ctx.phoneE164, `A última tentativa ${alvo} não fechou 💙 me manda de novo o WhatsApp do consultório que eu falo com eles na hora.`, ctx.traceId);
+    }
+    return;
+  }
+
+  // searching/quoting: re-cutuca a clínica (se dá) + tranquiliza
+  if (clinicPhone && q?.conversation_id) {
+    await sendOutboundToClinic(q.conversation_id, clinicPhone, 'Oi! Só passando pra saber se conseguiu ver um horário — o paciente tá bem interessado 🙂 obrigada!', ctx.traceId).catch(() => { /* best-effort */ });
+  }
+  await sendOutbound(ctx.conversationId, ctx.phoneE164,
+    `Tô insistindo com o consultório ${alvo} 💙 dei mais um alô lá agora — assim que responderem com horário, te aviso na hora!`, ctx.traceId);
+}
+
 /** Consulta DIRECIONADA a uma clínica específica (reusa o fluxo de clínica). */
 async function contactClinic(phone: string, clinicName: string, specialty: string | undefined, ctx: ReachCtx, professional?: string | null): Promise<void> {
   // Idempotência: não abre uma 2ª busca se já há consulta ativa. Carrega especialidade/médico/
@@ -211,16 +303,7 @@ async function contactClinic(phone: string, clinicName: string, specialty: strin
     // canceladas) e PERDIA a especialidade (virou "consulta de consulta"). Se o médico pedido OU o
     // telefone da clínica é o MESMO que já está em andamento, isto NÃO é contato novo — é re-envio/
     // pergunta sobre o MESMO. Tranquiliza e NÃO recria (idempotente).
-    const activeDoctor = String(activePrefs['requested_doctor'] ?? '').trim().toLowerCase();
-    const newDoctor = String(professional ?? '').trim().toLowerCase();
-    // Mesmo médico? Compara TOKENS de nome significativos (≥4 letras), não substring solto
-    // ("Ana" ⊂ "Mariana" daria falso-positivo e barraria um redirecionamento legítimo).
-    const nameTokens = (s: string) => s.split(/\s+/).filter((t) => t.replace(/[^a-zà-ú]/gi, '').length >= 4);
-    const aTok = nameTokens(activeDoctor);
-    const nTok = nameTokens(newDoctor);
-    const sameDoctor = activeDoctor && newDoctor && activeDoctor === newDoctor
-      ? true
-      : aTok.length > 0 && nTok.length > 0 && aTok.some((t) => nTok.includes(t));
+    const sameDoctor = doctorMatch(activePrefs['requested_doctor'] as string | null, professional);
     const newPhoneVariants = brPhoneVariants(phone);
     const { data: activeQuotes } = await db.from('consultation_quotes')
       .select('clinics(whatsapp_e164, phone_e164)').eq('consultation_id', activeC.id);
@@ -251,6 +334,28 @@ async function contactClinic(phone: string, clinicName: string, specialty: strin
     await db.from('consultations')
       .update({ status: 'cancelled', cancelled_reason: 'redirecionado — paciente forneceu contato direto da clínica' })
       .eq('id', activeC.id).in('status', ['searching', 'quoting']);
+    await closeConsultationQuotes(activeC.id, 'redirecionado pra outro contato'); // fecha órfãs (anti "N cotações abertas")
+  }
+
+  // R2a — HERANÇA DE CONTEXTO no RETOMAR (incidente Vadivino 22/07): a consulta de neuro FALHOU
+  // (rescue 6h) e o "estou dando sequência" nasceu genérica ("consulta de consulta") + re-perguntou
+  // convênio. Se há uma consulta RECENTE (<24h) do MESMO médico (viva/falhada/cancelada), herda a
+  // especialidade e os dados já coletados (convênio/carteirinha) — o guard de ativos acima já cobriu
+  // a MESMA em andamento; aqui cobrimos a retomada de uma encerrada.
+  let inheritedPatientData: Record<string, unknown> | undefined;
+  if (professional) {
+    const since = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+    const { data: prior } = await db.from('consultations')
+      .select('specialty, preferences, created_at')
+      .eq('user_id', ctx.userId).gt('created_at', since)
+      .order('created_at', { ascending: false }).limit(10);
+    for (const p of prior ?? []) {
+      const pPrefs = (p.preferences as Record<string, unknown> | null) ?? {};
+      if (!doctorMatch(pPrefs['requested_doctor'] as string | null, professional)) continue;
+      if ((!specialty || specialty === 'consulta') && p.specialty && p.specialty !== 'consulta') specialty = p.specialty as string;
+      if (pPrefs['patient_data'] && typeof pPrefs['patient_data'] === 'object') inheritedPatientData = pPrefs['patient_data'] as Record<string, unknown>;
+      break;
+    }
   }
 
   const { data: profile } = await db.from('users').select('home_city, home_state, preferred_name, full_name').eq('id', ctx.userId).maybeSingle();
@@ -272,7 +377,11 @@ async function contactClinic(phone: string, clinicName: string, specialty: strin
     // single_target=true: o paciente deu o contato DESTE consultório — a clínica-agent e a
     // consolidação sabem que é alvo único (nunca sugerem outra clínica/médico; agenda distante
     // vira decisão do paciente, não 'unavailable'). guarda o médico pedido → abertura por ELE.
-    preferences: { single_target: true, ...(professional ? { requested_doctor: professional } : {}) } as never,
+    preferences: {
+      single_target: true,
+      ...(professional ? { requested_doctor: professional } : {}),
+      ...(inheritedPatientData ? { patient_data: inheritedPatientData } : {}),
+    } as never,
   }).select('id').single();
   const { data: q, error: qErr } = consult?.id
     ? await db.from('consultation_quotes').insert({ consultation_id: consult.id, clinic_id: clinic.id, status: 'pending' }).select('id').single()

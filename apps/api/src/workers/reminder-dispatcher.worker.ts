@@ -197,6 +197,12 @@ export async function dispatchReminders(): Promise<void> {
       // não confirmado (ou indeterminado) → segue o fluxo normal e DISPARA
     }
 
+    // NOTA: quiet-hours NÃO se aplica aqui de forma cega. O claim já avançou o next_run_at, então
+    // "pular" à noite DESCARTARIA a ocorrência pra sempre — e um lembrete de exercício às 6h ou de
+    // água às 22h é ESCOLHA do usuário (não dá pra suprimir por horário sem quebrar a intenção). O
+    // anti-flood noturno vem do CAP DE PUSH abaixo (que corta só o push do app, não o remédio), e o
+    // quiet-hours de verdade fica nos NUDGES/rescue de consulta (que re-tentam de dia, sem descartar).
+
     // 🧯 CAP DIÁRIO (incidente Antônia Flávia 09/07): a coluna users.reminder_max_per_day
     // existia SÓ no banco — o código nunca a leu, e ela recebia 10 lembretes/dia há 6 dias
     // SEM responder um único (fadiga real + risco de block/ban do WhatsApp). Janela ROLLING
@@ -208,8 +214,10 @@ export async function dispatchReminders(): Promise<void> {
     // primário NÃO foi confirmado — é rede de segurança de dose, volume baixo e alto valor
     // (capar o backup da insulina não-confirmada inverteria o fail-safe do 0020).
     const isConditionalBackup = (reminder.payload as { condition?: string } | null)?.condition === 'if_not_confirmed';
+    let pushCapReached = false; // flood de PUSH no app pra usuário pouco responsivo (ver abaixo)
     if (reminder.rrule && !isConditionalBackup) {
       const cap = user.reminder_max_per_day ?? 6;
+      const since24 = new Date(now.getTime() - 24 * 60 * 60_000).toISOString();
       // Conta só o que REALMENTE CHEGOU no WhatsApp (payload.window_open=true = texto livre
       // entregue). Lembrete BLOQUEADO pela janela de 24h (paciente mudo) não conta — senão o
       // cap enche de mensagens-fantasma que a pessoa nunca recebeu e passa a BLOQUEAR até o
@@ -223,7 +231,7 @@ export async function dispatchReminders(): Promise<void> {
         .eq('event_name', 'reminder.dispatched')
         .eq('user_id', reminder.user_id)
         .eq('payload->>window_open', 'true')
-        .gte('occurred_at', new Date(now.getTime() - 24 * 60 * 60_000).toISOString());
+        .gte('occurred_at', since24);
       if (capErr) {
         // fail-open deliberado (melhor lembrar demais que calar remédio) — mas NUNCA mudo.
         await writeLog('warn', 'reminder', `cap: query do event_log falhou (${capErr.message.slice(0, 80)}) — fail-open, enviando`, {});
@@ -235,6 +243,22 @@ export async function dispatchReminders(): Promise<void> {
           payload: { reminder_id: reminder.id, cap, sent_24h: sent24h ?? 0 },
         });
         continue;
+      }
+      // FLOOD DE PUSH (incidente Antônia 22/07): o usuário MUDO recebe tudo como window_blocked (não
+      // conta no cap de janela acima) mas ainda leva um PUSH no app a CADA lembrete → 10 pushes/dia.
+      // Conta TODOS os disparos (entregues + bloqueados) das últimas 24h e, batido o teto, corta só
+      // o PUSH — o texto/template do WhatsApp já respeitam a janela, e o espelho segue pro dashboard.
+      // O template de re-engajamento (outro caminho, com back-off próprio) NÃO é afetado.
+      // SÓ corta push de tipo de BAIXA urgência (água/exercício/custom). Medicação/consulta/sono
+      // NUNCA têm o push cortado — o usuário mudo que depende do app precisa do alerta de remédio.
+      if (['hydration', 'exercise', 'custom'].includes(reminder.type)) {
+        const { count: allDispatched } = await db
+          .from('event_log')
+          .select('id', { count: 'exact', head: true })
+          .eq('event_name', 'reminder.dispatched')
+          .eq('user_id', reminder.user_id)
+          .gte('occurred_at', since24);
+        pushCapReached = (allDispatched ?? 0) >= cap;
       }
     }
 
@@ -373,7 +397,7 @@ export async function dispatchReminders(): Promise<void> {
     //    não configurado; tokens mortos são limpos. Abre direto no chat.
     try {
       const tokens = await listDeviceTokens(reminder.user_id);
-      if (tokens.length) {
+      if (tokens.length && !pushCapReached) {
         const title = reminder.type === 'medication' ? '💊 Hora do remédio' : 'Xarlote';
         const result = await sendPush(tokens, {
           title,
@@ -381,6 +405,8 @@ export async function dispatchReminders(): Promise<void> {
           data: { kind: 'reminder', reminder_id: reminder.id, route: '/app' },
         });
         if (result.invalidTokens.length) await deleteDeviceTokens(result.invalidTokens);
+      } else if (tokens.length && pushCapReached) {
+        await writeLog('info', 'reminder', `push do app suprimido — teto diário atingido (anti-flood pra usuário pouco responsivo, "${reminder.title}")`, {});
       }
     } catch (err) {
       await writeLog('warn', 'reminder', `push falhou: ${String(err).slice(0, 120)}`, { traceId: undefined });

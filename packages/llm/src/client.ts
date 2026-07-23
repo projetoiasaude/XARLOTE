@@ -110,6 +110,54 @@ const OpenRouterResponseSchema = z
   })
   .passthrough();
 
+/** Distância de edição (Levenshtein). Puro, O(m·n) com 2 linhas. */
+function levenshtein(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, i) => i);
+  let cur = new Array<number>(n + 1).fill(0);
+  for (let i = 1; i <= m; i++) {
+    cur[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + cost);
+    }
+    [prev, cur] = [cur, prev];
+  }
+  return prev[n]!;
+}
+
+/**
+ * RESILIÊNCIA A TYPO DE TOOL DO MODELO (incidente Vadivino 22/07): o LLM chamou
+ * `request_cllarification` (L dobrado) → o dispatcher tratou como "tool desconhecida" e ENGOLIU a
+ * chamada em silêncio (5× num dia) → o relay ao paciente nunca saía e a consulta travava. Em vez de
+ * caçar cada typo, resolvemos o nome cru pro nome VÁLIDO mais próximo — UMA vez, no client, então
+ * TODOS os agentes (paciente, clínica, farmácia) ganham a blindagem de graça. Conservador de
+ * propósito: só corrige quando tem certeza; na dúvida devolve o cru (o handler loga "desconhecida").
+ *   1. exato → 2. case-insensitive → 3. normalizado (colapsa letras repetidas, tira separadores)
+ *   → 4. distância de edição ≤ limiar E inequívoco (o mais próximo tem que ser ÚNICO).
+ */
+export function resolveToolName(raw: string, validNames: string[]): string {
+  if (!raw || !validNames.length) return raw;
+  if (validNames.includes(raw)) return raw;
+  const lower = raw.toLowerCase();
+  const ci = validNames.find((n) => n.toLowerCase() === lower);
+  if (ci) return ci;
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/(.)\1+/g, '$1');
+  const nr = norm(raw);
+  const normHits = validNames.filter((n) => norm(n) === nr);
+  if (normHits.length === 1) return normHits[0]!;
+  const scored = validNames
+    .map((n) => ({ n, d: levenshtein(lower, n.toLowerCase()) }))
+    .sort((a, b) => a.d - b.d);
+  const best = scored[0];
+  const second = scored[1];
+  const maxD = Math.min(3, Math.max(2, Math.floor(raw.length * 0.25)));
+  if (best && best.d <= maxD && (!second || second.d > best.d)) return best.n;
+  return raw;
+}
+
 function getApiKey(override?: string): string {
   const key = override ?? process.env['OPENROUTER_API_KEY'] ?? process.env['GOOGLE_GENAI_API_KEY'] ?? '';
   if (!key) throw new Error('No LLM API key configured. Set OPENROUTER_API_KEY or configure in the Prompts dashboard.');
@@ -185,10 +233,18 @@ async function callOpenRouter(
   const choice = data.choices[0];
   if (!choice) throw new Error('No choices in OpenRouter response');
 
-  const toolCalls: ToolCall[] = (choice.message.tool_calls ?? []).map((tc) => ({
-    name: tc.function.name,
-    args: (() => { try { return JSON.parse(tc.function.arguments); } catch { return {}; } })(),
-  }));
+  const validToolNames = (tools ?? []).map((t) => t.function.name);
+  const toolCalls: ToolCall[] = (choice.message.tool_calls ?? []).map((tc) => {
+    const resolved = resolveToolName(tc.function.name, validToolNames);
+    if (resolved !== tc.function.name) {
+      // Observável no Railway sem dependência de db: corrigimos um typo de tool do modelo.
+      console.warn(`[llm] tool-name corrigido: "${tc.function.name}" → "${resolved}"`);
+    }
+    return {
+      name: resolved,
+      args: (() => { try { return JSON.parse(tc.function.arguments); } catch { return {}; } })(),
+    };
+  });
 
   return {
     text: choice.message.content ?? '',

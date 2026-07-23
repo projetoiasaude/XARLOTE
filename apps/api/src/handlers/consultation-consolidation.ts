@@ -61,6 +61,11 @@ export async function rescueStalledConsultations(): Promise<void> {
       return;
     }
     const now = Date.now();
+    // 🌙 QUIET HOURS (incidente Vadivino 22/07: "não consegui fechar" às 02:25): de madrugada não
+    // FALHA consulta nem manda nudge (re-engajamento não-urgente) — só apresenta boa-nova (oferta
+    // real). O consult fica vivo e o próximo scan diurno resolve. Base de usuários BR (Brasília).
+    const hourBrt = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'America/Sao_Paulo', hour: '2-digit', hour12: false }).format(new Date(now)));
+    const isNightBrt = hourBrt >= 22 || hourBrt < 7;
     for (const c of rows ?? []) {
       try {
         if (!c.conversation_id) continue;
@@ -81,14 +86,31 @@ export async function rescueStalledConsultations(): Promise<void> {
         // 2) Sem horário ainda. Horizonte LONGO estourou → desiste com honestidade (allowFail).
         const ageMin = (now - new Date(c.created_at as string).getTime()) / 60_000;
         if (ageMin >= CLINIC_FAIL_MIN) {
+          if (isNightBrt) continue; // não desiste de madrugada — espera o dia (evita fail às 2h)
+          // R5 (incidente Vadivino 22/07): NÃO desiste se a CLÍNICA ainda está CONVERSANDO. Ela
+          // ofertou "amanhã, mas particular" às 18:45 e o rescue matou a consulta às 19:39 (54min
+          // depois) — perdendo uma negociação VIVA. Só falha se a clínica está de fato muda há horas.
+          const { data: cq } = await db.from('consultation_quotes')
+            .select('conversation_id').eq('consultation_id', c.id)
+            .not('conversation_id', 'is', null).order('created_at', { ascending: false }).limit(1).maybeSingle();
+          if (cq?.conversation_id) {
+            const { data: lastIn } = await db.from('messages')
+              .select('created_at').eq('conversation_id', cq.conversation_id).eq('direction', 'in')
+              .order('created_at', { ascending: false }).limit(1).maybeSingle();
+            const clinicActive = !!lastIn?.created_at && (now - new Date(lastIn.created_at as string).getTime()) < 2 * 60 * 60 * 1000;
+            if (clinicActive) {
+              await writeLog('info', 'consultation', `Rescue: ${Math.round(ageMin)}min mas a CLÍNICA respondeu há pouco — negociação viva, NÃO desiste`, { traceId, consultationId: c.id });
+              continue; // dá mais tempo; o próximo scan reavalia (quando a clínica calar de vez, falha)
+            }
+          }
           await writeLog('warn', 'consultation', `Rescue: ${Math.round(ageMin)}min sem retorno de clínica — desistindo (honesto)`, { traceId, consultationId: c.id });
           await consolidateConsultationQuotes(c.id, c.conversation_id, phoneE164, traceId, true);
           continue;
         }
 
-        // 3) Entre o nudge e o fail: tranquiliza UMA vez (não repete o do check de 10min).
+        // 3) Entre o nudge e o fail: tranquiliza UMA vez (não repete o do check de 10min). Não de madrugada.
         const prefs = (c.preferences as Record<string, unknown> | null) ?? {};
-        if (!prefs['waiting_nudged']) {
+        if (!prefs['waiting_nudged'] && !isNightBrt) {
           await db.from('consultations').update({ preferences: { ...prefs, waiting_nudged: true } }).eq('id', c.id);
           await sendOutbound(c.conversation_id, phoneE164,
             `Ainda tô aguardando o retorno da clínica sobre sua consulta de ${c.specialty} 🙏 Elas às vezes demoram um pouco pra responder. Assim que tiver horário, te aviso na hora!`,
@@ -291,6 +313,19 @@ export async function notifyUserConsultationQuoteArrived(
 }
 
 /**
+ * INVARIANTE DE CICLO DE VIDA (incidente Vadivino 22/07): quando uma consulta vira terminal
+ * (failed/cancelled), suas cotações ainda 'pending'/'offered' precisam ser FECHADAS — senão ficam
+ * abertas na conversa COMPARTILHADA da clínica (mesma por telefone) e o agent-clinic vê "N cotações
+ * abertas na mesma conversa" (19× no caso Vadivino) e atribui a resposta à errada. Fecha pra
+ * 'unavailable' (NÃO 'timeout' — timeout é revivível pela resposta-tardia; um alvo morto não deve
+ * ressuscitar). Idempotente, escopo por consultation_id (não toca cotações de OUTRAS consultas). */
+export async function closeConsultationQuotes(consultationId: string, reason: string): Promise<void> {
+  await db.from('consultation_quotes')
+    .update({ status: 'unavailable', notes: `[encerrada] ${reason}`.slice(0, 200), responded_at: new Date().toISOString() })
+    .eq('consultation_id', consultationId).in('status', ['pending', 'offered']);
+}
+
+/**
  * ALVO ÚNICO — beco sem saída HONESTO (incidente Vadivino 22/07): a ÚNICA clínica que o paciente
  * escolheu não pode atender de jeito nenhum (número errado, médico não atende ali). Não há outra
  * clínica pra procurar e **NÃO se sugere outro médico**. Avisa o paciente com honestidade, deixa a
@@ -312,6 +347,7 @@ export async function notifyUserSingleTargetDeadEnd(
     .eq('id', consultationId).in('status', ['searching', 'quoting']).select('conversation_id, specialty');
   const row = flipped?.[0];
   if (!row?.conversation_id) return; // já resolvida/encerrada/apresentada por outro caminho — não duplica aviso
+  await closeConsultationQuotes(consultationId, 'alvo único indisponível'); // fecha órfãs (anti-ambiguidade)
   const { data: conv } = await db.from('conversations').select('whatsapp_jid').eq('id', row.conversation_id).single();
   const phone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
   if (!phone) return;
@@ -432,6 +468,7 @@ export async function consolidateConsultationQuotes(
         traceId,
       );
       await db.from('consultations').update({ status: 'failed' }).eq('id', consultationId);
+      await closeConsultationQuotes(consultationId, 'sem retorno da clínica (horizonte longo)');
       await writeLog('warn', 'consultation', 'Alvo único sem retorno (horizonte longo) — paciente avisado, sem sugerir alternativa', { traceId, consultationId });
       return;
     }
@@ -442,6 +479,7 @@ export async function consolidateConsultationQuotes(
       traceId,
     );
     await db.from('consultations').update({ status: 'failed' }).eq('id', consultationId);
+    await closeConsultationQuotes(consultationId, 'nenhuma clínica retornou (horizonte longo)');
     await writeLog('warn', 'consultation', 'Nenhuma cotação obtida pra consulta (horizonte longo)', { traceId, consultationId });
     return;
   }

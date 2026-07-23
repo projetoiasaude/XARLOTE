@@ -517,6 +517,15 @@ export const xarloteTools: ToolDefinition[] = [
   {
     type: 'function',
     function: {
+      name: 'nudge_consultation',
+      description:
+        'INSISTIR/CONTINUAR uma consulta médica JÁ em andamento (você verá "🩺 CONSULTA ATIVA" no seu contexto). Use quando o paciente cobra, insiste ou pergunta o status da consulta: "insiste em marcar", "e aí, já marcou?", "tenta de novo", "continua", "não desiste", "vê isso pra mim", "cadê a consulta?". Eu dou um alô no consultório, reabro se tinha encerrado, e aviso o paciente quando responderem. ⚠️ NÃO use pra COMEÇAR uma consulta nova (aí é find_clinic_by_name/contact_establishment) nem pra nada de FARMÁCIA (message_supplier/start_pharmacy_order são de REMÉDIO, não de consulta).',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'set_emergency_contact',
       description:
         'Cadastra o contato de emergência do paciente. Use quando o paciente mencionar quem deve ser avisado em caso de emergência (ex: "minha mãe Maria, número tal", "meu marido João, +55..."). Salva nome + telefone + relação. Em caso futuro de red flag, esse contato será avisado automaticamente.',

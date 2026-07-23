@@ -21,6 +21,7 @@ import { handleToolCall } from './tool-executor.js';
 import { saveContactsToMemory } from './reach-out.js';
 import { findPendingClarificationForUser } from './clarification.js';
 import { loadLatestOrderState, buildOrderStateBlock } from './order-state.js';
+import { buildConsultationStateBlock } from './consultation-state.js';
 import { consolidateQuotes } from './quote-consolidation.js';
 import { withUserLock } from '../concurrency/user-lock.js';
 
@@ -405,7 +406,7 @@ async function processInboundUserInner(
     }
   };
 
-  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif, activeRemindersRes, recentTasksRes, orderState] = await Promise.all([
+  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif, activeRemindersRes, recentTasksRes, orderState, consultStateBlock] = await Promise.all([
     getConversationMessages(conversation.id, 30),
     queryUser360(user.id),
     db.from('orders')
@@ -450,6 +451,9 @@ async function processInboundUserInner(
     // num ponto) — pra Xarlote entender o pedido inteiro, re-contatar uma específica
     // (message_supplier) e nunca alucinar "confirmado" num pedido que falhou.
     loadLatestOrderState(user.id).catch(() => null),
+    // ESTADO DA CONSULTA ativa — sem isto a Xarlote fica CEGA à consulta em andamento e "insiste
+    // em marcar" cai no fluxo de farmácia (incidente Vadivino 22/07).
+    buildConsultationStateBlock(user.id).catch(() => null),
   ]);
 
   const geminiHistory = trimHistory(messagesToHistory(history.slice(0, -1)), 20);
@@ -590,6 +594,12 @@ async function processInboundUserInner(
   // voltar numa farmácia específica (message_supplier), reportar honesto e não alucinar.
   if (orderState) {
     systemPrompt += `\n\n${buildOrderStateBlock(orderState)}`;
+  }
+
+  // Estado da CONSULTA ativa (espelho do de farmácia) — dá o anchor pra Xarlote não confundir
+  // "insiste em marcar [consulta]" com pedido de remédio, e saber usar nudge_consultation.
+  if (consultStateBlock) {
+    systemPrompt += `\n\n${consultStateBlock}`;
   }
 
   // 9. Build user message — texto, áudio (transcrito), imagem (multimodal vision), localização.
