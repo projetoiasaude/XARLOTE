@@ -961,6 +961,11 @@ async function handleStartPharmacyOrder(
   // Marca o pedido como criado NESTE turno → cancel_order não pode cancelá-lo (HIGH-1).
   ctx.ordersCreatedThisTurn?.add(order.id as string);
 
+  // Loop ReAct: o pedido JÁ nasceu e o paciente JÁ foi avisado da busca. Sem esta nota o
+  // modelo re-chamava start_pharmacy_order ou prometia preço que ainda não existe.
+  if (ctx.observation) {
+    ctx.observation.note = `Pedido ${order.id.slice(0, 8)} criado e busca de farmácias INICIADA (o paciente já foi avisado). As cotações chegam de forma assíncrona — você AINDA NÃO tem preço nenhum. Não invente valores nem prometa prazo.`;
+  }
   await startPharmacyDiscovery(order.id, lat, lng, args.items, deliveryAddress, args.payment_method ?? null, ctx, Array.isArray(args.preferred_pharmacy_names) ? args.preferred_pharmacy_names : []);
 }
 
@@ -1488,6 +1493,7 @@ async function handleGetOrderStatus(ctx: ToolContext) {
       'No momento não tem nenhum pedido em andamento aqui 💙 É só me falar o medicamento e o endereço que eu cuido pra você.',
       ctx.traceId,
     );
+    if (ctx.observation) ctx.observation.note = 'NÃO existe pedido ativo nas últimas 24h. Você já avisou o paciente e se ofereceu pra começar um.';
     return;
   }
 
@@ -1500,10 +1506,16 @@ async function handleGetOrderStatus(ctx: ToolContext) {
       'Esse pedido não fechou — nenhuma farmácia deu certo dessa vez 😔 Quer que eu volte em alguma que respondeu ou procure num raio maior?',
       ctx.traceId,
     );
+    if (ctx.observation) ctx.observation.note = 'O pedido mais recente FALHOU (nenhuma farmácia fechou). Você já foi honesta com o paciente e ofereceu re-engajar ou ampliar o raio. NUNCA diga que ele está confirmado.';
     return;
   }
 
   await sendCurrentOrderStatus(order.id, ctx.conversationId, ctx.phoneE164, ctx.traceId);
+  // Loop ReAct: o status real vai pro MODELO, não só pro paciente. Sem isto ela "consultava"
+  // o pedido e continuava chutando o estado dele na frase seguinte.
+  if (ctx.observation) {
+    ctx.observation.note = `Pedido ${order.id.slice(0, 8)} está em "${order.status}". O status detalhado JÁ foi enviado ao paciente — não repita, apenas complemente se tiver algo novo.`;
+  }
 }
 
 /**
@@ -1793,6 +1805,11 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
   // tool) que autoriza a Xarlote a dizer "falei com a farmácia" — incidente Vadivino 17/07:
   // 15 message_supplier, 0 envios, e ela afirmou "Falei com as 5 redes".
   if (ctx.turnFlags) ctx.turnFlags.supplierMessaged = true;
+  // Loop ReAct: o modelo precisa saber PRA QUEM foi e que já foi — senão, ao ver o turno de
+  // novo, ele "reforça" mandando uma SEGUNDA mensagem real pra mesma farmácia.
+  if (ctx.observation) {
+    ctx.observation.note = `Mensagem REALMENTE enviada para ${target.supplierName}. Não envie de novo nesta conversa; agora é aguardar a resposta deles.`;
+  }
 
   await writeLog('info', 'order', `message_supplier → ${target.supplierName} (re-engajamento dirigido)`, {
     traceId: ctx.traceId, orderId: state.orderId, quoteId: target.quoteId, revived: revivedTerminal,
@@ -2054,6 +2071,13 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
     }
   }
 
+  // Loop ReAct: 0 cancelados é um resultado REAL e o modelo precisa vê-lo — senão ele diz
+  // "cancelei" pra um lembrete que continua ativo e vai disparar de novo amanhã.
+  if (ctx.observation) {
+    ctx.observation.note = count > 0
+      ? `${count} lembrete(s) cancelado(s) de verdade.`
+      : `NENHUM lembrete foi cancelado (nada casou com "${args.all ? '*' : q}"). NÃO diga que cancelou. O paciente já recebeu a lista dos ativos pra escolher.`;
+  }
   await writeLog('info', 'tool', `cancel_reminders: ${count} lembrete(s) cancelado(s) (query="${args.all ? '*' : q}")`, {
     traceId: ctx.traceId, userId: ctx.userId,
   });
@@ -2294,6 +2318,11 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
       'Só me confirma o número (ou quadra/lote e complemento) do endereço pra eu passar certinho pra entrega 💙', ctx.traceId);
   }
 
+  // Loop ReAct: o fechamento é IRREVERSÍVEL (a farmácia já foi avisada e vai despachar).
+  // O modelo precisa ver isso pra nunca re-confirmar nem prometer algo fora do combinado.
+  if (ctx.observation) {
+    ctx.observation.note = `Pedido FECHADO com ${supplierName} (handed_off) — a farmácia já recebeu o pedido. NÃO confirme de novo. Daqui pra frente é acompanhamento de entrega.`;
+  }
   await writeLog('info', 'order', `Pedido finalizado — handed_off para ${supplierName}`, {
     traceId: ctx.traceId, orderId: args.order_id, quoteId: args.quote_id,
   });
