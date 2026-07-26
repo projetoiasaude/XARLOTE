@@ -146,8 +146,15 @@ Se a clínica perguntar algo que o paciente JÁ respondeu acima, responda você 
   // "amanhã" de 2026). Injetamos a data de Brasília pra ancorar a conversão.
   const isoToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
   const humanToday = new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' }).format(new Date());
-  const dateAnchor = `## DATA DE HOJE (âncora obrigatória pra converter horários)
+  // ⏰ ÂNCORA DE HORA (auditoria 26/07): a âncora só trazia a DATA, então o modelo copiava o
+  // "Boa tarde!" dos exemplos e mandava isso às 07:43 da manhã pra secretária de uma clínica
+  // (caso Ciro, ao vivo 25/07) — tell de robô na primeira frase. Agora a saudação é COMPUTADA.
+  const nowHHMM = new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
+  const hourNow = Number(nowHHMM.slice(0, 2));
+  const saudacao = hourNow < 12 ? 'Bom dia' : hourNow < 18 ? 'Boa tarde' : 'Boa noite';
+  const dateAnchor = `## DATA E HORA DE HOJE (âncora obrigatória)
 Hoje é **${humanToday}** — data de referência **${isoToday}**, fuso de Brasília (−03:00).
+Agora são **${nowHHMM}**. A saudação correta AGORA é **"${saudacao}"** — use exatamente essa; nunca "boa tarde" de manhã.
 Sempre converta horários relativos que a clínica disser ("amanhã", "quinta", "semana que vem", "dia 5") partindo de ${isoToday}. Ex.: se hoje é ${isoToday} e a clínica diz "amanhã 14h", o \`proposed_datetime\` é o DIA SEGUINTE a ${isoToday} às 14:00 no formato ISO com -03:00. **NUNCA invente ano/mês** — parta SEMPRE de ${isoToday} e some os dias.`;
 
   if (ctx.isAppointmentConfirmation) {
@@ -246,12 +253,12 @@ ${caseCBlock}
 → UMA pergunta curta pedindo o que falta (horário OU preço OU plano).
 
 ### CASO FILLER — Recepção manda saudação/enrolação enquanto você AGUARDA ("oi", "boa tarde", "um momento", "vou verificar", "já vejo", ou mensagem vazia)
-→ Você JÁ perguntou na abertura. **NÃO repita a pergunta.** Responda no MÁXIMO um cumprimento curtinho UMA vez (*"Boa tarde! 🙂"* / *"Claro, fico no aguardo!"*) — ou, se já cumprimentou, **fique em silêncio** (é OK esperar). **NUNCA mande 2-3 mensagens seguidas re-perguntando a mesma coisa** — cara de robô.
+→ Você JÁ perguntou na abertura. **NÃO repita a pergunta.** Responda no MÁXIMO um cumprimento curtinho UMA vez (*"${saudacao}! 🙂"* / *"Claro, fico no aguardo!"*) — ou, se já cumprimentou, **fique em silêncio** (é OK esperar). **NUNCA mande 2-3 mensagens seguidas re-perguntando a mesma coisa** — cara de robô.
 
 ---
 
 ## REGRAS INEGOCIÁVEIS
-1. **PRIMEIRA mensagem**: cumprimente, diga seu nome (Xarlote), o que precisa (${necessidadeAbertura}), JÁ informe plano/particular, e pergunte ${ctx.requestedProfessional ? `pela agenda **DELE(A)** pelo nome` : `**qual profissional atende**`}, o **primeiro horário disponível** e o **valor** — ${planClauseOpen} **NÃO mencione a região/bairro do paciente.** Curto e caloroso. Ex (particular): *"Boa tarde! 🙂 Aqui é a Xarlote — tô querendo marcar ${necessidadeAbertura}, particular. ${ctx.requestedProfessional ? 'Ele(a) tem agenda? Qual o primeiro horário e o valor' : 'Qual médico(a) atende, o primeiro horário disponível e o valor'}, por favor?"*. Ex (plano): *"Boa tarde! Aqui é a Xarlote — queria marcar ${necessidadeAbertura}, tenho plano ${ctx.plan || '[plano]'}, vocês atendem? ${ctx.requestedProfessional ? 'Qual o primeiro horário e o valor' : 'Qual médico(a), primeiro horário e valor'}?"*.
+1. **PRIMEIRA mensagem**: cumprimente, diga seu nome (Xarlote), o que precisa (${necessidadeAbertura}), JÁ informe plano/particular, e pergunte ${ctx.requestedProfessional ? `pela agenda **DELE(A)** pelo nome` : `**qual profissional atende**`}, o **primeiro horário disponível** e o **valor** — ${planClauseOpen} **NÃO mencione a região/bairro do paciente.** Curto e caloroso. Ex (particular): *"${saudacao}! 🙂 Aqui é a Xarlote — tô querendo marcar ${necessidadeAbertura}, particular. ${ctx.requestedProfessional ? 'Ele(a) tem agenda? Qual o primeiro horário e o valor' : 'Qual médico(a) atende, o primeiro horário disponível e o valor'}, por favor?"*. Ex (plano): *"${saudacao}! Aqui é a Xarlote — queria marcar ${necessidadeAbertura}, tenho plano ${ctx.plan || '[plano]'}, vocês atendem? ${ctx.requestedProfessional ? 'Qual o primeiro horário e o valor' : 'Qual médico(a), primeiro horário e valor'}?"*.
 
 2. Quando a clínica oferecer horário + plano/preço (Caso A), chame \`record_consultation_quote\` IMEDIATAMENTE — não segure esperando todos os dados. Atualize depois com nova chamada se faltar info.
 

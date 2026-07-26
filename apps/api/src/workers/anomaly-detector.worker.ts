@@ -281,11 +281,77 @@ async function detectBrokenOutboundContent(): Promise<void> {
   } catch {}
 }
 
+/**
+ * 💊 LEMBRETE CRÍTICO NÃO ENTREGUE (auditoria 26/07 — casos Arthur e Antônia).
+ *
+ * O evento `reminder.wa_window_closed` existia desde 13/07 e NUNCA teve consumidor: 50
+ * lembretes morreram em 3 dias — incluindo 100% do anti-hipertensivo do Arthur (Neblock
+ * 5mg) — sem UM alerta. O paciente some, a janela de 24h fecha, o template entra em
+ * cooldown e o remédio simplesmente evapora, em silêncio, para sempre.
+ *
+ * Alerta só o que exige AÇÃO HUMANA: medicação/consulta (payload.critical) que não está
+ * em re-tentativa. Água/exercício bloqueado é ruído — não acorda ninguém às 3h.
+ */
+/**
+ * Cooldown PRÓPRIO deste alerta. O throttle do telegram-alerter é de 60s — inútil pra um
+ * detector que roda a cada 10min. Sem isto, um paciente mudo com 3 remédios/dia geraria
+ * alerta a cada disparo bloqueado e o canal viraria ruído.
+ */
+let lastUndeliveredAlertMs = 0;
+const UNDELIVERED_ALERT_COOLDOWN_MS = 3 * 60 * 60_000;
+
+async function detectUndeliveredCriticalReminders(): Promise<void> {
+  try {
+    if (Date.now() - lastUndeliveredAlertMs < UNDELIVERED_ALERT_COOLDOWN_MS) return;
+    // Janela = o próprio intervalo do detector (10min). Com janela de 60min o mesmo evento
+    // era recontado 6× e gerava 6 alertas idênticos — e `severity:'critical'` PULA o throttle
+    // do telegram-alerter, então o throttleKey não segurava nada. Um paciente mudo com 3
+    // remédios/dia geraria ~18 alertas/dia e o canal viraria ruído (aí ninguém vê o que importa).
+    const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
+    const { data, count } = await db
+      .from('event_log')
+      .select('user_id, payload', { count: 'exact' })
+      .eq('event_name', 'reminder.wa_window_closed')
+      .eq('payload->>critical', 'true')
+      // `neq` DESCARTA linha com chave ausente (NULL não é ≠ 'true' em SQL) — o `or` com
+      // `is.null` cobre eventos gravados antes deste campo existir.
+      .or('payload->>retrying.is.null,payload->>retrying.neq.true')
+      .gte('occurred_at', cutoff)
+      .limit(200);
+    const n = count ?? 0;
+    if (n > 0) {
+      const sample = data ?? [];
+      const affected = new Set(sample.map((r) => String(r.user_id))).size;
+      const maxSilent = Math.max(
+        0,
+        ...sample.map((r) => Number((r.payload as Record<string, unknown> | null)?.['silent_days']) || 0),
+      );
+      // `count` é o TOTAL (PostgREST ignora o limit na contagem); `sample` é o que veio.
+      const affectedLabel = n > sample.length ? `${affected}+` : String(affected);
+      await sendTelegramAlert({
+        title: '💊 Remédio/consulta NÃO entregue (janela fechada)',
+        body: `${n} lembrete(s) CRÍTICO(s) de ${affectedLabel} paciente(s) não chegaram nos últimos 10min — janela de 24h fechada e template em cooldown. Silêncio máximo: ${maxSilent}d. Esses pacientes estão sem lembrete de medicação; pode exigir contato humano.`,
+        // 'high' (não 'critical') DE PROPÓSITO: é o que ativa o throttle por chave no
+        // telegram-alerter. Um alerta que floda é um alerta que ninguém lê.
+        severity: 'high',
+        throttleKey: 'undelivered_critical_reminders',
+      });
+      lastUndeliveredAlertMs = Date.now();
+      await writeEvent({
+        eventName: 'anomaly.undelivered_critical_reminders',
+        severity: 'critical',
+        payload: { count: n, users_affected: affected, max_silent_days: maxSilent },
+      });
+    }
+  } catch {}
+}
+
 async function runOnce(): Promise<void> {
   try {
     await Promise.all([
       detectUntreatedRedFlags(),
       detectToolFailureSpike(),
+      detectUndeliveredCriticalReminders(),
       detectLLMLatencyDegradation(),
       detectStuckConversations(),
       detectOrderFailureRate(),

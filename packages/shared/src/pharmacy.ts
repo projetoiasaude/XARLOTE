@@ -195,10 +195,29 @@ export function mentionsFreeShipping(text: string | null | undefined): boolean {
  *   • resposta com preço    → repassa e oferece fechar
  *   • proposta/condição     → repassa e oferece seguir ou ver outra
  */
-export function formatSupplierRelayToUser(supplierName: string, rawText: string): string {
+export function formatSupplierRelayToUser(
+  supplierName: string,
+  rawText: string,
+  opts: { paraphrase?: boolean } = {},
+): string {
   const t = (rawText ?? '').trim();
   const snippet = t.length > 200 ? `${t.slice(0, 200).trim()}…` : t;
   const low = t.toLowerCase();
+
+  // 🚫 CITAÇÃO FABRICADA (auditoria 26/07 — caso Ciro/Dr. Rafael, ao vivo 25/07).
+  // Os formatos abaixo põem o texto entre ASPAS depois de `A {nome} respondeu:` — ou seja,
+  // atribuem ao estabelecimento uma fala LITERAL. Isso só é honesto quando `rawText` é MESMO
+  // a mensagem crua recebida. Quando o texto é AUTORAL do LLM (o arg `question` do
+  // `request_clarification` — "Pergunta a fazer ao paciente"), citar é FABRICAR. Foi o que
+  // saiu ao paciente em 25/07:
+  //     A clínica respondeu: "A clínica perguntou a idade do paciente. Ciro, qual a sua idade?…"
+  // …quando a clínica só disse "Qual a idade do paciente por favor".
+  // O CALLER declara a procedência: quem tem paráfrase passa `paraphrase: true`.
+  if (opts.paraphrase) {
+    const nameKey = supplierName.trim().toLowerCase().slice(0, 12);
+    const alreadyNames = nameKey.length >= 4 && low.includes(nameKey);
+    return alreadyNames ? t : `Sobre a *${supplierName}*: ${t}`;
+  }
   const hasPrice = /\$\s?\d|\d+[.,]\d{2}\b|\b\d+\s?(reais|conto)\b/.test(low);
   const isQuestion = /\?\s*$/.test(t) ||
     /\b(qual|quais|quanto|quantos|quantas|prefere|gostaria|aceita|voc[eê]\s+(quer|queria|tem|prefere|gostaria)|me confirma|confirma pra|seria|pode ser|é pra|é para)\b/.test(low);

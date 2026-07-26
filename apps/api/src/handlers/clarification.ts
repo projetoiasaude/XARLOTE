@@ -101,7 +101,9 @@ export async function relaySupplierQuestionToUser(
   }
 
   const supplierName = quote.suppliers?.name ?? 'a farmácia';
-  const msg = formatSupplierRelayToUser(supplierName, question);
+  // `question` é texto AUTORAL do LLM ("Pergunta ao PACIENTE, na linguagem que ele entende"),
+  // NÃO a mensagem crua da farmácia → paráfrase, nunca entre aspas (auditoria 26/07).
+  const msg = formatSupplierRelayToUser(supplierName, question, { paraphrase: true });
   // dedup 90s: a mesma pergunta da mesma farmácia não deve chegar duplicada ao cliente
   // (incidente: "só tem genérico, serve?" saiu 2× em 16s).
   await sendOutbound(order.conversation_id, `+${digits}`, msg, traceId, {}, { dedup: true, dedupWindowMs: 90_000 });
@@ -136,7 +138,9 @@ export async function relayClinicQuestionToUser(
   }
 
   const clinicName = quote.clinics?.name ?? 'a clínica';
-  const msg = formatSupplierRelayToUser(clinicName, question);
+  // Idem clínica: `question` vem do `request_clarification` do agente (texto da Xarlote),
+  // então citá-lo como fala da clínica seria fabricar (caso Ciro 25/07).
+  const msg = formatSupplierRelayToUser(clinicName, question, { paraphrase: true });
   await sendOutbound(consultation.conversation_id, `+${digits}`, msg, traceId, {}, { dedup: true, dedupWindowMs: 90_000 });
   await writeLog('info', 'clarification', `❓ Pergunta da clínica levada ao cliente: "${question.slice(0, 80)}"`, { traceId, quoteId: quote.id });
 }

@@ -14,9 +14,26 @@ export type ChatContent =
   | { type: 'text'; text: string }
   | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } };
 
+/** Tool call na forma do provider (OpenAI/OpenRouter) — usada pra ECOAR de volta no histórico. */
+export interface RawToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+}
+
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string | ChatContent[];
+  /**
+   * `'tool'` fecha o LOOP AGÊNTICO (ReAct): devolve ao modelo o RESULTADO da ferramenta
+   * que ele pediu. Antes de 26/07 este papel não existia — o modelo emitia tool calls e
+   * NUNCA via o que aconteceu, então escrevia a resposta ao paciente descrevendo o que
+   * IMAGINAVA ("já falei com a farmácia" sem ter falado). Era a raiz da "burrice".
+   */
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | ChatContent[] | null;
+  /** Só em `role:'assistant'` — as tool calls que o modelo emitiu naquele passo. */
+  tool_calls?: RawToolCall[];
+  /** Só em `role:'tool'` — id da tool call que este resultado responde. */
+  tool_call_id?: string;
 }
 
 /**
@@ -48,6 +65,12 @@ export interface ToolDefinition {
 }
 
 export interface ToolCall {
+  /**
+   * id do provider — necessário pro round-trip do loop agêntico (o `tool_call_id` da
+   * mensagem de resultado precisa casar com este id). Opcional porque tool calls
+   * FORÇADAS por backstop determinístico são sintetizadas localmente.
+   */
+  id?: string;
   name: string;
   args: Record<string, unknown>;
 }
@@ -55,6 +78,8 @@ export interface ToolCall {
 export interface ChatResponse {
   text: string;
   toolCalls: ToolCall[];
+  /** As tool calls na forma CRUA do provider — pra ecoar no histórico do loop ReAct. */
+  rawToolCalls: RawToolCall[];
   tokensIn: number;
   tokensOut: number;
   /** Tokens de input servidos do CACHE do provider (F2.G3). 0 = sem cache hit. */
@@ -72,6 +97,12 @@ export interface ChatOptions {
   temperature?: number;
   maxOutputTokens?: number;
   timeoutMs?: number;
+  /**
+   * Transcrição do LOOP AGÊNTICO já percorrida neste turno: pares
+   * assistant(tool_calls) → tool(resultado). Anexada DEPOIS da mensagem do usuário, então
+   * o modelo re-decide já ENXERGANDO o que suas ferramentas devolveram.
+   */
+  priorMessages?: ChatMessage[];
 }
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
@@ -93,7 +124,13 @@ const OpenRouterResponseSchema = z
           message: z.object({
             content: z.string().nullish(),
             tool_calls: z
-              .array(z.object({ function: z.object({ name: z.string(), arguments: z.string() }) }))
+              .array(z.object({
+                // id do provider — obrigatório pro round-trip do loop ReAct (o resultado
+                // volta com `tool_call_id` igual). Nullish por robustez: se o provider
+                // omitir, sintetizamos um id local abaixo.
+                id: z.string().nullish(),
+                function: z.object({ name: z.string(), arguments: z.string() }),
+              }))
               .nullish(),
           }),
         }),
@@ -234,13 +271,24 @@ async function callOpenRouter(
   if (!choice) throw new Error('No choices in OpenRouter response');
 
   const validToolNames = (tools ?? []).map((t) => t.function.name);
-  const toolCalls: ToolCall[] = (choice.message.tool_calls ?? []).map((tc) => {
+  const rawToolCalls: RawToolCall[] = [];
+  const toolCalls: ToolCall[] = (choice.message.tool_calls ?? []).map((tc, i) => {
     const resolved = resolveToolName(tc.function.name, validToolNames);
     if (resolved !== tc.function.name) {
       // Observável no Railway sem dependência de db: corrigimos um typo de tool do modelo.
       console.warn(`[llm] tool-name corrigido: "${tc.function.name}" → "${resolved}"`);
     }
+    // id estável pro round-trip. Se o provider omitir, sintetiza — o que importa é que o
+    // `tool_call_id` do resultado case com o id ecoado na mensagem do assistant.
+    // ⚠️ `??` NÃO trata string vazia como nulo — e um provider que devolva `id: ""` faria
+    // duas tool calls compartilharem o mesmo tool_call_id vazio, o que a API rejeita com 400
+    // (e queimaria 3 retries + o breaker global do OpenRouter). Testa o conteúdo, não o nulo.
+    const id = tc.id && tc.id.trim() ? tc.id : `call_${i}_${Date.now().toString(36)}`;
+    // Ecoa com o nome JÁ CORRIGIDO: senão o histórico do loop levaria o typo de volta
+    // ao modelo e ele repetiria o erro na rodada seguinte.
+    rawToolCalls.push({ id, type: 'function', function: { name: resolved, arguments: tc.function.arguments } });
     return {
+      id,
       name: resolved,
       args: (() => { try { return JSON.parse(tc.function.arguments); } catch { return {}; } })(),
     };
@@ -249,6 +297,7 @@ async function callOpenRouter(
   return {
     text: choice.message.content ?? '',
     toolCalls,
+    rawToolCalls,
     tokensIn: data.usage?.prompt_tokens ?? 0,
     tokensOut: data.usage?.completion_tokens ?? 0,
     cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens ?? 0,
@@ -275,6 +324,11 @@ export async function chat(
     messages.push(...opts.history);
   }
   messages.push({ role: 'user', content: userMessage });
+  // Transcrição do loop agêntico deste turno (assistant→tool→assistant→…). Vem DEPOIS da
+  // mensagem do usuário: é o que o modelo já tentou e o que as ferramentas responderam.
+  if (opts.priorMessages?.length) {
+    messages.push(...opts.priorMessages);
+  }
 
   // F2.F5: breaker do OpenRouter. Envolve CADA tentativa (não só o chat inteiro),
   // então o circuito abre RÁPIDO numa queda sustentada (~5 tentativas falhas) e as

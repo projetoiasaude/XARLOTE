@@ -326,6 +326,7 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   let appointmentConfirmed = false;  // record_appointment_confirmation
   let clarificationRequested = false; // request_clarification (levou pergunta ao paciente)
   let singleTargetDeadEnd = false;   // alvo único deu beco sem saída → paciente avisado, clínica recebe cortesia
+  let repliedToClinic = false;       // já mandamos algo à clínica dentro do loop de tools (não duplicar no passo 9)
 
   for (const tc of llmResponse.toolCalls) {
     switch (tc.name) {
@@ -345,7 +346,21 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
 
         const proposedISO = safeParseISO(a.proposed_datetime);
         if (!proposedISO) {
-          await writeLog('warn', 'consultation_quote', `proposed_datetime inválido: "${a.proposed_datetime}"`, { traceId });
+          // 🛟 NÃO DESCARTA MAIS EM SILÊNCIO (auditoria 26/07). O `break` mudo era grave: a
+          // oferta REAL da clínica evaporava (sem quote gravada, `countRealReplies` nunca
+          // contava), o paciente nunca via, a consulta caminhava pro fail de 6h — e a clínica
+          // ficava sem resposta nenhuma, porque nem o fallback de texto era acionado
+          // (`toolCalls.length !== 0`). Visto em prod: `proposed_datetime inválido: "undefined"`.
+          // Agora: sobe pra error (acionável, com ids) e PERGUNTA o horário à recepção, que é
+          // exatamente o que um humano faria ao receber preço sem data.
+          await writeLog('error', 'consultation_quote', `proposed_datetime ausente/inválido: "${a.proposed_datetime}" — perguntando o horário à clínica em vez de descartar a oferta`, {
+            traceId, quoteId: quote.id, consultationId: quote.consultation_id,
+          });
+          const askSlot = a.price_brl
+            ? `Perfeito, obrigada! E qual seria o primeiro horário disponível?`
+            : `Obrigada! E qual o primeiro horário disponível e o valor da consulta?`;
+          await sendOutboundToClinic(conversationId, clinicPhone, askSlot, traceId);
+          repliedToClinic = true; // já falamos com a clínica: não duplicar cortesia no passo 9
           break;
         }
         quoteRecorded = true;
@@ -419,13 +434,26 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
         });
 
         const clinic = quote.clinics as { name?: string } | null;
-        await notifyUserConsultationQuoteArrived(
-          quote.consultation_id,
-          clinic?.name ?? 'clínica',
-          traceId,
-        ).catch((e) =>
-          writeLog('warn', 'consultation', `Falha ao notificar paciente: ${String(e)}`, { traceId }),
-        );
+        // 🔀 GATE DE CLARIFICAÇÃO SEM CORRIDA (auditoria 26/07 — caso Ciro, 12:26 do dia 25/07).
+        // Quando o modelo emite `record_consultation_quote` E `request_clarification` no MESMO
+        // turno, cada case mandava a sua mensagem: o paciente recebia o CARD de horário e, no
+        // mesmo minuto, o relay da pergunta — sobre o mesmo assunto. O gate existente
+        // (hasPendingClinicClarification) perdia a corrida porque a quote é a PRIMEIRA da lista
+        // de tools e a clarificação só é marcada depois. Pré-varremos o turno: se há pergunta
+        // pendente, a oferta é gravada mas o aviso ESPERA — quando o paciente responder, a
+        // consolidação apresenta o card já com o dado resolvido.
+        const clarificationInSameTurn = llmResponse.toolCalls.some((t) => t.name === 'request_clarification');
+        if (clarificationInSameTurn) {
+          await writeLog('info', 'consultation', 'Oferta registrada, aviso ao paciente ADIADO — há pergunta da clínica no mesmo turno (evita mensagem dupla)', { traceId, quoteId: quote.id });
+        } else {
+          await notifyUserConsultationQuoteArrived(
+            quote.consultation_id,
+            clinic?.name ?? 'clínica',
+            traceId,
+          ).catch((e) =>
+            writeLog('warn', 'consultation', `Falha ao notificar paciente: ${String(e)}`, { traceId }),
+          );
+        }
 
         shouldFinalize = true;
         outcome = 'offered';
@@ -561,7 +589,11 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   // ALVO ÚNICO num beco sem saída: a clínica ENGAJOU — não a deixa no vácuo. Manda cortesia
   // de encerramento (o paciente já foi avisado com honestidade em outro canal).
   const silentOutcome = (outcome === 'unavailable' || outcome === 'timeout') && !singleTargetDeadEnd;
-  if (llmResponse.text.trim() && !silentOutcome) {
+  if (repliedToClinic) {
+    // Já respondemos dentro do loop de tools (ex.: perguntamos o horário que faltava) —
+    // mandar a cortesia genérica agora seria mensagem dupla pra recepção.
+    await writeLog('info', 'agent-clinic', 'Resposta à clínica já enviada no loop de tools — pulando o passo 9', { traceId, conversationId });
+  } else if (llmResponse.text.trim() && !silentOutcome) {
     await sendOutboundToClinic(conversationId, clinicPhone, llmResponse.text.trim(), traceId);
   } else if (!llmResponse.text.trim() && !silentOutcome && (quoteRecorded || appointmentConfirmed || clarificationRequested || singleTargetDeadEnd)) {
     // FALLBACK DETERMINÍSTICO (paridade c/ farmácia): o gpt-4.1-mini às vezes chama
@@ -573,7 +605,17 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     await sendOutboundToClinic(conversationId, clinicPhone, fallbackMsg, traceId);
     await writeLog('info', 'agent-clinic', 'Resposta determinística à clínica (LLM não gerou texto)', { traceId, conversationId, quoteRecorded, appointmentConfirmed, clarificationRequested, singleTargetDeadEnd });
   } else if (!llmResponse.text.trim() && !shouldFinalize && llmResponse.toolCalls.length === 0) {
-    await writeLog('warn', 'agent-clinic', 'Agente clínica retornou resposta vazia', { traceId, conversationId });
+    // 🛟 PARIDADE COM A FARMÁCIA (auditoria 26/07). Antes isto SÓ logava: o modelo voltava
+    // vazio (sem texto e sem tool) e a recepção — que acabou de escrever — ficava no vácuo,
+    // exatamente o comportamento que faz um humano concluir "é robô / desistiu". A farmácia
+    // já tratava esse caso; a clínica não. Agora nunca deixamos a clínica sem resposta.
+    await writeLog('warn', 'agent-clinic', 'Agente clínica retornou resposta vazia — enviando cortesia determinística', { traceId, conversationId });
+    await sendOutboundToClinic(
+      conversationId,
+      clinicPhone,
+      'Perfeito, obrigada! Deixa eu confirmar aqui rapidinho e já te retorno 🙂',
+      traceId,
+    );
   }
 
   // 10. Finaliza se necessário (após cotação ou indisponibilidade)
@@ -678,7 +720,11 @@ export async function initiateClinicNegotiation(opts: {
   const alvoConsulta = ctx.requestedProfessional
     ? `uma consulta com ${ctx.requestedProfessional}`
     : specOpenGeneric ? `uma consulta médica` : `uma consulta de ${specOpen}`;
-  const fallbackOpening = `Boa tarde! Aqui é a Xarlote, estou ajudando um paciente a marcar ${alvoConsulta}. ${planClause}${urgencyClause}${modalityClause}Qual o primeiro horário disponível? Obrigada!`;
+  // Saudação pela HORA DE BRASÍLIA (auditoria 26/07): o literal "Boa tarde!" saía às 07:43
+  // da manhã pra recepção — tell de robô logo na primeira frase (caso Ciro, 25/07).
+  const openHour = Number(new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', hour12: false }).format(new Date()));
+  const openGreeting = openHour < 12 ? 'Bom dia' : openHour < 18 ? 'Boa tarde' : 'Boa noite';
+  const fallbackOpening = `${openGreeting}! Aqui é a Xarlote, estou ajudando um paciente a marcar ${alvoConsulta}. ${planClause}${urgencyClause}${modalityClause}Qual o primeiro horário disponível? Obrigada!`;
 
   let opening: string;
   try {

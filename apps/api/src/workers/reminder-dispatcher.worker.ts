@@ -19,7 +19,44 @@ import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBod
 import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
-import { reengageTemplateEnabled, buildReengageTemplate, reengageReasonForReminder, REENGAGE_REASON_SILENT, reengageIntervalMs } from '../config/template-registry.js';
+import { reengageTemplateEnabled, buildReengageTemplate, reengageReasonForReminder, REENGAGE_REASON_SILENT, reengageIntervalMs, reminderTemplatePriority } from '../config/template-registry.js';
+
+/** One-shot bloqueado re-tenta a cada 20min, no máx 8x (~2h40) antes de desistir com alerta. */
+const ONE_SHOT_RETRY_MS = 20 * 60_000;
+const ONE_SHOT_MAX_ATTEMPTS = 8;
+
+/** Teto de espera pra segurar o template esperando um lembrete crítico do mesmo paciente. */
+const CRITICAL_LOOKAHEAD_CAP_MS = 12 * 60 * 60_000;
+
+/**
+ * Existe um lembrete MAIS CRÍTICO deste paciente vencendo em breve?
+ *
+ * Por que isto existe (review adversarial 26/07): arbitrar só entre os lembretes do MESMO
+ * tick não resolve nada — o tick é de 30 segundos e a água da Antônia (8:00) está 30 MINUTOS
+ * distante do remédio dela (8:30); eles nunca se encontram no mesmo batch. Quem realmente
+ * queima o único template do dia é o COOLDOWN POR TEMPO: a água dispara primeiro, gasta o
+ * template, grava `reengage_template_at`, e meia hora depois o remédio encontra o cooldown
+ * fechado. Resultado real medido: a medicação nunca chegava.
+ *
+ * Então a decisão tem que ser por JANELA DE TEMPO: antes de um lembrete de baixa prioridade
+ * gastar o template, olhamos à frente (até o fim do cooldown, no máx 12h) e, se houver
+ * medicação/consulta vindo, seguramos o slot pra ela.
+ */
+async function criticalReminderComingSoon(userId: string, currentPriority: number, lookaheadMs: number): Promise<boolean> {
+  if (currentPriority >= reminderTemplatePriority('appointment')) return false; // já é crítico
+  const until = new Date(Date.now() + Math.min(lookaheadMs, CRITICAL_LOOKAHEAD_CAP_MS)).toISOString();
+  const { data, error } = await db
+    .from('reminders')
+    .select('id')
+    .eq('user_id', userId)
+    .eq('status', 'pending')
+    .in('type', ['medication', 'appointment'])
+    .lte('next_run_at', until)
+    .limit(1);
+  // Fail-open: erro de query NÃO pode segurar o template (melhor mandar algo que nada).
+  if (error) return false;
+  return (data?.length ?? 0) > 0;
+}
 
 /** A perna do usuário (SARA) é WhatsApp oficial (zpro) → a janela de 24h se aplica? */
 function saraNeedsWabaWindow(): boolean {
@@ -33,17 +70,29 @@ function saraNeedsWabaWindow(): boolean {
  * → texto livre rejeitado marcado como entregue (a mentira que este fix elimina). Review 13/07.
  */
 async function lastUserInboundMs(conversationId: string): Promise<number | null> {
-  const { data } = await db
+  // FILTRO NO SERVIDOR (auditoria 26/07). Antes isto pegava os 10 inbounds mais recentes e
+  // filtrava 'sim-*' EM MEMÓRIA: para quem conversa muito pelo app, os 10 últimos podiam ser
+  // TODOS sintéticos → a função devolvia null mesmo existindo inbound REAL do WhatsApp
+  // recente → janela dada como fechada + silêncio "Infinity" → back-off de 7 dias → 100% dos
+  // lembretes bloqueados. Agora o `not like` roda no Postgres e sempre acha o inbound real.
+  // ⚠️ O `is.null` no OR é OBRIGATÓRIO: 418 inbounds REAIS têm external_id NULL (verificado
+  // em prod 26/07). Em SQL, `NULL LIKE 'sim-%'` é NULL e `NOT NULL` também é NULL (≠ TRUE),
+  // então um `not.like` sozinho DESCARTARIA todos eles — janela sempre "fechada".
+  const { data, error } = await db
     .from('messages')
-    .select('created_at, external_id')
+    .select('created_at')
     .eq('conversation_id', conversationId)
     .eq('direction', 'in')
+    .or('external_id.is.null,external_id.not.like.sim-*') // sintético (app/simulador) não abre a janela
     .order('created_at', { ascending: false })
-    .limit(10);
-  const real = (data ?? []).find((m) => {
-    const ext = (m.external_id as string | null) ?? '';
-    return !ext.startsWith('sim-'); // sintético (app/simulador) não abre a janela WhatsApp
-  });
+    .limit(1);
+  // Falha de query aqui é PERIGOSA e era silenciosa: `data` vinha null → janela dada como
+  // FECHADA pra todo mundo + silêncio "Infinity" → back-off de 7 dias → 100% dos lembretes
+  // bloqueados, sem ninguém saber por quê. Agora vaza pro log (acionável no Railway).
+  if (error) {
+    await writeLog('error', 'reminder', `lastUserInboundMs falhou (${error.message.slice(0, 100)}) — janela será tratada como FECHADA`, {});
+  }
+  const real = (data ?? [])[0];
   return real?.created_at ? new Date(real.created_at as string).getTime() : null;
 }
 
@@ -95,6 +144,31 @@ export async function dispatchReminders(): Promise<void> {
   // paciente bloquear o número (risco de ban). Caso real: Antônia, muda há 5 dias, tem 10
   // lembretes/dia — receberia ~6 templates/dia.
   const reengagedThisTick = new Set<string>(); // no máx 1 check-in de re-engajamento por usuário por tick
+
+  // 🎯 DONO DO SLOT DE TEMPLATE (auditoria 26/07 — caso Arthur/Antônia).
+  // Com a janela fechada só UM template sai por paciente (cooldown pago + anti-ban). Antes o
+  // slot ia pro PRIMEIRO vencido do tick (a query ordena por next_run_at), então a "água das
+  // 8h" da Antônia consumia o template e os 9 lembretes restantes — incluindo REMÉDIO — eram
+  // descartados. O Arthur (Neblock 5mg, anti-hipertensivo) ficou 2 dias sem NADA.
+  // Agora o slot é reservado, POR USUÁRIO, pro lembrete mais crítico do tick
+  // (medicação > consulta > sono > resto; empate = o mais antigo).
+  const templateOwner = new Map<string, string>(); // user_id → reminder_id dono do slot
+  {
+    const best = new Map<string, { id: string; prio: number; at: number }>();
+    for (const r of due as unknown as DueReminder[]) {
+      const prio = reminderTemplatePriority(r.type);
+      const at = new Date(r.next_run_at).getTime();
+      const cur = best.get(r.user_id);
+      if (!cur || prio > cur.prio || (prio === cur.prio && at < cur.at)) {
+        best.set(r.user_id, { id: r.id, prio, at });
+      }
+    }
+    for (const [uid, b] of best) templateOwner.set(uid, b.id);
+  }
+  /** Libera o slot quando o dono é pulado (staleness/cap/condicional) — senão ninguém usa. */
+  const releaseTemplateSlot = (userId: string, reminderId: string) => {
+    if (templateOwner.get(userId) === reminderId) templateOwner.delete(userId);
+  };
   // GUARD DE TICK (auditoria 20/07): no máx 1 template de re-engajamento por usuário por tick.
   // Sem isto, dois lembretes do MESMO usuário vencidos no mesmo tick (ex.: 8h + 8h30 no backlog)
   // — ambos com snapshot STALE de reengage_template_at — disparariam DOIS templates. É o mesmo
@@ -141,6 +215,7 @@ export async function dispatchReminders(): Promise<void> {
     // atrasado ainda envia (é a única chance dele).
     const lateMs = now.getTime() - new Date(reminder.next_run_at).getTime();
     if (reminder.rrule && lateMs > STALE_MS) {
+      releaseTemplateSlot(reminder.user_id, reminder.id); // dono pulado → libera pro próximo
       await writeLog('warn', 'reminder', `lembrete recorrente pulado — atrasado ${Math.round(lateMs / 60000)}min (aguarda próxima ocorrência)`, {});
       continue;
     }
@@ -191,6 +266,7 @@ export async function dispatchReminders(): Promise<void> {
       const afterLastRun = !primary?.last_run_at
         || (!!primary?.last_confirmed_at && new Date(primary.last_confirmed_at).getTime() >= new Date(primary.last_run_at).getTime());
       if (confirmedToday && afterLastRun) {
+        releaseTemplateSlot(reminder.user_id, reminder.id);
         await writeLog('info', 'reminder', `backup condicional pulado — primário confirmado hoje ("${reminder.title}")`, {});
         continue; // claim JÁ avançou next_run_at → recorrência intacta, sem loop
       }
@@ -236,6 +312,7 @@ export async function dispatchReminders(): Promise<void> {
         // fail-open deliberado (melhor lembrar demais que calar remédio) — mas NUNCA mudo.
         await writeLog('warn', 'reminder', `cap: query do event_log falhou (${capErr.message.slice(0, 80)}) — fail-open, enviando`, {});
       } else if ((sent24h ?? 0) >= cap) {
+        releaseTemplateSlot(reminder.user_id, reminder.id);
         await writeLog('warn', 'reminder', `cap diário atingido (${sent24h}/${cap} em 24h) — "${reminder.title}" pulado (ocorrência consumida)`, {});
         void writeEvent({
           eventName: 'reminder.capped',
@@ -261,6 +338,13 @@ export async function dispatchReminders(): Promise<void> {
         pushCapReached = (allDispatched ?? 0) >= cap;
       }
     }
+
+    // Re-tentativa de one-shot bloqueado? (ver RESGATE mais abaixo). Numa re-tentativa o
+    // espelho no app JÁ existe da 1ª passada — não duplicamos linha nem push, e não
+    // recontamos o disparo. Sem isto, 8 tentativas = 8 mensagens-fantasma no dashboard e o
+    // cap de push do paciente estourava com eventos que ninguém recebeu.
+    const prevAttempts = Number((reminder.payload as { delivery_attempts?: unknown } | null)?.delivery_attempts) || 0;
+    const isRetryPass = !reminder.rrule && prevAttempts > 0;
 
     const name = user.preferred_name ?? 'você';
     // body:"" (string vazia que a LLM às vezes manda) NÃO é null → `?? fallback`
@@ -304,7 +388,7 @@ export async function dispatchReminders(): Promise<void> {
     // entregues em 17–19/07 (incl. o anti-hipertensivo do Arthur) apareciam no dashboard
     // como se tivessem sido enviados, e ninguém tinha como ver.
     let mirroredMessageId: string | null = null;
-    if (conv) {
+    if (conv && !isRetryPass) {
       const { data: mirrored } = await db.from('messages').insert({
         conversation_id: conv.id,
         direction: 'out',
@@ -335,12 +419,36 @@ export async function dispatchReminders(): Promise<void> {
     // 2 semanas → semanal. + guard de tick (não 2 templates no mesmo tick pro mesmo user).
     const uMeta = (user.metadata ?? {}) as Record<string, unknown> & { reengage_template_at?: string };
     const lastTplMs = uMeta.reengage_template_at ? new Date(uMeta.reengage_template_at).getTime() : 0;
-    const reengageTplAllowed =
-      now.getTime() - lastTplMs >= reengageIntervalMs(windowSilentMs) && !templateSentThisTick.has(reminder.user_id);
+    // Três condições pro template: (1) cooldown por tempo vencido; (2) nenhum template já
+    // saiu neste tick pro paciente; (3) ser o dono do slot no tick (desempate barato).
+    const cooldownMs = reengageIntervalMs(windowSilentMs);
+    let reengageTplAllowed =
+      now.getTime() - lastTplMs >= cooldownMs
+      && !templateSentThisTick.has(reminder.user_id)
+      && (templateOwner.get(reminder.user_id) ?? reminder.id) === reminder.id;
+
+    // (4) E o mais importante: um lembrete de BAIXA prioridade cede o template quando há
+    // medicação/consulta vindo dentro da janela de cooldown (ver criticalReminderComingSoon).
+    // É esta checagem — não a do tick — que impede a água das 8h de queimar o template que o
+    // anti-hipertensivo das 8h30 precisa.
+    if (reengageTplAllowed && needsWindow && !windowOpen) {
+      const yieldToCritical = await criticalReminderComingSoon(
+        reminder.user_id,
+        reminderTemplatePriority(reminder.type),
+        cooldownMs,
+      );
+      if (yieldToCritical) {
+        reengageTplAllowed = false;
+        await writeLog('info', 'reminder', `template SEGURADO — "${reminder.title}" (${reminder.type}) cede o slot pra um lembrete de medicação/consulta vindo dentro da janela de cooldown`, {});
+      }
+    }
 
     // 3. WhatsApp real, SEMPRE pela fila (rate-limit anti-ban).
     let whatsappDelivered = false;
     let deliveryStatus: 'delivered' | 'window_blocked' | 'suppressed' = 'suppressed';
+    // One-shot que voltou pra fila de re-tentativa (ver RESGATE abaixo): não repete o push
+    // do app a cada tentativa — senão 8 tentativas viram 8 notificações do mesmo aviso.
+    let oneShotRetryAttempt = 0;
     if (!isSimulatorMode()) {
       if (windowOpen) {
         // messageId → o WORKER da fila re-carimba o RESULTADO REAL (delivered/failed) por cima
@@ -355,10 +463,19 @@ export async function dispatchReminders(): Promise<void> {
         // quando o usuário responder, a janela reabre.
         // {{2}} = o MOTIVO real deste lembrete ("Passei só pra te lembrar de tomar o seu
         // Neblock 5mg hoje às 7h…") — o template é o mesmo pra todos os casos, só muda a frase.
-        const hhmm = new Intl.DateTimeFormat('pt-BR', { timeZone: userTz || 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' }).format(now);
+        // Âncora no horário REAL do lembrete (não em `now`): numa re-tentativa de one-shot o
+        // `now` já derivou até ~2h40 e o template diria a hora errada da consulta.
+        const anchorIso = (reminder.payload as { original_run_at?: string } | null)?.original_run_at
+          ?? (reminder.rrule ? now.toISOString() : reminder.next_run_at);
+        const anchorDate = new Date(anchorIso);
+        const hhmm = new Intl.DateTimeFormat('pt-BR', { timeZone: userTz || 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' }).format(anchorDate);
         const [hh, mm] = hhmm.split(':');
         const whenLabel = `hoje às ${mm === '00' ? `${Number(hh)}h` : `${Number(hh)}h${mm}`}`;
-        const tpl = buildReengageTemplate(name.split(' ')[0] ?? name, reengageReasonForReminder(reminder, whenLabel));
+        // Mudo há ≥2 dias → o motivo PEDE resposta (e explica por quê). É isso que reabre a
+        // janela: template do negócio NÃO abre janela de 24h — só a resposta do paciente abre.
+        // Sem esse pedido, o paciente ficava preso recebendo 1 lembrete/dia pra sempre.
+        const silentDays = Number.isFinite(windowSilentMs) ? windowSilentMs / 86_400_000 : 999;
+        const tpl = buildReengageTemplate(name.split(' ')[0] ?? name, reengageReasonForReminder(reminder, whenLabel, silentDays));
         await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text, messageId: mirroredMessageId ?? undefined });
         whatsappDelivered = true;
         deliveryStatus = 'delivered';
@@ -374,11 +491,62 @@ export async function dispatchReminders(): Promise<void> {
         // Honestidade: registra o não-entregue por WhatsApp — visível pro fundador agir.
         deliveryStatus = 'window_blocked';
         await writeLog('warn', 'reminder', `lembrete "${reminder.title}" NÃO entregue por WhatsApp — janela de 24h fechada (usuário mudo) e ${reengageTemplateEnabled() ? 'template em cooldown de re-engajamento (back-off por silêncio)' : 'sem template de re-engajamento aprovado'}`, {});
+
+        // 🛟 RESGATE DO ONE-SHOT (auditoria 26/07). O claim no topo já marcou `status:'sent'`
+        // pra one-shot — mas ele NÃO chegou. Um aviso único (consulta, quimio, exame) marcado
+        // como enviado sem ter sido entregue é perda DEFINITIVA e silenciosa. Reverte pra
+        // pending e re-tenta em 20min (até ONE_SHOT_MAX_ATTEMPTS ≈ 2h40); a janela pode abrir
+        // a qualquer momento (basta o paciente escrever) ou o cooldown do template liberar.
+        // Recorrente NÃO é revertido de propósito: entregar "seu remédio das 8h" às 14h é pior
+        // que não entregar (dose fora de hora) — pra ele o caminho é o template/alerta.
+        let oneShotRetrying = false;
+        if (!reminder.rrule) {
+          const prevPayload = (reminder.payload ?? {}) as Record<string, unknown>;
+          const attempts = prevAttempts + 1;
+          oneShotRetryAttempt = attempts;
+          if (attempts <= ONE_SHOT_MAX_ATTEMPTS) {
+            const { data: reverted } = await db.from('reminders').update({
+              status: 'pending',
+              next_run_at: new Date(now.getTime() + ONE_SHOT_RETRY_MS).toISOString(),
+              payload: {
+                ...prevPayload,
+                delivery_attempts: attempts,
+                // Guarda o horário ORIGINAL na 1ª reversão: o whenLabel do template sai de
+                // `now`, e sem esta âncora a 8ª tentativa (≈2h40 depois) diria "hoje às 16h40"
+                // pra uma consulta das 14h.
+                original_run_at: (prevPayload['original_run_at'] as string | undefined) ?? reminder.next_run_at,
+              },
+            })
+              .eq('id', reminder.id)
+              // Só reverte se o claim AINDA está de pé: se o paciente tocou "concluído"/
+              // "cancelar" no app no meio do tick, não ressuscitamos o lembrete.
+              .eq('status', 'sent')
+              .select('id');
+            oneShotRetrying = Boolean(reverted?.length);
+            if (!oneShotRetrying) {
+              await writeLog('info', 'reminder', `one-shot "${reminder.title}" NÃO revertido — status mudou durante o tick (provável ação do paciente no app)`, {});
+            } else {
+              await writeLog('info', 'reminder', `one-shot "${reminder.title}" bloqueado — re-tentativa ${attempts}/${ONE_SHOT_MAX_ATTEMPTS} em ${ONE_SHOT_RETRY_MS / 60000}min`, {});
+            }
+          } else {
+            await writeLog('error', 'reminder', `one-shot "${reminder.title}" DESISTIDO após ${ONE_SHOT_MAX_ATTEMPTS} tentativas — paciente nunca recebeu (janela fechada)`, {});
+          }
+        }
+
         void writeEvent({
           eventName: 'reminder.wa_window_closed',
           userId: reminder.user_id,
           conversationId: conv?.id,
-          payload: { reminder_id: reminder.id, type: reminder.type },
+          payload: {
+            reminder_id: reminder.id,
+            type: reminder.type,
+            recurring: Boolean(reminder.rrule),
+            // Sinais pro anomaly-detector priorizar: one-shot em retry ainda tem chance;
+            // medicação bloqueada é o que exige ação humana.
+            retrying: oneShotRetrying,
+            critical: reminder.type === 'medication' || reminder.type === 'appointment',
+            silent_days: Number.isFinite(windowSilentMs) ? Math.round(windowSilentMs / 86_400_000) : null,
+          },
         });
       }
     }
@@ -397,7 +565,8 @@ export async function dispatchReminders(): Promise<void> {
     //    não configurado; tokens mortos são limpos. Abre direto no chat.
     try {
       const tokens = await listDeviceTokens(reminder.user_id);
-      if (tokens.length && !pushCapReached) {
+      // Re-tentativa de one-shot (2ª em diante) não repete o push — a 1ª já notificou o app.
+      if (tokens.length && !pushCapReached && oneShotRetryAttempt <= 1) {
         const title = reminder.type === 'medication' ? '💊 Hora do remédio' : 'Xarlote';
         const result = await sendPush(tokens, {
           title,
@@ -414,7 +583,10 @@ export async function dispatchReminders(): Promise<void> {
 
     // AWAIT (não fire-and-forget): o cap do PRÓXIMO lembrete deste tick conta este evento —
     // sem await, 8 lembretes às 8h do mesmo usuário passariam todos antes do 1º ser contado.
-    await writeEvent({
+    // Numa re-tentativa NÃO recontamos o disparo: 8 eventos-fantasma inflavam o dashboard e
+    // estouravam o cap de push do paciente (que conta TODOS os `reminder.dispatched`),
+    // suprimindo o push de água/exercício dele por 24h por causa de um único aviso.
+    if (!isRetryPass) await writeEvent({
       eventName: 'reminder.dispatched',
       userId: reminder.user_id,
       conversationId: conv?.id,
@@ -470,9 +642,19 @@ export async function dispatchReminders(): Promise<void> {
             // cooldown/guard do caminho por-lembrete.)
             const canFreeText = !needsWindow || windowOpen;
             const lastTplMsFresh = meta.reengage_template_at ? new Date(meta.reengage_template_at).getTime() : 0;
+            // O check-in é o texto GENÉRICO ("faz uns dias que a gente não conversa"). Ele
+            // não pode gastar o template que um lembrete de medicação/consulta precisa: antes
+            // deste guard, ele saía no rodapé da iteração de um lembrete de baixa prioridade,
+            // carimbava `reengage_template_at` e o remédio do mesmo paciente ficava sem canal.
+            const criticalWaiting = await criticalReminderComingSoon(
+              reminder.user_id,
+              0, // check-in genérico = prioridade mínima por definição
+              reengageIntervalMs(silentMs),
+            );
             const tplAllowed = !isSimulatorMode() && !canFreeText && reengageTemplateEnabled()
               && now.getTime() - lastTplMsFresh >= reengageIntervalMs(silentMs)
-              && !templateSentThisTick.has(reminder.user_id);
+              && !templateSentThisTick.has(reminder.user_id)
+              && !criticalWaiting;
 
             if (!isSimulatorMode() && !canFreeText && !tplAllowed) {
               // Não dá pra entregar nada novo (fora da janela + template em cooldown): ADIA —

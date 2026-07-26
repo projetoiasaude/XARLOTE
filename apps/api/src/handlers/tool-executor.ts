@@ -91,11 +91,48 @@ interface ToolContext {
    * lugar de "o nome da tool apareceu na lista" (que dava true mesmo em 10 dead-ends).
    */
   turnFlags?: { suppressLlmText: boolean; supplierMessaged?: boolean };
+  /**
+   * OBSERVAÇÃO PRO MODELO (loop ReAct, 26/07). O handler escreve aqui o que o MODELO
+   * precisa saber pra decidir o próximo passo — não é texto pro paciente. Ex.:
+   * "5 farmácias contatadas, aguardando preço". Resetado a cada tool call.
+   */
+  observation?: { note: string | null };
 }
 
-export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<void> {
-  const taskId = await recordTaskStart(tc, ctx);
+/**
+ * Resultado de uma tool call — o que volta ao modelo no loop agêntico.
+ *
+ * Antes de 26/07 `handleToolCall` retornava `void`: o modelo pedia a ferramenta e nunca
+ * sabia se deu certo. Um erro era ENGOLIDO pelo catch e a Xarlote seguia escrevendo ao
+ * paciente como se tivesse funcionado ("já falei com a farmácia"). Agora o erro volta
+ * pro modelo, que pode se corrigir na mesma conversa.
+ */
+export interface ToolResult {
+  ok: boolean;
+  /** Erro real da execução (o modelo PRECISA ver pra mudar de rumo). */
+  error?: string;
+  /** Nota do handler pro modelo (ver ToolContext.observation). */
+  note?: string;
+  /** O handler já respondeu ao paciente sozinho (uma-voz) — não escreva de novo. */
+  spoke?: boolean;
+}
+
+export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<ToolResult> {
+  // recordTaskStart DENTRO de um guard: ele estava fora do try, então uma falha do Supabase
+  // ao inserir em `assistant_tasks` (contabilidade, não a ação) lançava pra fora do handler,
+  // escapava do loop de tools e derrubava o turno INTEIRO — o paciente não recebia nada.
+  // A contabilidade nunca pode matar o atendimento.
+  let taskId = '';
+  try {
+    taskId = await recordTaskStart(tc, ctx);
+  } catch (err) {
+    await writeLog('warn', 'tool', `recordTaskStart falhou (seguindo mesmo assim): ${String(err).slice(0, 120)}`, { traceId: ctx.traceId });
+  }
   const startedAt = Date.now();
+  // Buffer de observação desta chamada (handlers escrevem via ctx.observation.note).
+  const obs: { note: string | null } = { note: null };
+  ctx.observation = obs;
+  const spokeBefore = ctx.turnFlags?.suppressLlmText === true;
 
   try {
     switch (tc.name) {
@@ -207,7 +244,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
       default:
         break;
     }
-    await db.from('assistant_tasks').update({ status: 'success', tool_output: tc.args, completed_at: new Date().toISOString() }).eq('id', taskId);
+    if (taskId) await db.from('assistant_tasks').update({ status: 'success', tool_output: tc.args, completed_at: new Date().toISOString() }).eq('id', taskId);
     await auditToolCall({
       toolName: tc.name,
       userId: ctx.userId,
@@ -217,8 +254,14 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
       result: 'success',
       durationMs: Date.now() - startedAt,
     });
+    return {
+      ok: true,
+      ...(obs.note ? { note: obs.note } : {}),
+      // "Falei com o paciente por conta própria" — o modelo não deve repetir a mensagem.
+      ...(!spokeBefore && ctx.turnFlags?.suppressLlmText === true ? { spoke: true } : {}),
+    };
   } catch (err) {
-    await db.from('assistant_tasks').update({ status: 'error', error: String(err), completed_at: new Date().toISOString() }).eq('id', taskId);
+    if (taskId) await db.from('assistant_tasks').update({ status: 'error', error: String(err), completed_at: new Date().toISOString() }).eq('id', taskId);
     await auditToolCall({
       toolName: tc.name,
       userId: ctx.userId,
@@ -229,6 +272,9 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<vo
       error: String(err).slice(0, 240),
       durationMs: Date.now() - startedAt,
     });
+    // O erro NÃO é mais engolido em silêncio: volta pro modelo no loop agêntico pra ele
+    // corrigir o rumo (ou ser honesto com o paciente) em vez de narrar sucesso inexistente.
+    return { ok: false, error: String(err).slice(0, 240) };
   }
 }
 
@@ -1914,6 +1960,14 @@ async function handleCreateReminder(
     // event_at no payload → o dispatcher re-ancora rows de véspera no disparo também.
     payload: { ...(args.payload ?? {}), ...(eventAt ? { event_at: eventAt } : {}), ...condPayload },
   });
+  if (!insErr) {
+    // Loop ReAct: confirma AO MODELO o que ficou agendado, com a recorrência real. Sem isto
+    // ele só "acha" que criou — e é assim que nascem o lembrete duplicado e o "já agendei"
+    // quando nada foi criado.
+    if (ctx.observation) {
+      ctx.observation.note = `Lembrete criado: "${title}" — ${describeReminder(rrule, firstRun)}. Já está ativo; não crie de novo.`;
+    }
+  }
   if (insErr) {
     // Insert falhou (ex: enum inválido) — o turno da LLM já pode ter dito "agendei".
     // Ser honesto > ficar bonito: avisa que NÃO ficou agendado.
@@ -2029,11 +2083,17 @@ async function handleListReminders(ctx: ToolContext) {
   if (!rows?.length) {
     await sendOutbound(ctx.conversationId, ctx.phoneE164,
       'Você não tem nenhum lembrete ativo no momento 💙 Quer criar algum?', ctx.traceId);
+    // Loop ReAct: o modelo PRECISA saber o que a leitura devolveu — senão ele "consulta" e
+    // segue chutando (era uma tool que só falava com o paciente e não retornava nada a ela).
+    if (ctx.observation) ctx.observation.note = 'Nenhum lembrete ativo. Você já avisou o paciente e ofereceu criar um.';
     return;
   }
   const lines = rows.map((r) => `• *${r.title}* — ${describeReminder(r.rrule, r.next_run_at)}`);
   await sendOutbound(ctx.conversationId, ctx.phoneE164,
     `Seus lembretes ativos 📋\n\n${lines.join('\n')}\n\nQuer mudar ou cancelar algum? É só falar!`, ctx.traceId);
+  if (ctx.observation) {
+    ctx.observation.note = `${rows.length} lembrete(s) ativo(s): ${rows.map((r) => r.title).join('; ')}. A lista JÁ foi enviada ao paciente — não repita.`;
+  }
 }
 
 async function handleConfirmOrder(args: { order_id: string; quote_id: string }, ctx: ToolContext) {

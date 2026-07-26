@@ -140,13 +140,59 @@ export const REENGAGE_REASON_SILENT =
   'Faz uns dias que a gente não conversa e você ficou na minha cabeça. Está tudo bem por aí?';
 
 /**
+ * A partir de quantos dias de silêncio o motivo passa a PEDIR resposta (decisão do
+ * fundador 26/07). Antes de 2 dias a pessoa ainda está "quente" — o lembrete seco basta.
+ */
+export const SILENT_ASK_DAYS = 2;
+
+/**
+ * Prioridade do lembrete na disputa pelo ÚNICO template disponível quando a janela de
+ * 24h está fechada (auditoria 26/07). Antes o slot ia pro PRIMEIRO vencido do tick, então
+ * "beber água às 8h" consumia o template que o anti-hipertensivo das 7h precisava — o
+ * Arthur ficou 2 dias sem NENHUM lembrete do Neblock. Remédio e consulta ganham sempre.
+ */
+export function reminderTemplatePriority(type?: string | null): number {
+  switch (type) {
+    case 'medication': return 3;
+    case 'appointment': return 2;
+    case 'sleep': return 1;
+    default: return 0; // hydration, exercise, custom
+  }
+}
+
+/**
+ * Pedido de resposta ({{2}}, sufixo) pra quem está mudo há ≥ SILENT_ASK_DAYS.
+ *
+ * Por que existe: fora da janela de 24h a Xarlote só entrega UM template por vez — e a
+ * janela só REABRE quando o paciente responde (regra da Meta: template do negócio não
+ * abre janela). Sem resposta, todos os outros lembretes do dia morrem. Então o template
+ * precisa fazer o trabalho de trazer a pessoa de volta, não só avisar.
+ *
+ * Tom: breve e objetivo, explicando em UMA frase por que responder importa (a Xarlote só
+ * consegue acompanhar a adesão se a pessoa confirmar). Nunca culpado, nunca sermão.
+ */
+function replyAskFor(type?: string | null): string {
+  switch (type) {
+    case 'medication':
+      return ' Me responde aqui quando tomar? É assim que eu consigo acompanhar se o tratamento tá em dia.';
+    case 'appointment':
+      return ' Me responde aqui pra eu saber que você viu? Assim eu consigo te acompanhar direito.';
+    default:
+      return ' Me responde aqui, nem que seja um "ok"? Assim eu consigo acompanhar de perto e te ajudar melhor.';
+  }
+}
+
+/**
  * Motivo ({{2}}) a partir de um LEMBRETE que não pôde ser entregue. Frase única, sem
  * saudação (a saudação já está no {{1}}) e sem quebra de linha — no estilo aprovado.
  * `whenLabel` ex.: "hoje às 7h", "amanhã às 16h30".
+ * `silentDays`: dias sem resposta. A partir de SILENT_ASK_DAYS o motivo PEDE resposta
+ * (ver replyAskFor) — sem isso o paciente mudo nunca reabre a janela e perde todo o resto.
  */
 export function reengageReasonForReminder(
   reminder: { type?: string | null; title?: string | null },
   whenLabel?: string | null,
+  silentDays?: number | null,
 ): string {
   const titulo = templateVar(reminder.title ?? '', 90) || 'seu lembrete de saúde';
   const quando = whenLabel ? ` ${templateVar(whenLabel, 40)}` : '';
@@ -154,14 +200,29 @@ export function reengageReasonForReminder(
   // NOME ("Neblock 5mg") OU uma FRASE DE AÇÃO ("Passar remédio nas sobrancelhas") — e
   // "tomar o seu Passar remédio nas sobrancelhas" soa robótico (visto ao vivo 20/07, Antônia).
   // O dois-pontos funciona pros dois casos.
+  let base: string;
   switch (reminder.type) {
     case 'medication':
-      return templateVar(`Passei pra te lembrar do seu remédio${quando}: ${titulo}. Não vale esquecer, tá?`);
+      base = `Passei pra te lembrar do seu remédio${quando}: ${titulo}. Não vale esquecer, tá?`;
+      break;
     case 'appointment':
-      return templateVar(`Passando pra lembrar do seu compromisso${quando}: ${titulo}.`);
+      base = `Passando pra lembrar do seu compromisso${quando}: ${titulo}.`;
+      break;
     default:
-      return templateVar(`Passei pra te lembrar${quando}: ${titulo}.`);
+      base = `Passei pra te lembrar${quando}: ${titulo}.`;
   }
+  // Mudo há ≥2 dias: acrescenta o pedido de resposta (é o que reabre a janela).
+  const ask = (silentDays ?? 0) >= SILENT_ASK_DAYS ? replyAskFor(reminder.type) : '';
+  // O teto da variável é 300 chars. Se o título for longo, o corte cairia EM CIMA do pedido
+  // de resposta ("…se o tratamento tá em d") — justamente a frase que existe pra trazer o
+  // paciente de volta. Então encurtamos o TÍTULO e preservamos o pedido inteiro.
+  const full = `${base}${ask}`;
+  if (ask && full.length > 300) {
+    const room = Math.max(20, titulo.length - (full.length - 300) - 1);
+    const shortTitle = `${titulo.slice(0, room).trimEnd()}…`;
+    return templateVar(`${base.replace(titulo, shortTitle)}${ask}`);
+  }
+  return templateVar(full);
 }
 
 export function buildReengageTemplate(

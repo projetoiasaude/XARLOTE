@@ -13,7 +13,7 @@
  */
 import { db, writeLog, writeAudit, saveMemoryCard } from '@iasaude/db';
 import { findPlacesByTextSearch, getPlacePhone } from '@iasaude/integrations';
-import { toE164BR, isPlaceholderPhone, brPhoneVariants, isServiceNumber, sameMedication, itemDisplayName, type OrderItem } from '@iasaude/shared';
+import { toE164BR, isPlaceholderPhone, brPhoneVariants, isServiceNumber, sameMedication, itemDisplayName, specialtyPhrase, type OrderItem } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
 import { sendOutboundToClinic } from './outbound-agent.js';
@@ -82,6 +82,13 @@ export async function handleFindByName(
   args: { name: string; city?: string; kind?: 'clinic' | 'pharmacy'; specialty?: string },
   ctx: ReachCtx,
 ): Promise<void> {
+  // UMA VOZ (auditoria 26/07 — caso Ciro/Dr. Rafael, ao vivo 25/07): os 3 caminhos deste
+  // handler respondem ao paciente por conta própria, mas ele era o ÚNICO que esquecia de
+  // suprimir o texto do LLM (handleContactEstablishment e handleNudgeConsultation setam).
+  // Resultado visível ao paciente: "Achei o Dr. Rafael… É essa mesma?" (pedindo confirmação)
+  // seguido de "Vou procurar o Dr. Rafael, já vou buscando" (dizendo que já faz) — duas
+  // vozes se contradizendo no mesmo turno.
+  if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
   const name = (args.name ?? '').trim();
   if (!name) {
     await sendOutbound(ctx.conversationId, ctx.phoneE164, 'Me diz o nome do médico ou da clínica que eu procuro 🙂', ctx.traceId);
@@ -131,7 +138,7 @@ export async function handleFindByName(
 
   const cityLabel = candidate.city ? ` em ${candidate.city}` : '';
   await sendOutbound(ctx.conversationId, ctx.phoneE164,
-    `Achei *${candidate.name}*${cityLabel} 📍 e consegui o WhatsApp deles ✅\n\nÉ essa mesma? Se sim, eu já falo com eles${args.specialty ? ` pra ver ${args.specialty}` : ''} 💙`,
+    `Achei *${candidate.name}*${cityLabel} 📍 e consegui o WhatsApp deles ✅\n\nÉ essa mesma? Se sim, eu já falo com eles${specialtyPhrase(args.specialty) ? ` pra ver ${specialtyPhrase(args.specialty)}` : ''} 💙`,
     ctx.traceId);
   await writeLog('info', 'lookup', `Candidato apresentado: ${candidate.name}`, { traceId: ctx.traceId, placeId: candidate.placeId });
 }
@@ -393,7 +400,7 @@ async function contactClinic(phone: string, clinicName: string, specialty: strin
   }
 
   await sendOutbound(ctx.conversationId, ctx.phoneE164,
-    `Show! Já tô falando com *${clinicName}*${professional ? ` pra marcar com ${professional}` : specialty ? ` pra ver ${specialty}` : ''} 🔍 Assim que eles responderem com horário e valor, te aviso 💙`,
+    `Show! Já tô falando com *${clinicName}*${professional ? ` pra marcar com ${professional}` : specialtyPhrase(specialty) ? ` pra ver ${specialtyPhrase(specialty)}` : ''} 🔍 Assim que eles responderem com horário e valor, te aviso 💙`,
     ctx.traceId);
   await writeAudit({
     actorType: 'xarlote', action: 'consultation.targeted_contact', userId: ctx.userId,

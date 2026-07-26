@@ -4,5 +4,6 @@ export * from './circuit-breaker.js';
 export * from './rrule.js';
 export * from './reminder-deictics.js';
 export * from './waba-window.js';
+export * from './specialty.js';
 export * from './phone.js';
 export * from './pharmacy.js';

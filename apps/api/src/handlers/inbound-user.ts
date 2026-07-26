@@ -10,14 +10,38 @@ import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INS
  * um "Ok" solto.
  */
 const BACKSTOP_MAX_PRESENTED_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Teto de rodadas do loop agêntico. 4 cobre o encadeamento real mais longo observado
+ * (buscar → ver resultado → agir → confirmar) sem risco de loop infinito ou latência
+ * absurda pro paciente esperando no WhatsApp.
+ */
+const AGENT_MAX_ROUNDS = 4;
+
+/**
+ * Orçamento de tempo do LOOP inteiro (não por rodada). Sem teto global, 4 rodadas ×
+ * (3 tentativas × 60s de timeout) passariam de 10min e estourariam o TTL do lock de turno
+ * — aí a 2ª mensagem do paciente rodaria EM PARALELO com a 1ª (dupla execução de tool).
+ * 75s deixa folga confortável dentro do TURN_LOCK_TTL_MS.
+ */
+const AGENT_LOOP_BUDGET_MS = 75_000;
+
+/**
+ * Kill-switch do loop agêntico. Default LIGADO — é a correção da cegueira estrutural
+ * (ver o bloco ReAct no turno). `AGENT_LOOP_ENABLED=false` no Railway volta ao
+ * comportamento single-shot antigo NA HORA, sem redeploy, se algo se comportar mal.
+ */
+function agentLoopEnabled(): boolean {
+  return process.env['AGENT_LOOP_ENABLED'] !== 'false';
+}
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard, QuoteOption } from '@iasaude/shared';
-import { chat, buildXarloteSystemPrompt, xarloteTools, messagesToHistory, trimHistory, embed, userContentWithImage, dataUrl, type ChatContent } from '@iasaude/llm';
+import { chat, buildXarloteSystemPrompt, xarloteTools, messagesToHistory, trimHistory, embed, userContentWithImage, dataUrl, type ChatContent, type ChatMessage, type ToolCall } from '@iasaude/llm';
 import { sendMenu, isSimulatorMode, fetchInboundMedia } from '@iasaude/whatsapp';
 import { transcribeAudio } from '@iasaude/integrations';
 import { Queue } from 'bullmq';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutbound, sendOutboundAudio } from './outbound.js';
-import { handleToolCall } from './tool-executor.js';
+import { handleToolCall, type ToolResult } from './tool-executor.js';
 import { saveContactsToMemory } from './reach-out.js';
 import { findPendingClarificationForUser } from './clarification.js';
 import { loadLatestOrderState, buildOrderStateBlock } from './order-state.js';
@@ -50,7 +74,11 @@ export function looksLikeImage(buf: Buffer | null | undefined): boolean {
 const TURN_LOCK_WAIT_MS = 45_000;
 // TTL > pior turno (transcrição 30s + LLM 60s + retry + follow-up ≈ 130s) pra o lock NÃO
 // auto-expirar no meio e deixar um turno concorrente entrar (review H3-ressalva).
-const TURN_LOCK_TTL_MS = 180_000;
+// TTL > pior turno. Com o LOOP AGÊNTICO o turno ganhou rodadas extras (orçamento
+// AGENT_LOOP_BUDGET_MS=75s) além de transcrição, retry de lembrete e narrador — o teto de
+// 180s virou apertado e um lock expirando com o turno vivo faz a próxima mensagem do
+// paciente rodar EM PARALELO (dupla execução de tool). 300s cobre o pior caso com folga.
+const TURN_LOCK_TTL_MS = 300_000;
 
 // Queue pra disparar enricher async — instância única por processo
 const enricherQueue = new Queue(QUEUE_NAMES.PROFILE_ENRICHER, {
@@ -824,15 +852,130 @@ async function processInboundUserInner(
     distressPreempted = true;
   }
 
-  if (llmResponse.toolCalls.length > 0) {
+  // ═══ LOOP AGÊNTICO (ReAct) — a correção da CEGUEIRA ═══════════════════════════════
+  // Antes de 26/07 este bloco era um `for` de uma passada: as tools rodavam, o resultado ia
+  // pro VAZIO (handleToolCall era `void`) e o texto ao paciente já tinha sido escrito NA
+  // MESMA chamada — ou seja, a Xarlote descrevia o que IMAGINAVA que ia acontecer. Daí
+  // "já falei com a farmácia" sem ter falado, contradição no mesmo turno e tool errada sem
+  // chance de correção. Agora: executa → DEVOLVE o resultado ao modelo → ele re-decide
+  // ENXERGANDO o que aconteceu. É a diferença entre narrar e observar.
+  //
+  // Custo: só há rodada extra quando houve tool call (turno de papo puro sai em 1 chamada,
+  // como antes) e o prompt-cache cobre ~99% do input a partir da 2ª. Kill-switch:
+  // AGENT_LOOP_ENABLED=false volta ao comportamento antigo sem redeploy.
+  const EMERGENCY_SKIP_TOOLS = ['message_supplier', 'relay_answer_to_establishment', 'confirm_order_selection', 'start_pharmacy_order', 'expand_pharmacy_search', 'get_order_status', 'contact_establishment', 'find_clinic_by_name', 'start_consultation_search', 'confirm_consultation_selection', 'cancel_order'];
+  const priorMessages: ChatMessage[] = [];
+  // Guarda o `ok` junto: os backstops anti-mentira precisam saber se a tool teve SUCESSO,
+  // não só se foi TENTADA — senão um create_reminder que falhou marca "já chamou a tool" e
+  // o backstop deixa passar a promessa falsa (paciente fica sem o lembrete).
+  const executedToolCalls: Array<ToolCall & { ok: boolean }> = [];
+  // Tools de efeito IRREVERSÍVEL que não podem repetir entre rodadas do loop (o modelo, ao
+  // ver o resultado, tende a "reforçar" a ação). Emergência escalonada 2× liga 2 vezes pro
+  // contato do paciente; message_supplier 2× manda 2 WhatsApps reais pra farmácia.
+  const ONCE_PER_TURN_TOOLS = new Set(['red_flag_check', 'message_supplier', 'send_emergency_orientation']);
+  const alreadyRanThisTurn = new Set<string>();
+  // Orçamento de tempo do turno INTEIRO: sem isto, 4 rodadas × (3 tentativas × 60s) podia
+  // passar de 10min e estourar o TTL do lock de turno (180s) — dois turnos do mesmo paciente
+  // rodariam em paralelo, que é exatamente a corrida que o lock existe pra matar.
+  const agentDeadline = Date.now() + AGENT_LOOP_BUDGET_MS;
+  let agentRounds = 0;
+  let redFlagFiredInLoop = false;
+  let lastNonEmptyRoundText = '';
+
+  for (;;) {
+    agentRounds++;
+    const roundResults: Array<{ tc: ToolCall; res: ToolResult }> = [];
+    let skippedAny = false;
     for (const tc of llmResponse.toolCalls) {
       // Emergência tem precedência: não deixa a conversa de PEDIDO/farmácia sair junto do
       // protocolo de emergência (o usuário não pode ouvir "mandei msg pra farmácia" agora).
-      if (distressPreempted && ['message_supplier', 'relay_answer_to_establishment', 'confirm_order_selection', 'start_pharmacy_order', 'expand_pharmacy_search', 'get_order_status', 'contact_establishment', 'find_clinic_by_name', 'start_consultation_search', 'confirm_consultation_selection', 'cancel_order'].includes(tc.name)) continue;
+      // Vale em TODA rodada — inclusive quando quem disparou a emergência foi o próprio
+      // modelo (aí `distressPreempted` é false, mas `redFlagFiredInLoop` pega).
+      if ((distressPreempted || redFlagFiredInLoop) && EMERGENCY_SKIP_TOOLS.includes(tc.name)) { skippedAny = true; continue; }
+      if (ONCE_PER_TURN_TOOLS.has(tc.name) && alreadyRanThisTurn.has(tc.name)) {
+        await writeLog('warn', 'tool', `Tool ${tc.name} repetida no mesmo turno — IGNORADA (efeito irreversível)`, { traceId });
+        skippedAny = true;
+        continue;
+      }
       await writeLog('info', 'tool', `Tool call: ${tc.name}`, { traceId, args: tc.args });
-      await handleToolCall(tc, turnToolCtx);
+      const res = await handleToolCall(tc, turnToolCtx);
+      alreadyRanThisTurn.add(tc.name);
+      if (tc.name === 'red_flag_check' && res.ok) redFlagFiredInLoop = true;
+      executedToolCalls.push({ ...tc, ok: res.ok });
+      roundResults.push({ tc, res });
     }
+
+    // Continua o loop só se: flag ligada, alguma tool rodou, NENHUMA foi pulada (senão o
+    // transcript teria tool_call sem resultado e a API rejeita o turno inteiro), há orçamento
+    // de rodadas e de tempo, e não estamos em contexto de emergência.
+    const canLoop = agentLoopEnabled()
+      && roundResults.length > 0
+      && !skippedAny
+      && roundResults.length === llmResponse.toolCalls.length
+      && roundResults.every((r) => Boolean(r.tc.id))
+      && agentRounds < AGENT_MAX_ROUNDS
+      && Date.now() < agentDeadline
+      && !distressPreempted
+      && !redFlagFiredInLoop;
+    if (!canLoop) break;
+
+    // Ecoa o passo do assistant + o RESULTADO de cada tool. Regra dura da API: toda
+    // tool_call ecoada PRECISA de uma mensagem `role:'tool'` com o mesmo id.
+    priorMessages.push({ role: 'assistant', content: llmResponse.text || '', tool_calls: llmResponse.rawToolCalls });
+    for (const { tc, res } of roundResults) {
+      priorMessages.push({
+        role: 'tool',
+        tool_call_id: tc.id as string, // garantido pelo `every(r => Boolean(r.tc.id))` acima
+        content: JSON.stringify(res),
+      });
+    }
+
+    // Guarda o melhor texto já visto: modelos costumam devolver `content` vazio na rodada
+    // final (os tool results já disseram tudo). Sem isto, um turno que produziu uma resposta
+    // ótima na rodada 1 cairia no narrador genérico ("Prontinho, já cuidei disso aqui!").
+    if (llmResponse.text.trim()) lastNonEmptyRoundText = llmResponse.text.trim();
+
+    const roundStart = Date.now();
+    try {
+      llmResponse = await chat(userMsgContent, {
+        model,
+        apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
+        systemInstruction: systemPrompt,
+        history: geminiHistory,
+        tools: xarloteTools,
+        temperature: 0.4,
+        maxOutputTokens: 2000,
+        // Rodadas ≥2 têm timeout CURTO: o paciente já está esperando desde a rodada 1 e o
+        // orçamento total do turno é limitado (ver agentDeadline).
+        timeoutMs: 25_000,
+        priorMessages,
+      });
+    } catch (err) {
+      // Rodada extra falhou: NÃO derruba o turno — as tools da rodada anterior JÁ rodaram
+      // (efeito real no mundo). Mantém o que temos e segue pros backstops/narrador.
+      await writeLog('warn', 'llm', `rodada ${agentRounds + 1} do loop agêntico falhou (${String(err).slice(0, 120)}) — seguindo com o resultado parcial`, { traceId });
+      break;
+    }
+    await writeLog('info', 'llm', `↻ loop agêntico rodada ${agentRounds + 1} [${llmResponse.model}] — ${llmResponse.tokensIn}in (${llmResponse.cachedTokens} cache)/${llmResponse.tokensOut}out, ${Date.now() - roundStart}ms${llmResponse.toolCalls.length ? ` — tools: ${llmResponse.toolCalls.map((t) => t.name).join(', ')}` : ' — resposta final'}`, {
+      traceId, round: agentRounds + 1, model: llmResponse.model,
+    });
   }
+
+  // Os backstops abaixo inspecionam `llmResponse.toolCalls` pra decidir se precisam agir.
+  // Sem isto eles só enxergariam a ÚLTIMA rodada e re-forçariam tools que já rodaram.
+  // A última rodada terminou sem pedir mais nada? Então o texto dela é a conclusão do modelo
+  // DEPOIS de ver os resultados — o texto mais informado do turno (ver suppressReply).
+  const llmResponseFinalHadNoTools = llmResponse.toolCalls.length === 0;
+  // Rodada final veio sem texto? Reaproveita o melhor texto do turno (ver lastNonEmptyRoundText).
+  const finalText = llmResponse.text.trim() || lastNonEmptyRoundText;
+  llmResponse = { ...llmResponse, text: finalText, toolCalls: executedToolCalls };
+  /**
+   * A tool rodou COM SUCESSO neste turno? Os backstops anti-mentira precisam disto e não de
+   * "foi tentada": um `create_reminder` que EXPLODIU deixava `calledReminderTool = true`, o
+   * backstop se calava e a promessa falsa ("te lembro todo dia às 7h") ia pro paciente com o
+   * lembrete inexistente. Agora só o sucesso conta.
+   */
+  const toolRanOk = (...names: string[]) => executedToolCalls.some((t) => names.includes(t.name) && t.ok);
 
   // 11a. BACKSTOP DE CONSOLIDAÇÃO SOB DEMANDA (auditoria 1º pedido 14/07): o usuário disse
   // "pode pedir" com uma farmácia já precificada, mas o pedido ainda estava 'quoting' (NÃO
@@ -1056,7 +1199,7 @@ async function processInboundUserInner(
   // trocamos por resposta honesta. Espelha o backstop anti-mentira da farmácia.
   let reminderClaimUnfulfilled = false;
   {
-    const calledReminderTool = llmResponse.toolCalls.some((t) => ['create_reminder', 'cancel_reminders', 'list_reminders'].includes(t.name));
+    const calledReminderTool = toolRanOk('create_reminder', 'cancel_reminders', 'list_reminders');
     const txt = llmResponse.text ?? '';
     // Precisa de: verbo de agendamento + menção a LEMBRETE/AGENDAMENTO (senão pega "te aviso"
     // de contexto de PEDIDO) + HORÁRIO DE RELÓGIO (não só "amanhã") + não ser pergunta.
@@ -1067,7 +1210,15 @@ async function processInboundUserInner(
       // OU ser promessa de RE-CHAMADA/backup condicional (caso Ciro 09/07: "te chamo de novo
       // às 8h pra garantir" não tem "lembr" nenhum e passava batido — o backup nunca existiu).
       && (/lembr/i.test(txt) || /\b(te (chamo|aviso|lembro) de novo|volto a te (chamar|avisar|lembrar)|se (voc[êe] )?n[ãa]o confirmar)\b/i.test(txt))
-      && /(\b\d{1,2}\s*h\b|\b\d{1,2}:\d{2}\b|meio[- ]dia)/i.test(txt)
+      // ÂNCORA TEMPORAL: relógio ("7h", "14:30", "meio-dia") OU cadência sem relógio
+      // ("4 vezes ao dia", "todo dia", "de manhã"). O gate só-relógio deixou passar o caso
+      // REAL de 24/07: "Vou te lembrar 4 vezes ao longo do dia" + "Tô organizando seus
+      // lembretes de água" → NENHUM create_reminder rodou; o 1º só veio 3h depois.
+      && (
+        /(\b\d{1,2}\s*h\b|\b\d{1,2}:\d{2}\b|meio[- ]dia)/i.test(txt)
+        || /\b(\d+|uma|duas|tr[êe]s|quatro|cinco|seis)\s*(x|vezes)\b/i.test(txt)
+        || /\b(todo dia|todos os dias|diariamente|toda (manh[ãa]|tarde|noite)|de (manh[ãa]|tarde|noite)|ao longo do dia|por dia|a cada \d+)\b/i.test(txt)
+      )
       && !/\bquer que eu\b/i.test(txt);
     if (claimsReminder && !calledReminderTool && !distressPreempted) {
       await writeLog('warn', 'agent', `🚫 Anti-mentira de lembrete: LLM afirmou agendar SEM chamar create_reminder → retry forçado`, { traceId, textPreview: txt.slice(0, 80) });
@@ -1216,8 +1367,18 @@ async function processInboundUserInner(
   // Cancelamento PURO = o backstop cancelou e o LLM não narrou OUTRA ação legítima
   // (ex.: create_reminder empacotado). Se narrou, mantém a narração e só ANEXA o "cancelei".
   const onlyCancelTurn = !llmResponse.toolCalls.some((t) => !['cancel_order', 'start_pharmacy_order'].includes(t.name));
-  const suppressReply = (backstopConfirmed && onlyAcceptTurn) || turnToolCtx.turnFlags.suppressLlmText
-    || backstopReContacted || (backstopCancelled && onlyCancelTurn);
+  // 🔊 UMA VOZ ≠ AMORDAÇAR A HONESTIDADE (review adversarial 26/07). `suppressLlmText` é
+  // setado por um handler AUTO-CONTIDO — mas com o loop agêntico o texto final pode vir de
+  // uma rodada POSTERIOR, escrita já sabendo que a tool FALHOU. Suprimir esse texto trocava
+  // "não consegui buscar o Dr. Rafael agora" por um genérico "tô cuidando disso" — falsa
+  // tranquilização, exatamente o que o loop existe pra eliminar. Quando a última rodada não
+  // executou tool nenhuma, o texto dela é resposta ao RESULTADO: esse texto vale mais que a
+  // supressão e passa.
+  const lastRoundHadNoTools = agentRounds > 1 && llmResponseFinalHadNoTools;
+  const suppressReply = !lastRoundHadNoTools && (
+    (backstopConfirmed && onlyAcceptTurn) || turnToolCtx.turnFlags.suppressLlmText
+    || backstopReContacted || (backstopCancelled && onlyCancelTurn)
+  );
   let replyText = suppressReply ? '' : llmResponse.text.trim();
 
   // Backstop de cancelamento (11c2): o cancelActiveOrder só mexe no banco, não avisa o

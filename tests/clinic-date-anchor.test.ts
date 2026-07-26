@@ -20,16 +20,42 @@ function isoTodayBR(): string {
   }).format(new Date());
 }
 
+/** Saudação correta agora, no fuso de Brasília. */
+function expectedGreetingBR(): string {
+  const h = Number(new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'America/Sao_Paulo', hour: '2-digit', hour12: false,
+  }).format(new Date()));
+  return h < 12 ? 'Bom dia' : h < 18 ? 'Boa tarde' : 'Boa noite';
+}
+
 describe('buildAgentClinicSystemPrompt — âncora de data', () => {
   it('injeta a data de HOJE (Brasília) na negociação', () => {
     const p = buildAgentClinicSystemPrompt(baseCtx);
-    expect(p).toContain('DATA DE HOJE');
+    expect(p).toContain('DATA E HORA DE HOJE');
     expect(p).toContain(isoTodayBR());
   });
 
   it('injeta a data de HOJE também na confirmação de agendamento', () => {
     const p = buildAgentClinicSystemPrompt({ ...baseCtx, isAppointmentConfirmation: true });
-    expect(p).toContain('DATA DE HOJE');
+    expect(p).toContain('DATA E HORA DE HOJE');
     expect(p).toContain(isoTodayBR());
+  });
+});
+
+// Auditoria 26/07 (caso Ciro): a âncora só tinha DATA, então o modelo copiava o "Boa tarde!"
+// dos exemplos do prompt e mandava isso às 07:43 da manhã pra secretária da clínica.
+describe('buildAgentClinicSystemPrompt — âncora de HORA e saudação', () => {
+  it('injeta a hora atual e manda usar a saudação correta', () => {
+    const p = buildAgentClinicSystemPrompt(baseCtx);
+    expect(p).toMatch(/Agora são \*\*\d{2}:\d{2}\*\*/);
+    expect(p).toContain(`A saudação correta AGORA é **"${expectedGreetingBR()}"**`);
+  });
+
+  it('os EXEMPLOS de abertura usam a saudação da hora, não "Boa tarde" fixo', () => {
+    const p = buildAgentClinicSystemPrompt(baseCtx);
+    const greeting = expectedGreetingBR();
+    // Fora do período da tarde, "Boa tarde" não pode sobrar em lugar nenhum do prompt.
+    if (greeting !== 'Boa tarde') expect(p).not.toContain('Boa tarde!');
+    expect(p).toContain(`${greeting}!`);
   });
 });
