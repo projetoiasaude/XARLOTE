@@ -14,11 +14,12 @@
  * NÃO passa por aqui: mensagens de emergência (red-flag sendMenu / aviso ao
  * contato), que são enviadas diretamente pra ter prioridade/imediatismo.
  */
+import { createHash, randomUUID } from 'node:crypto';
 import { Queue, Worker, type Job } from 'bullmq';
 import { sendText, sendAudio, sendMenu, sendTemplate } from '@iasaude/whatsapp';
 import { writeLog, db } from '@iasaude/db';
 import { AGENT_INSTANCE, QUEUE_NAMES, isPlaceholderPhone } from '@iasaude/shared';
-import { getRedisConnection } from '../queue-config.js';
+import { getRedisConnection, getRedisClient } from '../queue-config.js';
 
 export interface OutboundJob {
   kind: 'text' | 'audio' | 'menu' | 'template';
@@ -36,6 +37,11 @@ export interface OutboundJob {
   templateName?: string;
   templateLanguage?: string;
   templateVariables?: string[];
+  /**
+   * Token único do ENFILEIRAMENTO (idempotência de envio — ver sendDedupKey). Preenchido
+   * automaticamente pelo `dispatchOutbound`; os callers não passam.
+   */
+  sendToken?: string;
   traceId?: string;
   /** Linha em `messages` a carimbar com o veredito REAL do canal (ver 0022). */
   messageId?: string;
@@ -67,6 +73,63 @@ function queueFor(instance: string): Queue {
   return q;
 }
 
+/**
+ * 🔒 TRAVA DE ENVIO ÚNICO (incidente Hiago 27/07: o MESMO lembrete de água chegou 2× no
+ * WhatsApp, ambos às 10:00 — enquanto o banco tinha 1 lembrete, 1 espelho e 1 evento).
+ *
+ * Causa: a fila outbound tem DOIS consumidores (o service `api` roda com ROLE=all, que
+ * sobe os workers, e o service `worker` também). Isso é normal em BullMQ — cada job vai
+ * pra um worker só — EXCETO quando um job "stalled" (o worker não renovou o lock a tempo,
+ * ex.: event loop travado ou envio lento) é reentregue ao outro worker. Aí o mesmo job
+ * executa duas vezes e o paciente recebe a mensagem em duplicidade.
+ *
+ * `attempts: 5` piora: um envio que CHEGA mas cuja resposta HTTP falha é retentado.
+ *
+ * A trava é um claim atômico no Redis (SET NX EX) ANTES do envio real. O primeiro a
+ * reivindicar envia; qualquer repetição do mesmo conteúdo, pro mesmo número, na mesma
+ * janela, é descartada. Fica no `rawSend` (não no processor) porque este é o ÚNICO ponto
+ * por onde todo envio passa — incluindo o fallback direto fora da fila.
+ *
+ * Fail-open deliberado: se o Redis estiver fora, ENVIA (perder um lembrete de remédio é
+ * pior que arriscar uma duplicata rara).
+ */
+const SEND_DEDUP_TTL_S = 900; // 15min cobre stalled-job + os 5 retries com backoff exponencial
+
+/**
+ * Chave de idempotência do envio. Identifica o ENFILEIRAMENTO, não o conteúdo.
+ *
+ * Isto é essencial: deduplicar por TEXTO suprimiria repetição legítima (o paciente
+ * pergunta a mesma coisa duas vezes e a resposta certa é a mesma). O `sendToken` é
+ * sorteado UMA vez, no `dispatchOutbound`, e viaja dentro do job — então uma
+ * RE-EXECUÇÃO do mesmo job (stalled/retry) carrega o mesmo token e é barrada, enquanto
+ * dois envios distintos com texto idêntico têm tokens diferentes e ambos passam.
+ *
+ * Sem token (envio direto fora da fila) → devolve null e o envio segue sem trava: esse
+ * caminho não é re-executado por worker nenhum.
+ */
+export function sendDedupKey(job: OutboundJob): string | null {
+  if (!job.sendToken) return null;
+  return `outb:sent:${createHash('sha1').update(job.sendToken).digest('hex')}`;
+}
+
+async function claimSend(job: OutboundJob): Promise<boolean> {
+  const key = sendDedupKey(job);
+  if (!key) return true;
+  try {
+    // ioredis: set(k, v, 'EX', s, 'NX') → 'OK' se reivindicou, null se já existia.
+    const ok = await getRedisClient().set(key, '1', 'EX', SEND_DEDUP_TTL_S, 'NX');
+    if (ok === null) {
+      await writeLog('warn', 'outbound', `Envio DUPLICADO barrado — este job já foi enviado (re-execução por stalled/retry da fila)`, {
+        traceId: job.traceId, instance: job.instance, kind: job.kind,
+      });
+      return false;
+    }
+    return true;
+  } catch {
+    return true; // Redis fora → envia (fail-open: perder lembrete de remédio é pior)
+  }
+}
+
 /** Executa o envio real na uazapi. Áudio cai pra texto se falhar. */
 async function rawSend(job: OutboundJob): Promise<void> {
   // 🛑 TRAVA DE SEGURANÇA (incidente 2026-07-01): NUNCA enviar pra número sintético/
@@ -79,6 +142,8 @@ async function rawSend(job: OutboundJob): Promise<void> {
     });
     return;
   }
+  // Envio único: barra a re-execução do MESMO job (stalled/retry) — ver claimSend.
+  if (!(await claimSend(job))) return;
   if (job.kind === 'text') {
     await sendText(job.instance, job.phoneE164, job.text ?? '');
     return;
@@ -173,6 +238,9 @@ async function stampDelivery(messageId: string | undefined, status: 'delivered' 
  * pra nunca deixar a Xarlote muda por causa de um Redis fora do ar.
  */
 export async function dispatchOutbound(job: OutboundJob): Promise<void> {
+  // Carimba o token de idempotência UMA vez, aqui: ele viaja no job e é o que permite
+  // distinguir "o mesmo job rodando de novo" de "um segundo envio legítimo e igual".
+  job = { ...job, sendToken: job.sendToken ?? randomUUID() };
   try {
     // FAIL-FAST: se o Redis estiver fora, o BullMQ (maxRetriesPerRequest:null)
     // deixa o queue.add() pendurado pra sempre em vez de errar — e o fallback de
