@@ -38,6 +38,21 @@ describe('sendDedupKey — barra re-execução, não repetição legítima', () 
     expect(sendDedupKey(base)).toBeNull();
   });
 
+  // messageId = id da linha-espelho. Dois envios pra MESMA linha são sempre duplicata,
+  // mesmo vindos de enfileiramentos diferentes — cobre o caso que o token sozinho deixaria
+  // passar (dois dispatchOutbound para o mesmo lembrete).
+  it('messageId tem precedência: mesma linha-espelho → mesma chave, mesmo com tokens diferentes', () => {
+    const a = sendDedupKey({ ...base, messageId: 'msg-7e38ee2b', sendToken: 'tok-1' });
+    const b = sendDedupKey({ ...base, messageId: 'msg-7e38ee2b', sendToken: 'tok-2' });
+    expect(a).toBe(b);
+  });
+
+  it('linhas-espelho diferentes → chaves diferentes (lembretes distintos não se anulam)', () => {
+    const a = sendDedupKey({ ...base, messageId: 'msg-10h' });
+    const b = sendDedupKey({ ...base, messageId: 'msg-13h' });
+    expect(a).not.toBe(b);
+  });
+
   it('a chave é namespaced e estável (não vaza o token cru)', () => {
     const k = sendDedupKey({ ...base, sendToken: 'tok-abc' })!;
     expect(k.startsWith('outb:sent:')).toBe(true);

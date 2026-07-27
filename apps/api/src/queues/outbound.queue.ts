@@ -108,8 +108,13 @@ const SEND_DEDUP_TTL_S = 900; // 15min cobre stalled-job + os 5 retries com back
  * caminho não é re-executado por worker nenhum.
  */
 export function sendDedupKey(job: OutboundJob): string | null {
-  if (!job.sendToken) return null;
-  return `outb:sent:${createHash('sha1').update(job.sendToken).digest('hex')}`;
+  // PREFERE `messageId` (id da linha-espelho em `messages`): ele é estável e único por
+  // MENSAGEM LÓGICA, então cobre também o caso de dois `dispatchOutbound` distintos para
+  // o mesmo lembrete — que o sendToken (único por enfileiramento) deixaria passar.
+  // Dois envios para a mesma linha-espelho são SEMPRE duplicata.
+  const basis = job.messageId ? `msg:${job.messageId}` : job.sendToken ? `tok:${job.sendToken}` : null;
+  if (!basis) return null;
+  return `outb:sent:${createHash('sha1').update(basis).digest('hex')}`;
 }
 
 async function claimSend(job: OutboundJob): Promise<boolean> {
@@ -119,14 +124,19 @@ async function claimSend(job: OutboundJob): Promise<boolean> {
     // ioredis: set(k, v, 'EX', s, 'NX') → 'OK' se reivindicou, null se já existia.
     const ok = await getRedisClient().set(key, '1', 'EX', SEND_DEDUP_TTL_S, 'NX');
     if (ok === null) {
-      await writeLog('warn', 'outbound', `Envio DUPLICADO barrado — este job já foi enviado (re-execução por stalled/retry da fila)`, {
-        traceId: job.traceId, instance: job.instance, kind: job.kind,
+      await writeLog('warn', 'outbound', `🚫 Envio DUPLICADO barrado — esta mensagem já saiu (key=${key.slice(-12)})`, {
+        traceId: job.traceId, instance: job.instance, kind: job.kind, messageId: job.messageId,
       });
       return false;
     }
     return true;
-  } catch {
-    return true; // Redis fora → envia (fail-open: perder lembrete de remédio é pior)
+  } catch (err) {
+    // Fail-open (perder lembrete de remédio é pior que arriscar duplicata) — mas NUNCA
+    // em silêncio: se o Redis estiver falhando, a trava está desligada e precisamos saber.
+    await writeLog('error', 'outbound', `Trava de envio único INDISPONÍVEL (Redis): ${String(err).slice(0, 140)} — enviando sem proteção`, {
+      traceId: job.traceId, instance: job.instance,
+    });
+    return true;
   }
 }
 
@@ -145,7 +155,22 @@ async function rawSend(job: OutboundJob): Promise<void> {
   // Envio único: barra a re-execução do MESMO job (stalled/retry) — ver claimSend.
   if (!(await claimSend(job))) return;
   if (job.kind === 'text') {
-    await sendText(job.instance, job.phoneE164, job.text ?? '');
+    const res = await sendText(job.instance, job.phoneE164, job.text ?? '');
+    // 🔬 INSTRUMENTAÇÃO DA DUPLICATA (caso Hiago 27/07, reincidente às 16h).
+    // O banco mostra 1 lembrete / 1 espelho / 1 evento e a trava nunca disparou — ou seja,
+    // do nosso lado houve UMA chamada. Este log fecha o cerco na próxima ocorrência:
+    //   • 2 linhas com o MESMO wa_key  → o job re-executou e a trava falhou (Redis)
+    //   • 2 linhas com wa_key DIFERENTE → dois envios distintos (bug acima da fila)
+    //   • 1 linha só                    → nós enviamos 1×; a duplicação é do zpro/Meta
+    // O `providerMessageId` é a prova do lado de lá (2 wamids = 2 mensagens de verdade).
+    await writeLog('info', 'outbound', `📤 envio text pid=${process.pid} wa_key=${(sendDedupKey(job) ?? 'none').slice(-12)} providerMessageId=${res.messageId || '(vazio)'}`, {
+      traceId: job.traceId, instance: job.instance, messageId: job.messageId,
+    });
+    if (job.messageId && res.messageId) {
+      // Guarda o id do provider: sem ele somos cegos pra entrega dupla (external_id
+      // do outbound estava sempre null).
+      await db.from('messages').update({ external_id: res.messageId }).eq('id', job.messageId).then(() => {}, () => {});
+    }
     return;
   }
   if (job.kind === 'menu') {
