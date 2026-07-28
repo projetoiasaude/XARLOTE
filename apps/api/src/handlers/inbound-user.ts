@@ -567,7 +567,17 @@ async function processInboundUserInner(
         : '';
       return `- "${r.title}" (${r.type}) — ${r.rrule ? `recorrente, próximo às ${fmtHora(r.next_run_at)}` : `único em ${fmtData(r.next_run_at)} às ${fmtHora(r.next_run_at)}`}${tag}`;
     });
-    systemPrompt += `\n\n## ⏰ LEMBRETES ATIVOS DESTE USUÁRIO (${activeReminders.length})\n${linhas.join('\n')}\n\nEstes JÁ EXISTEM. NÃO crie de novo os mesmos (mesmo assunto/horário) — se ele reperguntar "agendou?"/"criou?", responda SIM olhando esta lista, sem chamar create_reminder. Pra MUDAR/REDIVIDIR um plano, chame cancel_reminders (title_query) ANTES de criar os novos — nunca deixe dois planos do mesmo assunto coexistirem. Se pedir pra parar, cancel_reminders resolve sozinho.`;
+    systemPrompt += `\n\n## ⏰ LEMBRETES ATIVOS DESTE USUÁRIO (${activeReminders.length})\n${linhas.join('\n')}\n\nEsta lista é a VERDADE — vale mais que qualquer coisa dita no histórico da conversa. Estes JÁ EXISTEM. NÃO crie de novo os mesmos (mesmo assunto/horário) — se ele reperguntar "agendou?"/"criou?", responda SIM olhando esta lista, sem chamar create_reminder. Pra MUDAR/REDIVIDIR um plano, chame cancel_reminders (title_query) ANTES de criar os novos — nunca deixe dois planos do mesmo assunto coexistirem. Se pedir pra parar, cancel_reminders resolve sozinho.`;
+  } else {
+    // 🔴 O NEGATIVO PRECISA SER EXPLÍCITO (incidente Hiago 28/07).
+    // Antes, lista vazia = bloco AUSENTE, e o silêncio é ambíguo: o modelo preencheu com o
+    // histórico, onde ELE MESMO tinha escrito no dia anterior "criei 4 lembretes pra hoje:
+    // 10h, 13h, 16h e 19h". Respondeu "você já tem lembretes marcados pra hoje" com ZERO
+    // lembretes no banco — e às 10h não chegou nada. Pior: um lembrete one-shot de ontem
+    // dizia "pra HOJE", que lido hoje vira uma data diferente (armadilha de dêitico, agora
+    // no histórico da conversa e não no corpo do lembrete).
+    // A ausência de informação estava sendo lida como confirmação. Agora o vazio FALA.
+    systemPrompt += `\n\n## ⏰ LEMBRETES ATIVOS DESTE USUÁRIO (0)\nEste usuário **NÃO tem NENHUM lembrete ativo agora**. Esta é a VERDADE do banco de dados neste instante.\n\n⚠️ O histórico da conversa pode conter você dizendo que criou lembretes em dias anteriores — **aqueles JÁ DISPARARAM e não existem mais**. NUNCA use o histórico pra afirmar que existe lembrete: se ele perguntar "tenho lembrete?"/"vai me avisar?", a resposta honesta é que NÃO há nenhum ativo, e ofereça criar agora. Um lembrete que você "lembra" de ter criado ontem para "hoje" era para o dia ANTERIOR.`;
   }
 
   // Fix #5 — desfecho REAL das tools do turno anterior (anti-contradição). O loop é
@@ -620,6 +630,12 @@ async function processInboundUserInner(
   // Estado COMPLETO do pedido (todas as farmácias + o que cada uma disse + quais dá pra
   // re-contatar na janela de 24h). Dá à Xarlote a compreensão do pedido inteiro — pra
   // voltar numa farmácia específica (message_supplier), reportar honesto e não alucinar.
+  if (!orderState) {
+    // Mesmo defeito do bloco de lembretes (incidente Hiago 28/07): sem pedido ativo o bloco
+    // some, e o silêncio deixa o modelo inferir do histórico que a compra de dias atrás
+    // ainda está viva ("já mandei pras farmácias, te aviso"). O negativo tem que ser dito.
+    systemPrompt += `\n\n## 📦 ESTADO DO PEDIDO\nEste usuário **NÃO tem nenhum pedido de medicamento ativo** nas últimas 24h. Esta é a VERDADE do banco neste instante — o histórico da conversa pode mencionar pedidos ANTIGOS, já encerrados. Se ele perguntar sobre um pedido, seja honesta: não há nenhum em andamento, e ofereça começar.`;
+  }
   if (orderState) {
     systemPrompt += `\n\n${buildOrderStateBlock(orderState)}`;
   }
