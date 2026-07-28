@@ -104,7 +104,19 @@ export async function zproSendText(
     externalKey: randomUUID(),
     isClosed: false,
   });
-  return { messageId: pickMessageId(data) };
+  const messageId = pickMessageId(data);
+  // 🔬 O shape da resposta do zpro NÃO é documentado e nenhum dos candidatos casou em prod
+  // (`providerMessageId=(vazio)` em 100% dos envios de 27/07). Sem esse id somos cegos pra
+  // entrega dupla — e é exatamente o id que o suporte do zpro pede pra investigar.
+  // Logamos só as CHAVES do JSON (nunca o corpo: ele carrega telefone/texto = PII) pra
+  // descobrir o formato real e apertar o pickMessageId na sequência.
+  if (!messageId && data && typeof data === 'object') {
+    const shape = Object.entries(data as Record<string, unknown>)
+      .map(([k, v]) => `${k}:${Array.isArray(v) ? 'array' : typeof v}`)
+      .join(', ');
+    console.warn(`[zpro] resposta de envio SEM messageId reconhecido — shape={ ${shape} }`);
+  }
+  return { messageId };
 }
 
 /**

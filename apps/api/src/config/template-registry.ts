@@ -117,14 +117,22 @@ export function reengageTemplateEnabled(): boolean {
  * NÃO pausa o LEMBRETE em si (remédio de paciente silencioso é o que NÃO se auto-pausa —
  * fail-safe pró-cuidado): o espelho no app/dashboard continua; só o HSM pago recua.
  */
-export function reengageIntervalMs(silentMs: number): number {
+export function reengageIntervalMs(silentMs: number, critical = false): number {
   const HOUR = 60 * 60_000;
   const DAY = 24 * HOUR;
   const days = silentMs / DAY;
-  if (days < 3) return 20 * HOUR;
-  if (days < 7) return 48 * HOUR;
-  if (days < 14) return 72 * HOUR;
-  return 7 * DAY;
+  const base = days < 3 ? 20 * HOUR
+    : days < 7 ? 48 * HOUR
+    : days < 14 ? 72 * HOUR
+    : 7 * DAY;
+  // 💊 TETO PARA MEDICAÇÃO/CONSULTA (auditoria 27/07 — caso Arthur, Neblock 5mg).
+  // O recuo por silêncio existe pra não queimar template PAGO com quem claramente sumiu —
+  // e faz todo sentido pra hidratação. Mas o Arthur está mudo há semanas E toma
+  // anti-hipertensivo: o back-off o jogou em 1 tentativa a cada 7 DIAS, e o template é o
+  // ÚNICO canal que resta quando a janela de 24h está fechada. Resultado real: 100% dos
+  // lembretes dele bloqueados por 2 dias seguidos. Pra remédio/consulta o custo do template
+  // é irrelevante perto do custo de uma dose perdida — segura em 1×/dia, no máximo.
+  return critical ? Math.min(base, 24 * HOUR) : base;
 }
 
 /**

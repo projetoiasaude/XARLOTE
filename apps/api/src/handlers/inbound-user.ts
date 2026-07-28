@@ -1367,15 +1367,22 @@ async function processInboundUserInner(
   // Cancelamento PURO = o backstop cancelou e o LLM não narrou OUTRA ação legítima
   // (ex.: create_reminder empacotado). Se narrou, mantém a narração e só ANEXA o "cancelei".
   const onlyCancelTurn = !llmResponse.toolCalls.some((t) => !['cancel_order', 'start_pharmacy_order'].includes(t.name));
-  // 🔊 UMA VOZ ≠ AMORDAÇAR A HONESTIDADE (review adversarial 26/07). `suppressLlmText` é
-  // setado por um handler AUTO-CONTIDO — mas com o loop agêntico o texto final pode vir de
-  // uma rodada POSTERIOR, escrita já sabendo que a tool FALHOU. Suprimir esse texto trocava
-  // "não consegui buscar o Dr. Rafael agora" por um genérico "tô cuidando disso" — falsa
-  // tranquilização, exatamente o que o loop existe pra eliminar. Quando a última rodada não
-  // executou tool nenhuma, o texto dela é resposta ao RESULTADO: esse texto vale mais que a
-  // supressão e passa.
-  const lastRoundHadNoTools = agentRounds > 1 && llmResponseFinalHadNoTools;
-  const suppressReply = !lastRoundHadNoTools && (
+  // 🔊 UMA VOZ ≠ AMORDAÇAR A HONESTIDADE — mas SÓ quando há o que ser honesto sobre.
+  //
+  // A exceção existe pra um caso específico: a tool FALHOU, o handler não conseguiu dizer
+  // nada útil, e a rodada seguinte do loop escreveu a explicação honesta ("não consegui
+  // buscar agora"). Suprimir esse texto o trocaria por um genérico "tô cuidando disso" —
+  // falsa tranquilização, exatamente o que o loop existe pra eliminar.
+  //
+  // ⚠️ REGRESSÃO CORRIGIDA (27/07): a condição era só "a última rodada não teve tool", o que
+  // destravava TAMBÉM o caso em que a tool deu certo e o handler JÁ FALOU com o paciente —
+  // reintroduzindo a voz dupla. Aconteceu 2× ao vivo: o handler mandou "Achei a Odonpaz…
+  // É essa mesma?" e a rodada 2 mandou "Encontrei a Odontopaz! Te mandei os detalhes…"
+  // (mesmo padrão com a Antônia/IAD às 18:03). Agora a exceção exige FALHA REAL: se toda
+  // tool teve sucesso, quem já falou tem a palavra final.
+  const anyToolFailed = executedToolCalls.some((t) => !t.ok);
+  const lastRoundIsHonestyRecovery = agentRounds > 1 && llmResponseFinalHadNoTools && anyToolFailed;
+  const suppressReply = !lastRoundIsHonestyRecovery && (
     (backstopConfirmed && onlyAcceptTurn) || turnToolCtx.turnFlags.suppressLlmText
     || backstopReContacted || (backstopCancelled && onlyCancelTurn)
   );

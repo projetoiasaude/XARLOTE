@@ -13,6 +13,7 @@ import {
   reengageReasonForReminder,
   reminderTemplatePriority,
   SILENT_ASK_DAYS,
+  reengageIntervalMs,
 } from '../apps/api/src/config/template-registry.js';
 
 describe('specialtyPhrase — sintagma da especialidade (caso Ciro 25/07)', () => {
@@ -92,6 +93,31 @@ describe('reminderTemplatePriority — quem ganha o único template (casos Arthu
   it('tipo desconhecido/nulo tem a menor prioridade (nunca rouba o slot do remédio)', () => {
     expect(reminderTemplatePriority(null)).toBeLessThan(reminderTemplatePriority('medication'));
     expect(reminderTemplatePriority('qualquer-coisa')).toBeLessThan(reminderTemplatePriority('appointment'));
+  });
+});
+
+// Auditoria 27/07 — caso Arthur (Neblock 5mg, anti-hipertensivo, 100% dos lembretes
+// bloqueados por 2 dias): mudo há semanas → back-off empurrou o único canal disponível
+// (template) pra 1 tentativa a cada 7 dias.
+describe('reengageIntervalMs — recuo por silêncio vs. criticidade', () => {
+  const H = 60 * 60_000;
+  const D = 24 * H;
+
+  it('não-crítico mantém o recuo integral (não queima template pago à toa)', () => {
+    expect(reengageIntervalMs(1 * D)).toBe(20 * H);
+    expect(reengageIntervalMs(5 * D)).toBe(48 * H);
+    expect(reengageIntervalMs(10 * D)).toBe(72 * H);
+    expect(reengageIntervalMs(30 * D)).toBe(7 * D);
+  });
+
+  it('medicação/consulta nunca recua além de 1×/dia — o caso do Arthur', () => {
+    expect(reengageIntervalMs(30 * D, true)).toBe(24 * H);
+    expect(reengageIntervalMs(10 * D, true)).toBe(24 * H);
+  });
+
+  it('crítico com silêncio CURTO usa o intervalo menor (20h), não o teto', () => {
+    // O teto é limite superior, não piso: não pode AFROUXAR quem está respondendo.
+    expect(reengageIntervalMs(1 * D, true)).toBe(20 * H);
   });
 });
 

@@ -290,8 +290,14 @@ export async function dispatchReminders(): Promise<void> {
     // primário NÃO foi confirmado — é rede de segurança de dose, volume baixo e alto valor
     // (capar o backup da insulina não-confirmada inverteria o fail-safe do 0020).
     const isConditionalBackup = (reminder.payload as { condition?: string } | null)?.condition === 'if_not_confirmed';
+    // 💊 MEDICAÇÃO/CONSULTA são ISENTAS do cap diário (auditoria 27/07). O cap é anti-FLOOD
+    // — nasceu do caso da Antônia com 10 lembretes/dia. Mas ele contava tudo junto, então a
+    // água das 8h/10h30/13h consumia a cota e o REMÉDIO das 15h era cortado por excesso de…
+    // água. O cap de PUSH logo abaixo já aplica essa distinção (só corta hydration/exercise/
+    // custom); o cap de MENSAGEM não aplicava. Mesma regra nos dois agora: nunca cortar dose.
+    const capExempt = reminder.type === 'medication' || reminder.type === 'appointment';
     let pushCapReached = false; // flood de PUSH no app pra usuário pouco responsivo (ver abaixo)
-    if (reminder.rrule && !isConditionalBackup) {
+    if (reminder.rrule && !isConditionalBackup && !capExempt) {
       const cap = user.reminder_max_per_day ?? 6;
       const since24 = new Date(now.getTime() - 24 * 60 * 60_000).toISOString();
       // Conta só o que REALMENTE CHEGOU no WhatsApp (payload.window_open=true = texto livre
@@ -421,7 +427,9 @@ export async function dispatchReminders(): Promise<void> {
     const lastTplMs = uMeta.reengage_template_at ? new Date(uMeta.reengage_template_at).getTime() : 0;
     // Três condições pro template: (1) cooldown por tempo vencido; (2) nenhum template já
     // saiu neste tick pro paciente; (3) ser o dono do slot no tick (desempate barato).
-    const cooldownMs = reengageIntervalMs(windowSilentMs);
+    // Remédio/consulta recuam no máximo até 1×/dia (ver reengageIntervalMs) — pro resto o
+    // back-off por silêncio vale integral.
+    const cooldownMs = reengageIntervalMs(windowSilentMs, capExempt);
     let reengageTplAllowed =
       now.getTime() - lastTplMs >= cooldownMs
       && !templateSentThisTick.has(reminder.user_id)
