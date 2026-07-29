@@ -11,6 +11,12 @@ interface XarloteContext {
   activeOrderSummary?: string | null;
   /** Método de pagamento mais usado pelo usuário (pedidos anteriores) — confirmar, não re-perguntar. */
   paymentPreference?: string | null;
+  /**
+   * Convênio/plano de saúde declarado pelo paciente (users.metadata.health_plan). Serve pra
+   * ela NÃO re-perguntar e pra priorizar clínicas que aceitam o plano dele na busca de
+   * consulta — hoje isso só se descobre perguntando à clínica, o que custou 5h no caso real.
+   */
+  healthPlan?: string | null;
 }
 
 /** "quinta-feira, 11/06/2026, 09:55" em America/Sao_Paulo — pro LLM agendar lembretes. */
@@ -440,6 +446,7 @@ Alergias: ${allergies}
 Medicamentos em uso: ${medications}
 Endereços salvos: ${addressStr}
 Forma de pagamento usual: ${ctx.paymentPreference ?? 'não registrada'}
+Convênio (pra consulta/exame): ${ctx.healthPlan ?? 'não registrado'}
 
 ### Memória recuperada (por relevância semântica)
 ${memorySection}${activeOrderSection ? `\n\n${activeOrderSection}` : ''}`;

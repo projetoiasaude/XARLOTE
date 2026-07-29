@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -527,6 +527,14 @@ async function processInboundUserInner(
       }))
     : (Array.isArray(conversation.memory_cards) ? conversation.memory_cards : []);
 
+  // Convênio declarado pelo paciente. Fica em users.metadata (gravado por
+  // save_user_profile_fact category 'other', que faz MERGE no metadata) — sem coluna nova.
+  const userHealthPlan = (() => {
+    const m = user.metadata as Record<string, unknown> | null | undefined;
+    const v = m?.['health_plan'];
+    return typeof v === 'string' && v.trim() ? v.trim() : null;
+  })();
+
   let systemPrompt = buildXarloteSystemPrompt({
     user,
     preferredName: user.preferred_name,
@@ -537,7 +545,64 @@ async function processInboundUserInner(
     memoryCards,
     activeOrderSummary,
     paymentPreference,
+    healthPlan: userHealthPlan,
   });
+
+  // 🤝 CONHECER O PACIENTE — 3 perguntas de baixa fricção, só pra quem acabou de entrar.
+  //
+  // Roda DEPOIS do onboarding existente (consentimento → nome → áudio): o gate é
+  // `onboarding_status === 'active'`, que só é atingido quando aquele fluxo terminou. Nada
+  // do que já funciona é tocado.
+  //
+  // Estado DERIVADO, sem máquina de estado nova: a pergunta some sozinha quando o dado
+  // existe. Sem migração, sem flag pra corromper, sem escrita extra por turno.
+  //   • medicação de uso contínuo → destrava reposição automática e lembretes
+  //   • condição acompanhada      → contexto que ela nunca infere sozinha com segurança
+  //   • convênio                  → prioriza clínicas que aceitam o plano (no caso real do
+  //     Ciro, a clínica só revelou "não atendo plano" depois de 5h de ida e volta)
+  // Alergia NÃO entra aqui (decisão do fundador): é colhida no 1º pedido de remédio, onde
+  // a pergunta é natural e a taxa de resposta é maior.
+  {
+    const PERGUNTA: Record<OnboardingTopic, string> = {
+      medication: '- **Remédio de uso contínuo**: *"Você toma algum remédio todo dia?"* → guarde com `save_user_profile_fact` (category `medication`).',
+      condition: '- **Condição acompanhada**: *"Tem alguma condição que você acompanha? Pressão, diabetes, tireoide, colesterol…"* (os exemplos são obrigatórios — sem eles a pessoa trava e diz "não") → `save_user_profile_fact` (category `condition`).',
+      health_plan: '- **Convênio**: *"E pra consulta ou exame, você tem plano de saúde ou prefere particular?"* → `save_user_profile_fact` (category `other`, payload `{"health_plan": "<nome do plano ou \'particular\'>"}`). ⚠️ Diga SEMPRE "pra consulta ou exame": em FARMÁCIA você não aplica desconto de convênio, e sem esse recorte a pessoa entende errado.',
+    };
+    const decision = shouldAskOnboardingQuestions({
+      onboardingStatus: user.onboarding_status,
+      createdAtIso: (user.created_at as string | null | undefined) ?? null,
+      nowMs: Date.now(),
+      hasMedications: Boolean(medications?.length),
+      hasConditions: Boolean(conditions?.length),
+      hasHealthPlan: Boolean(userHealthPlan),
+      // Já ofereceu nesta conversa? Deriva do próprio histórico — nada é gravado pra isso.
+      alreadyOffered: (history ?? []).some((m) => {
+        const c = typeof (m as { content?: unknown }).content === 'string' ? (m as { content: string }).content : '';
+        return (m as { direction?: string }).direction === 'out' && /nos conhecer melhor|perguntinhas/i.test(c);
+      }),
+      // Recusa DURÁVEL: `alreadyOffered` só enxerga a janela de histórico carregada, então
+      // sem isto a pergunta voltaria dias depois pra quem já disse não.
+      declined: (user.metadata as Record<string, unknown> | null | undefined)?.['onboarding_qs_declined'] === true,
+      isProfilingTurn: wasProfiling,
+    });
+
+    if (decision.ask) {
+      systemPrompt += `\n\n## 🤝 CONHECER ESTE PACIENTE (ele é novo — você ainda não sabe estas coisas)
+${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
+
+**COMO CONDUZIR (a ordem importa):**
+1. Primeiro responda o que ele trouxe nesta mensagem. Sempre. O paciente vem antes do roteiro.
+2. Se ele não trouxe nada específico (só cumprimentou/agradeceu), OFEREÇA a escolha, uma vez só: *"Posso te fazer duas ou três perguntinhas rápidas pra te conhecer melhor? Ou, se preferir, já me diz o que você precisa 💙"*
+3. Com o "sim", faça **UMA pergunta por mensagem** — nunca as três juntas, nunca em lista.
+4. Recebeu a resposta → chame \`save_user_profile_fact\` na hora e emende a próxima com naturalidade.
+
+**QUANDO PARAR (inegociável):**
+- Ele pediu QUALQUER coisa (remédio, consulta, dúvida, lembrete) → **abandone o roteiro imediatamente** e atenda. Não volte ao assunto nesse turno.
+- Ele disse que não quer, desconversou ou ignorou → aceite na primeira vez e **NUNCA insista**. Some com o assunto e registre a recusa com \`save_user_profile_fact\` (category \`other\`, payload \`{"onboarding_qs_declined": true}\`) pra você não voltar a perguntar em outro dia.
+- Nunca pergunte o que já está no CONTEXTO DESTE USUÁRIO acima.
+- Isto é conversa, não formulário: nada de "pergunta 1 de 3", numeração ou "para finalizar seu cadastro".`;
+    }
+  }
 
   // Se temos user360 com tratamentos/sintomas/consultas/skills, anexa contexto rico
   if (user360 && (
