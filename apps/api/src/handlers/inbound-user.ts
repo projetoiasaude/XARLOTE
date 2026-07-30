@@ -71,7 +71,14 @@ export function looksLikeImage(buf: Buffer | null | undefined): boolean {
 // Serialização de turno (review H3): 2 mensagens rápidas do MESMO telefone geram 2 turnos
 // concorrentes → dupla execução de tools + estado stale + vozes contraditórias. Espera generosa
 // pra NÃO dropar a 2ª msg; se o turno anterior demorar mais que isso (raro), processa mesmo assim.
-const TURN_LOCK_WAIT_MS = 45_000;
+// ⚠️ A ESPERA TEM QUE SER MAIOR QUE O PIOR TURNO — senão a serialização vira ficção.
+// Regressão minha (30/07): o loop agêntico levou o turno a durar até ~75s
+// (AGENT_LOOP_BUDGET_MS) e eu subi o TTL pra 300s, mas deixei a ESPERA em 45s. Resultado: a
+// 2ª mensagem esperava 45s, desistia e rodava EM PARALELO com a 1ª. Foi isso que produziu a
+// mensagem TRIPLICADA às 14:17 e o "turn-lock não liberou (degradado)" nos logs — e, com dois
+// turnos disputando o mesmo estado, mensagem de paciente se perde.
+// 150s cobre o pior turno (loop 75s + transcrição + retry + narrador) com folga.
+const TURN_LOCK_WAIT_MS = 150_000;
 // TTL > pior turno (transcrição 30s + LLM 60s + retry + follow-up ≈ 130s) pra o lock NÃO
 // auto-expirar no meio e deixar um turno concorrente entrar (review H3-ressalva).
 // TTL > pior turno. Com o LOOP AGÊNTICO o turno ganhou rodadas extras (orçamento

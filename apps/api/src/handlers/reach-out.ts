@@ -469,7 +469,18 @@ async function contactClinic(phone: string, clinicName: string, specialty: strin
   }
 
   await sendOutbound(ctx.conversationId, ctx.phoneE164,
-    `Show! Já tô falando com *${clinicName}*${professional ? ` pra marcar com ${professional}` : specialtyPhrase(specialty) ? ` pra ver ${specialtyPhrase(specialty)}` : ''} 🔍 Assim que eles responderem com horário e valor, te aviso 💙`,
+    // Quando o consultório É o próprio médico ("Dr. Marco Elísio Sócrates de Castro"), dizer
+    // "falando com Dr. Marco pra marcar com Dr. Marco" é redundante e soa quebrado (caso
+    // Glauber 30/07). Se o nome do profissional já está no nome do lugar, não repete.
+    (() => {
+      const nomeLugar = clinicName.toLowerCase();
+      const primeiroNome = (professional ?? '').replace(/^(dr|dra)\.?\s*/i, '').trim().split(/\s+/)[0]?.toLowerCase() ?? '';
+      const jaEhOMedico = primeiroNome.length >= 3 && nomeLugar.includes(primeiroNome);
+      const alvo = professional && !jaEhOMedico
+        ? ` pra marcar com ${professional}`
+        : specialtyPhrase(specialty) ? ` pra ver ${specialtyPhrase(specialty)}` : '';
+      return `Show! Já tô falando com *${clinicName}*${alvo} 🔍 Assim que eles responderem com horário e valor, te aviso 💙`;
+    })(),
     ctx.traceId);
   // 🎯 HONESTIDADE DO QUE FOI DITO (auditoria 30/07). Ela afirmou ao Glauber, duas vezes,
   // "já informei que é pelo IPASGO" — sendo que o contato saíra 10 SEGUNDOS ANTES de ele

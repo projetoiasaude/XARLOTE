@@ -618,6 +618,23 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     );
   }
 
+  // 9b. 🛟 BACKSTOP DE REPASSE AO PACIENTE (auditoria 30/07 — caso Glauber/Dr. Marco Elísio).
+  // O consultório respondeu com informação CONCRETA e acionável — "enviar foto da carteirinha
+  // do Ipasgo e do pedido médico, aguardar 72h" — mas como a resposta não trazia HORÁRIO,
+  // nenhuma tool voltada ao paciente rodou (`record_consultation_quote` precisa de data,
+  // `request_clarification` o modelo não chamou). A Xarlote respondeu à clínica e o Glauber
+  // ficou sem saber de nada. Todo o resto do fluxo trava esperando um documento que ele nem
+  // sabe que precisa mandar.
+  // Regra: se a clínica FALOU algo com substância e NADA foi repassado ao paciente neste
+  // turno, repassa. Verbatim (é a mensagem REAL da clínica, não paráfrase do LLM).
+  const nadaFoiAoPaciente = !quoteRecorded && !appointmentConfirmed && !clarificationRequested && !singleTargetDeadEnd;
+  const clinicaDisseAlgo = (text ?? '').trim().length >= 15;
+  if (nadaFoiAoPaciente && clinicaDisseAlgo && !isAppointmentConfirmation) {
+    await writeLog('warn', 'agent-clinic', 'Backstop: clínica respondeu e NADA foi repassado ao paciente — repassando', { traceId, conversationId, quoteId: quote.id });
+    await relayClinicQuestionToUser(quote, text, traceId)
+      .catch((e) => writeLog('error', 'agent-clinic', `Backstop de repasse falhou: ${String(e).slice(0, 140)}`, { traceId }));
+  }
+
   // 10. Finaliza se necessário (após cotação ou indisponibilidade)
   if (shouldFinalize && !isAppointmentConfirmation) {
     await finalizeConsultationQuote(quote.id, quote.consultation_id, outcome, traceId);
