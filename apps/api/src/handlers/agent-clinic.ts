@@ -18,7 +18,7 @@ import {
   trimHistory,
   type AgentClinicContext,
 } from '@iasaude/llm';
-import { AGENT_INSTANCE, whatsappJidVariants } from '@iasaude/shared';
+import { AGENT_INSTANCE, whatsappJidVariants, specialtyPhrase } from '@iasaude/shared';
 import type { NormalizedInbound, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToClinic, sendTemplateOpeningToClinic } from './outbound-agent.js';
@@ -715,11 +715,11 @@ export async function initiateClinicNegotiation(opts: {
   // Alvo da consulta: se o paciente pediu um MÉDICO específico, a recepção precisa ouvir o NOME
   // dele (senão vira consulta genérica — incidente Vadivino/São Silvestre). Especialidade
   // genérica/vazia ("consulta"/"médico") NÃO pode gerar "consulta de consulta".
-  const specOpen = (ctx.specialty ?? '').trim();
-  const specOpenGeneric = !specOpen || /^consultas?$/i.test(specOpen) || /^m[eé]dic[ao]s?$/i.test(specOpen);
+  // Fonte ÚNICA do sintagma (specialtyPhrase): genérico vira null e cai no rótulo neutro,
+  // nunca "consulta de consulta".
   const alvoConsulta = ctx.requestedProfessional
     ? `uma consulta com ${ctx.requestedProfessional}`
-    : specOpenGeneric ? `uma consulta médica` : `uma consulta de ${specOpen}`;
+    : (specialtyPhrase(ctx.specialty) ?? 'uma consulta médica');
   // Saudação pela HORA DE BRASÍLIA (auditoria 26/07): o literal "Boa tarde!" saía às 07:43
   // da manhã pra recepção — tell de robô logo na primeira frase (caso Ciro, 25/07).
   const openHour = Number(new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', hour12: false }).format(new Date()));
@@ -764,10 +764,13 @@ export async function initiateClinicNegotiation(opts: {
   // é assim que o template foi aprovado na Meta. Ligado por WHATSAPP_TEMPLATES_ENABLED
   // =true; desligado (default), segue o texto livre de hoje.
   if (templatesEnabled()) {
-    // Default defensivo: especialidade vazia/whitespace (input vago do paciente ou LLM
-    // sem valor) não pode gerar "uma consulta de " e travar o template — cai pra genérico.
-    const spec = (ctx.specialty ?? '').trim();
-    const necessidade = spec ? `uma consulta de ${spec}` : 'uma consulta médica';
+    // ⚠️ Este caminho (template) checava só string VAZIA e deixava passar a especialidade
+    // GENÉRICA — foi assim que a clínica do Glauber recebeu, duas vezes, "preciso de uma
+    // consulta de consulta" (29-30/07). O caminho de texto livre (alvoConsulta, acima) já
+    // tinha a guarda; os dois divergiram. Agora ambos usam `specialtyPhrase`, fonte única:
+    // genérico ("consulta", "médico") → null → cai pro rótulo neutro.
+    const necessidade = specialtyPhrase(ctx.specialty)
+      ?? (ctx.requestedProfessional ? `uma consulta com ${ctx.requestedProfessional}` : 'uma consulta médica');
     await sendTemplateOpeningToClinic(conv.id, clinicWhatsApp, 'clinic_outreach', [necessidade], traceId);
   } else {
     await sendOutboundToClinic(conv.id, clinicWhatsApp, opening, traceId);

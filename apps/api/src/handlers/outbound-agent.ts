@@ -1,6 +1,29 @@
 import { db, writeLog } from '@iasaude/db';
 import { isSimulatorMode, zproConfigured } from '@iasaude/whatsapp';
-import { AGENT_INSTANCE, humanizeSupplierText } from '@iasaude/shared';
+import { AGENT_INSTANCE, humanizeSupplierText, checkOutboundSanity } from '@iasaude/shared';
+
+/**
+ * Relê a mensagem antes de mandar pra um terceiro real (clínica/farmácia).
+ * Conserta o que dá (interpolação degenerada) e BLOQUEIA o que não dá conserto seguro —
+ * é melhor a Xarlote ficar calada e alertar do que mandar "consulta de consulta" ou
+ * "undefined" pra uma recepção. Devolve o texto são, ou null se não deve enviar.
+ */
+async function assertSane(
+  text: string,
+  alvo: string,
+  conversationId: string,
+  traceId: string,
+): Promise<string | null> {
+  const { text: fixed, blockers, repairs } = checkOutboundSanity(text);
+  if (repairs.length) {
+    await writeLog('warn', 'outbound', `🪞 Auto-verificação corrigiu a fala antes de enviar pra ${alvo}: ${repairs.join('; ')}`, { traceId, conversationId });
+  }
+  if (blockers.length) {
+    await writeLog('error', 'outbound', `🛑 Envio pra ${alvo} BLOQUEADO pela auto-verificação: ${blockers.join('; ')} — texto: "${text.slice(0, 120)}"`, { traceId, conversationId });
+    return null;
+  }
+  return fixed;
+}
 import { dispatchOutbound } from '../queues/outbound.queue.js';
 import { buildTemplatePayload, humanizeTemplate, type TemplateKey } from '../config/template-registry.js';
 
@@ -28,6 +51,12 @@ export async function sendOutboundToSupplier(
   // farmácia real achou que era robô e não entregou): tira TODO emoji e troca travessão
   // por vírgula — vale pro texto do LLM E pros determinísticos, sem caçar cada string.
   text = humanizeSupplierText(text);
+  // 🪞 AUTO-VERIFICAÇÃO: relê o que vai sair antes de sair (ver checkOutboundSanity).
+  {
+    const sane = await assertSane(text, 'farmácia', conversationId, traceId);
+    if (!sane) return;
+    text = sane;
+  }
   // SEM dedup aqui (review): a conversa de fornecedor é COMPARTILHADA por telefone entre
   // pedidos concorrentes; uma msg idêntica (ex.: pergunta de frete determinística) de
   // OUTRO pedido seria suprimida por engano. Dedup só no canal do usuário.
@@ -78,6 +107,11 @@ export async function sendOutboundToClinic(
   traceId: string,
 ): Promise<void> {
   text = humanizeSupplierText(text); // paridade com a farmácia: sem emoji, sem travessão
+  {
+    const sane = await assertSane(text, 'clínica', conversationId, traceId);
+    if (!sane) return;
+    text = sane;
+  }
   // SEM dedup aqui (review): mesma razão do fornecedor — conversa de estabelecimento
   // compartilhada; dedup só no canal do usuário.
   await db.from('messages').insert({

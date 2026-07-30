@@ -38,6 +38,8 @@ interface ReachCtx {
   traceId: string;
   /** UMA VOZ: handlers auto-contidos setam suppressLlmText (ver ToolContext). */
   turnFlags?: { suppressLlmText: boolean; supplierMessaged?: boolean };
+  /** Observação pro MODELO no loop ReAct (ver ToolContext.observation). */
+  observation?: { note: string | null };
 }
 
 /** E.164 SÓ se for BR plausível — rejeita país estrangeiro explícito (não fabrica número BR). */
@@ -102,10 +104,28 @@ export async function handleFindByName(
   }
   const query = [name, args.specialty, city].filter(Boolean).join(' ');
 
+  // 🔁 REJEIÇÃO AVANÇA PRA O PRÓXIMO (auditoria 30/07 — caso Glauber).
+  // Antes, "Não"/"Errado" fazia o LLM re-chamar esta tool com a MESMA busca, que devolvia o
+  // MESMO primeiro resultado — o paciente recebeu duas vezes seguidas "Achei Dra. Marilia
+  // Oliveira Ribeiro… é essa?" depois de já ter dito que não era. O Google devolve 5
+  // candidatos e nós usávamos só o primeiro, jogando os outros 4 fora.
+  // Agora os descartados ficam registrados e a próxima chamada pula quem já foi recusado.
+  const { data: convRow } = await db.from('conversations').select('pending_lookup').eq('id', ctx.conversationId).maybeSingle();
+  const prev = (convRow?.pending_lookup ?? null) as { query?: string; rejected?: string[]; place_id?: string } | null;
+  // Mesma busca de antes ⇒ o candidato que estava na mesa foi recusado.
+  const rejected = new Set<string>(
+    prev?.query === query ? [...(prev.rejected ?? []), ...(prev.place_id ? [prev.place_id] : [])] : [],
+  );
+
   let candidate: { placeId: string; name: string; address: string; city: string; phone: string } | null = null;
+  let exhausted = false;
   try {
     const results = await findPlacesByTextSearch(query, 5);
-    for (const r of results) {
+    const fresh = results.filter((r) => !rejected.has(r.placeId));
+    exhausted = results.length > 0 && fresh.length === 0;
+    for (const r of fresh) {
+      // Resolve o telefone SÓ do candidato da vez (lazy): fetchar os 5 de uma vez
+      // multiplicaria por 5 o custo de Place Details sem necessidade.
       const phone = toE164BR(await getPlacePhone(r.placeId).catch(() => null));
       if (phone && !isPlaceholderPhone(phone)) {
         candidate = { placeId: r.placeId, name: r.name, address: r.address, city: r.city || city, phone };
@@ -117,9 +137,18 @@ export async function handleFindByName(
   }
 
   if (!candidate) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      `Procurei "${name}"${city ? ` em ${city}` : ''} mas não achei um contato confiável no Google 😕 Você tem o telefone/WhatsApp deles? Aí eu falo direto.`,
-      ctx.traceId);
+    // 🪜 ESCADA DE FALLBACK: nunca terminar em beco sem saída. Se acabaram os candidatos
+    // (ou nenhum tinha telefone), volta ao paciente pedindo o que destrava o contato —
+    // nome da clínica onde o médico atende, ou o telefone direto, que é o caminho curto.
+    const msg = exhausted
+      ? `Já te mostrei as opções que o Google me deu pra "${name}" e nenhuma era a certa 😕\n\nMe ajuda a chegar nele(a): você sabe o **nome da clínica** onde atende? Ou, melhor ainda, tem o **telefone/WhatsApp** deles? Com o número eu falo direto agora.`
+      : `Procurei "${name}"${city ? ` em ${city}` : ''} mas não achei um contato confiável 😕\n\nVocê sabe o **nome da clínica** onde atende, ou tem o **telefone/WhatsApp** deles? Com qualquer um dos dois eu consigo seguir.`;
+    await sendOutbound(ctx.conversationId, ctx.phoneE164, msg, ctx.traceId);
+    // Guarda os recusados pra uma próxima tentativa não repetir os mesmos.
+    await db.from('conversations').update({
+      pending_lookup: { kind: args.kind ?? 'clinic', query, rejected: [...rejected], awaiting: 'clinic_name_or_phone', at: new Date().toISOString() },
+    }).eq('id', ctx.conversationId);
+    if (ctx.observation) ctx.observation.note = `Busca por "${name}" sem candidato novo. Você JÁ pediu ao paciente o nome da clínica ou o telefone — não repita a busca com o mesmo nome, espere a resposta dele.`;
     return;
   }
 
@@ -132,6 +161,9 @@ export async function handleFindByName(
       place_id: candidate.placeId,
       city: candidate.city,
       specialty: args.specialty ?? null,
+      // `query` + `rejected` sustentam o avanço na próxima recusa (ver acima).
+      query,
+      rejected: [...rejected],
       at: new Date().toISOString(),
     },
   }).eq('id', ctx.conversationId);
@@ -402,6 +434,22 @@ async function contactClinic(phone: string, clinicName: string, specialty: strin
   await sendOutbound(ctx.conversationId, ctx.phoneE164,
     `Show! Já tô falando com *${clinicName}*${professional ? ` pra marcar com ${professional}` : specialtyPhrase(specialty) ? ` pra ver ${specialtyPhrase(specialty)}` : ''} 🔍 Assim que eles responderem com horário e valor, te aviso 💙`,
     ctx.traceId);
+  // 🎯 HONESTIDADE DO QUE FOI DITO (auditoria 30/07). Ela afirmou ao Glauber, duas vezes,
+  // "já informei que é pelo IPASGO" — sendo que o contato saíra 10 SEGUNDOS ANTES de ele
+  // mencionar o plano, e a mensagem não citava plano nenhum. O modelo não tinha como saber
+  // o conteúdo real do que saiu, então preencheu com o que parecia razoável.
+  // Agora ele recebe o inventário EXATO do que foi (e do que não foi) dito.
+  if (ctx.observation) {
+    const foi: string[] = [];
+    if (professional) foi.push(`o nome do profissional (${professional})`);
+    if (specialtyPhrase(specialty)) foi.push(`a especialidade (${specialtyPhrase(specialty)})`);
+    ctx.observation.note =
+      `Abertura enviada para ${clinicName}. INCLUÍA: ${foi.length ? foi.join(', ') : 'apenas o pedido genérico de consulta'}.`
+      + ` NÃO INCLUÍA o convênio/plano do paciente — esta abertura nunca leva plano.`
+      + ` NÃO afirme ao paciente que passou nada além do que está nesta lista.`
+      + ` Se ele perguntar do convênio ou disser o plano agora, a verdade é que a clínica AINDA NÃO sabe:`
+      + ` use \`message_supplier\` pra complementar de verdade e SÓ DEPOIS diga que informou.`;
+  }
   await writeAudit({
     actorType: 'xarlote', action: 'consultation.targeted_contact', userId: ctx.userId,
     targetTable: 'consultation_quotes', targetId: q.id, conversationId: ctx.conversationId,
