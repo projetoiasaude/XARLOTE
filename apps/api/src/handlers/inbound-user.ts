@@ -953,7 +953,14 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
   // Tools de efeito IRREVERSÍVEL que não podem repetir entre rodadas do loop (o modelo, ao
   // ver o resultado, tende a "reforçar" a ação). Emergência escalonada 2× liga 2 vezes pro
   // contato do paciente; message_supplier 2× manda 2 WhatsApps reais pra farmácia.
-  const ONCE_PER_TURN_TOOLS = new Set(['red_flag_check', 'message_supplier', 'send_emergency_orientation']);
+  // Toda tool que FALA COM UM TERCEIRO REAL entra aqui: rodar de novo numa 2ª rodada do loop
+  // manda uma SEGUNDA mensagem de verdade. Foi o que aconteceu com o IAD, que recebeu a
+  // mesma cutucada duas vezes no mesmo minuto (09:28 e 09:28, caso Glauber 30/07).
+  const ONCE_PER_TURN_TOOLS = new Set([
+    'red_flag_check', 'message_supplier', 'send_emergency_orientation',
+    'nudge_consultation', 'contact_establishment', 'find_clinic_by_name',
+    'start_consultation_search', 'start_pharmacy_order', 'expand_pharmacy_search',
+  ]);
   const alreadyRanThisTurn = new Set<string>();
   // Orçamento de tempo do turno INTEIRO: sem isto, 4 rodadas × (3 tentativas × 60s) podia
   // passar de 10min e estourar o TTL do lock de turno (180s) — dois turnos do mesmo paciente

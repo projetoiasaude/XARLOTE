@@ -736,9 +736,12 @@ export function isServiceNumber(phone: string | null | undefined): boolean {
   const local = d.startsWith('55') ? d.slice(2) : d;
   // 0800/0300 podem vir SEM DDD (8-11 dígitos começando com 0800/0300)
   if (/^0(800|300)\d{6,8}$/.test(local) || /^0(800|300)\d{6,8}$/.test(d)) return true;
-  // Com DDD: assinante começando com 4002/4004/4020/3003 (números corporativos não-móveis)
+  // Com DDD: assinante corporativo não-móvel. A família 40XX inteira é de central
+  // (4002/4003/4004/4007/4009/4020…) — a lista fechada anterior deixou o **4009** passar e
+  // o IAD (+55 62 4009-1919) recebeu 5 mensagens da Xarlote sem nunca responder, porque
+  // central 4009 não é WhatsApp de consultório (caso Glauber, 27-30/07).
   const subscriber = local.length >= 10 ? local.slice(2) : local;
-  return /^(4002|4004|4020|3003)\d{4}$/.test(subscriber);
+  return /^(40\d{2}|3003|3004)\d{4}$/.test(subscriber);
 }
 
 /**

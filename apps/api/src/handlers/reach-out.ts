@@ -127,7 +127,10 @@ export async function handleFindByName(
       // Resolve o telefone SÓ do candidato da vez (lazy): fetchar os 5 de uma vez
       // multiplicaria por 5 o custo de Place Details sem necessidade.
       const phone = toE164BR(await getPlacePhone(r.placeId).catch(() => null));
-      if (phone && !isPlaceholderPhone(phone)) {
+      // Central (4002/4009/0800…) NUNCA é WhatsApp de consultório: o caso Glauber mostrou
+      // 5 mensagens no vácuo pro +55 62 4009-1919 do IAD. Descarta o candidato e segue pro
+      // próximo em vez de queimar a busca num número que não atende.
+      if (phone && !isPlaceholderPhone(phone) && !isServiceNumber(phone)) {
         candidate = { placeId: r.placeId, name: r.name, address: r.address, city: r.city || city, phone };
         break;
       }

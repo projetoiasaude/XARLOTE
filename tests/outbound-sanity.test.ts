@@ -8,6 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import { checkOutboundSanity } from '../packages/shared/src/sanity.js';
 import { specialtyPhrase } from '../packages/shared/src/specialty.js';
+import { isServiceNumber } from '../packages/shared/src/pharmacy.js';
 
 describe('checkOutboundSanity — conserta o que tem conserto', () => {
   it('a frase REAL do incidente é reparada', () => {
@@ -69,5 +70,25 @@ describe('specialtyPhrase — fonte única, genérico nunca vira "consulta de co
   it('especialidade real é preservada', () => {
     expect(specialtyPhrase('gastroenterologia')).toBe('uma consulta de gastroenterologia');
     expect(specialtyPhrase('ginecologista')).toBe('um ginecologista');
+  });
+});
+
+// Caso Glauber (27-30/07): o IAD recebeu 5 mensagens no +55 62 4009-1919 e nunca respondeu.
+// 4009 é central — a lista fechada anterior (4002/4004/4020/3003) deixava passar.
+describe('isServiceNumber — família 40XX inteira é central', () => {
+  it('4009 (o número do IAD) é reconhecido como central', () => {
+    expect(isServiceNumber('+556240091919')).toBe(true);
+  });
+
+  it('mantém os que já eram pegos', () => {
+    expect(isServiceNumber('+556240028282')).toBe(true);  // 4002
+    expect(isServiceNumber('+556230031234')).toBe(true);  // 3003
+    expect(isServiceNumber('0800 123 4567')).toBe(true);
+  });
+
+  it('NÃO confunde celular nem fixo comum de consultório', () => {
+    expect(isServiceNumber('+5562981882177')).toBe(false); // celular (clínica do Dr. Rafael)
+    expect(isServiceNumber('+556232551234')).toBe(false);  // fixo 3255
+    expect(isServiceNumber(null)).toBe(false);
   });
 });
