@@ -254,15 +254,23 @@ export async function handleContactEstablishment(
  * tranquiliza o paciente; retoma uma consulta recém-encerrada sem duplicar. Auto-contido (uma voz).
  */
 export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
-  if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
+  // ⚠️ NÃO amordaçar o modelo aqui (auditoria 30/07 — caso Ciro).
+  // Antes, `suppressLlmText = true` era setado INCONDICIONALMENTE na 1ª linha, antes de
+  // saber qualquer coisa. Nos estados informativos o handler despejava um texto FIXO e a
+  // resposta real do modelo era jogada fora. Resultado ao vivo: o Ciro recebeu 7× seguidas
+  // "As opções de horário ainda estão de pé…" — inclusive quando escreveu "Pode confirmar
+  // terça feira 09:30". Ele estava CONFIRMANDO e ela respondia com o enlatado.
+  //
+  // Princípio novo: em estado INFORMATIVO o handler entrega FATOS ao modelo (observation) e
+  // NÃO fala pelo paciente. Texto pronto só sobrevive onde o handler executa uma AÇÃO que o
+  // modelo não tem como narrar sozinho — e, mesmo lá, a supressão é setada na hora do envio.
   const { data: c } = await db.from('consultations')
     .select('id, status, specialty, preferences, created_at')
     .eq('user_id', ctx.userId)
     .in('status', ['searching', 'quoting', 'quoted', 'confirming', 'failed'])
     .order('created_at', { ascending: false }).limit(1).maybeSingle();
   if (!c || (c.status === 'failed' && Date.now() - new Date(c.created_at as string).getTime() > 24 * 60 * 60_000)) {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      'Não achei nenhuma consulta em andamento pra retomar 💙 Quer que eu comece a marcar uma? Me diz o médico ou a especialidade.', ctx.traceId);
+    if (ctx.observation) ctx.observation.note = 'NÃO existe consulta em andamento pra retomar. Diga isso ao paciente com suas palavras e ofereça começar uma (peça o médico ou a especialidade).';
     return;
   }
   const prefs = (c.preferences as Record<string, unknown> | null) ?? {};
@@ -270,15 +278,41 @@ export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
   const alvo = doctor ? `com ${doctor}` : (c.specialty && c.specialty !== 'consulta' ? `de ${c.specialty}` : '');
 
   if (c.status === 'quoted') {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      `As opções de horário ${alvo} que te mandei ainda estão de pé 💙 Quer confirmar alguma? Se preferir, me diz que eu procuro mais.`, ctx.traceId);
+    // Entrega os horários REAIS que a clínica ofereceu pro modelo responder com precisão —
+    // inclusive pra reconhecer quando o paciente ESTÁ escolhendo um deles.
+    const { data: opts } = await db.from('consultation_quotes')
+      .select('proposed_datetime, alternative_datetimes, price_brl, clinics(name)')
+      .eq('consultation_id', c.id)
+      .not('proposed_datetime', 'is', null)
+      .order('created_at', { ascending: false }).limit(3);
+    const fmt = (iso: string) => new Date(iso).toLocaleString('pt-BR', { weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
+    const linhas = (opts ?? []).flatMap((o) => {
+      const base = o.proposed_datetime ? [fmt(o.proposed_datetime as string)] : [];
+      const alts = Array.isArray(o.alternative_datetimes) ? (o.alternative_datetimes as string[]).map(fmt) : [];
+      return [...base, ...alts];
+    });
+    const preco = (opts ?? [])[0]?.price_brl;
+    if (ctx.observation) {
+      ctx.observation.note =
+        `Consulta ${alvo || ''} está AGUARDANDO A ESCOLHA do paciente.`
+        + (linhas.length ? ` Horários que a clínica ofereceu: ${linhas.join(' | ')}.` : '')
+        + (preco ? ` Valor: R$${preco}.` : '')
+        + ` ⚠️ LEIA a mensagem dele: se ele ESCOLHEU um horário ou disse que quer confirmar,`
+        + ` NÃO repita as opções — chame \`confirm_consultation_selection\` e feche.`
+        + ` Se ele pediu OUTRA data, diga que vai checar e use \`message_supplier\` pra perguntar à clínica de verdade.`;
+    }
     return;
   }
   if (c.status === 'confirming') {
-    await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      `Tô confirmando a reserva ${alvo} com a clínica 💙 assim que baterem o martelo, te aviso na hora!`, ctx.traceId);
+    if (ctx.observation) ctx.observation.note = `A reserva ${alvo || ''} já está em confirmação com a clínica — aguardando o retorno deles. Tranquilize o paciente com suas palavras, sem prometer horário que ainda não foi confirmado.`;
     return;
   }
+
+  // Daqui pra baixo o handler EXECUTA uma ação (cutuca a clínica / revive a consulta) e conta
+  // isso ao paciente com uma frase que depende do resultado da ação — coisa que o modelo não
+  // teria como narrar com precisão. SÓ AQUI a supressão se justifica; nos estados informativos
+  // acima ela era o que produzia o loop de enlatado.
+  if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
 
   // searching/quoting/failed → dá um alô no consultório e (se falhou) retoma a MESMA consulta.
   const { data: q } = await db.from('consultation_quotes')
