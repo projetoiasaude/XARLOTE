@@ -220,3 +220,43 @@ export async function sendTemplateOpeningToClinic(
     text: human, traceId,
   });
 }
+
+/**
+ * 📎 Encaminha um DOCUMENTO do paciente (carteirinha, pedido médico, receita) a um
+ * estabelecimento — clínica ou farmácia.
+ *
+ * Nasceu do caso Glauber (30/07): o consultório do Dr. Marco Elísio pediu "foto da
+ * carteirinha do Ipasgo e do pedido médico" e a Xarlote não tinha como repassar NADA —
+ * a fila só aceitava texto e a mídia recebida nem era guardada. O fluxo travava ali,
+ * esperando um documento que nunca ia chegar.
+ *
+ * A imagem vai por URL pública (é como o zpro envia foto), servida do nosso Storage.
+ * `caption` é a legenda humana que acompanha o documento.
+ */
+export async function sendMediaToEstablishment(
+  conversationId: string,
+  phoneE164: string,
+  imageUrl: string,
+  caption: string,
+  traceId: string,
+): Promise<void> {
+  const legenda = humanizeSupplierText(caption || '');
+  await db.from('messages').insert({
+    conversation_id: conversationId,
+    direction: 'out',
+    sender_role: 'assistant',
+    content_type: 'image',
+    content: legenda || '[documento encaminhado]',
+    trace_id: traceId,
+  });
+  await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversationId);
+  await dispatchOutbound({
+    kind: 'image',
+    instance: AGENT_INSTANCE,
+    phoneE164,
+    imageUrl,
+    text: legenda || undefined,
+    traceId,
+  });
+  await writeLog('info', 'outbound', '📎 documento do paciente encaminhado ao estabelecimento', { traceId, conversationId });
+}

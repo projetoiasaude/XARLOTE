@@ -42,6 +42,7 @@ import { Queue } from 'bullmq';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutbound, sendOutboundAudio } from './outbound.js';
 import { handleToolCall, type ToolResult } from './tool-executor.js';
+import { uploadInboundMedia } from './media-host.js';
 import { saveContactsToMemory } from './reach-out.js';
 import { findPendingClarificationForUser } from './clarification.js';
 import { loadLatestOrderState, buildOrderStateBlock } from './order-state.js';
@@ -786,12 +787,16 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
     const longId =
       (inbound.raw as { message?: { id?: string } } | null)?.message?.id ?? inbound.externalId;
     let dataUrlValue: string | null = null;
+    // Buffer da imagem válida — guardado pra HOSPEDAR e poder ENCAMINHAR depois
+    // (o `media_storage_path` era sempre null e a foto sumia no fim do turno).
+    let mediaBuf: { buffer: Buffer; mime: string } | null = null;
     try {
       if (inbound.mediaBase64) {
         // Valida magic bytes ANTES de mandar ao modelo (corpo pode vir corrompido/não-imagem).
         const probe = Buffer.from(inbound.mediaBase64.slice(0, 64), 'base64');
         if (looksLikeImage(probe)) {
           dataUrlValue = dataUrl(inbound.mediaBase64, inbound.mediaMime ?? 'image/jpeg');
+          mediaBuf = { buffer: Buffer.from(inbound.mediaBase64, 'base64'), mime: inbound.mediaMime ?? 'image/jpeg' };
         } else {
           await writeLog('warn', 'vision', `mediaBase64 não parece imagem válida — tratando como falha (id=${longId})`, { traceId, longId });
         }
@@ -800,6 +805,7 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
         if (media && looksLikeImage(media.buffer)) {
           await writeLog('info', 'vision', `Imagem baixada (${media.buffer.length} bytes, ${media.mime})`, { traceId });
           dataUrlValue = dataUrl(media.buffer.toString('base64'), media.mime || 'image/jpeg');
+          mediaBuf = { buffer: media.buffer, mime: media.mime || 'image/jpeg' };
         } else if (media) {
           // 200 com corpo que NÃO é imagem (ex.: lookaside da Meta devolvendo erro HTML/JSON com
           // token expirado) → NÃO manda ao modelo (senão ele alucina que "viu"). Trata como falha.
@@ -818,6 +824,17 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
         : `[O usuário enviou uma imagem. Olhe e responda naturalmente — descreva brevemente o que vê e siga a conversa.]`;
       userMsgContent = userContentWithImage(promptText, [dataUrlValue]);
       userMsgPreview = `[imagem${caption ? ` + "${caption.slice(0, 40)}"` : ''}]`;
+      // 📎 HOSPEDA a imagem e carimba o caminho na mensagem: é o que torna possível
+      // ENCAMINHAR o documento à clínica/farmácia depois (forward_media_to_establishment).
+      // Best-effort e fora do caminho crítico — falhar aqui não pode afetar a resposta.
+      if (mediaBuf) {
+        void uploadInboundMedia(mediaBuf.buffer, mediaBuf.mime, traceId).then(async (hosted) => {
+          if (hosted) {
+            await db.from('messages').update({ media_storage_path: hosted.path }).eq('id', inboundMsg.id);
+            await writeLog('info', 'media', `imagem do paciente hospedada pra encaminhamento (${hosted.path})`, { traceId });
+          }
+        }).catch(() => { /* best-effort */ });
+      }
     } else {
       userMsgContent = `[Recebi uma imagem mas não consegui carregar. Peça pra mandar de novo.]${caption ? ` Legenda: ${caption}` : ''}`;
       userMsgPreview = userMsgContent;

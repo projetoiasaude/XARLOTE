@@ -13,7 +13,7 @@ import { loadPrompts } from '../config/prompts.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
 import { relayUserAnswerToEstablishment } from './clarification.js';
-import { handleFindByName, handleContactEstablishment, handleNudgeConsultation } from './reach-out.js';
+import { handleFindByName, handleContactEstablishment, handleNudgeConsultation , handleForwardMediaToEstablishment } from './reach-out.js';
 import { loadLatestOrderState, resolveTargetSupplier } from './order-state.js';
 import {
   handleStartTreatmentFromOrder, handleLogMedicationTaken, handleUpdateTreatmentStatus,
@@ -184,6 +184,9 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
         break;
       case 'cancel_order':
         await handleCancelOrder(tc.args as { order_id?: string; reason?: string }, ctx);
+        break;
+      case 'forward_media_to_establishment':
+        await handleForwardMediaToEstablishment(tc.args as { what?: string; caption?: string; message_id?: string }, ctx);
         break;
       case 'find_clinic_by_name':
         await handleFindByName(tc.args as { name: string; city?: string; specialty?: string }, ctx);

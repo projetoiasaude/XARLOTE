@@ -16,18 +16,20 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { Queue, Worker, type Job } from 'bullmq';
-import { sendText, sendAudio, sendMenu, sendTemplate } from '@iasaude/whatsapp';
+import { sendText, sendAudio, sendMenu, sendTemplate, sendImage } from '@iasaude/whatsapp';
 import { writeLog, db } from '@iasaude/db';
 import { AGENT_INSTANCE, QUEUE_NAMES, isPlaceholderPhone } from '@iasaude/shared';
 import { getRedisConnection, getRedisClient } from '../queue-config.js';
 
 export interface OutboundJob {
-  kind: 'text' | 'audio' | 'menu' | 'template';
+  kind: 'text' | 'audio' | 'menu' | 'template' | 'image';
   instance: string;       // SARA_INSTANCE | AGENT_INSTANCE
   phoneE164: string;
   text?: string;          // texto (kind=text) ou FALLBACK (kind=audio | kind=template)
   audioBase64?: string;   // buffer de áudio em base64 (kind=audio, via uazapi /base64)
   audioUrl?: string;      // URL pública do áudio (kind=audio, via zpro /voice = PTT)
+  /** kind=image — URL PÚBLICA da imagem (o zpro envia foto por URL). `text` vira legenda. */
+  imageUrl?: string;
   mime?: string;
   ptv?: boolean;
   buttons?: string[];     // kind=menu
@@ -171,6 +173,19 @@ async function rawSend(job: OutboundJob): Promise<void> {
       // do outbound estava sempre null).
       await db.from('messages').update({ external_id: res.messageId }).eq('id', job.messageId).then(() => {}, () => {});
     }
+    return;
+  }
+  if (job.kind === 'image') {
+    // Encaminhar documento (carteirinha, pedido médico, receita) a clínica/farmácia.
+    // Exige URL pública — por isso a mídia recebida é re-hospedada (ver media-host.ts).
+    if (!job.imageUrl) {
+      await writeLog('error', 'outbound', 'envio de imagem SEM imageUrl — nada enviado', { traceId: job.traceId, instance: job.instance });
+      return;
+    }
+    const res = await sendImage(job.instance, job.phoneE164, job.imageUrl, job.text || undefined);
+    await writeLog('info', 'outbound', `📎 imagem enviada pid=${process.pid} providerMessageId=${res.messageId || '(vazio)'}`, {
+      traceId: job.traceId, instance: job.instance, messageId: job.messageId,
+    });
     return;
   }
   if (job.kind === 'menu') {

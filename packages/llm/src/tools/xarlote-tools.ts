@@ -161,6 +161,35 @@ export const xarloteTools: ToolDefinition[] = [
   {
     type: 'function',
     function: {
+      name: 'forward_media_to_establishment',
+      description:
+        'Encaminha ao ESTABELECIMENTO (clínica ou farmácia) uma FOTO/DOCUMENTO que o paciente mandou — carteirinha do convênio, pedido médico, receita, exame. '
+        + 'Use quando o estabelecimento PEDIU o documento e o paciente acabou de enviá-lo, ou quando enviar o documento claramente destrava o atendimento. '
+        + 'ANTES de chamar, confirme que a foto é REALMENTE o que foi pedido (você enxerga a imagem): não encaminhe foto pessoal, print aleatório, resultado de exame quando pediram carteirinha, etc. '
+        + 'Se a foto NÃO for pertinente, não chame esta ferramenta — peça ao paciente a foto certa. Na dúvida, pergunte antes de encaminhar (é um documento dele indo pra terceiro).',
+      parameters: {
+        type: 'object',
+        properties: {
+          what: {
+            type: 'string',
+            description: 'O que é o documento, em 2-4 palavras, do jeito que você VIU na imagem. Ex.: "carteirinha do Ipasgo", "pedido médico", "receita do Neblock".',
+          },
+          caption: {
+            type: 'string',
+            description: 'Legenda humana que acompanha o documento, falando com a recepção. Ex.: "Segue a carteirinha do Ipasgo do paciente" ou "Aqui está o pedido médico, obrigada!".',
+          },
+          message_id: {
+            type: 'string',
+            description: 'OPCIONAL. Id da mensagem com a foto. Se omitir, usa a foto MAIS RECENTE que o paciente enviou.',
+          },
+        },
+        required: ['what', 'caption'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'expand_pharmacy_search',
       description:
         'Amplia a busca do pedido de medicamento ATIVO: procura farmácias num raio MAIOR e contata SÓ as farmácias NOVAS (que ainda não foram cotadas neste pedido), adicionando ao mesmo pedido. Use quando o usuário pedir pra "buscar em mais farmácias", "ampliar o raio", "procurar mais longe", ou quando as cotadas não têm o que ele quer. NÃO reinicia o pedido e NÃO re-contata as mesmas farmácias.',

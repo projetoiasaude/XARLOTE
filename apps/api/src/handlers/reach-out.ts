@@ -11,12 +11,13 @@
  *    direcionado). Reaproveita os mesmos initiate*Negotiation dos fluxos normais
  *    (com relay bidirecional já pronto).
  */
+import { publicUrlForStoredMedia } from './media-host.js';
 import { db, writeLog, writeAudit, saveMemoryCard } from '@iasaude/db';
 import { findPlacesByTextSearch, getPlacePhone } from '@iasaude/integrations';
 import { toE164BR, isPlaceholderPhone, brPhoneVariants, isServiceNumber, sameMedication, itemDisplayName, specialtyPhrase, type OrderItem } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
-import { sendOutboundToClinic } from './outbound-agent.js';
+import { sendOutboundToClinic, sendMediaToEstablishment } from './outbound-agent.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleConsultationTimeout, closeConsultationQuotes } from './consultation-consolidation.js';
 
@@ -711,4 +712,65 @@ async function contactPharmacy(phone: string, pharmacyName: string, items: Order
     initiatePharmacyNegotiation(quote.id, order.id, items, neighborhood, null, ctx.conversationId, ctx.phoneE164, ctx.traceId)
       .catch((err) => writeLog('error', 'lookup', `Contato farmácia falhou: ${String(err).slice(0, 160)}`, { traceId: ctx.traceId }));
   });
+}
+
+/**
+ * 📎 Encaminha um DOCUMENTO do paciente ao estabelecimento em atendimento.
+ *
+ * Caso Glauber (30/07): o consultório pediu "foto da carteirinha do Ipasgo e do pedido
+ * médico" e não havia NENHUM caminho pra repassar — a fila só aceitava texto e a mídia
+ * recebida nem era guardada. O atendimento travava esperando um documento que nunca ia
+ * chegar, e nem a Xarlote nem o paciente percebiam.
+ *
+ * A decisão de PERTINÊNCIA é do modelo (ele enxerga a imagem); aqui garantimos o resto:
+ * existe mídia? existe estabelecimento em atendimento? a mídia está hospedada?
+ */
+export async function handleForwardMediaToEstablishment(
+  args: { what?: string; caption?: string; message_id?: string },
+  ctx: ReachCtx,
+): Promise<void> {
+  const what = (args.what ?? 'documento').trim();
+  const caption = (args.caption ?? `Segue ${what} do paciente.`).trim();
+
+  // 1. A mídia: a indicada, ou a MAIS RECENTE que o paciente mandou nesta conversa.
+  let q = db.from('messages')
+    .select('id, media_storage_path, media_mime, created_at')
+    .eq('conversation_id', ctx.conversationId)
+    .eq('direction', 'in')
+    .not('media_storage_path', 'is', null);
+  if (args.message_id) q = q.eq('id', args.message_id);
+  const { data: media } = await q.order('created_at', { ascending: false }).limit(1).maybeSingle();
+
+  if (!media?.media_storage_path) {
+    if (ctx.observation) ctx.observation.note = 'NÃO há foto do paciente disponível pra encaminhar (nenhuma hospedada nesta conversa). Peça a ele pra enviar a foto de novo — NÃO diga que encaminhou.';
+    return;
+  }
+  const url = publicUrlForStoredMedia(media.media_storage_path as string);
+  if (!url) {
+    if (ctx.observation) ctx.observation.note = 'A foto existe mas não consegui gerar o link pra enviar. Seja honesta: peça pro paciente reenviar.';
+    return;
+  }
+
+  // 2. O destino: clínica em atendimento tem precedência; senão, a farmácia do pedido ativo.
+  const { data: consulta } = await db.from('consultations')
+    .select('id, consultation_quotes(conversation_id, clinics(name, whatsapp_e164, phone_e164))')
+    .eq('user_id', ctx.userId)
+    .in('status', ['searching', 'quoting', 'quoted', 'confirming'])
+    .order('created_at', { ascending: false }).limit(1).maybeSingle();
+  const cq = (consulta?.consultation_quotes as Array<{ conversation_id?: string; clinics?: { name?: string; whatsapp_e164?: string; phone_e164?: string } }> | undefined)?.slice(-1)[0];
+  const destino = cq?.clinics?.whatsapp_e164 ?? cq?.clinics?.phone_e164 ?? null;
+  const destinoConv = cq?.conversation_id ?? null;
+  const destinoNome = cq?.clinics?.name ?? 'o estabelecimento';
+
+  if (!destino || !destinoConv) {
+    if (ctx.observation) ctx.observation.note = 'NÃO há clínica/farmácia em atendimento pra receber o documento agora. Não diga que encaminhou — explique ao paciente e guarde pra quando houver.';
+    return;
+  }
+
+  await sendMediaToEstablishment(destinoConv, destino, url, caption, ctx.traceId);
+  if (ctx.turnFlags) ctx.turnFlags.supplierMessaged = true;
+  if (ctx.observation) {
+    ctx.observation.note = `${what} REALMENTE encaminhado para ${destinoNome} com a legenda "${caption}". Confirme isso ao paciente e NÃO envie de novo.`;
+  }
+  await writeLog('info', 'lookup', `📎 ${what} encaminhado para ${destinoNome}`, { traceId: ctx.traceId });
 }
