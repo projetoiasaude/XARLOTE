@@ -839,6 +839,35 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
       userMsgContent = `[Recebi uma imagem mas não consegui carregar. Peça pra mandar de novo.]${caption ? ` Legenda: ${caption}` : ''}`;
       userMsgPreview = userMsgContent;
     }
+  } else if (inbound.contentType === 'document') {
+    // 📄 DOCUMENTO (PDF do pedido médico, laudo, receita digital). Antes caía no `else` e a
+    // Xarlote nem sabia que algo tinha chegado — o paciente mandava o pedido médico em PDF e
+    // ficava no vácuo. Agora: hospeda (pra poder ENCAMINHAR à clínica/farmácia) e conta ao
+    // modelo o que chegou, com nome do arquivo, pra ele saber do que se trata.
+    const nomeArq = (inbound.raw as { message?: { document?: { filename?: string } } } | null)?.message?.document?.filename
+      ?? (inbound as { fileName?: string }).fileName ?? null;
+    let hospedado = false;
+    try {
+      const media = await fetchInboundMedia(inbound, SARA_INSTANCE);
+      if (media?.buffer?.length) {
+        const hosted = await uploadInboundMedia(media.buffer, media.mime || 'application/pdf', traceId);
+        if (hosted) {
+          await db.from('messages').update({ media_storage_path: hosted.path }).eq('id', inboundMsg.id);
+          hospedado = true;
+          await writeLog('info', 'media', `documento do paciente hospedado pra encaminhamento (${hosted.path})`, { traceId });
+        }
+      }
+    } catch (err) {
+      await writeLog('warn', 'media', `falha ao guardar documento: ${String(err).slice(0, 140)}`, { traceId });
+    }
+    // Honesto com o modelo: ele NÃO consegue LER o conteúdo do PDF (a visão só lê imagem).
+    // Sabe o nome do arquivo e a legenda — e pode perguntar ao paciente o que é.
+    const legendaDoc = inbound.text ?? '';
+    const descr = [nomeArq ? `arquivo "${nomeArq}"` : 'um documento', legendaDoc ? `legenda: "${legendaDoc}"` : null].filter(Boolean).join(', ');
+    userMsgContent = hospedado
+      ? `[O usuário enviou um DOCUMENTO (${descr}). Você NÃO consegue ler o conteúdo dele, mas ele está guardado e você PODE encaminhá-lo à clínica/farmácia com forward_media_to_establishment. Se não estiver claro do que se trata, pergunte a ele em uma linha.]`
+      : `[O usuário enviou um documento (${descr}) mas não consegui guardar o arquivo. Peça pra ele mandar de novo, de preferência como FOTO.]`;
+    userMsgPreview = `[documento${nomeArq ? ` ${nomeArq}` : ''}]`;
   } else {
     userMsgPreview = typeof userMsgContent === 'string' ? userMsgContent : '[multimodal]';
   }

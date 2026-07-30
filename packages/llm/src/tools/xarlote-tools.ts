@@ -163,9 +163,9 @@ export const xarloteTools: ToolDefinition[] = [
     function: {
       name: 'forward_media_to_establishment',
       description:
-        'Encaminha ao ESTABELECIMENTO (clínica ou farmácia) uma FOTO/DOCUMENTO que o paciente mandou — carteirinha do convênio, pedido médico, receita, exame. '
+        'Encaminha ao ESTABELECIMENTO (clínica ou farmácia) uma FOTO ou DOCUMENTO/PDF que o paciente mandou — carteirinha do convênio, pedido médico, receita, exame. Funciona igual pros dois. '
         + 'Use quando o estabelecimento PEDIU o documento e o paciente acabou de enviá-lo, ou quando enviar o documento claramente destrava o atendimento. '
-        + 'ANTES de chamar, confirme que a foto é REALMENTE o que foi pedido (você enxerga a imagem): não encaminhe foto pessoal, print aleatório, resultado de exame quando pediram carteirinha, etc. '
+        + 'Se for IMAGEM, você a enxerga: confirme que é REALMENTE o que foi pedido antes de encaminhar (não mande exame quando pediram carteirinha, nem foto pessoal/print aleatório). Se for PDF/DOCUMENTO, você NÃO lê o conteúdo — guie-se pelo nome do arquivo e pelo que o paciente disse; se não estiver claro, PERGUNTE a ele o que é antes de encaminhar. '
         + 'Se a foto NÃO for pertinente, não chame esta ferramenta — peça ao paciente a foto certa. Na dúvida, pergunte antes de encaminhar (é um documento dele indo pra terceiro).',
       parameters: {
         type: 'object',
