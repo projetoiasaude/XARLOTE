@@ -253,6 +253,37 @@ export async function handleContactEstablishment(
 }
 
 /**
+ * COOLDOWN do alô à clínica — decisão PURA (testável em tests/clinic-nudge-cooldown.test.ts).
+ *
+ * Incidente Rita/Dr. Rafael 31/07: dois turnos do paciente em 19s ("Tomei" + "Agenda com o
+ * Dr. Rafael Navarrete") e a secretária recebeu a MESMA frase 2× em 10 segundos — cara de
+ * robô, queima a relação com o consultório. O ONCE_PER_TURN protege só DENTRO do turno;
+ * ENTRE turnos não havia nada (100% dos nudges reais até 31/07 saíram em dupla).
+ *
+ * Regra: se NÓS mandamos a última mensagem da conversa da clínica e ela ainda não respondeu,
+ * um novo alô só depois do cooldown. Clínica respondeu por último = conversa viva, alô livre.
+ * Timestamp ilegível = trata como nunca-enviado (fail-open, padrão do projeto); timestamp no
+ * FUTURO (skew) = acabou de mandar, bloqueia.
+ */
+export const CLINIC_NUDGE_COOLDOWN_MS = 3 * 60 * 60_000; // 3h — humano insiste no máximo a cada meio expediente
+
+export function shouldPokeClinicAgain(args: {
+  lastOutboundAt: string | null;
+  lastClinicReplyAt: string | null;
+  nowMs: number;
+  cooldownMs?: number;
+}): { poke: boolean; minutesSinceLastPoke: number | null } {
+  const cooldownMs = args.cooldownMs ?? CLINIC_NUDGE_COOLDOWN_MS;
+  const out = args.lastOutboundAt ? Date.parse(args.lastOutboundAt) : NaN;
+  if (!Number.isFinite(out)) return { poke: true, minutesSinceLastPoke: null };
+  const reply = args.lastClinicReplyAt ? Date.parse(args.lastClinicReplyAt) : NaN;
+  if (Number.isFinite(reply) && reply >= out) return { poke: true, minutesSinceLastPoke: null };
+  const elapsedMs = args.nowMs - out;
+  const minutes = Math.max(1, Math.round(elapsedMs / 60_000)); // nunca "há 0 min" na observation
+  return { poke: elapsedMs >= cooldownMs, minutesSinceLastPoke: minutes };
+}
+
+/**
  * INSISTIR/CONTINUAR uma consulta em andamento (incidente Vadivino 22/07: "insiste em marcar" caía
  * no fluxo de FARMÁCIA). Dá ao LLM uma ação de CONSULTA de verdade: re-cutuca o consultório e
  * tranquiliza o paciente; retoma uma consulta recém-encerrada sem duplicar. Auto-contido (uma voz).
@@ -312,11 +343,11 @@ export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
     return;
   }
 
-  // Daqui pra baixo o handler EXECUTA uma ação (cutuca a clínica / revive a consulta) e conta
-  // isso ao paciente com uma frase que depende do resultado da ação — coisa que o modelo não
-  // teria como narrar com precisão. SÓ AQUI a supressão se justifica; nos estados informativos
-  // acima ela era o que produzia o loop de enlatado.
-  if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
+  // Daqui pra baixo o handler PODE executar uma ação (cutucar a clínica / reviver a consulta)
+  // e contar isso ao paciente com uma frase que depende do resultado — coisa que o modelo não
+  // teria como narrar com precisão. A supressão é setada POR BRANCH, no ponto do envio: os
+  // caminhos que NÃO agem (cooldown, sem canal, envio falhou) entregam observation e o modelo
+  // fala — dizer "dei mais um alô lá agora" sem ter mandado nada é a classe de mentira de 20/07.
 
   // searching/quoting/failed → dá um alô no consultório e (se falhou) retoma a MESMA consulta.
   const { data: q } = await db.from('consultation_quotes')
@@ -326,6 +357,7 @@ export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
   const clinicPhone = clinic?.whatsapp_e164 ?? clinic?.phone_e164 ?? null;
 
   if (c.status === 'failed') {
+    if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
     if (clinicPhone && q?.id) {
       // Revive a MESMA consulta (não duplica). **created_at = agora** é OBRIGATÓRIO: o rescue de 6h
       // decide falhar pela IDADE (created_at); sem resetar, uma consulta que falhou POR ter 6h+
@@ -358,12 +390,50 @@ export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
     return;
   }
 
-  // searching/quoting: re-cutuca a clínica (se dá) + tranquiliza
+  // searching/quoting: re-cutuca a clínica — com COOLDOWN entre turnos (incidente Rita 31/07).
   if (clinicPhone && q?.conversation_id) {
-    await sendOutboundToClinic(q.conversation_id, clinicPhone, 'Oi! Só passando pra saber se conseguiu ver um horário — o paciente tá bem interessado 🙂 obrigada!', ctx.traceId).catch(() => { /* best-effort */ });
+    const lastOut = (await db.from('messages').select('created_at')
+      .eq('conversation_id', q.conversation_id).eq('direction', 'out')
+      .order('created_at', { ascending: false }).limit(1).maybeSingle()).data;
+    const lastIn = (await db.from('messages').select('created_at')
+      .eq('conversation_id', q.conversation_id).eq('direction', 'in')
+      .order('created_at', { ascending: false }).limit(1).maybeSingle()).data;
+    const decision = shouldPokeClinicAgain({
+      lastOutboundAt: (lastOut?.created_at as string | undefined) ?? null,
+      lastClinicReplyAt: (lastIn?.created_at as string | undefined) ?? null,
+      nowMs: Date.now(),
+    });
+    if (!decision.poke) {
+      // Estado INFORMATIVO (não agiu): o modelo fala. Sem supressão, sem texto pronto.
+      if (ctx.observation) ctx.observation.note =
+        `Consulta${alvo ? ` ${alvo}` : ''}: o consultório JÁ levou um alô há ${decision.minutesSinceLastPoke} min e ainda não respondeu. `
+        + `NÃO mandei mensagem nova agora (re-insistir tão cedo queima a relação com o consultório). `
+        + `Tranquilize o paciente com suas palavras — já estamos em cima e ele será avisado assim que responderem. `
+        + `NUNCA diga que acabou de mandar outra mensagem.`;
+      await writeLog('info', 'lookup', `nudge_consultation em cooldown (último alô há ${decision.minutesSinceLastPoke}min, sem resposta) — clínica NÃO re-cutucada`, { traceId: ctx.traceId });
+      return;
+    }
+    let poked = false;
+    try {
+      await sendOutboundToClinic(q.conversation_id, clinicPhone, 'Oi! Só passando pra saber se conseguiu ver um horário — o paciente tá bem interessado 🙂 obrigada!', ctx.traceId);
+      poked = true;
+    } catch { /* best-effort: a falha vira observation honesta abaixo */ }
+    if (poked) {
+      if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
+      await sendOutbound(ctx.conversationId, ctx.phoneE164,
+        `Tô insistindo com o consultório ${alvo} 💙 dei mais um alô lá agora — assim que responderem com horário, te aviso na hora!`, ctx.traceId);
+      return;
+    }
+    if (ctx.observation) ctx.observation.note =
+      'Tentei dar um alô no consultório AGORA e o envio FALHOU (problema técnico). NÃO afirme que mandou mensagem — diga que está em cima disso e que tenta de novo em instantes.';
+    return;
   }
-  await sendOutbound(ctx.conversationId, ctx.phoneE164,
-    `Tô insistindo com o consultório ${alvo} 💙 dei mais um alô lá agora — assim que responderem com horário, te aviso na hora!`, ctx.traceId);
+
+  // SEM canal direto com um consultório (busca em andamento, sem quote/telefone ainda): não há
+  // "alô" a dar — afirmar contato que não houve é a classe de mentira de 20/07. Estado real:
+  if (ctx.observation) ctx.observation.note =
+    `A ${c.status === 'searching' ? 'busca' : 'negociação'} de consulta${alvo ? ` ${alvo}` : ''} está EM ANDAMENTO, mas ainda NÃO tenho canal direto de WhatsApp com um consultório pra insistir. `
+    + `Tranquilize o paciente SEM dizer que mandou mensagem agora; se ele tiver o WhatsApp do consultório, peça — com o número em mãos eu falo com eles na hora.`;
 }
 
 /** Consulta DIRECIONADA a uma clínica específica (reusa o fluxo de clínica). */
