@@ -69,23 +69,53 @@ async function zproCall(cfg: ZproConfig, path: string, body: unknown): Promise<u
   }
 }
 
-/** O shape da resposta do zpro não é documentado — extraímos um id best-effort. */
-function pickMessageId(data: unknown): string {
-  if (!data || typeof data !== 'object') return '';
-  const d = data as Record<string, unknown>;
-  const candidates: unknown[] = [
-    d['messageId'],
-    d['id'],
-    d['wamid'],
-    (d['message'] as Record<string, unknown> | undefined)?.['id'],
-    (d['data'] as Record<string, unknown> | undefined)?.['id'],
-    Array.isArray(d['messages']) ? (d['messages'][0] as Record<string, unknown>)?.['id'] : undefined,
-  ];
-  for (const c of candidates) {
-    if (typeof c === 'string' && c) return c;
-    if (typeof c === 'number') return String(c);
+/**
+ * O shape da resposta do zpro não é documentado — extraímos um id best-effort.
+ * Prod 27/07 provou o envelope `{ success:boolean, data:object }` com o id em ALGUM lugar
+ * dentro de `data` (nenhum candidato de raiz casou → providerMessageId vazio em 100%).
+ * Então procuramos os mesmos candidatos na RAIZ e DENTRO de `data` — incluindo `msg.id` e
+ * `message.id`, o vocabulário que o zpro usa no webhook de entrada (zpro-normalize.ts).
+ */
+export function pickMessageId(data: unknown): string {
+  const root = data && typeof data === 'object' ? (data as Record<string, unknown>) : null;
+  const scopes = [root, root?.['data']];
+  for (const s of scopes) {
+    if (!s || typeof s !== 'object') continue;
+    const d = s as Record<string, unknown>;
+    const candidates: unknown[] = [
+      d['messageId'],
+      d['id'],
+      d['wamid'],
+      (d['message'] as Record<string, unknown> | undefined)?.['id'],
+      (d['msg'] as Record<string, unknown> | undefined)?.['id'],
+      Array.isArray(d['messages']) ? (d['messages'][0] as Record<string, unknown>)?.['id'] : undefined,
+    ];
+    for (const c of candidates) {
+      if (typeof c === 'string' && c) return c;
+      if (typeof c === 'number') return String(c);
+    }
   }
   return '';
+}
+
+/**
+ * Assinatura ESTRUTURAL de um JSON — só CHAVES e tipos, NUNCA valores (o corpo carrega
+ * telefone/texto = PII). Profundidade limitada; é o que falta pra cravar o caminho do
+ * providerMessageId quando nenhum candidato casa.
+ */
+export function describeShape(v: unknown, depth = 3): string {
+  if (Array.isArray(v)) {
+    if (depth <= 0 || v.length === 0) return 'array';
+    return `array<${describeShape(v[0], depth - 1)}>`;
+  }
+  if (v && typeof v === 'object') {
+    if (depth <= 0) return 'object';
+    const inner = Object.entries(v as Record<string, unknown>)
+      .map(([k, val]) => `${k}:${describeShape(val, depth - 1)}`)
+      .join(', ');
+    return `{ ${inner} }`;
+  }
+  return v === null ? 'null' : typeof v;
 }
 
 function toNumber(phoneE164: string): string {
@@ -105,16 +135,13 @@ export async function zproSendText(
     isClosed: false,
   });
   const messageId = pickMessageId(data);
-  // 🔬 O shape da resposta do zpro NÃO é documentado e nenhum dos candidatos casou em prod
-  // (`providerMessageId=(vazio)` em 100% dos envios de 27/07). Sem esse id somos cegos pra
-  // entrega dupla — e é exatamente o id que o suporte do zpro pede pra investigar.
-  // Logamos só as CHAVES do JSON (nunca o corpo: ele carrega telefone/texto = PII) pra
-  // descobrir o formato real e apertar o pickMessageId na sequência.
+  // 🔬 `providerMessageId` vazio em 100% dos envios de 27/07 e o log raso só revelou o
+  // envelope `{ success, data }`. Sem esse id somos cegos pra entrega dupla — e é exatamente
+  // o que o suporte do zpro pede pra investigar. Agora logamos a assinatura PROFUNDA
+  // (chaves+tipos até 3 níveis, NUNCA valores: o corpo carrega telefone/texto = PII) pra
+  // cravar o caminho do id e apertar o pickMessageId na sequência.
   if (!messageId && data && typeof data === 'object') {
-    const shape = Object.entries(data as Record<string, unknown>)
-      .map(([k, v]) => `${k}:${Array.isArray(v) ? 'array' : typeof v}`)
-      .join(', ');
-    console.warn(`[zpro] resposta de envio SEM messageId reconhecido — shape={ ${shape} }`);
+    console.warn(`[zpro] resposta de envio SEM messageId reconhecido — shape=${describeShape(data)}`);
   }
   return { messageId };
 }
