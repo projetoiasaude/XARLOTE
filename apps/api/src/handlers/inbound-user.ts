@@ -69,6 +69,55 @@ export function looksLikeImage(buf: Buffer | null | undefined): boolean {
   return false;
 }
 
+/**
+ * Detecção PURA de "afirmei/prometi contato" na fala da Xarlote (testável em
+ * tests/contact-claim.test.ts). É o cérebro do guard anti-mentira do turno:
+ *
+ * - PASSADO (incidente 07/07): "já falei com a farmácia" sem nenhum envio real.
+ * - FUTURO (incidente Pague Menos 09/07): "Vou falar com a Pague Menos agora!" e o contato
+ *   nunca foi feito. O ALVO tem que vir LOGO APÓS a preposição — um \p{Lu}\p{Ll}+ solto
+ *   casava qualquer palavra capitalizada (inclusive o "Vou" inicial) e "Vou verificar pra
+ *   você" virava non-sequitur de farmácia (review 10/07 #22). Nome Próprio é checado
+ *   case-SENSITIVE em regex separada ( /i + \p{Lu} casaria "ele/eles" minúsculo).
+ * - CONSULTA (caso Ciro 26-30/07, backstop que só existia pra farmácia): "vou perguntar à
+ *   clínica se quinta dá", dito 3×, e a pergunta NUNCA saiu. Entram os verbos de pergunta
+ *   (perguntar/checar/verificar), as preposições contraídas (à/ao/às/aos) e os alvos de
+ *   consultório (clínica/consultório/secretária/recepção/médico).
+ *
+ * `futureTarget` classifica o alvo do claim futuro pra escolher a resposta honesta:
+ * 'clinic'/'pharmacy' explícitos; 'ambiguous' = nome próprio ou "eles/elas" (o call-site
+ * decide pelo estado do turno: consulta ativa sem pedido de farmácia → clínica).
+ * O passado segue farmácia/genérico por construção (recap de contato antigo de CONSULTA é
+ * frequentemente VERDADE fora do turno — guard de passado pra clínica daria falso positivo).
+ */
+export function detectContactClaim(replyText: string): {
+  past: boolean;
+  future: boolean;
+  futureTarget: 'clinic' | 'pharmacy' | 'ambiguous' | null;
+} {
+  const past = /(mandei\s+(uma\s+)?(mensagem|msg|recado)|entrei\s+em\s+contato|acabei de falar com (a|as|o) ?(farm|drog)|j[áa]\s+(falei|avisei|mandei|entrei em contato)\s+(com\s+)?(a\s+|as\s+|na\s+|pra\s+|para\s+|o\s+)?(farm[aá]cia|drog|eles\b|a loja))/i.test(replyText);
+
+  let future = false;
+  let futureTarget: 'clinic' | 'pharmacy' | 'ambiguous' | null = null;
+  const lead = /\b(vou (falar|conversar|entrar em contato|mandar (mensagem|msg)|cotar|perguntar|checar|verificar)|(j[áa] )?t[ôo] falando)\s+(com|na|no|pr[ao]s?|para|[àa]os?|[àa]s?)\s+(a\s+|o\s+|as\s+|os\s+)?/iu.exec(replyText);
+  if (lead) {
+    const target = replyText.slice(lead.index + lead[0].length);
+    if (!/^voc[êe]\b/i.test(target)) {
+      if (/^(cl[íi]nica|consult[óo]rio\w*|secret[áa]ri\w*|secretaria|recep[çc][ãa]o|m[ée]dic\w*)/i.test(target)) {
+        future = true;
+        futureTarget = 'clinic';
+      } else if (/^(farm[aá]c\w*|drog\w*|loja|televendas|atendimento|unidade)/i.test(target)) {
+        future = true;
+        futureTarget = 'pharmacy';
+      } else if (/^(eles|elas)\b/i.test(target) || /^\p{Lu}\p{Ll}+/u.test(target)) {
+        future = true;
+        futureTarget = 'ambiguous';
+      }
+    }
+  }
+  return { past, future, futureTarget };
+}
+
 // Serialização de turno (review H3): 2 mensagens rápidas do MESMO telefone geram 2 turnos
 // concorrentes → dupla execução de tools + estado stale + vozes contraditórias. Espera generosa
 // pra NÃO dropar a 2ª msg; se o turno anterior demorar mais que isso (raro), processa mesmo assim.
@@ -1557,31 +1606,22 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
         // nunca contata ninguém. Mantê-la aqui liberava "Já entrei em contato com a Clínica
         // São Lucas!" passar pelo guard (review).
         ['contact_establishment', 'relay_answer_to_establishment', 'confirm_order_selection', 'start_pharmacy_order', 'expand_pharmacy_search', 'start_consultation_search'].includes(t.name));
-    const claimsContactPast = /(mandei\s+(uma\s+)?(mensagem|msg|recado)|entrei\s+em\s+contato|acabei de falar com (a|as|o) ?(farm|drog)|j[áa]\s+(falei|avisei|mandei|entrei em contato)\s+(com\s+)?(a\s+|as\s+|na\s+|pra\s+|para\s+|o\s+)?(farm[aá]cia|drog|eles\b|a loja))/i.test(replyText);
-    // FUTURO também é mentira se nenhuma tool saiu (incidente Pague Menos 09/07: "Vou falar
-    // com a Pague Menos agora! 💙" repetido 2x e o contato NUNCA foi feito — o usuário ficou
-    // esperando uma cotação que não existia). O ALVO tem que vir LOGO APÓS a preposição —
-    // um \p{Lu}\p{Ll}+ solto casava qualquer palavra capitalizada da frase (inclusive o
-    // "Vou" inicial) e "Vou verificar pra você" virava non-sequitur de farmácia (review
-    // 10/07 #22; "verificar" fora do gatilho pelo mesmo motivo). Nome Próprio é checado
-    // case-SENSITIVE em regex separada ( /i + \p{Lu} casaria "ele/eles" minúsculo).
-    let claimsContactFuture = false;
-    {
-      const lead = /\b(vou (falar|conversar|entrar em contato|mandar (mensagem|msg)|cotar)|(j[áa] )?t[ôo] falando)\s+(com|na|no|pra|para)\s+(a\s+|o\s+|as\s+|os\s+)?/iu.exec(replyText);
-      if (lead) {
-        const target = replyText.slice(lead.index + lead[0].length);
-        claimsContactFuture =
-          (/^(farm[aá]c\w*|drog\w*|loja|televendas|atendimento|unidade|cl[íi]nica|eles\b|elas\b)/i.test(target)
-            || /^\p{Lu}\p{Ll}+/u.test(target))
-          && !/^voc[êe]\b/i.test(target);
-      }
-    }
-    const claimsContact = claimsContactPast || claimsContactFuture;
-    if (claimsContact && !reallyContacted) {
-      await writeLog('warn', 'agent', `🚫 Anti-mentira: LLM afirmou contato com farmácia sem chamar tool → resposta honesta`, { traceId, textPreview: replyText.slice(0, 60) });
-      replyText = orderState && orderState.suppliers.length
-        ? 'Deixa eu acertar direitinho: com qual farmácia do seu pedido você quer que eu fale? Me diz o nome que eu mando a mensagem na hora 💙'
-        : 'Pra eu falar com uma farmácia eu preciso de um pedido ativo — me fala o remédio e o endereço que eu começo a busca 💙';
+    // Detecção extraída pra função PURA `detectContactClaim` (testável) — cobre o PASSADO
+    // (incidente 07/07, farmácia), o FUTURO (incidente Pague Menos 09/07) e, desde 31/07, a
+    // promessa de CONSULTA (caso Ciro: "vou perguntar à clínica se quinta dá" dito 3× sem a
+    // pergunta nunca sair — a farmácia tinha este backstop desde 09/07, a consulta não).
+    const claim = detectContactClaim(replyText);
+    if ((claim.past || claim.future) && !reallyContacted) {
+      // Alvo ambíguo (nome próprio / "eles") decide pelo ESTADO do turno: consulta ativa sem
+      // pedido de farmácia em andamento = o contato prometido só pode ser o consultório.
+      const clinicish = !claim.past && (claim.futureTarget === 'clinic'
+        || (claim.futureTarget === 'ambiguous' && !!consultStateBlock && !(orderState && orderState.suppliers.length)));
+      await writeLog('warn', 'agent', `🚫 Anti-mentira: LLM afirmou contato com ${clinicish ? 'consultório' : 'farmácia'} sem envio real → resposta honesta`, { traceId, textPreview: replyText.slice(0, 60) });
+      replyText = clinicish
+        ? 'Deixa eu ser certinha com você: essa mensagem ainda NÃO foi pro consultório. Quer que eu pergunte pra eles agora? Me confirma que eu envio na hora 💙'
+        : orderState && orderState.suppliers.length
+          ? 'Deixa eu acertar direitinho: com qual farmácia do seu pedido você quer que eu fale? Me diz o nome que eu mando a mensagem na hora 💙'
+          : 'Pra eu falar com uma farmácia eu preciso de um pedido ativo — me fala o remédio e o endereço que eu começo a busca 💙';
     }
   }
 
