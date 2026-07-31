@@ -46,13 +46,14 @@ export const xarloteTools: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'parse_prescription_image',
-      description: 'Processa a imagem de uma receita médica para extrair os medicamentos prescritos.',
+      // Sem parâmetros DE PROPÓSITO: o `message_id` que esta tool pedia era um uuid que o
+      // modelo nunca teve como saber (30/07: chegaram "message_id", "1", "chatcmpl-…" —
+      // texto numa coluna uuid, insert perdido). O runtime sabe qual é a imagem.
+      description: 'Processa a imagem de uma receita médica para extrair os medicamentos prescritos. Use quando o paciente mandar foto de receita. Eu mesma localizo a imagem — você não precisa (nem consegue) informar id de mensagem.',
       parameters: {
         type: 'object',
-        properties: {
-          message_id: { type: 'string', description: 'ID da mensagem que contém a imagem da receita' },
-        },
-        required: ['message_id'],
+        properties: {},
+        required: [],
       },
     },
   },
@@ -89,7 +90,6 @@ export const xarloteTools: ToolDefinition[] = [
             },
           },
           exam_date: { type: 'string', description: 'Data do exame em AAAA-MM-DD, se estiver legível no laudo. Omita se não souber.' },
-          message_id: { type: 'string', description: 'ID da mensagem que contém a imagem do exame, se você souber.' },
         },
         required: ['exam_type', 'title'],
       },
@@ -177,10 +177,6 @@ export const xarloteTools: ToolDefinition[] = [
           caption: {
             type: 'string',
             description: 'Legenda humana que acompanha o documento, falando com a recepção. Ex.: "Segue a carteirinha do Ipasgo do paciente" ou "Aqui está o pedido médico, obrigada!".',
-          },
-          message_id: {
-            type: 'string',
-            description: 'OPCIONAL. Id da mensagem com a foto. Se omitir, usa a foto MAIS RECENTE que o paciente enviou.',
           },
         },
         required: ['what', 'caption'],

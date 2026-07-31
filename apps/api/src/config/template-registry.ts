@@ -191,6 +191,36 @@ function replyAskFor(type?: string | null): string {
 }
 
 /**
+ * Tira do TÍTULO a hora que o `whenLabel` já diz — e só ela.
+ *
+ * Ao vivo 30/07: "Passei pra te lembrar hoje às 16h: Água 16h." O paciente cria o lembrete
+ * e nomeia com o horário ("Água 16h", "Remédio 8h30"), o que é natural; o template então
+ * repetia a mesma hora duas vezes na mesma frase.
+ *
+ * Conservador de propósito: só remove quando a hora do título é a MESMA do rótulo e está no
+ * fim (onde é sufixo, não conteúdo). "Insulina 30 UI às 8h" com whenLabel "hoje às 20h" fica
+ * intacto — hora diferente é informação clínica, não redundância.
+ */
+export function stripRedundantTime(title: string, whenLabel?: string | null): string {
+  const t = (title ?? '').trim();
+  if (!t || !whenLabel) return t;
+  // 🛑 POSOLOGIA NÃO É SUFIXO DE HORÁRIO. "Dipirona 6/6h" com lembrete às 6h viraria
+  // "Dipirona 6/" — texto quebrado, dentro de um template pago, sobre remédio. O intervalo
+  // é informação clínica: na presença dele, não se mexe no título.
+  if (/(\d+\s*\/\s*\d+\s*h|de\s+\d+\s+em\s+\d+\s*h|a\s+cada\s+\d+\s*h)/i.test(t)) return t;
+  const norm = (h: string, m?: string) => `${Number(h)}:${(m ?? '0').padStart(2, '0').slice(0, 2)}`;
+  const labelHour = /(\d{1,2})\s*(?:h|:)\s*(\d{2})?/i.exec(whenLabel);
+  if (!labelHour) return t;
+  const target = norm(labelHour[1]!, labelHour[2]);
+  // Hora no FIM do título (com ou sem "às"), possivelmente seguida de pontuação.
+  const tail = /\s*(?:[àa]s\s*)?(\d{1,2})\s*(?:h|:)\s*(\d{2})?\s*[.,;]?$/i.exec(t);
+  if (!tail || norm(tail[1]!, tail[2]) !== target) return t;
+  const stripped = t.slice(0, tail.index).replace(/[\s\-–—:,]+$/, '').trim();
+  // Se sobrou só a hora (título era "16h"), preserva o original — melhor repetir que ficar vazio.
+  return stripped || t;
+}
+
+/**
  * Motivo ({{2}}) a partir de um LEMBRETE que não pôde ser entregue. Frase única, sem
  * saudação (a saudação já está no {{1}}) e sem quebra de linha — no estilo aprovado.
  * `whenLabel` ex.: "hoje às 7h", "amanhã às 16h30".
@@ -202,7 +232,7 @@ export function reengageReasonForReminder(
   whenLabel?: string | null,
   silentDays?: number | null,
 ): string {
-  const titulo = templateVar(reminder.title ?? '', 90) || 'seu lembrete de saúde';
+  const titulo = templateVar(stripRedundantTime(reminder.title ?? '', whenLabel), 90) || 'seu lembrete de saúde';
   const quando = whenLabel ? ` ${templateVar(whenLabel, 40)}` : '';
   // Formato de RÓTULO (com dois-pontos), NÃO "tomar o seu {título}": o título pode ser um
   // NOME ("Neblock 5mg") OU uma FRASE DE AÇÃO ("Passar remédio nas sobrancelhas") — e

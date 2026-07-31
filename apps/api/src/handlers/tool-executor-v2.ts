@@ -22,6 +22,7 @@ import { discoverClinics } from './clinic-discovery.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
 import { scheduleConsultationTimeout } from './consultation-consolidation.js';
 import { sendOutboundToClinic } from './outbound-agent.js';
+import { ToolFailure, resolveConsultationForUser, resolveConsultationQuote, resolveOrderForUser, LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TIPOS
@@ -83,26 +84,27 @@ export interface StartConsultationArgs {
  *   4. Agenda reminder diário (RRULE)
  */
 export async function handleStartTreatmentFromOrder(args: StartTreatmentArgs, ctx: BaseToolCtx): Promise<void> {
-  // 1. Busca order pra extrair items + supplier
-  const { data: order, error: orderErr } = await db
+  // 1. Busca o pedido — MESMA disciplina do resto: o `order_id` vem do modelo, então
+  // resolve dentro dos pedidos DESTE paciente em vez de confiar no id cru (que, sendo
+  // texto numa coluna uuid, devolvia null e virava `return` mudo → "comecei seu tratamento").
+  const resolved = await resolveOrderForUser(args.order_id, ctx.userId, {
+    action: 'iniciado', traceId: ctx.traceId,
+    statuses: ['confirming', 'handed_off', 'completed'],
+  });
+  const { data: order } = await db
     .from('orders')
     .select('id, status, items, selected_quote_id, user_id')
-    .eq('id', args.order_id)
+    .eq('id', resolved.id)
     .single();
 
-  if (orderErr || !order || order.user_id !== ctx.userId) {
-    await writeLog('warn', 'tool', `start_treatment_from_order: order ${args.order_id} não encontrado ou de outro user`, { traceId: ctx.traceId });
-    return;
-  }
-  if (order.status !== 'confirming' && order.status !== 'handed_off' && order.status !== 'completed') {
-    await writeLog('warn', 'tool', `start_treatment_from_order: order status=${order.status}, ainda não confirmado`, { traceId: ctx.traceId });
-    return;
+  if (!order) {
+    throw new ToolFailure('NÃO iniciei o tratamento: não consegui carregar o pedido. Não diga que começou o acompanhamento.');
   }
 
   const items = (order.items as Array<{ name: string; dosage?: string; quantity?: number }> | null) ?? [];
   if (items.length === 0) {
     await writeLog('warn', 'tool', `start_treatment_from_order: order sem items`, { traceId: ctx.traceId });
-    return;
+    throw new ToolFailure('NÃO iniciei o tratamento: esse pedido não tem itens registrados. Não diga que começou o acompanhamento.');
   }
 
   // 2. Cria/recupera user_health_condition se condition foi passada
@@ -144,7 +146,7 @@ export async function handleStartTreatmentFromOrder(args: StartTreatmentArgs, ct
 
   if (treatErr || !treatment) {
     await writeLog('error', 'tool', `start_treatment_from_order: falha ao criar treatment: ${treatErr?.message}`, { traceId: ctx.traceId });
-    return;
+    throw new ToolFailure('NÃO consegui registrar o tratamento (falha ao gravar). NÃO diga que vai acompanhar o tratamento nem que criou lembretes — nada foi criado.');
   }
 
   // 4. Pra cada item do pedido, cria/atualiza user_medications + inventory
@@ -340,7 +342,7 @@ export async function handleLogMedicationTaken(args: LogMedicationTakenArgs, ctx
       .single();
     if (createErr || !created) {
       await writeLog('warn', 'tool', `log_medication_taken: medicamento "${args.medication_name}" não encontrado e não foi possível criar inferido (${createErr?.message ?? 'sem retorno'})`, { traceId: ctx.traceId });
-      return;
+      throw new ToolFailure(`NÃO consegui registrar ${args.medication_name}: esse medicamento não está no perfil e não deu pra criar. Agradeça o aviso, mas NÃO diga que "anotei"/"marquei".`);
     }
     await writeLog('info', 'tool', `log_medication_taken: "${args.medication_name}" criado como medicamento INFERIDO (só existia como lembrete)`, { traceId: ctx.traceId });
     med = created;
@@ -359,7 +361,7 @@ export async function handleLogMedicationTaken(args: LogMedicationTakenArgs, ctx
     // Adesão que o usuário CONFIRMOU não pode se perder em silêncio (o
     // adherence-scorer lê essa tabela). Log honesto em vez de fingir sucesso.
     await writeLog('error', 'tool', `medication_log INSERT falhou ("${args.medication_name}"): ${logErr.message}`, { traceId: ctx.traceId, userId: ctx.userId });
-    return;
+    throw new ToolFailure(`NÃO consegui registrar que o paciente tomou ${args.medication_name} (falha ao gravar). Agradeça o aviso normalmente, mas NÃO afirme que "marquei"/"anotei" — o registro não existe.`);
   }
 
   // Se taken: decrementa inventário + update last_taken_at
@@ -431,7 +433,7 @@ export async function handleUpdateTreatmentStatus(args: UpdateTreatmentStatusArg
 
   if (!treatmentId || !before) {
     await writeLog('warn', 'tool', `update_treatment_status: tratamento "${args.treatment_name}" não achado`, { traceId: ctx.traceId });
-    return;
+    throw new ToolFailure(`NADA FOI ALTERADO: não existe um tratamento chamado "${args.treatment_name}" no perfil do paciente. Confirme com ele qual tratamento é — e não diga que pausou/encerrou nada.`);
   }
 
   const update: Record<string, unknown> = { status: args.new_status };
@@ -535,7 +537,7 @@ export async function handleSetDefaultAddress(args: { address_label: string }, c
 
   if (!addr?.id) {
     await writeLog('warn', 'tool', `set_default_address: label "${args.address_label}" não encontrado`, { traceId: ctx.traceId });
-    return;
+    throw new ToolFailure(`NADA FOI ALTERADO: o paciente não tem endereço salvo com o nome "${args.address_label}". Pergunte qual endereço ele quer como principal — não diga que mudou.`);
   }
   if (addr.is_default) return; // já é default
 
@@ -778,51 +780,54 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
  *   - Cria reminders: 1 dia antes + 2h antes
  */
 export async function handleConfirmConsultation(args: { consultation_id: string; quote_id: string }, ctx: BaseToolCtx): Promise<void> {
-  const { data: before } = await db.from('consultations').select('status, specialty').eq('id', args.consultation_id).single();
-  if (!before) {
-    await writeLog('warn', 'consultation', `confirm_consultation: consultation ${args.consultation_id} não encontrada`, { traceId: ctx.traceId });
-    return;
+  // ⚠️ Os ids vêm do MODELO e não são confiáveis (30/07: chegou `consultation_id:'Nilo
+  // Machado Junior'` e `quote_id:'13/08/2026 09:00'`). Resolver ANTES de tocar em qualquer
+  // coisa — e sempre dentro do que pertence a ESTE paciente. Referência insalvável lança
+  // ToolFailure: o modelo lê o motivo e não anuncia uma confirmação que não houve.
+  const consultation = await resolveConsultationForUser(args.consultation_id, ctx.userId, {
+    action: 'confirmado', traceId: ctx.traceId,
+  });
+  const consultationId = consultation.id;
+  const before = { status: consultation.status, specialty: consultation.specialty };
+  // IDEMPOTÊNCIA (paridade com handleConfirmOrder): sem esta guarda, chamar de novo mandava
+  // uma SEGUNDA mensagem real à clínica ("pode marcar pra…?") e inseria os lembretes 1d/2h
+  // duplicados. Reconfirmar não é reagendar: se o paciente quer outro horário, fala-se com
+  // a clínica.
+  if (before.status === 'confirming' || before.status === 'scheduled') {
+    throw new ToolFailure('Essa consulta JÁ está confirmada (aguardando/tendo a clínica reservado) — NÃO confirmei de novo e nenhuma mensagem nova foi enviada. Se o paciente quer OUTRO horário, fale com a clínica usando message_supplier em vez de confirmar de novo.');
   }
-
-  // Carrega quote escolhida
-  const { data: q } = await db
-    .from('consultation_quotes')
-    .select('id, clinic_id, prescriber_id, proposed_datetime, modality, price_brl, plan_accepted, conversation_id')
-    .eq('id', args.quote_id)
-    .single();
-
-  if (!q) {
-    await writeLog('warn', 'consultation', `confirm_consultation: quote ${args.quote_id} não encontrada`, { traceId: ctx.traceId });
-    return;
-  }
+  const q = await resolveConsultationQuote(args.quote_id, consultationId, {
+    action: 'confirmado', traceId: ctx.traceId, preferences: consultation.preferences,
+  });
+  const quoteId = q.id;
 
   // 1. Atualiza consultation
   await db.from('consultations').update({
     status: 'confirming',
-    selected_quote_id: args.quote_id,
+    selected_quote_id: quoteId,
     scheduled_at: q.proposed_datetime,
     scheduled_clinic_id: q.clinic_id,
     scheduled_prescriber_id: q.prescriber_id,
-  }).eq('id', args.consultation_id);
+  }).eq('id', consultationId);
 
   // 2. Marca outras quotes como 'rejected'
   await db.from('consultation_quotes')
     .update({ status: 'rejected' })
-    .eq('consultation_id', args.consultation_id)
-    .neq('id', args.quote_id)
+    .eq('consultation_id', consultationId)
+    .neq('id', quoteId)
     .eq('status', 'offered');
 
   // 3. Marca escolhida como 'selected'
-  await db.from('consultation_quotes').update({ status: 'selected' }).eq('id', args.quote_id);
+  await db.from('consultation_quotes').update({ status: 'selected' }).eq('id', quoteId);
 
   await writeAudit({
     actorType: 'xarlote',
     action: 'consultation.quote_selected',
     userId: ctx.userId,
     targetTable: 'consultations',
-    targetId: args.consultation_id,
+    targetId: consultationId,
     before: { status: before.status },
-    after: { status: 'confirming', selected_quote_id: args.quote_id },
+    after: { status: 'confirming', selected_quote_id: quoteId },
     conversationId: ctx.conversationId,
     traceId: ctx.traceId,
     metadata: { clinic_id: q.clinic_id, scheduled_at: q.proposed_datetime },
@@ -862,7 +867,7 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
           scheduled_at: oneDayBefore.toISOString(),
           next_run_at: oneDayBefore.toISOString(),
           status: 'pending',
-          payload: { consultation_id: args.consultation_id, quote_id: args.quote_id, kind: '1d_before' },
+          payload: { consultation_id: consultationId, quote_id: quoteId, kind: '1d_before' },
         });
         if (e1) await writeLog('error', 'consultation', `lembrete 1d_before falhou: ${e1.message}`, { traceId: ctx.traceId });
       }
@@ -875,7 +880,7 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
           scheduled_at: twoHoursBefore.toISOString(),
           next_run_at: twoHoursBefore.toISOString(),
           status: 'pending',
-          payload: { consultation_id: args.consultation_id, quote_id: args.quote_id, kind: '2h_before' },
+          payload: { consultation_id: consultationId, quote_id: quoteId, kind: '2h_before' },
         });
         if (e2) await writeLog('error', 'consultation', `lembrete 2h_before falhou: ${e2.message}`, { traceId: ctx.traceId });
       }
@@ -883,19 +888,38 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
   }
 
   await writeLog('info', 'consultation', `Consulta confirmada — esperando clínica reconfirmar`, {
-    traceId: ctx.traceId, consultationId: args.consultation_id, quoteId: args.quote_id,
+    traceId: ctx.traceId, consultationId: consultationId, quoteId: quoteId,
   });
 }
 
 /** Cancela consulta marcada/em busca. */
 export async function handleCancelConsultation(args: { consultation_id: string; reason: string }, ctx: BaseToolCtx): Promise<void> {
-  const { data: before } = await db.from('consultations').select('status, scheduled_at').eq('id', args.consultation_id).single();
-  if (!before) return;
+  // 🔴 INCIDENTE 30/07 18:52 (Glauber): o modelo mandou um `consultation_id` inventado, o
+  // `.single()` não achou nada, o handler fez `return` MUDO, a task foi carimbada `success`
+  // e a Xarlote anunciou "Pronto, cancelei a consulta com o Dr. Marco Elísio" — com a
+  // consulta VIVA. Cinco horas depois o rescue a contradisse na cara do paciente.
+  // Agora: resolve dentro das consultas DELE (uuid alheio nunca entra) e, se não der pra
+  // ter certeza, lança ToolFailure — o modelo lê "NADA FOI CANCELADO" e conta a verdade.
+  // `failed` entra AQUI (e só aqui): o bloco de contexto mostra a consulta que não fechou
+  // nas últimas 24h como RETOMÁVEL e manda usar cancel_consultation se o paciente desistir.
+  // Sem ela na lista, o resolvedor diria "não há consulta em andamento" contradizendo o
+  // prompt do mesmo turno — e o nudge depois REVIVERIA a consulta que ele mandou cancelar.
+  const consultation = await resolveConsultationForUser(args.consultation_id, ctx.userId, {
+    action: 'cancelado', traceId: ctx.traceId,
+    statuses: [...LIVE_CONSULTATION_STATUSES, 'failed'],
+  });
+  const consultationId = consultation.id;
+  const before = { status: consultation.status, scheduled_at: consultation.scheduled_at };
 
-  await db.from('consultations').update({
+  // CAS: só cancela o que ainda não foi cancelado. Sem isto, dois turnos concorrentes
+  // (ou tool + backstop) avisariam a clínica duas vezes do mesmo cancelamento.
+  const { data: cancelled } = await db.from('consultations').update({
     status: 'cancelled',
     cancelled_reason: args.reason,
-  }).eq('id', args.consultation_id);
+  }).eq('id', consultationId).neq('status', 'cancelled').select('id');
+  if (!cancelled?.length) {
+    throw new ToolFailure('Essa consulta JÁ estava cancelada — nada mudou agora. Não anuncie um cancelamento novo; se o paciente perguntou, apenas confirme que ela já não está mais de pé.');
+  }
 
   // Cancela reminders relacionados
   await db.from('reminders')
@@ -903,13 +927,13 @@ export async function handleCancelConsultation(args: { consultation_id: string; 
     .eq('user_id', ctx.userId)
     .eq('type', 'consultation')
     .eq('status', 'pending')
-    .filter('payload->>consultation_id', 'eq', args.consultation_id);
+    .filter('payload->>consultation_id', 'eq', consultationId);
 
   // Avisa a clínica se já tinha marcação confirmada
   if (before.status === 'confirming' || before.status === 'scheduled') {
     const { data: q } = await db.from('consultation_quotes')
       .select('conversation_id')
-      .eq('consultation_id', args.consultation_id)
+      .eq('consultation_id', consultationId)
       .eq('status', 'selected')
       .maybeSingle();
     if (q?.conversation_id) {
@@ -927,7 +951,7 @@ export async function handleCancelConsultation(args: { consultation_id: string; 
     action: 'consultation.cancelled',
     userId: ctx.userId,
     targetTable: 'consultations',
-    targetId: args.consultation_id,
+    targetId: consultationId,
     before: { status: before.status },
     after: { status: 'cancelled' },
     reason: args.reason,
@@ -955,8 +979,10 @@ export async function handleSetEmergencyContact(args: SetEmergencyContactArgs, c
     if (digits.length >= 10 && digits.length <= 13) {
       phone = digits.startsWith('55') ? `+${digits}` : `+55${digits}`;
     } else {
+      // Silêncio aqui é o mais caro de todos: a Xarlote diria "guardei o contato da sua
+      // filha" e, num red flag, não haveria quem avisar.
       await writeLog('warn', 'tool', `set_emergency_contact: phone inválido (${digits.length} dígitos)`, { traceId: ctx.traceId });
-      return;
+      throw new ToolFailure('NÃO guardei o contato de emergência: o telefone não parece válido. Peça o número completo com DDD ao paciente e NÃO diga que salvou.');
     }
   }
 
@@ -973,13 +999,9 @@ export async function handleSetEmergencyContact(args: SetEmergencyContactArgs, c
   }).eq('id', ctx.userId);
 
   if (error) {
-    // Coluna pode não existir ainda (migration 0007 pendente) — falha silenciosa
-    if (error.message?.includes('column') || error.message?.includes('does not exist')) {
-      await writeLog('warn', 'tool', `set_emergency_contact: schema pendente (migration 0007)`, { traceId: ctx.traceId });
-      return;
-    }
-    await writeLog('error', 'tool', `set_emergency_contact: ${error.message}`, { traceId: ctx.traceId });
-    return;
+    const schemaPendente = error.message?.includes('column') || error.message?.includes('does not exist');
+    await writeLog(schemaPendente ? 'warn' : 'error', 'tool', `set_emergency_contact: ${schemaPendente ? 'schema pendente (migration 0007)' : error.message}`, { traceId: ctx.traceId });
+    throw new ToolFailure('NÃO consegui guardar o contato de emergência (falha técnica ao gravar). NÃO diga que salvou — avise o paciente que deu um problema e que ele pode tentar de novo daqui a pouco.');
   }
 
   await writeAudit({

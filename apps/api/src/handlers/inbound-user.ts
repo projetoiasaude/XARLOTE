@@ -1062,6 +1062,9 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
     'red_flag_check', 'message_supplier', 'send_emergency_orientation',
     'nudge_consultation', 'contact_establishment', 'find_clinic_by_name',
     'start_consultation_search', 'start_pharmacy_order', 'expand_pharmacy_search',
+    // Manda "pode marcar pra tal hora?" pra clínica DE VERDADE e cria os lembretes 1d/2h:
+    // rodar 2× na mesma rodada dobraria a mensagem e os lembretes.
+    'confirm_consultation_selection', 'forward_media_to_establishment',
   ]);
   const alreadyRanThisTurn = new Set<string>();
   // Orçamento de tempo do turno INTEIRO: sem isto, 4 rodadas × (3 tentativas × 60s) podia
@@ -1089,7 +1092,12 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
       }
       await writeLog('info', 'tool', `Tool call: ${tc.name}`, { traceId, args: tc.args });
       const res = await handleToolCall(tc, turnToolCtx);
-      alreadyRanThisTurn.add(tc.name);
+      // Só "gasta" a cota do turno se a tool teve EFEITO: sucesso, ou recusa que já falou
+      // com o paciente. Uma recusa deliberada (ToolFailure) não fez nada — e as mensagens
+      // dela mandam explicitamente "chame de novo com o horário exato". Bloquear essa
+      // segunda chamada tornava a correção que o próprio handler pede inalcançável, e o
+      // skip é MUDO: o modelo acharia que rodou.
+      if (res.ok || res.spoke) alreadyRanThisTurn.add(tc.name);
       if (tc.name === 'red_flag_check' && res.ok) redFlagFiredInLoop = true;
       executedToolCalls.push({ ...tc, ok: res.ok });
       roundResults.push({ tc, res });
@@ -1343,7 +1351,10 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
     // Amplia o "já tratou": qualquer ação de progresso de pedido no turno significa que o
     // LLM NÃO leu como cancelamento — não força cancel (review 12/07: "não quero mais o
     // genérico, quero a marca" é refino, não cancelamento).
-    const calledCancel = llmResponse.toolCalls.some((t) =>
+    // `t.ok` é obrigatório: uma tool que FALHOU não tratou nada. Sem isso, um
+    // `cancel_order` que recusou (ToolFailure) suprimia este backstop — o pedido não era
+    // cancelado por NENHUM dos dois caminhos e a farmácia entregava mesmo assim.
+    const calledCancel = executedToolCalls.some((t) => t.ok &&
       ['cancel_order', 'start_pharmacy_order', 'confirm_order_selection', 'message_supplier', 'relay_answer_to_establishment', 'expand_pharmacy_search', 'contact_establishment'].includes(t.name));
     const uText = typeof userMsgContent === 'string' ? userMsgContent.replace(/^\[Áudio transcrito\]\s*/i, '').trim() : '';
     // Intenção de cancelar O PEDIDO, CLARA e sem ambiguidade (review 12/07 endureceu):
@@ -1570,8 +1581,16 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
   // É essa mesma?" e a rodada 2 mandou "Encontrei a Odontopaz! Te mandei os detalhes…"
   // (mesmo padrão com a Antônia/IAD às 18:03). Agora a exceção exige FALHA REAL: se toda
   // tool teve sucesso, quem já falou tem a palavra final.
+  // ⚠️ 2ª REGRESSÃO DA MESMA FAMÍLIA, fechada em 31/07: `anyToolFailed` é do TURNO INTEIRO,
+  // então bastava UMA tool falhar pra destravar a fala do modelo — mesmo quando OUTRO handler
+  // já tinha falado com o paciente e ligado a supressão. Isso importa muito mais agora que
+  // recusa deliberada (ToolFailure) é comum: um turno com `message_supplier` bem-sucedido
+  // ("Prontinho, mandei…") + qualquer recusa produziria a voz dupla de novo.
+  // A exceção existe pra quando NINGUÉM falou sobre a falha; se um handler já falou, ele tem
+  // a palavra final (a observação da tool que falhou segue visível no contexto do próximo turno).
   const anyToolFailed = executedToolCalls.some((t) => !t.ok);
-  const lastRoundIsHonestyRecovery = agentRounds > 1 && llmResponseFinalHadNoTools && anyToolFailed;
+  const lastRoundIsHonestyRecovery = agentRounds > 1 && llmResponseFinalHadNoTools && anyToolFailed
+    && !turnToolCtx.turnFlags.suppressLlmText;
   const suppressReply = !lastRoundIsHonestyRecovery && (
     (backstopConfirmed && onlyAcceptTurn) || turnToolCtx.turnFlags.suppressLlmText
     || backstopReContacted || (backstopCancelled && onlyCancelTurn)

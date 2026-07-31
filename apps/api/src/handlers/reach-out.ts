@@ -796,20 +796,21 @@ async function contactPharmacy(phone: string, pharmacyName: string, items: Order
  * existe mídia? existe estabelecimento em atendimento? a mídia está hospedada?
  */
 export async function handleForwardMediaToEstablishment(
-  args: { what?: string; caption?: string; message_id?: string },
+  args: { what?: string; caption?: string },
   ctx: ReachCtx,
 ): Promise<void> {
   const what = (args.what ?? 'documento').trim();
   const caption = (args.caption ?? `Segue ${what} do paciente.`).trim();
 
-  // 1. A mídia: a indicada, ou a MAIS RECENTE que o paciente mandou nesta conversa.
-  let q = db.from('messages')
+  // 1. A mídia: a MAIS RECENTE que o paciente mandou nesta conversa. O filtro por
+  // `message_id` do modelo saiu (schema e código): um id inventado zerava a busca e a
+  // Xarlote dizia "não tenho foto sua" com a foto hospedada ali — mentira por id ruim.
+  const { data: media } = await db.from('messages')
     .select('id, media_storage_path, media_mime, created_at')
     .eq('conversation_id', ctx.conversationId)
     .eq('direction', 'in')
-    .not('media_storage_path', 'is', null);
-  if (args.message_id) q = q.eq('id', args.message_id);
-  const { data: media } = await q.order('created_at', { ascending: false }).limit(1).maybeSingle();
+    .not('media_storage_path', 'is', null)
+    .order('created_at', { ascending: false }).limit(1).maybeSingle();
 
   if (!media?.media_storage_path) {
     if (ctx.observation) ctx.observation.note = 'NÃO há foto do paciente disponível pra encaminhar (nenhuma hospedada nesta conversa). Peça a ele pra enviar a foto de novo — NÃO diga que encaminhou.';

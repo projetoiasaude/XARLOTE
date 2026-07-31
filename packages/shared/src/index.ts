@@ -7,5 +7,6 @@ export * from './waba-window.js';
 export * from './specialty.js';
 export * from './onboarding.js';
 export * from './sanity.js';
+export * from './entity-ref.js';
 export * from './phone.js';
 export * from './pharmacy.js';

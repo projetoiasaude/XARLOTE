@@ -119,9 +119,61 @@ export function sendDedupKey(job: OutboundJob): string | null {
   return `outb:sent:${createHash('sha1').update(basis).digest('hex')}`;
 }
 
+/**
+ * Rede de segurança LOCAL da trava de envio único.
+ *
+ * Incidente 30/07: o Redis piscou 3× e cada piscada derrubou as DUAS proteções de envio ao
+ * mesmo tempo — a trava anti-duplicata (aqui) e o rate-limit da fila (ver dispatchOutbound).
+ * Ficar sem as duas justo quando a infra está instável é o pior momento possível.
+ *
+ * Este Set cobre a re-execução dentro do MESMO processo, que é de onde vem a duplicata real
+ * (retry do BullMQ, job stalled reentregue, fallback direto logo após timeout). Não substitui
+ * o Redis entre instâncias — e não pretende: é a segunda linha, não a primeira.
+ * Capado em MAX_LOCAL_KEYS com descarte FIFO pra nunca virar vazamento de memória.
+ */
+const localSentKeys = new Set<string>();
+const MAX_LOCAL_KEYS = 5_000;
+
+export function claimLocal(key: string): boolean {
+  if (localSentKeys.has(key)) return false;
+  localSentKeys.add(key);
+  if (localSentKeys.size > MAX_LOCAL_KEYS) {
+    // Set preserva ordem de inserção: o primeiro é o mais antigo.
+    const oldest = localSentKeys.values().next().value;
+    if (oldest !== undefined) localSentKeys.delete(oldest);
+  }
+  return true;
+}
+
+/**
+ * Devolve a reivindicação quando o envio FALHOU de verdade.
+ *
+ * Sem isto a trava viraria uma armadilha: a chave é criada ANTES do envio e vive 15 min,
+ * enquanto o back-off do BullMQ inteiro (2s→4s→8s→16s) cabe dentro desse TTL. Um 500 do
+ * zpro na 1ª tentativa deixava a chave de pé, TODAS as retentativas eram barradas e o
+ * lembrete de remédio nunca saía — carimbado como entregue (phantom-delivered de 21/07
+ * por outra porta). Duplicata só se previne contra envio que DEU CERTO.
+ */
+export function releaseLocal(key: string): void {
+  localSentKeys.delete(key);
+}
+
+async function releaseSend(job: OutboundJob): Promise<void> {
+  const key = sendDedupKey(job);
+  if (!key) return;
+  releaseLocal(key);
+  try {
+    await getRedisClient().del(key);
+  } catch { /* Redis fora: a chave expira sozinha em SEND_DEDUP_TTL_S */ }
+}
+
 async function claimSend(job: OutboundJob): Promise<boolean> {
   const key = sendDedupKey(job);
   if (!key) return true;
+  // A marca local é registrada SEMPRE (não só no fallback) pra que a segunda linha esteja
+  // pronta quando o Redis cair no meio de uma sequência. Ela só DECIDE dentro do catch —
+  // com o Redis vivo, quem manda é o SET NX, que é a trava correta entre instâncias.
+  const freshLocally = claimLocal(key);
   try {
     // ioredis: set(k, v, 'EX', s, 'NX') → 'OK' se reivindicou, null se já existia.
     const ok = await getRedisClient().set(key, '1', 'EX', SEND_DEDUP_TTL_S, 'NX');
@@ -133,9 +185,16 @@ async function claimSend(job: OutboundJob): Promise<boolean> {
     }
     return true;
   } catch (err) {
-    // Fail-open (perder lembrete de remédio é pior que arriscar duplicata) — mas NUNCA
-    // em silêncio: se o Redis estiver falhando, a trava está desligada e precisamos saber.
-    await writeLog('error', 'outbound', `Trava de envio único INDISPONÍVEL (Redis): ${String(err).slice(0, 140)} — enviando sem proteção`, {
+    // Redis fora: a trava distribuída caiu, mas a LOCAL continua de pé. Fail-open só pra
+    // quem nunca saiu daqui (perder lembrete de remédio é pior que arriscar duplicata);
+    // repetição do mesmo envio neste processo continua barrada.
+    if (!freshLocally) {
+      await writeLog('warn', 'outbound', `🚫 Envio DUPLICADO barrado pela trava LOCAL (Redis fora, key=${key.slice(-12)})`, {
+        traceId: job.traceId, instance: job.instance, kind: job.kind, messageId: job.messageId,
+      });
+      return false;
+    }
+    await writeLog('error', 'outbound', `Trava de envio único (Redis) INDISPONÍVEL: ${String(err).slice(0, 140)} — seguindo só com a trava local deste processo`, {
       traceId: job.traceId, instance: job.instance,
     });
     return true;
@@ -143,7 +202,17 @@ async function claimSend(job: OutboundJob): Promise<boolean> {
 }
 
 /** Executa o envio real na uazapi. Áudio cai pra texto se falhar. */
-async function rawSend(job: OutboundJob): Promise<void> {
+/**
+ * Desfecho do envio — três estados, porque colapsá-los mente no espelho `messages`:
+ *  - `sent`      → saiu de fato; carimba 'delivered'.
+ *  - `duplicate` → barrado pela trava; o envio ORIGINAL já carimbou. Não tocar no carimbo
+ *                  (marcar 'failed' aqui viraria um lembrete ENTREGUE contado como falho,
+ *                  envenenando o alerta de remédio não entregue, o cap e o back-off).
+ *  - `not-sent`  → nada saiu e nada vai sair (número placeholder, imagem sem URL) → 'failed'.
+ */
+type SendOutcome = 'sent' | 'duplicate' | 'not-sent';
+
+async function rawSend(job: OutboundJob): Promise<SendOutcome> {
   // 🛑 TRAVA DE SEGURANÇA (incidente 2026-07-01): NUNCA enviar pra número sintético/
   // placeholder (+555500000<id>) ou inválido. Fornecedor/clínica sem telefone real
   // gerava um número fake e o envio caía em número aleatório (spam/ban). Barra aqui,
@@ -152,10 +221,46 @@ async function rawSend(job: OutboundJob): Promise<void> {
     await writeLog('error', 'outbound', `Envio BLOQUEADO — número placeholder/inválido (${job.phoneE164}). Estabelecimento sem telefone real; nada enviado.`, {
       traceId: job.traceId, instance: job.instance, kind: job.kind, phone: job.phoneE164,
     });
-    return;
+    return 'not-sent';
   }
   // Envio único: barra a re-execução do MESMO job (stalled/retry) — ver claimSend.
-  if (!(await claimSend(job))) return;
+  // `false` NÃO é sucesso: quem chama não pode carimbar 'delivered' em cima disso (a
+  // entrega verdadeira, se houve, já foi carimbada pelo envio original).
+  if (!(await claimSend(job))) return 'duplicate';
+  try {
+    await sendClaimed(job);
+    return 'sent';
+  } catch (err) {
+    // Só devolve a reivindicação quando o erro PROVA que nada saiu (ver provesNothingWasSent).
+    // Um timeout NÃO prova: é o clássico "entregou e a resposta HTTP não voltou" — soltar a
+    // trava ali faria o BullMQ (attempts:5) reenviar e o paciente receber 2×, reabrindo
+    // justamente o incidente de 27/07 que a trava existe pra impedir.
+    if (provesNothingWasSent(err)) await releaseSend(job);
+    throw err;
+  }
+}
+
+/**
+ * O erro prova que a mensagem NÃO saiu?
+ *
+ * `zproCall` formata "zpro <path> HTTP <status>: <corpo>" quando o provedor RESPONDEU, e
+ * repropaga o erro cru quando não houve resposta (timeout/DNS/conexão). Só o 4xx é prova:
+ * o provedor recebeu, entendeu e RECUSOU — nada foi entregue, e a retentativa precisa da
+ * trava livre. 5xx e ausência de resposta ficam ambíguos e mantêm a trava (não duplicar
+ * vale mais que retentar, e o job vai pra 'failed' com carimbo — falha visível, não silenciosa).
+ */
+function provesNothingWasSent(err: unknown): boolean {
+  const m = String((err as Error)?.message ?? err);
+  // zpro: "zpro /url HTTP 400: …" · uazapi (axios cru): "Request failed with status code 400"
+  if (/\bHTTP 4\d\d\b/.test(m) || /status code 4\d\d/i.test(m)) return true;
+  // zpro responde 200 com {success:false} quando RECUSA (ex.: ERR_CHANNEL_NOT_SUPPORTED no
+  // /voice). É recusa explícita do provedor: nada saiu, e a retentativa precisa da trava livre.
+  if (/success=false/.test(m)) return true;
+  return false;
+}
+
+/** O envio propriamente dito, já com a reivindicação em mãos. */
+async function sendClaimed(job: OutboundJob): Promise<void> {
   if (job.kind === 'text') {
     const res = await sendText(job.instance, job.phoneE164, job.text ?? '');
     // 🔬 INSTRUMENTAÇÃO DA DUPLICATA (caso Hiago 27/07, reincidente às 16h).
@@ -179,8 +284,10 @@ async function rawSend(job: OutboundJob): Promise<void> {
     // Encaminhar documento (carteirinha, pedido médico, receita) a clínica/farmácia.
     // Exige URL pública — por isso a mídia recebida é re-hospedada (ver media-host.ts).
     if (!job.imageUrl) {
+      // `false` = NADA saiu. Devolver `true` aqui carimbaria 'delivered' numa carteirinha
+      // que a clínica nunca recebeu — phantom-delivered de 21/07 reencarnado na mídia.
       await writeLog('error', 'outbound', 'envio de imagem SEM imageUrl — nada enviado', { traceId: job.traceId, instance: job.instance });
-      return;
+      throw new Error('imagem sem imageUrl — HTTP 400 (nada enviado)');
     }
     const res = await sendImage(job.instance, job.phoneE164, job.imageUrl, job.text || undefined);
     await writeLog('info', 'outbound', `📎 imagem enviada pid=${process.pid} providerMessageId=${res.messageId || '(vazio)'}`, {
@@ -255,6 +362,7 @@ async function rawSend(job: OutboundJob): Promise<void> {
     }
     throw err;
   }
+  return;
 }
 
 /**
@@ -273,6 +381,62 @@ async function stampDelivery(messageId: string | undefined, status: 'delivered' 
   } catch { /* carimbo é observabilidade — nunca derruba o envio */ }
 }
 
+/** Espaçamento mínimo entre envios diretos, POR INSTÂNCIA (espelha o limiter da fila). */
+const lastDirectSendAt = new Map<string, number>();
+/** Teto de espera POR CHAMADA — o turno do paciente não pode ficar preso atrás de uma rajada. */
+function maxPaceWaitMs(): number {
+  const v = Number(process.env['WA_FALLBACK_MAX_WAIT_MS']);
+  return Number.isFinite(v) && v > 0 ? v : 3_000;
+}
+
+export function directSendIntervalMs(): number {
+  const max = Math.max(1, Number(process.env['WA_RATE_MAX'] ?? 1));
+  const duration = Math.max(0, Number(process.env['WA_RATE_DURATION_MS'] ?? 1200));
+  const ms = Math.round(duration / max);
+  return Number.isFinite(ms) && ms > 0 ? ms : 1200;
+}
+
+/**
+ * Segura o envio direto pelo tempo que falta pro espaçamento mínimo. Serializa por
+ * instância: cada chamada reserva seu slot ANTES de esperar, então N chamadas paralelas
+ * saem espaçadas em vez de todas juntas ao fim de um único sleep.
+ */
+export async function pacePerInstance(instance: string): Promise<void> {
+  const interval = directSendIntervalMs();
+  const now = Date.now();
+  const slot = Math.max(now, (lastDirectSendAt.get(instance) ?? 0) + interval);
+  lastDirectSendAt.set(instance, slot);
+  // ⏱️ TETO POR CHAMADA. Sem ele, uma queda de Redis durante um tick de 200 lembretes
+  // empurraria o slot pra +4min e QUALQUER envio seguinte — inclusive uma resposta de
+  // emergência — ficaria atrás da fila inteira; pior, o turno do paciente aguarda este
+  // await e estouraria o orçamento de 75s. Sob rajada extrema o espaçamento degrada
+  // (mensagens se agrupam) em vez de travar: é a troca certa, e fica no log.
+  const teto = maxPaceWaitMs();
+  const waitMs = Math.min(slot - now, teto);
+  if (slot - now > teto) {
+    // Observabilidade NUNCA derruba o envio (regra do projeto): sem await, sem propagação.
+    void writeLog('warn', 'outbound', `Fallback congestionado (${Math.round((slot - now) / 1000)}s de fila) — espaçamento limitado a ${teto}ms`, { instance })
+      .catch(() => { /* best-effort */ });
+  }
+  if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+}
+
+/** `queue.add` com timeout curto e UMA nova tentativa — piscada de Redis não vira fallback. */
+async function withQueueRetry<T>(fn: () => Promise<T>): Promise<T> {
+  const attempt = () => Promise.race([
+    fn(),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('queue.add timeout (Redis indisponível?)')), 2000),
+    ),
+  ]);
+  try {
+    return await attempt();
+  } catch {
+    await new Promise((r) => setTimeout(r, 400));
+    return await attempt();
+  }
+}
+
 /**
  * Enfileira um envio. Se a fila estiver indisponível, envia direto (fallback)
  * pra nunca deixar a Xarlote muda por causa de um Redis fora do ar.
@@ -286,19 +450,26 @@ export async function dispatchOutbound(job: OutboundJob): Promise<void> {
     // deixa o queue.add() pendurado pra sempre em vez de errar — e o fallback de
     // envio direto nunca dispararia, deixando a Xarlote MUDA. Corremos contra um
     // timeout curto pra garantir o failover pro envio direto.
-    await Promise.race([
-      queueFor(job.instance).add('send', job),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('queue.add timeout (Redis indisponível?)')), 2000),
-      ),
-    ]);
+    //
+    // 30/07: o Redis piscou 3× e cada piscada mandou o envio direto pro fallback,
+    // que não tem rate-limit. Mas as 3 piscadas foram TRANSITÓRIAS (segundos) — uma
+    // 2ª tentativa cobre a maioria delas e mantém o envio dentro da fila, que é onde
+    // mora a proteção anti-ban. Só o que falha DUAS vezes vira envio direto.
+    await withQueueRetry(() => queueFor(job.instance).add('send', job));
   } catch (err) {
     await writeLog('warn', 'outbound', `Fila indisponível — enviando direto (fallback): ${String(err).slice(0, 160)}`, {
       traceId: job.traceId, instance: job.instance, kind: job.kind,
     });
+    // Sem a fila não há limiter: o espaçamento mínimo passa a ser responsabilidade daqui,
+    // senão uma rajada (ex.: tick de lembretes) sai toda de uma vez pro WhatsApp — que é
+    // exatamente o padrão que gera ban de número.
+    await pacePerInstance(job.instance);
     try {
-      await rawSend(job);
-      await stampDelivery(job.messageId, 'delivered');
+      // O carimbo segue o desfecho REAL: 'duplicate' não mexe (o envio original já
+      // carimbou), 'not-sent' é falha, só 'sent' é entrega.
+      const outcome = await rawSend(job);
+      if (outcome === 'sent') await stampDelivery(job.messageId, 'delivered');
+      else if (outcome === 'not-sent') await stampDelivery(job.messageId, 'failed');
     } catch (e2) {
       await stampDelivery(job.messageId, 'failed');
       await writeLog('error', 'outbound', `Envio direto (fallback) falhou: ${String(e2).slice(0, 200)}`, {
@@ -322,7 +493,11 @@ export function startOutboundWorkers(): void {
   for (const name of [QUEUE_NAMES.OUTBOUND_SARA, QUEUE_NAMES.OUTBOUND_AGENT]) {
     const worker = new Worker(
       name,
-      async (job: Job<OutboundJob>) => { await rawSend(job.data); await stampDelivery(job.data.messageId, 'delivered'); },
+      async (job: Job<OutboundJob>) => {
+        const outcome = await rawSend(job.data);
+        if (outcome === 'sent') await stampDelivery(job.data.messageId, 'delivered');
+        else if (outcome === 'not-sent') await stampDelivery(job.data.messageId, 'failed');
+      },
       { connection, concurrency: 1, limiter: { max, duration } },
     );
     worker.on('failed', (job, err) => {

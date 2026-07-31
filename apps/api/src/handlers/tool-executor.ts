@@ -24,6 +24,7 @@ import {
   type LogSymptomArgs, type StartConsultationArgs, type SetEmergencyContactArgs,
 } from './tool-executor-v2.js';
 import { handleRedFlagCheck, type RedFlagArgs } from './red-flag-handler.js';
+import { ToolFailure, resolveOrderForUser, resolveMediaMessageId } from './entity-resolve.js';
 
 /**
  * Extrai um identificador curto do endereço pra usar na cotação com a farmácia:
@@ -143,7 +144,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
         // Xarlote will say it in text; nothing else needed
         break;
       case 'parse_prescription_image':
-        await handleParsePrescription(tc.args as { message_id: string }, ctx);
+        await handleParsePrescription({}, ctx);
         break;
       case 'save_exam_result':
         await handleSaveExamResult(tc.args as unknown as SaveExamArgs, ctx);
@@ -186,7 +187,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
         await handleCancelOrder(tc.args as { order_id?: string; reason?: string }, ctx);
         break;
       case 'forward_media_to_establishment':
-        await handleForwardMediaToEstablishment(tc.args as { what?: string; caption?: string; message_id?: string }, ctx);
+        await handleForwardMediaToEstablishment(tc.args as { what?: string; caption?: string }, ctx);
         break;
       case 'find_clinic_by_name':
         await handleFindByName(tc.args as { name: string; city?: string; specialty?: string }, ctx);
@@ -264,7 +265,15 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
       ...(!spokeBefore && ctx.turnFlags?.suppressLlmText === true ? { spoke: true } : {}),
     };
   } catch (err) {
-    if (taskId) await db.from('assistant_tasks').update({ status: 'error', error: String(err), completed_at: new Date().toISOString() }).eq('id', taskId);
+    // ToolFailure = recusa DELIBERADA do handler (referência inválida/ambígua, precondição
+    // não satisfeita). Não é crash: a mensagem já foi escrita pro modelo ler, então vai
+    // limpa (sem "Error:") e o log é warn. Qualquer outro erro segue como falha técnica.
+    const deliberate = err instanceof ToolFailure;
+    const forModel = deliberate ? (err as ToolFailure).modelMessage : String(err).slice(0, 240);
+    if (taskId) await db.from('assistant_tasks').update({ status: 'error', error: forModel.slice(0, 400), completed_at: new Date().toISOString() }).eq('id', taskId);
+    if (deliberate) {
+      await writeLog('warn', 'tool', `Tool ${tc.name} recusou executar: ${forModel.slice(0, 160)}`, { traceId: ctx.traceId });
+    }
     await auditToolCall({
       toolName: tc.name,
       userId: ctx.userId,
@@ -272,12 +281,21 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
       traceId: ctx.traceId,
       args: (tc.args as Record<string, unknown>) ?? {},
       result: 'failure',
-      error: String(err).slice(0, 240),
+      error: forModel.slice(0, 240),
       durationMs: Date.now() - startedAt,
     });
     // O erro NÃO é mais engolido em silêncio: volta pro modelo no loop agêntico pra ele
     // corrigir o rumo (ou ser honesto com o paciente) em vez de narrar sucesso inexistente.
-    return { ok: false, error: String(err).slice(0, 240) };
+    // `note` repete o motivo no canal de observação (alguns caminhos só leem a nota).
+    // `spoke` também vale no ERRO: um handler pode falhar DEPOIS de já ter falado com o
+    // paciente (parse_prescription pede a foto de novo e então recusa) — sem isso o modelo
+    // não sabe que a mensagem já saiu e escreve a segunda.
+    return {
+      ok: false,
+      error: forModel.slice(0, 400),
+      ...(deliberate ? { note: forModel } : {}),
+      ...(!spokeBefore && ctx.turnFlags?.suppressLlmText === true ? { spoke: true } : {}),
+    };
   }
 }
 
@@ -359,15 +377,19 @@ async function handleSaveProfileFact(
   }
 }
 
-async function handleParsePrescription(args: { message_id: string }, ctx: ToolContext) {
-  // Find the image message
-  const { data: msg } = await db.from('messages').select('*').eq('id', args.message_id).single();
-  if (!msg?.media_storage_path && !ctx.inbound.mediaBase64) return;
+async function handleParsePrescription(_args: { message_id?: string }, ctx: ToolContext) {
+  // Mesma raiz do save_exam_result: o `message_id` do modelo era inútil (ele não conhece
+  // uuids) e o `.single()` com texto inválido devolvia null → `return` mudo, sem o paciente
+  // nem o modelo saberem por quê. Quem sabe qual é a imagem é o runtime.
+  const messageId = await resolveMediaMessageId(ctx.conversationId, ctx.inboundMsg?.id, {
+    hasInboundMedia: !!ctx.inbound.mediaBase64,
+  });
 
   const base64 = ctx.inbound.mediaBase64 ?? null;
   if (!base64) {
     await sendOutbound(ctx.conversationId, ctx.phoneE164, 'Não consegui processar a imagem da receita. Pode mandar de novo? 📋', ctx.traceId);
-    return;
+    if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
+    throw new ToolFailure('A receita NÃO foi lida: a imagem não está disponível neste turno (o paciente precisa reenviar a foto). Já pedi a foto de novo a ele — não afirme que leu ou guardou a receita.');
   }
 
   interface OcrResult {
@@ -382,12 +404,13 @@ async function handleParsePrescription(args: { message_id: string }, ctx: ToolCo
 
   if (parsed.error === 'not_a_prescription') {
     await sendOutbound(ctx.conversationId, ctx.phoneE164, 'Não parece ser uma receita médica. Pode mandar a foto certinha? 📋', ctx.traceId);
-    return;
+    if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
+    throw new ToolFailure('A imagem NÃO é uma receita médica — nenhum medicamento foi extraído. Já pedi a foto certa ao paciente. NÃO liste medicamentos nem diga que leu a receita.');
   }
 
-  const { data: prescription } = await db.from('prescriptions').insert({
+  const { data: prescription, error: prescErr } = await db.from('prescriptions').insert({
     user_id: ctx.userId,
-    message_id: args.message_id,
+    message_id: messageId,
     ocr_raw_text: parsed.raw_text,
     parsed_json: parsed,
     doctor_name: parsed.doctor?.name,
@@ -396,7 +419,12 @@ async function handleParsePrescription(args: { message_id: string }, ctx: ToolCo
     issued_at: parsed.issued_at,
   }).select('id').single();
 
-  if (prescription?.id && parsed.items) {
+  if (prescErr || !prescription?.id) {
+    // Falha de escrita não pode virar "guardei sua receita" (mesma classe do save_exam).
+    await writeLog('error', 'exam', `Falha ao salvar receita: ${prescErr?.message ?? 'sem id'}`, { traceId: ctx.traceId, userId: ctx.userId });
+    throw new ToolFailure('LI a receita, mas NÃO consegui guardá-la no perfil (falha ao gravar). Pode falar dos medicamentos que leu, mas NÃO diga que salvou/registrou a receita.');
+  }
+  if (parsed.items) {
     for (const item of parsed.items) {
       await db.from('prescription_items').insert({ prescription_id: prescription.id, ...item });
     }
@@ -409,7 +437,6 @@ interface SaveExamArgs {
   summary?: string;
   findings?: Array<{ marker: string; value: string; unit?: string; reference?: string }>;
   exam_date?: string;
-  message_id?: string;
 }
 
 /**
@@ -440,14 +467,22 @@ function parseExamDate(input?: string): string | null {
 async function handleSaveExamResult(args: SaveExamArgs, ctx: ToolContext) {
   if (!args.exam_type || !args.title) {
     await writeLog('warn', 'exam', 'save_exam_result sem exam_type/title — ignorado', { traceId: ctx.traceId });
-    return;
+    throw new ToolFailure('NÃO guardei o exame: faltou o tipo ou o título. Chame de novo informando exam_type e title — e não diga que guardou até dar certo.');
   }
   const findings = Array.isArray(args.findings) ? args.findings : [];
   const examDate = parseExamDate(args.exam_date);
 
+  // 🔴 INCIDENTE 30/07 (Glauber, 12 falhas em 4 minutos): o `message_id` vinha do MODELO e
+  // chegou como "message_id", "message_0", "1", "chatcmpl-…" — texto numa coluna uuid, então
+  // o INSERT INTEIRO falhava e o exame do paciente se perdia (a leitura tinha funcionado).
+  // O modelo nunca teve como saber esse uuid: agora o parâmetro nem existe no schema e o
+  // runtime resolve a mensagem da mídia. Nunca peça ao LLM um dado que só o servidor tem.
+  const messageId = await resolveMediaMessageId(ctx.conversationId, ctx.inboundMsg?.id, {
+    hasInboundMedia: !!ctx.inbound.mediaBase64,
+  });
   const { data: row, error } = await db.from('user_exam_results').insert({
     user_id: ctx.userId,
-    message_id: args.message_id ?? ctx.inboundMsg?.id ?? null,
+    message_id: messageId,
     conversation_id: ctx.conversationId,
     exam_type: args.exam_type,
     title: args.title,
@@ -458,8 +493,9 @@ async function handleSaveExamResult(args: SaveExamArgs, ctx: ToolContext) {
   }).select('id').single();
 
   if (error) {
+    // Falha de escrita NÃO pode virar "guardei no seu perfil": volta pro modelo.
     await writeLog('error', 'exam', `Falha ao salvar exame: ${error.message}`, { traceId: ctx.traceId, userId: ctx.userId });
-    return;
+    throw new ToolFailure('NÃO consegui guardar o exame no perfil (falha ao gravar). NÃO diga que guardou — avise que deu um problema técnico e que ele pode mandar de novo daqui a pouco.');
   }
 
   // Memory card pra recall ("seu exame de X do dia Y"). Sem embedding agora — o
@@ -583,46 +619,36 @@ async function cancelActiveOrder(orderId: string, reason: string, traceId: strin
  * pedido ATIVO do usuário; só honra o order_id se ele pertencer a ESSE usuário.
  */
 async function handleCancelOrder(args: { order_id?: string; reason?: string }, ctx: ToolContext): Promise<void> {
-  const createdThisTurn = ctx.ordersCreatedThisTurn;
-  let targetId: string | null = null;
+  // 🔴 MESMA RAIZ DO INCIDENTE 30/07 (cancel_consultation), aqui no handler MAIS usado:
+  // o `order_id` do modelo ia cru pro `.eq('id', …)`; texto numa coluna uuid devolvia
+  // null, o handler fazia `return` mudo, a task era carimbada `success` e a Xarlote dizia
+  // "Pronto, cancelei seu pedido 💙" com o pedido VIVO — travando inclusive o pedido novo
+  // na idempotência (o delírio do Cefaliv). Agora resolve pelo estado real e, quando não
+  // dá pra ter certeza, recusa em voz alta em vez de fingir.
+  const target = await resolveOrderForUser(args.order_id, ctx.userId, {
+    action: 'cancelado',
+    traceId: ctx.traceId,
+    statuses: CANCELLABLE_ORDER_STATUSES,
+    excludeIds: ctx.ordersCreatedThisTurn,
+  });
 
-  if (args.order_id) {
-    // order_id FOI passado (o schema exige) → é O pedido nomeado. Só cancela se ele
-    // pertencer a ESTE usuário, estiver ATIVO e NÃO tiver sido criado neste turno.
-    // Se foi passado mas não resolve pra ativo (já terminal / de outro usuário /
-    // alucinado / recém-criado) → NO-OP. NUNCA cai no "cancela o mais recente" — era
-    // o HIGH-1: na ordem start→cancel, o fallback cancelava o pedido NOVO recém-criado.
-    if (!createdThisTurn?.has(args.order_id)) {
-      const { data: byId } = await db
-        .from('orders')
-        .select('id, status, user_id')
-        .eq('id', args.order_id)
-        .maybeSingle();
-      if (byId && byId.user_id === ctx.userId && CANCELLABLE_ORDER_STATUSES.includes(byId.status as string)) {
-        targetId = byId.id as string;
-      }
-    }
-  } else {
-    // order_id AUSENTE (raro — schema exige) → aí sim o pedido ativo mais recente do
-    // próprio usuário, EXCLUINDO qualquer um criado neste turno (blindagem HIGH-1).
-    const { data: actives } = await db
-      .from('orders')
-      .select('id')
-      .eq('user_id', ctx.userId)
-      .in('status', CANCELLABLE_ORDER_STATUSES)
-      .order('created_at', { ascending: false })
-      .limit(5);
-    targetId = (actives ?? []).map((o) => o.id as string).find((id) => !createdThisTurn?.has(id)) ?? null;
+  // 🛑 `handed_off` = a farmácia JÁ recebeu o pedido; cancelar dispara mensagem real ("não
+  // prepara, não envia"). O critério é RECÊNCIA, não como o id chegou: o modelo nunca tem o
+  // uuid de um pedido handed_off (o bloco PEDIDO ATIVO só lista quoting/quoted/confirming),
+  // então exigir identificação exata tornaria o cancelamento pós-fechamento IMPOSSÍVEL — e
+  // a farmácia entregaria um pedido que o paciente cancelou. Um handoff de horas atrás é
+  // quase certamente o que ele quer cancelar; um de semanas atrás, quase certamente não
+  // (ex.: ele pediu pra cancelar um LEMBRETE e o modelo errou a rota).
+  const handoffAgeMs = Date.now() - new Date(target.updated_at ?? 0).getTime();
+  if (target.status === 'handed_off' && target.resolvedBy === 'only-one' && handoffAgeMs > 48 * 60 * 60_000) {
+    throw new ToolFailure('NADA FOI CANCELADO: o único pedido que encontrei já foi entregue à farmácia há dias, e não ficou claro que é ESSE que o paciente quer cancelar (pode ser um lembrete, por exemplo). CONFIRME com ele antes de eu avisar a farmácia.');
   }
 
-  if (!targetId) {
-    await writeLog('info', 'order', 'cancel_order — nenhum pedido ativo elegível pra cancelar (no-op)', {
-      traceId: ctx.traceId, orderIdArg: args.order_id ?? null,
-    });
-    return;
+  const cancelled = await cancelActiveOrder(target.id, args.reason ?? 'cancelado pelo usuário', ctx.traceId);
+  if (!cancelled) {
+    // Corrida: outro turno cancelou entre a resolução e o UPDATE. Não é sucesso.
+    throw new ToolFailure('O pedido NÃO foi cancelado agora (ele já não estava mais ativo). Não anuncie um cancelamento novo — se o paciente perguntou, confirme que o pedido já não está de pé.');
   }
-
-  await cancelActiveOrder(targetId, args.reason ?? 'cancelado pelo usuário', ctx.traceId);
 }
 
 /**
@@ -2032,7 +2058,7 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
   const q = (args.title_query ?? '').trim();
   if (!q && !args.all) {
     await writeLog('warn', 'tool', 'cancel_reminders sem title_query e sem all — ignorado', { traceId: ctx.traceId, userId: ctx.userId });
-    return;
+    throw new ToolFailure('NENHUM lembrete foi cancelado: você não disse QUAL (title_query) nem pediu todos (all). Pergunte ao paciente qual lembrete ele quer cancelar — e não diga que cancelou.');
   }
   let query = db.from('reminders')
     .update({ status: 'cancelled' })
@@ -2043,7 +2069,7 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
 
   if (error) {
     await writeLog('error', 'tool', `cancel_reminders falhou: ${error.message}`, { traceId: ctx.traceId, userId: ctx.userId });
-    return;
+    throw new ToolFailure('NENHUM lembrete foi cancelado (falha técnica ao gravar) — eles vão continuar disparando. NÃO diga que cancelou; avise que deu um problema e que ele pode pedir de novo.');
   }
   let count = cancelled?.length ?? 0;
 
@@ -2128,10 +2154,13 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
   // turno concorrente / backstop), NÃO re-executa — senão manda 2ª msg à farmácia +
   // 2ª msg de pagamento ao usuário. Só segue se a transição quoted/quoting→confirming
   // pegar de fato (ou se já é este mesmo quote sendo re-tentado no mesmo estado).
-  const { data: ord0 } = await db.from('orders').select('status, selected_quote_id').eq('id', args.order_id).maybeSingle();
-  if (ord0 && ['confirming', 'handed_off', 'cancelled'].includes(ord0.status)) {
+  // O `order_id` vem do modelo: resolve dentro dos pedidos DESTE paciente (uuid de outro
+  // paciente nunca entra na lista) antes de qualquer leitura/transição.
+  const ord0 = await resolveOrderForUser(args.order_id, ctx.userId, { action: 'confirmado', traceId: ctx.traceId });
+  const orderId = ord0.id;
+  if (['confirming', 'handed_off', 'cancelled'].includes(ord0.status)) {
     await writeLog('info', 'order', `confirm_order_selection ignorado — pedido já '${ord0.status}' (idempotência)`, {
-      traceId: ctx.traceId, orderId: args.order_id, quoteId: args.quote_id,
+      traceId: ctx.traceId, orderId, quoteId: args.quote_id,
     });
     return;
   }
@@ -2144,15 +2173,14 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     .from('quotes')
     .select('*, suppliers(id, name, whatsapp_e164, phone_e164)')
     .eq('id', args.quote_id)
-    .single();
+    .eq('order_id', orderId)   // escopo: a cotação TEM que ser deste pedido (não confia no id solto)
+    .maybeSingle();
 
   if (!quote) {
-    await writeLog('error', 'order', `Quote ${args.quote_id} not found for confirmation — pedido intacto`, { traceId: ctx.traceId, orderId: args.order_id });
-    return;
-  }
-  if (quote.order_id !== args.order_id) {
-    await writeLog('error', 'order', `Quote ${args.quote_id} não pertence ao pedido ${args.order_id} — confirmação abortada (pedido intacto)`, { traceId: ctx.traceId, quoteOrderId: quote.order_id });
-    return;
+    // Antes: `return` mudo com a task carimbada success — o modelo anunciava a compra
+    // fechada e nada tinha sido confirmado. Agora o motivo volta pra ele.
+    await writeLog('error', 'order', `Quote ${args.quote_id} inexistente ou de outro pedido — pedido intacto`, { traceId: ctx.traceId, orderId });
+    throw new ToolFailure('NADA FOI CONFIRMADO: essa opção de farmácia não existe neste pedido. Releia as opções do PEDIDO ATIVO no seu contexto e peça ao paciente pra escolher de novo — não afirme que fechou a compra.');
   }
 
   // 2. Só AGORA transiciona o pedido pra 'confirming' + registra a escolha — via CAS ATÔMICO.
@@ -2163,12 +2191,12 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
   const { data: won } = await db
     .from('orders')
     .update({ status: 'confirming', selected_quote_id: args.quote_id })
-    .eq('id', args.order_id)
+    .eq('id', orderId)
     .not('status', 'in', '(confirming,handed_off,cancelled)')
     .select('id');
   if (!won || won.length === 0) {
     await writeLog('info', 'order', `confirm_order_selection: transição perdida p/ turno concorrente — abortando (idempotência CAS)`, {
-      traceId: ctx.traceId, orderId: args.order_id, quoteId: args.quote_id,
+      traceId: ctx.traceId, orderId: orderId, quoteId: args.quote_id,
     });
     return;
   }
@@ -2180,7 +2208,7 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
   // pedido) e só as que ainda estão vivas; limpa clarificação pendente das irmãs.
   await db.from('quotes')
     .update({ status: 'timeout', completed_at: new Date().toISOString() })
-    .eq('order_id', args.order_id)
+    .eq('order_id', orderId)
     .neq('id', args.quote_id)
     .in('status', ['pending', 'contacting', 'negotiating']);
   // Fecha clarificação pendente em TODAS as cotações do pedido — INCLUSIVE a escolhida
@@ -2188,14 +2216,14 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
   // cliente sobre um pedido JÁ FECHADO. Sem .neq de propósito.
   await db.from('quotes')
     .update({ clarification_status: 'closed' })
-    .eq('order_id', args.order_id)
+    .eq('order_id', orderId)
     .eq('clarification_status', 'awaiting_user');
 
   // 4. Load order items + delivery address + payment method (+ endereço salvo com nº/complemento)
   const { data: order } = await db
     .from('orders')
     .select('items, delivery_address, delivery_lat, delivery_lng, payment_method, user_address_id')
-    .eq('id', args.order_id)
+    .eq('id', orderId)
     .single();
   const items = (order?.items ?? []) as OrderItem[];
   const deliveryAddress =
@@ -2268,7 +2296,7 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
 
     // Variação leve pra não soar template (mesma pessoa não fala igual sempre).
     const openings = ['fechou! pode preparar', 'show, fechado! pode separar', 'fechou então, pode preparar'];
-    const opening = openings[Math.abs(args.order_id.charCodeAt(0) + args.order_id.charCodeAt(3)) % openings.length] as string;
+    const opening = openings[Math.abs(orderId.charCodeAt(0) + orderId.charCodeAt(3)) % openings.length] as string;
     // Nome do destinatário JÁ na 1ª msg (associado ao pedido) + de novo no recipientPart da 2ª
     // (auditoria 1º pedido: farmácia anotou "Igor" no lugar de "Hiago" — o nome aparecer cedo
     // e 2× reduz o erro de anotação humana da farmácia).
@@ -2306,7 +2334,7 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     closed_at: new Date().toISOString(),
     close_conditions: conditions.clause ?? (conditions.deadlineHour != null ? `entregar até ${conditions.deadlineHour}h` : null),
     delivery_deadline: deadlineIso,
-  }).eq('id', args.order_id);
+  }).eq('id', orderId);
 
   // 6. Send payment details to user
   const supplierName = supplier?.name ?? 'farmácia selecionada';
@@ -2327,7 +2355,7 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     ctx.observation.note = `Pedido FECHADO com ${supplierName} (handed_off) — a farmácia já recebeu o pedido. NÃO confirme de novo. Daqui pra frente é acompanhamento de entrega.`;
   }
   await writeLog('info', 'order', `Pedido finalizado — handed_off para ${supplierName}`, {
-    traceId: ctx.traceId, orderId: args.order_id, quoteId: args.quote_id,
+    traceId: ctx.traceId, orderId: orderId, quoteId: args.quote_id,
   });
 }
 
