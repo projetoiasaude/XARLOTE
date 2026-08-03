@@ -10,7 +10,8 @@
  *     (preço pesa menos que pharmacy porque consulta é "qualidade-first")
  *   - Apresentação inclui: data+hora, médico, modalidade, plano, preço, distância
  */
-import { db, writeLog, writeAudit } from '@iasaude/db';
+import { db, writeLog, writeAudit, writeEvent } from '@iasaude/db';
+import { pickValidOffers, isOfferStillValid } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { hasPendingClinicClarification } from './clarification.js';
 
@@ -28,10 +29,18 @@ const RESCUE_WINDOW_MIN = Number(process.env['CLINIC_QUOTE_WINDOW_MIN'] ?? 45);
 const CLINIC_FAIL_MIN = Number(process.env['CLINIC_FAIL_MIN'] ?? 360); // 6h antes de desistir
 const scheduledTimeouts = new Set<string>();
 
-/** Resposta REAL da clínica = contatada (status 'offered') E retornou com HORÁRIO (proposed_datetime).
- *  Só isso conta pra consolidar/apresentar — "offered" sozinho é só "mandei mensagem, aguardando". */
-function countRealReplies(quotes: Array<{ status: string; proposed_datetime: string | null }> | null): number {
-  return (quotes ?? []).filter((q) => q.status === 'offered' && q.proposed_datetime).length;
+/**
+ * Resposta REAL da clínica = contatada (`offered`), retornou com HORÁRIO, **e o horário
+ * ainda vale**. "offered" sozinho é só "mandei mensagem, aguardando".
+ *
+ * ⚠️ A validade temporal é a parte nova, e é o que destrava o rescue. Sem ela, uma oferta
+ * vencida contava como resposta real → `countRealReplies >= 1` → o rescue dava `continue`
+ * e NUNCA alcançava o teste de falha → a consulta com oferta podre era imortal (caso Ciro:
+ * 9 dias com uma oferta de 27/07). Agora a oferta vencida não conta, o rescue chega ao
+ * fim do horizonte e falha com honestidade.
+ */
+export function countRealReplies(quotes: Array<{ status: string; proposed_datetime: string | null }> | null): number {
+  return pickValidOffers(quotes, Date.now()).length;
 }
 
 /**
@@ -326,6 +335,52 @@ export async function closeConsultationQuotes(consultationId: string, reason: st
 }
 
 /**
+ * ⏰ EXPIRA oferta de horário que já passou. Espelha `expireAbandonedQuotes` do
+ * order-followup — o análogo de farmácia que a consulta nunca teve.
+ *
+ * Por que existe: em 03/08 as 5 cotações "confirmáveis" do banco tinham data no passado (a
+ * mais antiga de 06/07). Os filtros de validade que acabei de espalhar impedem que elas
+ * sejam apresentadas ou confirmadas, mas elas continuariam PARADAS no estado `offered` pra
+ * sempre, poluindo a conversa compartilhada da clínica e a contagem de cotações abertas.
+ *
+ * Status escolhido: **`withdrawn`**. Está no CHECK da migration e não tem NENHUM outro
+ * escritor — é o único slot semanticamente livre. `unavailable` significa "a clínica
+ * recusou" (não foi o caso: ela ofereceu, o tempo passou) e `timeout` é revivível pela
+ * resposta tardia da clínica, o que ressuscitaria justamente a oferta morta.
+ */
+export async function expireStaleConsultationOffers(): Promise<void> {
+  try {
+    const cutoffIso = new Date(Date.now() - 30 * 60_000).toISOString(); // mesma tolerância do predicado
+    const { data: stale } = await db
+      .from('consultation_quotes')
+      .select('id, consultation_id, proposed_datetime')
+      .in('status', ['pending', 'offered'])
+      .not('proposed_datetime', 'is', null)
+      .lt('proposed_datetime', cutoffIso)
+      .limit(50);
+    if (!stale?.length) return;
+
+    for (const q of stale) {
+      const { data: done } = await db.from('consultation_quotes')
+        .update({
+          status: 'withdrawn',
+          notes: `[oferta vencida] o horário ${String(q.proposed_datetime).slice(0, 16)} passou sem confirmação`.slice(0, 200),
+          responded_at: new Date().toISOString(),
+        })
+        .eq('id', q.id as string).in('status', ['pending', 'offered']).select('id');
+      if (!done?.length) continue; // outro tick pegou primeiro
+      await writeEvent({
+        eventName: 'consultation.offer_expired',
+        payload: { quote_id: q.id, consultation_id: q.consultation_id, proposed_datetime: q.proposed_datetime },
+      }).catch(() => { /* evento é best-effort */ });
+    }
+    await writeLog('info', 'consultation', `⏰ ${stale.length} oferta(s) de horário vencida(s) marcada(s) como withdrawn`, {});
+  } catch (err) {
+    await writeLog('warn', 'consultation', `expireStaleConsultationOffers falhou: ${String(err).slice(0, 160)}`, {});
+  }
+}
+
+/**
  * ALVO ÚNICO — beco sem saída HONESTO (incidente Vadivino 22/07): a ÚNICA clínica que o paciente
  * escolheu não pode atender de jeito nenhum (número errado, médico não atende ali). Não há outra
  * clínica pra procurar e **NÃO se sugere outro médico**. Avisa o paciente com honestidade, deixa a
@@ -443,7 +498,10 @@ export async function consolidateConsultationQuotes(
     .select('id, status, proposed_datetime, alternative_datetimes, price_brl, plan_accepted, modality, payment_methods, notes, clinic_id, prescriber_id')
     .eq('consultation_id', consultationId);
 
-  const successful = (quotes ?? []).filter((q) => q.status === 'offered' && q.proposed_datetime) as QuoteRow[];
+  // Só oferta com horário que AINDA VALE é apresentável. Apresentar uma opção vencida
+  // (numerada, com "quer que eu confirme?") é convidar o paciente a fechar um horário que
+  // já passou — e o "sim" dele viraria mensagem à clínica pedindo uma data da semana anterior.
+  const successful = pickValidOffers(quotes as QuoteRow[] | null, Date.now()) as QuoteRow[];
 
   if (successful.length === 0) {
     if (!allowFail) {
@@ -503,9 +561,13 @@ export async function consolidateConsultationQuotes(
   const ranked = [...successful].map((q) => {
     const clinic = clinicMap.get(q.clinic_id);
     const propTime = q.proposed_datetime ? new Date(q.proposed_datetime).getTime() : Number.MAX_SAFE_INTEGER;
-    const hoursAway = Math.max(0, (propTime - now) / (1000 * 60 * 60));
-    // Quanto mais próximo (mas no futuro), maior score (max 100 pra <=24h, decai)
-    const timeScore = hoursAway < 1 ? 50 : Math.max(0, 100 - hoursAway * 0.5);
+    // ⚠️ SEM `Math.max(0, …)` aqui: ele colapsava data PASSADA em 0, e `hoursAway < 1`
+    // premiava a oferta vencida com o mesmo score de "dentro de 1h". O filtro de validade
+    // acima já as remove; deixar a máscara era guardar a armadilha pro próximo refactor.
+    const hoursAway = (propTime - now) / (1000 * 60 * 60);
+    // Quanto mais próximo (mas no futuro), maior score (max 100 pra <=24h, decai).
+    // Passado (negativo) vai a zero de propósito — nunca deve ganhar de um horário real.
+    const timeScore = hoursAway < 0 ? 0 : hoursAway < 1 ? 50 : Math.max(0, 100 - hoursAway * 0.5);
     const ratingScore = (clinic?.rating ?? 0) * 20; // 0-100
     const priceScore = q.price_brl ? Math.max(0, 100 - q.price_brl / 5) : 50; // R$0 = 100, R$500 = 0
     const score = timeScore * 0.4 + ratingScore * 0.3 + priceScore * 0.3;

@@ -14,7 +14,7 @@
 import { publicUrlForStoredMedia } from './media-host.js';
 import { db, writeLog, writeAudit, saveMemoryCard } from '@iasaude/db';
 import { findPlacesByTextSearch, getPlacePhone } from '@iasaude/integrations';
-import { toE164BR, isPlaceholderPhone, brPhoneVariants, isServiceNumber, sameMedication, itemDisplayName, specialtyPhrase, type OrderItem } from '@iasaude/shared';
+import { toE164BR, isPlaceholderPhone, brPhoneVariants, isServiceNumber, sameMedication, itemDisplayName, specialtyPhrase, isOfferStillValid, type OrderItem } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
 import { sendOutboundToClinic, sendMediaToEstablishment } from './outbound-agent.js';
@@ -321,20 +321,30 @@ export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
       .not('proposed_datetime', 'is', null)
       .order('created_at', { ascending: false }).limit(3);
     const fmt = (iso: string) => new Date(iso).toLocaleString('pt-BR', { weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
+    // ⏰ Só horário que AINDA VALE vai pro modelo. Antes, uma oferta vencida era listada
+    // como se estivesse de pé E vinha com a instrução "chame confirm e feche" — empurrando
+    // o modelo a fechar uma consulta pra data que já passou.
+    const agora = Date.now();
     const linhas = (opts ?? []).flatMap((o) => {
-      const base = o.proposed_datetime ? [fmt(o.proposed_datetime as string)] : [];
-      const alts = Array.isArray(o.alternative_datetimes) ? (o.alternative_datetimes as string[]).map(fmt) : [];
+      const base = isOfferStillValid(o.proposed_datetime as string | null, agora) ? [fmt(o.proposed_datetime as string)] : [];
+      const alts = (Array.isArray(o.alternative_datetimes) ? (o.alternative_datetimes as string[]) : [])
+        .filter((a) => isOfferStillValid(a, agora)).map(fmt);
       return [...base, ...alts];
     });
     const preco = (opts ?? [])[0]?.price_brl;
     if (ctx.observation) {
-      ctx.observation.note =
-        `Consulta ${alvo || ''} está AGUARDANDO A ESCOLHA do paciente.`
-        + (linhas.length ? ` Horários que a clínica ofereceu: ${linhas.join(' | ')}.` : '')
-        + (preco ? ` Valor: R$${preco}.` : '')
-        + ` ⚠️ LEIA a mensagem dele: se ele ESCOLHEU um horário ou disse que quer confirmar,`
-        + ` NÃO repita as opções — chame \`confirm_consultation_selection\` e feche.`
-        + ` Se ele pediu OUTRA data, diga que vai checar e use \`message_supplier\` pra perguntar à clínica de verdade.`;
+      ctx.observation.note = linhas.length
+        ? `Consulta ${alvo || ''} está AGUARDANDO A ESCOLHA do paciente.`
+          + ` Horários que a clínica ofereceu e que ainda valem: ${linhas.join(' | ')}.`
+          + (preco ? ` Valor: R$${preco}.` : '')
+          + ` ⚠️ LEIA a mensagem dele: se ele ESCOLHEU um horário ou disse que quer confirmar,`
+          + ` NÃO repita as opções — chame \`confirm_consultation_selection\` e feche.`
+          + ` Se ele pediu OUTRA data, diga que vai checar e use \`message_supplier\` pra perguntar à clínica de verdade.`
+        // Havia oferta, mas o horário passou. NÃO é "aguardando escolha" — é preciso
+        // pedir horário novo. Dizer "as opções estão de pé" aqui seria mentira.
+        : `Consulta ${alvo || ''}: os horários que a clínica ofereceu JÁ PASSARAM e não há`
+          + ` nenhuma opção válida agora. NÃO ofereça esses horários nem diga que estão de pé.`
+          + ` Seja honesta com o paciente e use \`message_supplier\` pra pedir horários novos à clínica.`;
     }
     return;
   }

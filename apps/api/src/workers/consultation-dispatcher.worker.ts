@@ -16,7 +16,7 @@
  */
 import { db, writeLog } from '@iasaude/db';
 import { initiateClinicNegotiation } from '../handlers/agent-clinic.js';
-import { scheduleConsultationTimeout, rescueStalledConsultations } from '../handlers/consultation-consolidation.js';
+import { scheduleConsultationTimeout, rescueStalledConsultations, expireStaleConsultationOffers } from '../handlers/consultation-consolidation.js';
 import { rescueOrphanedPharmacyQuotes } from '../handlers/quote-consolidation.js';
 import { withCronLock } from '../middleware/cron-lock.js';
 
@@ -33,6 +33,11 @@ async function runOnce(): Promise<void> {
   // que morreram OU consolidação adiada pelo gate de clarificação que não re-disparou).
   // Idempotente: consolidateConsultationQuotes faz transição atômica + re-checa o gate.
   await rescueStalledConsultations();
+
+  // ⏰ Oferta de horário cujo dia já passou vira 'withdrawn'. Roda ANTES do resto pra que
+  // a mesma volta do tick já veja o estado limpo (uma consulta que só tinha oferta vencida
+  // passa a ser tratada como "sem oferta" e o rescue pode agir).
+  await expireStaleConsultationOffers();
 
   try {
     const now = Date.now();

@@ -16,7 +16,7 @@
  *   - Side-effects em transação quando possível
  */
 import { db, writeAudit, writeLog, writeEvent } from '@iasaude/db';
-import { nextOccurrence } from '@iasaude/shared';
+import { nextOccurrence, isOfferStillValid } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { discoverClinics } from './clinic-discovery.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
@@ -800,6 +800,13 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
     action: 'confirmado', traceId: ctx.traceId, preferences: consultation.preferences,
   });
   const quoteId = q.id;
+  // 🔒 CINTO E SUSPENSÓRIO. O resolvedor já filtra oferta vencida, mas confirmar é o passo
+  // IRREVERSÍVEL: aqui as irmãs viram `rejected`, a clínica recebe mensagem real e, se ela
+  // responder "confirmado", o worker de feedback pergunta "como foi sua consulta?" sobre
+  // algo que nunca aconteceu e marca `completed`. Vale checar duas vezes.
+  if (!isOfferStillValid(q.proposed_datetime, Date.now())) {
+    throw new ToolFailure('NADA FOI CONFIRMADO: esse horário JÁ PASSOU. Não confirme data no passado — peça horários novos à clínica com message_supplier e explique ao paciente que a vaga anterior venceu.');
+  }
 
   // 1. Atualiza consultation
   await db.from('consultations').update({
@@ -886,6 +893,14 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
           payload: { consultation_id: consultationId, quote_id: quoteId, kind: '2h_before' },
         });
         if (e2) await writeLog('error', 'consultation', `lembrete 2h_before falhou: ${e2.message}`, { traceId: ctx.traceId });
+      }
+      // Consulta confirmada SEM nenhum lembrete criado (horário tão próximo que as duas
+      // âncoras já passaram) deixava de ser registrado em qualquer lugar. Era o único sinal
+      // temporal do handler, e era silencioso: o paciente "tem consulta" e nada o avisa.
+      if (oneDayBefore <= now && twoHoursBefore <= now) {
+        await writeLog('warn', 'consultation', `Consulta confirmada mas NENHUM lembrete criado — o horário está a menos de 2h, as duas âncoras (1d/2h) já passaram`, {
+          traceId: ctx.traceId, consultationId,
+        });
       }
     }
   }

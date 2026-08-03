@@ -18,6 +18,7 @@
  *   - kill-switch: NUDGE_ENABLED=false desliga tudo
  */
 import { db, writeLog, writeEvent } from '@iasaude/db';
+import { pickValidOffers } from '@iasaude/shared';
 import { sendOutbound } from '../handlers/outbound.js';
 import { withCronLock } from '../middleware/cron-lock.js';
 import { loadPrompts } from '../config/prompts.js';
@@ -96,12 +97,20 @@ async function collectTargets(): Promise<NudgeTarget[]> {
   // b) Consultas com opções apresentadas e sem escolha
   const { data: consults } = await db
     .from('consultations')
-    .select('id, conversation_id, created_at')
+    .select('id, conversation_id, created_at, consultation_quotes(status, proposed_datetime)')
     .eq('status', 'quoted')
     .gt('created_at', oldest)
     .lt('created_at', newest)
     .limit(20);
   for (const c of consults ?? []) {
+    // ⏰ A copy afirma "as opções que te mandei ainda estão de pé" — então só cutuca se
+    // ALGUMA de fato estiver. Antes esta consulta era selecionada sem ler data nenhuma, e
+    // o paciente era convidado a confirmar um horário que já tinha passado.
+    const valid = pickValidOffers(
+      (c.consultation_quotes as Array<{ status: string; proposed_datetime: string | null }> | null) ?? null,
+      Date.now(),
+    );
+    if (!valid.length) continue;
     if (c.conversation_id) targets.push({ kind: 'consultation', entityId: c.id, conversationId: c.conversation_id, entityTs: c.created_at });
   }
 

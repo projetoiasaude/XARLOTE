@@ -18,7 +18,7 @@
  * com uma frase escrita PRA ELE LER, sempre dizendo explicitamente que nada foi alterado.
  */
 import { db, writeLog } from '@iasaude/db';
-import { resolveEntityRef, loneNumberRef, type EntityCandidate } from '@iasaude/shared';
+import { resolveEntityRef, loneNumberRef, isOfferStillValid, type EntityCandidate } from '@iasaude/shared';
 
 /**
  * Falha ESPERADA de tool (referência inválida, ambígua ou inexistente) — não é bug.
@@ -164,7 +164,12 @@ export async function resolveConsultationQuote(
     .in('status', ['pending', 'offered', 'selected'])
     .order('created_at', { ascending: true })
     .limit(10);
-  const rows = (data ?? []) as unknown as QuoteRow[];
+  // ⏰ E o horário tem que AINDA VALER. Sem isto, "quero confirmar" fechava uma consulta
+  // pra data que já passou: `scheduled_at` retroativo, a clínica recebendo "pode marcar
+  // pra 27/07?" e, quando ela respondesse "confirmado", o worker de feedback perguntando
+  // "como foi sua consulta?" sobre algo que nunca aconteceu (e marcando `completed`).
+  const rows = ((data ?? []) as unknown as QuoteRow[])
+    .filter((r) => isOfferStillValid(r.proposed_datetime, Date.now()));
 
   // Número da opção como foi APRESENTADO ao paciente (o resumo consolidado é a fonte);
   // sem ele, a ordem de criação, que é a mesma usada na hora de listar.
@@ -196,7 +201,7 @@ export async function resolveConsultationQuote(
   if (decision.kind === 'none') {
     throw new ToolFailure(
       decision.reason === 'no-candidates'
-        ? `NADA FOI ${opts.action.toUpperCase()}: essa consulta não tem NENHUMA opção de horário confirmável (a clínica ainda não passou horário, ou a vaga oferecida caiu). NÃO diga que confirmou — pergunte à clínica com message_supplier ou avise o paciente que ainda não há horário.`
+        ? `NADA FOI ${opts.action.toUpperCase()}: essa consulta não tem NENHUMA opção de horário confirmável — a clínica ainda não passou horário, a vaga caiu, ou os horários que ela ofereceu JÁ PASSARAM. NÃO diga que confirmou: peça horários novos à clínica com message_supplier e avise o paciente com honestidade.`
         : `NADA FOI ${opts.action.toUpperCase()}: nenhuma opção corresponde a "${String(raw).slice(0, 60)}". As opções REAIS são: ${horarios}. Se o paciente escolheu uma delas, chame de novo com o horário exato; se ele quer outra data, pergunte à clínica com message_supplier.`,
     );
   }
