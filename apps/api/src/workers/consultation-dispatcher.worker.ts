@@ -39,9 +39,9 @@ async function runOnce(): Promise<void> {
   // Idempotente: consolidateConsultationQuotes faz transição atômica + re-checa o gate.
   await rescueStalledConsultations();
 
-  // ⏰ Oferta de horário cujo dia já passou vira 'withdrawn'. Roda ANTES do resto pra que
-  // a mesma volta do tick já veja o estado limpo (uma consulta que só tinha oferta vencida
-  // passa a ser tratada como "sem oferta" e o rescue pode agir).
+  // ⏰ Oferta de horário cujo dia já passou vira 'withdrawn'. Roda DEPOIS do rescue de
+  // propósito: no próximo tick (30s) o estado já está limpo, e assim o rescue nunca vê uma
+  // consulta cujas cotações mudaram de status no meio da própria varredura dele.
   await expireStaleConsultationOffers();
 
   try {

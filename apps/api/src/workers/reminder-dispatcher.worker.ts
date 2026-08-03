@@ -323,7 +323,12 @@ export async function dispatchReminders(): Promise<void> {
         await writeLog('warn', 'reminder', `cap: query do event_log falhou (${capErr.message.slice(0, 80)}) — fail-open, enviando`, {});
       } else if ((sent24h ?? 0) >= cap) {
         releaseTemplateSlot(reminder.user_id, reminder.id);
-        await writeLog('warn', 'reminder', `cap diário atingido (${sent24h}/${cap} em 24h) — "${reminder.title}" pulado (ocorrência consumida)`, {});
+        // `info`, não `warn`: este bloco só roda quando `!capExempt`, e capExempt === isCritical
+        // — logo esta linha é INALCANÇÁVEL pra remédio/consulta. Era um warn 100% de baixa
+        // urgência, o gêmeo do que a auditoria de 03/08 mandou rebaixar.
+        await writeLog('info', 'reminder', `cap diário atingido (${sent24h}/${cap} em 24h) — "${reminder.title}" pulado (ocorrência consumida)`, {
+          reminderId: reminder.id, reminderType: reminder.type, userId: reminder.user_id, cap, sent24h: sent24h ?? 0,
+        });
         void writeEvent({
           eventName: 'reminder.capped',
           userId: reminder.user_id,
@@ -568,7 +573,10 @@ export async function dispatchReminders(): Promise<void> {
               userId: reminder.user_id,
               conversationId: conv?.id,
               severity: isCritical ? 'critical' : 'warn',
-              payload: { reminder_id: reminder.id, type: reminder.type, title: reminder.title, attempts: ONE_SHOT_MAX_ATTEMPTS },
+              // ⚠️ SEM `title`: ele é dado CLÍNICO ("Quimioterapia — Dr. X") e não está em
+              // SENSITIVE_KEY, então iria verbatim pro event_log e daí pro Telegram — um
+              // terceiro que a exclusão do Art. 18 não alcança. O tipo basta pro alerta.
+              payload: { reminder_id: reminder.id, type: reminder.type, attempts: ONE_SHOT_MAX_ATTEMPTS },
             });
           }
         }

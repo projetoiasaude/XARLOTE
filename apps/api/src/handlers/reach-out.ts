@@ -428,13 +428,16 @@ export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
       // `templateSubject`: este é o caso que expôs o buraco (Ciro/Rita 03/08). Cutucar uma
       // clínica calada há dias é EXATAMENTE quando a janela de 24h está fechada — sem
       // assunto pro template de reabertura, o alô sai no vácuo e nós nem sabemos.
-      await sendOutboundToClinic(
+      // `poked` = ENTREGOU, não "chamei a função". Com a janela de 24h fechada e sem
+      // template disponível nada sai, e dizer "dei mais um alô lá agora" seria a mentira
+      // de 20/07 outra vez — agora com o agravante de eu ter acabado de construir a
+      // detecção de não-entrega e ignorá-la.
+      poked = await sendOutboundToClinic(
         q.conversation_id, clinicPhone,
         'Oi! Só passando pra saber se conseguiu ver um horário — o paciente tá bem interessado 🙂 obrigada!',
         ctx.traceId,
         `a disponibilidade de horário${doctor ? ` do ${doctor}` : ''} pra marcar a consulta de um paciente`,
       );
-      poked = true;
     } catch { /* best-effort: a falha vira observation honesta abaixo */ }
     if (poked) {
       if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
@@ -443,7 +446,7 @@ export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
       return;
     }
     if (ctx.observation) ctx.observation.note =
-      'Tentei dar um alô no consultório AGORA e o envio FALHOU (problema técnico). NÃO afirme que mandou mensagem — diga que está em cima disso e que tenta de novo em instantes.';
+      'NÃO consegui alcançar o consultório agora: ou a janela de 24h do WhatsApp com eles está fechada e não houve como reabrir, ou o envio falhou. NÃO afirme que mandou mensagem. Diga ao paciente que está tentando alcançá-los e que avisa assim que conseguir.';
     return;
   }
 
@@ -856,7 +859,17 @@ export async function handleForwardMediaToEstablishment(
     return;
   }
 
-  await sendMediaToEstablishment(destinoConv, destino, url, caption, ctx.traceId);
+  // "REALMENTE encaminhado" tem que depender do DESFECHO. Template não carrega imagem, então
+  // fora da janela de 24h a mídia genuinamente não sai — e este é o caso Glauber (o consultório
+  // pediu carteirinha e pedido médico). Dizer "encaminhei" sem encaminhar é pior que dizer
+  // "não consegui": o paciente para de tentar e o documento nunca chega.
+  const encaminhado = await sendMediaToEstablishment(destinoConv, destino, url, caption, ctx.traceId);
+  if (!encaminhado) {
+    if (ctx.observation) {
+      ctx.observation.note = `NÃO consegui encaminhar ${what} para ${destinoNome}: a janela de 24h do WhatsApp com eles está fechada e documento não pode ir por template. NÃO diga que encaminhou. Explique ao paciente que estou tentando reabrir o contato e que aviso assim que conseguir enviar.`;
+    }
+    return;
+  }
   if (ctx.turnFlags) ctx.turnFlags.supplierMessaged = true;
   if (ctx.observation) {
     ctx.observation.note = `${what} REALMENTE encaminhado para ${destinoNome} com a legenda "${caption}". Confirme isso ao paciente e NÃO envie de novo.`;

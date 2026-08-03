@@ -1362,7 +1362,10 @@ export async function initiatePharmacyNegotiation(
     const t = pharmacyColdOpen(itemsText, userNeighborhood);
     await sendTemplateOpeningToSupplier(conv.id, supplierPhone, t.key, t.variables, traceId);
   } else {
-    await sendOutboundToSupplier(conv.id, supplierPhone, opening, traceId);
+    // Assunto obrigatório (mesma razão da clínica): abertura fria está sempre fora da
+    // janela, então sem assunto o kill-switch de template calaria o contato inicial.
+    await sendOutboundToSupplier(conv.id, supplierPhone, opening, traceId,
+      'a cotação de um medicamento pra um paciente que estou ajudando');
   }
 }
 

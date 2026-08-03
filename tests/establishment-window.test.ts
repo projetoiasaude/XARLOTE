@@ -49,3 +49,31 @@ describe('chooseEstablishmentChannel — janela fechada', () => {
     expect(chooseEstablishmentChannel({ ...fechada, templatesOn: false, templateSlotFree: true })).toBe('blocked');
   });
 });
+
+describe('o INVARIANTE que a revisão adversarial cobrou', () => {
+  // A 1ª versão deste fix detectava a não-entrega e jogava a informação no lixo:
+  // `deliverToEstablishment` devolvia void, então `message_supplier` carimbava
+  // `supplierMessaged=true`, gravava "Mensagem REALMENTE enviada" e a Xarlote dizia
+  // "Prontinho, mandei pra farmácia" — as três coisas falsas, na mesma classe de mentira
+  // que db8f37e existiu pra matar. Construir a detecção e ignorá-la é pior que não detectar.
+  it('só o canal `text` e `template` significam ENTREGA; `blocked` nunca é sucesso', () => {
+    const entregou = (c: ReturnType<typeof chooseEstablishmentChannel>) => c !== 'blocked';
+    expect(entregou(chooseEstablishmentChannel({ windowOpen: true, hasSubject: false, templatesOn: false, templateSlotFree: false }))).toBe(true);
+    expect(entregou(chooseEstablishmentChannel({ windowOpen: false, hasSubject: true, templatesOn: true, templateSlotFree: true }))).toBe(true);
+    expect(entregou(chooseEstablishmentChannel({ windowOpen: false, hasSubject: true, templatesOn: true, templateSlotFree: false }))).toBe(false);
+  });
+
+  it('a política tem exatamente 3 desfechos — nenhum "talvez"', () => {
+    const vistos = new Set<string>();
+    for (const windowOpen of [true, false]) {
+      for (const hasSubject of [true, false]) {
+        for (const templatesOn of [true, false]) {
+          for (const templateSlotFree of [true, false]) {
+            vistos.add(chooseEstablishmentChannel({ windowOpen, hasSubject, templatesOn, templateSlotFree }));
+          }
+        }
+      }
+    }
+    expect([...vistos].sort()).toEqual(['blocked', 'template', 'text']);
+  });
+});

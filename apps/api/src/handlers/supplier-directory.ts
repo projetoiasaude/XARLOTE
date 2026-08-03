@@ -73,7 +73,15 @@ async function stampLastOutboundDelivered(
   traceId: string,
 ): Promise<void> {
   const jids = phoneVariants.map((p) => `whatsapp_jid.eq.${p.replace(/\D/g, '')}@s.whatsapp.net`).join(',');
-  const { data: convs } = await db.from('conversations').select('id').or(jids).limit(5);
+  // 🔒 ESCOPO DE ESTABELECIMENTO. Sem este filtro, um eco no número de um PACIENTE promovia
+  // a última mensagem dele de `window_blocked` → `delivered` — e `window_blocked` é
+  // justamente o que o reminder-dispatcher escreve pro paciente. "Paciente mudo lê mensagem
+  // antiga" é gatilho realista, e ler NÃO reabre a janela da Meta: recriaria o
+  // phantom-delivered de 21/07 na única perna que já tinha verdade de entrega.
+  // Todas as outras buscas de estabelecimento filtram assim (inbound-supplier, agent-clinic).
+  const { data: convs } = await db.from('conversations').select('id')
+    .in('party_type', ['supplier', 'clinic'])
+    .or(jids).limit(5);
   const convIds = (convs ?? []).map((c) => c.id as string);
   if (!convIds.length) return;
   const since = new Date(Date.now() - ECHO_ATTRIBUTION_MS).toISOString();

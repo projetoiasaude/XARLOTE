@@ -357,27 +357,47 @@ export async function closeConsultationQuotes(consultationId: string, reason: st
  */
 export async function normalizePhantomConsultationStates(): Promise<void> {
   try {
-    const { data: rows } = await db
+    const { data: rows, error } = await db
       .from('consultations')
-      .select('id, status, updated_at')
+      .select('id, status, updated_at, consultation_quotes!consultation_quotes_consultation_id_fkey(status, proposed_datetime)')
       .not('status', 'in', NOT_TERMINAL_FILTER)
+      .order('updated_at', { ascending: true })   // sem ordenação, o .limit podia perder órfãs pra sempre
       .limit(50);
-    if (!rows?.length) return;
+    if (error || !rows?.length) return;
 
     for (const c of rows) {
       const status = c.status as string;
-      // Status vivo COM vigilante próprio: não é da conta desta função.
-      if (!(PHANTOM_CONSULTATION_STATUSES as readonly string[]).includes(status)) continue;
+      const quotes = (c.consultation_quotes as Array<{ status: string; proposed_datetime: string | null }> | null) ?? null;
+      const semOfertaValida = pickValidOffers(quotes, Date.now()).length === 0;
+
+      // A AÇÃO tem que cobrir o mesmo espaço que a QUERY, senão a "cobertura por construção"
+      // é só uma query larga com um if estreito. Dois casos ficam órfãos hoje:
+      //  • status FANTASMA (`quoting`/`drafting`): vivo pra todo leitor, sem vigilante;
+      //  • `quoted` SEM nenhuma oferta válida: o nudge é o único dono de `quoted` e ele
+      //    (corretamente) desiste quando não há o que oferecer — então ninguém sobra.
+      const fantasma = (PHANTOM_CONSULTATION_STATUSES as readonly string[]).includes(status);
+      const quotedSemOferta = status === 'quoted' && semOfertaValida;
+      if (!fantasma && !quotedSemOferta) continue;
+
+      // ⏰ `created_at` RESETADO junto — e isto NÃO é detalhe. O rescue decide falha pela
+      // IDADE em `created_at`; sem o reset, uma consulta dobrada aqui já nasce com semanas
+      // de idade e o MESMO tick que a resgata a mata, disparando "não consegui fechar" a um
+      // paciente que acabou de pedir pra confirmar. É o mesmo motivo (e o mesmo remédio) do
+      // reset em handleNudgeConsultation. Dar horizonte fresco é o que permite ao caminho de
+      // template (P0) alcançar a clínica ANTES de qualquer desistência.
       const { data: folded } = await db.from('consultations')
-        .update({ status: 'searching' })
+        .update({ status: 'searching', created_at: new Date().toISOString() })
         .eq('id', c.id as string).eq('status', status).select('id');
       if (!folded?.length) continue;
-      await writeLog('warn', 'consultation', `Consulta em status FANTASMA '${status}' (sem vigilante e sem escritor no código) dobrada em 'searching' — o rescue passa a enxergá-la`, {
+      const motivo = fantasma
+        ? `status FANTASMA '${status}' (sem vigilante e sem escritor no código)`
+        : `'quoted' sem NENHUMA oferta de horário válida (as que existiam venceram)`;
+      await writeLog('warn', 'consultation', `Consulta com ${motivo} dobrada em 'searching' com horizonte novo — o rescue passa a enxergá-la e a clínica volta a ser contatada`, {
         consultationId: c.id as string,
       });
       await writeEvent({
         eventName: 'consultation.phantom_state_normalized',
-        payload: { consultation_id: c.id, from: status, to: 'searching', stale_since: c.updated_at },
+        payload: { consultation_id: c.id, from: status, to: 'searching', reason: fantasma ? 'phantom' : 'quoted_no_valid_offer', stale_since: c.updated_at },
       }).catch(() => { /* best-effort */ });
     }
   } catch (err) {
@@ -405,27 +425,33 @@ export async function expireStaleConsultationOffers(): Promise<void> {
     const { data: stale } = await db
       .from('consultation_quotes')
       .select('id, consultation_id, proposed_datetime')
-      .in('status', ['pending', 'offered'])
+      // Só `offered`: `pending` significa que a clínica NUNCA respondeu — não há oferta pra
+      // vencer, e o dono desse caso é o rescue, não este expirador.
+      .eq('status', 'offered')
       .not('proposed_datetime', 'is', null)
       .lt('proposed_datetime', cutoffIso)
       .limit(50);
     if (!stale?.length) return;
 
+    let marcadas = 0;
     for (const q of stale) {
       const { data: done } = await db.from('consultation_quotes')
-        .update({
-          status: 'withdrawn',
-          notes: `[oferta vencida] o horário ${String(q.proposed_datetime).slice(0, 16)} passou sem confirmação`.slice(0, 200),
-          responded_at: new Date().toISOString(),
-        })
+        // ⚠️ `notes` NÃO é tocado: ele carrega o que a CLÍNICA disse (preço, plano, "traz
+        // carteirinha"), é lido por sanitizeSupplierNote/noteSignalsConditionalOffer e
+        // exibido no /app. Sobrescrever seria perder, de forma irreversível, justamente o
+        // contexto que uma reativação precisa.
+        .update({ status: 'withdrawn' })
         .eq('id', q.id as string).in('status', ['pending', 'offered']).select('id');
       if (!done?.length) continue; // outro tick pegou primeiro
+      marcadas++;
       await writeEvent({
         eventName: 'consultation.offer_expired',
         payload: { quote_id: q.id, consultation_id: q.consultation_id, proposed_datetime: q.proposed_datetime },
       }).catch(() => { /* evento é best-effort */ });
     }
-    await writeLog('info', 'consultation', `⏰ ${stale.length} oferta(s) de horário vencida(s) marcada(s) como withdrawn`, {});
+    if (marcadas) {
+      await writeLog('info', 'consultation', `⏰ ${marcadas} de ${stale.length} oferta(s) de horário vencida(s) marcada(s) como withdrawn`, {});
+    }
   } catch (err) {
     await writeLog('warn', 'consultation', `expireStaleConsultationOffers falhou: ${String(err).slice(0, 160)}`, {});
   }

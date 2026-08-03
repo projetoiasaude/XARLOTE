@@ -1,5 +1,5 @@
 import { db, writeLog, writeEvent } from '@iasaude/db';
-import { isSimulatorMode, zproConfigured } from '@iasaude/whatsapp';
+import { isSimulatorMode, zproConfigured, providerFor } from '@iasaude/whatsapp';
 import { AGENT_INSTANCE, humanizeSupplierText, checkOutboundSanity, isWabaWindowOpen } from '@iasaude/shared';
 
 /**
@@ -63,9 +63,23 @@ function establishmentTemplateEnabled(): boolean {
  * utilitário que a perna do paciente usa — a regra da Meta é uma só.
  */
 export async function establishmentWindow(conversationId: string): Promise<{ open: boolean; lastInboundMs: number | null }> {
-  const { data } = await db.from('messages').select('created_at')
+  // 🚪 GATE DE PROVIDER. A janela de 24h é regra da META (WABA/zpro); a uazapi não tem
+  // janela. Sem este gate, se `WHATSAPP_PROVIDER_AGENT` faltar num serviço o default é
+  // uazapi e a mensagem seria bloqueada — ou pior, SUBSTITUÍDA pelo texto do template
+  // ("Oi, tudo bem? Aqui é a Xarlote…" no lugar de "pode marcar pra terça 09:30?").
+  // Precedente: `providerHasWindow` em order-state.ts:126, pra esta mesma instância.
+  if (providerFor(AGENT_INSTANCE) !== 'zpro') return { open: true, lastInboundMs: null };
+
+  const { data, error } = await db.from('messages').select('created_at')
     .eq('conversation_id', conversationId).eq('direction', 'in')
     .order('created_at', { ascending: false }).limit(1).maybeSingle();
+  // Falha de QUERY não é "sem inbound": um timeout de banco converteria uma mensagem
+  // perfeitamente entregável em bloqueada. Na dúvida, trata como janela aberta (o pior
+  // caso é a Meta rejeitar, que é o estado de hoje) em vez de calar por conta própria.
+  if (error) {
+    await writeLog('warn', 'outbound', `Não consegui ler a janela de 24h do estabelecimento (${error.message.slice(0, 80)}) — assumindo aberta`, { conversationId });
+    return { open: true, lastInboundMs: null };
+  }
   const iso = data?.created_at as string | undefined;
   const lastInboundMs = iso ? new Date(iso).getTime() : null;
   return { open: isWabaWindowOpen(lastInboundMs, Date.now()), lastInboundMs };
@@ -130,7 +144,7 @@ async function deliverToEstablishment(args: {
   alvo: 'farmácia' | 'clínica';
   category: 'agent' | 'clinic';
   traceId: string;
-}): Promise<void> {
+}): Promise<boolean> {
   const { conversationId, phoneE164, text, messageId, alvo, category, traceId } = args;
   const { open, lastInboundMs } = await establishmentWindow(conversationId);
 
@@ -138,7 +152,7 @@ async function deliverToEstablishment(args: {
     // `messageId` vai junto — é ele que faz o worker carimbar delivered/failed. Sem ele,
     // toda mensagem a estabelecimento ficava com `delivery_status` NULL pra sempre.
     await dispatchOutbound({ kind: 'text', instance: AGENT_INSTANCE, phoneE164, text, traceId, messageId: messageId ?? undefined });
-    return;
+    return true;
   }
 
   const silentH = lastInboundMs ? Math.round((Date.now() - lastInboundMs) / 3_600_000) : null;
@@ -159,7 +173,7 @@ async function deliverToEstablishment(args: {
         text: humanizeTemplate('general', [assunto]), traceId, messageId: messageId ?? undefined,
       });
       await writeLog('info', category, `Janela de 24h fechada com a ${alvo} (${silentH ?? '?'}h sem retorno) — follow-up saiu por TEMPLATE de reabertura`, { traceId, conversationId });
-      return;
+      return true;
     } catch (err) {
       await writeLog('warn', category, `Template de reabertura pra ${alvo} inválido: ${String(err).slice(0, 160)}`, { traceId, conversationId });
     }
@@ -173,8 +187,10 @@ async function deliverToEstablishment(args: {
   await writeEvent({
     eventName: 'establishment.window_blocked',
     conversationId,
+    severity: 'warn',
     payload: { alvo, silent_hours: silentH, had_subject: !!assunto, templates_on: templatesEnabled() && establishmentTemplateEnabled() },
   }).catch(() => { /* evento é best-effort */ });
+  return false;
 }
 
 /**
@@ -193,7 +209,7 @@ export async function sendOutboundToSupplier(
   traceId: string,
   /** Assunto curto pro template de reabertura, se a janela de 24h estiver fechada. */
   templateSubject?: string,
-): Promise<void> {
+): Promise<boolean> {
   // HIGIENE HUMANA no ponto ÚNICO de saída pra farmácia (incidente Santa Lúcia 07/07:
   // farmácia real achou que era robô e não entregou): tira TODO emoji e troca travessão
   // por vírgula — vale pro texto do LLM E pros determinísticos, sem caçar cada string.
@@ -201,7 +217,7 @@ export async function sendOutboundToSupplier(
   // 🪞 AUTO-VERIFICAÇÃO: relê o que vai sair antes de sair (ver checkOutboundSanity).
   {
     const sane = await assertSane(text, 'farmácia', conversationId, traceId);
-    if (!sane) return;
+    if (!sane) return false;
     text = sane;
   }
   // SEM dedup aqui (review): a conversa de fornecedor é COMPARTILHADA por telefone entre
@@ -229,10 +245,10 @@ export async function sendOutboundToSupplier(
     await writeLog('info', 'agent', 'Mensagem do agente salva — aguardando resposta manual no dashboard (chat por farmácia)', {
       traceId, conversationId,
     });
-    return;
+    return true;  // simulação: o operador responde pelo dashboard, não é falha de entrega
   }
 
-  await deliverToEstablishment({
+  return deliverToEstablishment({
     conversationId, phoneE164: supplierPhone, text,
     messageId: (mirror?.id as string | undefined) ?? null,
     templateSubject, alvo: 'farmácia', category: 'agent', traceId,
@@ -257,11 +273,11 @@ export async function sendOutboundToClinic(
   traceId: string,
   /** Assunto curto pro template de reabertura, se a janela de 24h estiver fechada. */
   templateSubject?: string,
-): Promise<void> {
+): Promise<boolean> {
   text = humanizeSupplierText(text); // paridade com a farmácia: sem emoji, sem travessão
   {
     const sane = await assertSane(text, 'clínica', conversationId, traceId);
-    if (!sane) return;
+    if (!sane) return false;
     text = sane;
   }
   // SEM dedup aqui (review): mesma razão do fornecedor — conversa de estabelecimento
@@ -286,15 +302,20 @@ export async function sendOutboundToClinic(
     await writeLog('info', 'clinic', 'Mensagem pra clínica salva (modo simulação) — responda pelo painel do simulador', {
       traceId, conversationId,
     });
-    return;
+    return true;  // simulação: o operador responde pelo painel, não é falha de entrega
   }
 
-  await deliverToEstablishment({
+  const entregue = await deliverToEstablishment({
     conversationId, phoneE164: clinicPhone, text,
     messageId: (mirror?.id as string | undefined) ?? null,
     templateSubject, alvo: 'clínica', category: 'clinic', traceId,
   });
-  await writeLog('info', 'clinic', `Mensagem REAL enfileirada pra clínica ${clinicPhone.slice(0, 8)}***`, { traceId, conversationId });
+  // Só loga "enfileirada" se de fato foi — antes este info saía mesmo com a mensagem
+  // bloqueada, e o /logs mostrava "NÃO entregue" e "enfileirada" pra mesma mensagem.
+  if (entregue) {
+    await writeLog('info', 'clinic', `Mensagem REAL enfileirada pra clínica ${clinicPhone.slice(0, 8)}***`, { traceId, conversationId });
+  }
+  return entregue;
 }
 
 // ─── Abertura FRIA via TEMPLATE (HSM/WABA) — Fase 6 ──────────────────────────
@@ -394,17 +415,38 @@ export async function sendMediaToEstablishment(
   imageUrl: string,
   caption: string,
   traceId: string,
-): Promise<void> {
+): Promise<boolean> {
   const legenda = humanizeSupplierText(caption || '');
-  await db.from('messages').insert({
+  const { data: mirror } = await db.from('messages').insert({
     conversation_id: conversationId,
     direction: 'out',
     sender_role: 'assistant',
     content_type: 'image',
     content: legenda || '[documento encaminhado]',
     trace_id: traceId,
-  });
+  }).select('id').single();
   await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversationId);
+  const messageId = (mirror?.id as string | undefined) ?? null;
+
+  // 🚪 A MÍDIA TAMBÉM PRECISA DA JANELA. Este caminho furava o "ponto único": sem checagem
+  // de janela e sem carimbo. E template NÃO carrega imagem — então, fora das 24h, mídia
+  // genuinamente não tem como sair. O que não pode é fingir que saiu: a feature nasceu do
+  // caso Glauber (o consultório pediu carteirinha e pedido médico), e dizer "encaminhei"
+  // sem encaminhar é pior que dizer "não consegui".
+  const { open, lastInboundMs } = await establishmentWindow(conversationId);
+  if (!open) {
+    const silentH = lastInboundMs ? Math.round((Date.now() - lastInboundMs) / 3_600_000) : null;
+    await stampEstablishmentDelivery(messageId, 'window_blocked');
+    await writeLog('warn', 'outbound', `📎 documento NÃO encaminhado — janela de 24h fechada com o estabelecimento (${silentH ?? '?'}h sem retorno) e template não carrega imagem`, { traceId, conversationId });
+    await writeEvent({
+      eventName: 'establishment.window_blocked',
+      conversationId,
+      severity: 'warn',
+      payload: { alvo: 'estabelecimento', kind: 'image', silent_hours: silentH },
+    }).catch(() => { /* best-effort */ });
+    return false;
+  }
+
   await dispatchOutbound({
     kind: 'image',
     instance: AGENT_INSTANCE,
@@ -412,6 +454,8 @@ export async function sendMediaToEstablishment(
     imageUrl,
     text: legenda || undefined,
     traceId,
+    messageId: messageId ?? undefined,
   });
   await writeLog('info', 'outbound', '📎 documento do paciente encaminhado ao estabelecimento', { traceId, conversationId });
+  return true;
 }

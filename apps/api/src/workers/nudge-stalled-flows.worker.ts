@@ -97,7 +97,12 @@ async function collectTargets(): Promise<NudgeTarget[]> {
   // b) Consultas com opções apresentadas e sem escolha
   const { data: consults } = await db
     .from('consultations')
-    .select('id, conversation_id, created_at, consultation_quotes(status, proposed_datetime)')
+    // ⚠️ HINT DE FK OBRIGATÓRIO: existem DUAS FKs entre estas tabelas
+    // (`consultation_quotes.consultation_id` e `consultations.selected_quote_id`), então um
+    // embed sem hint devolve PGRST201/HTTP 300 — e como o `error` é descartado, `data` viria
+    // null e o nudge de consulta morria INTEIRO, em silêncio, inclusive pras ofertas válidas.
+    // O padrão certo já estava 27 linhas abaixo neste mesmo arquivo.
+    .select('id, conversation_id, created_at, consultation_quotes!consultation_quotes_consultation_id_fkey(status, proposed_datetime)')
     .eq('status', 'quoted')
     .gt('created_at', oldest)
     .lt('created_at', newest)

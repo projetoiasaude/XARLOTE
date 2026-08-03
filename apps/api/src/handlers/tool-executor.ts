@@ -1831,11 +1831,17 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
   // Envia pela FILA do agente (ban-safe). A `message` pode conter PII (endereço) → NÃO logar.
   // O assunto do template é genérico DE PROPÓSITO: `message` pode carregar endereço do
   // paciente, e variável de template vai pra Meta — PII não entra ali.
-  await sendOutboundToSupplier(target.conversationId, target.phoneE164, message, ctx.traceId,
+  const entregue = await sendOutboundToSupplier(target.conversationId, target.phoneE164, message, ctx.traceId,
     'o pedido de medicamento de um paciente que estou ajudando');
   // ✅ ÚNICO ponto onde uma mensagem REALMENTE sai pra farmácia. É este sinal (não o nome da
   // tool) que autoriza a Xarlote a dizer "falei com a farmácia" — incidente Vadivino 17/07:
   // 15 message_supplier, 0 envios, e ela afirmou "Falei com as 5 redes".
+  // ⚠️ E agora depende do DESFECHO, não da chamada: com a janela de 24h fechada e sem
+  // template disponível, nada sai — e carimbar `supplierMessaged` ali reintroduziria
+  // exatamente a mentira que este sinal existe pra impedir.
+  if (!entregue) {
+    throw new ToolFailure(`A mensagem NÃO chegou em ${target.supplierName}: a janela de 24h do WhatsApp com eles está fechada e não houve como reabrir agora. NÃO diga que falou com a farmácia nem que já pediu a cotação. Seja honesta com o paciente: diga que está tentando alcançá-los e que avisa assim que conseguir.`);
+  }
   if (ctx.turnFlags) ctx.turnFlags.supplierMessaged = true;
   // Loop ReAct: o modelo precisa saber PRA QUEM foi e que já foi — senão, ao ver o turno de
   // novo, ele "reforça" mandando uma SEGUNDA mensagem real pra mesma farmácia.

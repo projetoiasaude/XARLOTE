@@ -355,8 +355,11 @@ async function detectUndeliveredCriticalReminders(): Promise<void> {
  * bloqueio de janela (que ainda pode ser reaberto e re-tentado), aqui as 8 tentativas
  * acabaram: só um humano recupera.
  */
+let lastAbandonedAlertMs = 0;
+
 async function detectAbandonedOneShots(): Promise<void> {
   try {
+    if (Date.now() - lastAbandonedAlertMs < UNDELIVERED_ALERT_COOLDOWN_MS) return;
     const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
     const { data, count } = await db
       .from('event_log')
@@ -366,15 +369,26 @@ async function detectAbandonedOneShots(): Promise<void> {
       .limit(50);
     const n = count ?? 0;
     if (!n) return;
-    const titulos = (data ?? [])
-      .map((r) => String((r.payload as Record<string, unknown> | null)?.['title'] ?? '?'))
-      .slice(0, 3).join(', ');
-    const affected = new Set((data ?? []).map((r) => String(r.user_id))).size;
+    // Só o TIPO vai pro Telegram — nunca o título. Título de lembrete é dado clínico e o
+    // Telegram é armazenamento em terceiro (regra #3 do projeto / Art. 18 da LGPD).
+    const tipos = [...new Set((data ?? []).map((r) => String((r.payload as Record<string, unknown> | null)?.['type'] ?? '?')))].join(', ');
+    const sample = data ?? [];
+    const affected = new Set(sample.map((r) => String(r.user_id))).size;
+    const affectedLabel = n > sample.length ? `${affected}+` : String(affected);
     await sendTelegramAlert({
       title: '🔴 Aviso único PERDIDO em definitivo',
-      body: `${n} lembrete(s) de dose única desistiram após todas as tentativas e o paciente NUNCA recebeu (${affected} paciente(s)): ${titulos}. Não há re-tentativa — isso exige contato humano.`,
+      body: `${n} lembrete(s) de dose única desistiram após todas as tentativas e o paciente NUNCA recebeu (${affectedLabel} paciente(s), tipo: ${tipos}). Não há re-tentativa — isso exige contato humano. Ver /logs categoria reminder.`,
       severity: 'high',
       throttleKey: 'abandoned_one_shots',
+    });
+    lastAbandonedAlertMs = Date.now();
+    // Evento DURÁVEL: os 5 detectores irmãos pareiam Telegram com writeEvent, e sem isso o
+    // alerta depende de um token do Telegram que segue pendente — o achado mais grave do
+    // worker sobreviveria só como uma linha `debug`.
+    await writeEvent({
+      eventName: 'anomaly.abandoned_one_shots',
+      severity: 'critical',
+      payload: { count: n, users_affected: affected, types: tipos },
     });
   } catch {}
 }

@@ -96,7 +96,11 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
       // inequívoco (só a FK clinic_id).
       .select('*, consultations!consultation_quotes_consultation_id_fkey(*), clinics(*)')
       .eq('conversation_id', conversationId)
-      .in('status', ['pending', 'offered'])
+      // `withdrawn` ENTRA (03/08): é o status que o expirador de oferta vencida usa. Sem ele
+      // aqui, a clínica que responde "consegui encaixar segunda 9h" DEPOIS de a oferta antiga
+      // vencer cairia num beco — resposta nenhuma pra ela e o horário novo nunca chegaria ao
+      // paciente. Expirar a oferta não pode significar expirar a CONVERSA.
+      .in('status', ['pending', 'offered', 'withdrawn'])
       .order('created_at', { ascending: false });
     // Torna VISÍVEL um erro de query (ex.: embed ambíguo) — antes era engolido em
     // silêncio e a cotação parecia "não existir", travando a resposta à clínica.
@@ -152,7 +156,9 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
       .from('consultation_quotes')
       .select('*, consultations!consultation_quotes_consultation_id_fkey(*), clinics(*)')
       .eq('conversation_id', conversationId)
-      .eq('status', 'timeout')
+      // `withdrawn` junto de `timeout`: os dois significam "ninguém disse não". Oferta que
+      // venceu por tempo é revivível; `unavailable` (a clínica recusou) segue fora.
+      .in('status', ['timeout', 'withdrawn'])
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -790,7 +796,11 @@ export async function initiateClinicNegotiation(opts: {
       ?? (ctx.requestedProfessional ? `uma consulta com ${ctx.requestedProfessional}` : 'uma consulta médica');
     await sendTemplateOpeningToClinic(conv.id, clinicWhatsApp, 'clinic_outreach', [necessidade], traceId);
   } else {
-    await sendOutboundToClinic(conv.id, clinicWhatsApp, opening, traceId);
+    // Assunto obrigatório: sem ele, uma abertura FRIA (janela fechada por definição) seria
+    // bloqueada quando o template estivesse desligado — o kill-switch de custo mataria o
+    // contato inicial inteiro, não só o template.
+    await sendOutboundToClinic(conv.id, clinicWhatsApp, opening, traceId,
+      'a disponibilidade e o valor de uma consulta pra um paciente que estou ajudando');
   }
 }
 
