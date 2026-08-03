@@ -223,8 +223,8 @@ export async function resolveConsultationQuote(
   if (decision.kind === 'none') {
     throw new ToolFailure(
       decision.reason === 'no-candidates'
-        ? `NADA FOI ${opts.action.toUpperCase()}: essa consulta não tem NENHUMA opção de horário confirmável — a clínica ainda não passou horário, a vaga caiu, ou os horários que ela ofereceu JÁ PASSARAM. NÃO diga que confirmou: peça horários novos à clínica com message_supplier e avise o paciente com honestidade.`
-        : `NADA FOI ${opts.action.toUpperCase()}: nenhuma opção corresponde a "${String(raw).slice(0, 60)}". As opções REAIS são: ${horarios}. Se o paciente escolheu uma delas, chame de novo com o horário exato; se ele quer outra data, pergunte à clínica com message_supplier.`,
+        ? `NADA FOI ${opts.action.toUpperCase()}: essa consulta não tem NENHUMA opção de horário confirmável — a clínica ainda não passou horário, a vaga caiu, ou os horários que ela ofereceu JÁ PASSARAM. NÃO diga que confirmou: peça horários novos à clínica com nudge_consultation (passando message) e avise o paciente com honestidade. ⚠️ message_supplier é de FARMÁCIA e não alcança consultório nenhum.`
+        : `NADA FOI ${opts.action.toUpperCase()}: nenhuma opção corresponde a "${String(raw).slice(0, 60)}". As opções REAIS são: ${horarios}. Se o paciente escolheu uma delas, chame de novo com o horário exato; se ele quer outra data, pergunte à clínica com nudge_consultation passando message (message_supplier é de FARMÁCIA e não alcança consultório).`,
     );
   }
   if (decision.kind === 'ambiguous') {

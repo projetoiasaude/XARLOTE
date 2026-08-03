@@ -794,7 +794,7 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
   // duplicados. Reconfirmar não é reagendar: se o paciente quer outro horário, fala-se com
   // a clínica.
   if (before.status === 'confirming' || before.status === 'scheduled') {
-    throw new ToolFailure('Essa consulta JÁ está confirmada (aguardando/tendo a clínica reservado) — NÃO confirmei de novo e nenhuma mensagem nova foi enviada. Se o paciente quer OUTRO horário, fale com a clínica usando message_supplier em vez de confirmar de novo.');
+    throw new ToolFailure('Essa consulta JÁ está confirmada (aguardando/tendo a clínica reservado) — NÃO confirmei de novo e nenhuma mensagem nova foi enviada. Se o paciente quer OUTRO horário, fale com a clínica usando `nudge_consultation` com `message` (message_supplier é de FARMÁCIA) em vez de confirmar de novo.');
   }
   const q = await resolveConsultationQuote(args.quote_id, consultationId, {
     action: 'confirmado', traceId: ctx.traceId, preferences: consultation.preferences,
@@ -805,7 +805,7 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
   // responder "confirmado", o worker de feedback pergunta "como foi sua consulta?" sobre
   // algo que nunca aconteceu e marca `completed`. Vale checar duas vezes.
   if (!isOfferStillValid(q.proposed_datetime, Date.now())) {
-    throw new ToolFailure('NADA FOI CONFIRMADO: esse horário JÁ PASSOU. Não confirme data no passado — peça horários novos à clínica com message_supplier e explique ao paciente que a vaga anterior venceu.');
+    throw new ToolFailure('NADA FOI CONFIRMADO: esse horário JÁ PASSOU. Não confirme data no passado — peça horários novos à clínica com `nudge_consultation` passando `message` (message_supplier é de FARMÁCIA) e explique ao paciente que a vaga anterior venceu.');
   }
 
   // 1. Atualiza consultation

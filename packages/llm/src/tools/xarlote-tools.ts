@@ -544,8 +544,17 @@ export const xarloteTools: ToolDefinition[] = [
     function: {
       name: 'nudge_consultation',
       description:
-        'INSISTIR/CONTINUAR uma consulta médica JÁ em andamento (você verá "🩺 CONSULTA ATIVA" no seu contexto). Use quando o paciente cobra, insiste ou pergunta o status da consulta: "insiste em marcar", "e aí, já marcou?", "tenta de novo", "continua", "não desiste", "vê isso pra mim", "cadê a consulta?". Eu dou um alô no consultório, reabro se tinha encerrado, e aviso o paciente quando responderem. ⚠️ NÃO use pra COMEÇAR uma consulta nova (aí é find_clinic_by_name/contact_establishment) nem pra nada de FARMÁCIA (message_supplier/start_pharmacy_order são de REMÉDIO, não de consulta).',
-      parameters: { type: 'object', properties: {}, required: [] },
+        'FALAR COM O CONSULTÓRIO de uma consulta JÁ em andamento (você verá "🩺 CONSULTA ATIVA" no seu contexto). Dois usos: (a) o paciente cobra/insiste/pergunta status ("e aí, já marcou?", "tenta de novo", "cadê a consulta?") → eu dou um alô e reabro se tinha encerrado; (b) o paciente pede OUTRA DATA/HORÁRIO ou quer perguntar algo específico ao consultório → passe a pergunta em `message` e eu levo LITERALMENTE pra eles. ⚠️ Esta é a ÚNICA forma de falar com uma CLÍNICA: `message_supplier` é de FARMÁCIA (remédio) e não alcança consultório nenhum. NÃO use pra COMEÇAR consulta nova (aí é find_clinic_by_name/contact_establishment).',
+      parameters: {
+        type: 'object',
+        properties: {
+          message: {
+            type: 'string',
+            description: 'OPCIONAL. A pergunta/pedido que vai DIRETO pro consultório, em 1ª pessoa e curta, como se VOCÊ estivesse escrevendo no WhatsApp (a recepção não sabe que existe um paciente por trás). Use SEMPRE que o paciente pedir uma data/horário específico ou fizer uma pergunta concreta. Com DATA EXPLÍCITA (dia/mês), nunca só "quarta". Ex.: "O paciente pediu quarta, dia 26/08, às 10h. O Dr. tem esse horário?" / "Vocês atendem Unimed?". Sem `message` eu mando só um alô genérico perguntando se já tem horário.',
+          },
+        },
+        required: [],
+      },
     },
   },
   {

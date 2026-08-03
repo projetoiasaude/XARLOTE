@@ -288,7 +288,7 @@ export function shouldPokeClinicAgain(args: {
  * no fluxo de FARMÁCIA). Dá ao LLM uma ação de CONSULTA de verdade: re-cutuca o consultório e
  * tranquiliza o paciente; retoma uma consulta recém-encerrada sem duplicar. Auto-contido (uma voz).
  */
-export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
+export async function handleNudgeConsultation(ctx: ReachCtx, args?: { message?: string }): Promise<void> {
   // ⚠️ NÃO amordaçar o modelo aqui (auditoria 30/07 — caso Ciro).
   // Antes, `suppressLlmText = true` era setado INCONDICIONALMENTE na 1ª linha, antes de
   // saber qualquer coisa. Nos estados informativos o handler despejava um texto FIXO e a
@@ -339,12 +339,12 @@ export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
           + (preco ? ` Valor: R$${preco}.` : '')
           + ` ⚠️ LEIA a mensagem dele: se ele ESCOLHEU um horário ou disse que quer confirmar,`
           + ` NÃO repita as opções — chame \`confirm_consultation_selection\` e feche.`
-          + ` Se ele pediu OUTRA data, diga que vai checar e use \`message_supplier\` pra perguntar à clínica de verdade.`
+          + ` Se ele pediu OUTRA data, diga que vai checar e use \`nudge_consultation\` passando o campo message pra perguntar à clínica de verdade (NUNCA message_supplier: essa é de FARMÁCIA e não alcança consultório).`
         // Havia oferta, mas o horário passou. NÃO é "aguardando escolha" — é preciso
         // pedir horário novo. Dizer "as opções estão de pé" aqui seria mentira.
         : `Consulta ${alvo || ''}: os horários que a clínica ofereceu JÁ PASSARAM e não há`
           + ` nenhuma opção válida agora. NÃO ofereça esses horários nem diga que estão de pé.`
-          + ` Seja honesta com o paciente e use \`message_supplier\` pra pedir horários novos à clínica.`;
+          + ` Seja honesta com o paciente e use \`nudge_consultation\` passando o campo message pra pedir horários novos à clínica (NUNCA message_supplier: essa é de FARMÁCIA e não alcança consultório).`;
     }
     return;
   }
@@ -413,7 +413,12 @@ export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
       lastClinicReplyAt: (lastIn?.created_at as string | undefined) ?? null,
       nowMs: Date.now(),
     });
-    if (!decision.poke) {
+    // ⚠️ O cooldown vale pro ALÔ REPETIDO ("e aí, já viu?"), que é o que queima a relação
+    // com o consultório. Uma PERGUNTA ESPECÍFICA do paciente é informação NOVA — segurá-la
+    // por 3h significaria que ele pediu "marca dia 26 às 10h" e a clínica não soube. Sem
+    // esta exceção, os dois fixes de hoje brigariam entre si.
+    const perguntaEspecifica = (args?.message ?? '').trim();
+    if (!decision.poke && !perguntaEspecifica) {
       // Estado INFORMATIVO (não agiu): o modelo fala. Sem supressão, sem texto pronto.
       if (ctx.observation) ctx.observation.note =
         `Consulta${alvo ? ` ${alvo}` : ''}: o consultório JÁ levou um alô há ${decision.minutesSinceLastPoke} min e ainda não respondeu. `
@@ -432,9 +437,14 @@ export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
       // template disponível nada sai, e dizer "dei mais um alô lá agora" seria a mentira
       // de 20/07 outra vez — agora com o agravante de eu ter acabado de construir a
       // detecção de não-entrega e ignorá-la.
+      // 🗣️ PERGUNTA ESPECÍFICA vs alô genérico. Sem isto, "marca dia 26 às 10h" não tinha
+      // como chegar ao consultório: NENHUMA tool falava com clínica de forma livre, e seis
+      // pontos do código mandavam o modelo usar `message_supplier` — que é de FARMÁCIA.
+      // O modelo obedecia, a tool não achava pedido de remédio, e o paciente ouvia sobre
+      // farmácia depois de pedir consulta (incidente Ciro 03/08 18:08).
       poked = await sendOutboundToClinic(
         q.conversation_id, clinicPhone,
-        'Oi! Só passando pra saber se conseguiu ver um horário — o paciente tá bem interessado 🙂 obrigada!',
+        perguntaEspecifica || 'Oi! Só passando pra saber se conseguiu ver um horário — o paciente tá bem interessado 🙂 obrigada!',
         ctx.traceId,
         `a disponibilidade de horário${doctor ? ` do ${doctor}` : ''} pra marcar a consulta de um paciente`,
       );
