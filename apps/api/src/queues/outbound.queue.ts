@@ -259,6 +259,18 @@ function provesNothingWasSent(err: unknown): boolean {
   return false;
 }
 
+/**
+ * Avisa UMA vez que a migration 0023 está pendente. Sem o "uma vez", isto viraria um log por
+ * mensagem enviada — e o ruído é justamente o que a leva de hoje está consertando.
+ */
+let ticketColumnWarned = false;
+function noteTicketColumnMissing(msg: string): void {
+  if (ticketColumnWarned) return;
+  ticketColumnWarned = true;
+  void writeLog('warn', 'outbound', `provider_ticket_id não gravado — migration 0023 pendente? (${msg.slice(0, 120)}). O ticketId segue visível no log de envio.`, {})
+    .catch(() => { /* best-effort */ });
+}
+
 /** O envio propriamente dito, já com a reivindicação em mãos. */
 async function sendClaimed(job: OutboundJob): Promise<void> {
   if (job.kind === 'text') {
@@ -269,14 +281,24 @@ async function sendClaimed(job: OutboundJob): Promise<void> {
     //   • 2 linhas com o MESMO wa_key  → o job re-executou e a trava falhou (Redis)
     //   • 2 linhas com wa_key DIFERENTE → dois envios distintos (bug acima da fila)
     //   • 1 linha só                    → nós enviamos 1×; a duplicação é do zpro/Meta
-    // O `providerMessageId` é a prova do lado de lá (2 wamids = 2 mensagens de verdade).
-    await writeLog('info', 'outbound', `📤 envio text pid=${process.pid} wa_key=${(sendDedupKey(job) ?? 'none').slice(-12)} providerMessageId=${res.messageId || '(vazio)'}`, {
-      traceId: job.traceId, instance: job.instance, messageId: job.messageId,
+    // O identificador do provedor é a prova do lado de lá. RESOLVIDO em 03/08: o zpro NÃO
+    // devolve wamid — devolve `ticketId`, e é ele que o suporte deles rastreia. É o número
+    // que o fundador precisa pro chamado da entrega duplicada.
+    await writeLog('info', 'outbound', `📤 envio text pid=${process.pid} wa_key=${(sendDedupKey(job) ?? 'none').slice(-12)} ticket=${res.ticketId ?? '(nenhum)'} providerMessageId=${res.messageId || '(o zpro não devolve)'}`, {
+      traceId: job.traceId, instance: job.instance, messageId: job.messageId, providerTicketId: res.ticketId ?? null,
     });
+    // Persiste o que o provedor devolveu, em DUAS escritas independentes de propósito: a
+    // coluna `provider_ticket_id` vem da migration 0023, e enquanto ela não estiver aplicada
+    // um patch combinado derrubaria também o `external_id`. Separado, cada um degrada só a si.
     if (job.messageId && res.messageId) {
-      // Guarda o id do provider: sem ele somos cegos pra entrega dupla (external_id
-      // do outbound estava sempre null).
       await db.from('messages').update({ external_id: res.messageId }).eq('id', job.messageId).then(() => {}, () => {});
+    }
+    if (job.messageId && res.ticketId !== undefined) {
+      // O `ticketId` é a chave que também vem no webhook de ENTRADA (providerTicketId) — é
+      // por ela que um dia dá pra dizer "ESTA mensagem foi entregue", em vez da atribuição
+      // por telefone+recência de hoje.
+      await db.from('messages').update({ provider_ticket_id: String(res.ticketId) }).eq('id', job.messageId)
+        .then(({ error }) => { if (error) noteTicketColumnMissing(error.message); }, () => {});
     }
     return;
   }

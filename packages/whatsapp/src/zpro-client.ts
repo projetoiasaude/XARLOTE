@@ -70,11 +70,23 @@ async function zproCall(cfg: ZproConfig, path: string, body: unknown): Promise<u
 }
 
 /**
- * O shape da resposta do zpro não é documentado — extraímos um id best-effort.
- * Prod 27/07 provou o envelope `{ success:boolean, data:object }` com o id em ALGUM lugar
- * dentro de `data` (nenhum candidato de raiz casou → providerMessageId vazio em 100%).
- * Então procuramos os mesmos candidatos na RAIZ e DENTRO de `data` — incluindo `msg.id` e
- * `message.id`, o vocabulário que o zpro usa no webhook de entrada (zpro-normalize.ts).
+ * 🔬 CONCLUÍDO EM PRODUÇÃO (03/08): a resposta de ENVIO do zpro NÃO TRAZ id de mensagem.
+ *
+ * O log de shape profundo revelou, em 100% dos envios:
+ *     { success: boolean, data: { message: string, ticketId: number } }
+ *
+ * `message` é texto de status, não o objeto da mensagem. Não existe wamid. Ou seja: o
+ * `pickMessageId` passou semanas caçando um campo inexistente, e `messages.external_id`
+ * ficava NULL por isso — não por parser errado.
+ *
+ * A lição de método: eu tinha ASSUMIDO que a resposta traria um id porque toda API de
+ * WhatsApp traz. Instrumentar (logar as chaves, nunca os valores) custou uma linha e
+ * respondeu o que meses de tentativa de parsing não responderam.
+ *
+ * A varredura por candidatos fica — é barata, e um dia o zpro pode passar a devolver id.
+ * O que muda é que agora capturamos o `ticketId`, que é o identificador REAL: é ele que o
+ * suporte do zpro usa, e é ele que o webhook de ENTRADA também carrega (`providerTicketId`),
+ * o que abre a porta pra correlacionar entrega por mensagem.
  */
 export function pickMessageId(data: unknown): string {
   const root = data && typeof data === 'object' ? (data as Record<string, unknown>) : null;
@@ -96,6 +108,33 @@ export function pickMessageId(data: unknown): string {
     }
   }
   return '';
+}
+
+/**
+ * Resultado de um envio. `messageId` continua no contrato (uazapi devolve; zpro não), e
+ * `ticketId` é opcional porque só o zpro tem. Alargar o tipo é source-compatible: todos os
+ * call-sites ou ignoram o retorno ou leem apenas `.messageId`.
+ */
+export interface SendResult {
+  messageId: string;
+  ticketId?: number | string;
+}
+
+/**
+ * O `ticketId` da resposta de envio — o ÚNICO identificador que o zpro devolve.
+ * Serve pra dois fins: é o que o suporte deles pede pra rastrear uma entrega, e é a mesma
+ * chave que aparece no webhook de entrada (`providerTicketId`), então é por aqui que um dia
+ * dá pra dizer "esta mensagem específica foi entregue" em vez de "o POST não lançou".
+ */
+export function pickTicketId(data: unknown): number | string | undefined {
+  const root = data && typeof data === 'object' ? (data as Record<string, unknown>) : null;
+  for (const scope of [root?.['data'], root]) {
+    if (!scope || typeof scope !== 'object') continue;
+    const v = (scope as Record<string, unknown>)['ticketId'] ?? (scope as Record<string, unknown>)['ticket_id'];
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return undefined;
 }
 
 /**
@@ -126,7 +165,7 @@ export async function zproSendText(
   instance: string,
   phoneE164: string,
   text: string,
-): Promise<{ messageId: string }> {
+): Promise<SendResult> {
   const cfg = buildZproConfig(instance);
   const data = await zproCall(cfg, '', {
     number: toNumber(phoneE164),
@@ -135,15 +174,16 @@ export async function zproSendText(
     isClosed: false,
   });
   const messageId = pickMessageId(data);
-  // 🔬 `providerMessageId` vazio em 100% dos envios de 27/07 e o log raso só revelou o
-  // envelope `{ success, data }`. Sem esse id somos cegos pra entrega dupla — e é exatamente
-  // o que o suporte do zpro pede pra investigar. Agora logamos a assinatura PROFUNDA
-  // (chaves+tipos até 3 níveis, NUNCA valores: o corpo carrega telefone/texto = PII) pra
-  // cravar o caminho do id e apertar o pickMessageId na sequência.
-  if (!messageId && data && typeof data === 'object') {
-    console.warn(`[zpro] resposta de envio SEM messageId reconhecido — shape=${describeShape(data)}`);
+  const ticketId = pickTicketId(data);
+  // O warn por envio foi APOSENTADO: a pergunta que ele existia pra responder está
+  // respondida (a resposta do zpro não traz wamid — ver o comentário do pickMessageId), e
+  // repeti-lo a cada mensagem só produziria ruído. Ele volta a falar apenas se o shape
+  // MUDAR, isto é, se um dia o ticketId também desaparecer — aí é regressão do provedor e
+  // vale saber na hora.
+  if (!messageId && !ticketId && data && typeof data === 'object') {
+    console.warn(`[zpro] resposta de envio sem messageId E sem ticketId (shape mudou?) — shape=${describeShape(data)}`);
   }
-  return { messageId };
+  return ticketId !== undefined ? { messageId, ticketId } : { messageId };
 }
 
 /**
@@ -162,7 +202,7 @@ export async function zproSendMenu(
   text: string,
   choices: string[],
   opts: { footerText?: string; ticketId?: number | string } = {},
-): Promise<{ messageId: string }> {
+): Promise<SendResult> {
   const cfg = buildZproConfig(instance);
   const top3 = choices.slice(0, 3);
   const message = opts.footerText ? `${text}\n\n${opts.footerText}` : text;
@@ -187,7 +227,7 @@ export async function zproSendImage(
   phoneE164: string,
   imageUrl: string,
   caption?: string,
-): Promise<{ messageId: string }> {
+): Promise<SendResult> {
   const cfg = buildZproConfig(instance);
   const data = await zproCall(cfg, '/url', {
     number: toNumber(phoneE164),
@@ -209,7 +249,7 @@ export async function zproSendAudio(
   phoneE164: string,
   audio: Buffer | string,
   opts: { mime?: string } = {},
-): Promise<{ messageId: string }> {
+): Promise<SendResult> {
   const cfg = buildZproConfig(instance);
   const number = toNumber(phoneE164);
   if (typeof audio === 'string') {
@@ -272,7 +312,7 @@ export async function zproSendTemplate(
   instance: string,
   phoneE164: string,
   template: { name: string; language: string; variables: string[] },
-): Promise<{ messageId: string }> {
+): Promise<SendResult> {
   const cfg = buildZproConfig(instance);
   const path = process.env['ZPRO_TEMPLATE_PATH']?.trim() || '/template';
   const number = toNumber(phoneE164);

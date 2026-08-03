@@ -16,6 +16,7 @@ import {
   zproSendTemplate,
   zproCheckWhatsApp,
   zproGetInstanceStatus,
+  type SendResult,
 } from './zpro-client.js';
 
 // ─── uazapi (não-oficial) — implementação interna ────────────────────────────
@@ -46,7 +47,7 @@ async function apiCall(cfg: ClientConfig, method: string, path: string, body?: u
   return res.data;
 }
 
-async function uazSendText(instance: string, phoneE164: string, text: string): Promise<{ messageId: string }> {
+async function uazSendText(instance: string, phoneE164: string, text: string): Promise<SendResult> {
   const cfg = buildConfig(instance);
   const number = phoneE164.replace('+', '');
   const result = await apiCall(cfg, 'POST', '/send/text', { number, text });
@@ -59,7 +60,7 @@ async function uazSendMenu(
   text: string,
   choices: string[],
   opts: { type?: 'button' | 'list' | 'poll'; footerText?: string } = {},
-): Promise<{ messageId: string }> {
+): Promise<SendResult> {
   const cfg = buildConfig(instance);
   const number = phoneE164.replace('+', '');
   const result = await apiCall(cfg, 'POST', '/send/menu', {
@@ -72,7 +73,7 @@ async function uazSendMenu(
   return { messageId: result?.messageid ?? result?.id ?? '' };
 }
 
-async function uazSendImage(instance: string, phoneE164: string, imageUrl: string, caption?: string): Promise<{ messageId: string }> {
+async function uazSendImage(instance: string, phoneE164: string, imageUrl: string, caption?: string): Promise<SendResult> {
   const cfg = buildConfig(instance);
   const number = phoneE164.replace('+', '');
   const result = await apiCall(cfg, 'POST', '/send/media', {
@@ -89,7 +90,7 @@ async function uazSendAudio(
   phoneE164: string,
   audio: Buffer | string,
   opts: { mime?: string; ptv?: boolean } = {},
-): Promise<{ messageId: string }> {
+): Promise<SendResult> {
   const cfg = buildConfig(instance);
   const number = phoneE164.replace('+', '');
   const file = Buffer.isBuffer(audio) ? audio.toString('base64') : audio;
@@ -147,7 +148,7 @@ async function uazDownloadMedia(instance: string, messageId: string): Promise<{ 
 
 // ─── Fachada pública (despacha por provedor) ─────────────────────────────────
 
-export async function sendText(instance: string, phoneE164: string, text: string): Promise<{ messageId: string }> {
+export async function sendText(instance: string, phoneE164: string, text: string): Promise<SendResult> {
   return providerFor(instance) === 'zpro'
     ? zproSendText(instance, phoneE164, text)
     : uazSendText(instance, phoneE164, text);
@@ -164,14 +165,14 @@ export async function sendMenu(
   text: string,
   choices: string[],
   opts: { type?: 'button' | 'list' | 'poll'; footerText?: string; ticketId?: number | string } = {},
-): Promise<{ messageId: string }> {
+): Promise<SendResult> {
   if (providerFor(instance) === 'zpro') {
     return zproSendMenu(instance, phoneE164, text, choices, { footerText: opts.footerText, ticketId: opts.ticketId });
   }
   return uazSendMenu(instance, phoneE164, text, choices, { type: opts.type, footerText: opts.footerText });
 }
 
-export async function sendImage(instance: string, phoneE164: string, imageUrl: string, caption?: string): Promise<{ messageId: string }> {
+export async function sendImage(instance: string, phoneE164: string, imageUrl: string, caption?: string): Promise<SendResult> {
   return providerFor(instance) === 'zpro'
     ? zproSendImage(instance, phoneE164, imageUrl, caption)
     : uazSendImage(instance, phoneE164, imageUrl, caption);
@@ -186,7 +187,7 @@ export async function sendAudio(
   phoneE164: string,
   audio: Buffer | string,
   opts: { mime?: string; ptv?: boolean } = {},
-): Promise<{ messageId: string }> {
+): Promise<SendResult> {
   return providerFor(instance) === 'zpro'
     ? zproSendAudio(instance, phoneE164, audio, { mime: opts.mime })
     : uazSendAudio(instance, phoneE164, audio, opts);
@@ -201,7 +202,7 @@ export async function sendTemplate(
   instance: string,
   phoneE164: string,
   template: { name: string; language: string; variables: string[] },
-): Promise<{ messageId: string }> {
+): Promise<SendResult> {
   if (providerFor(instance) === 'zpro') {
     return zproSendTemplate(instance, phoneE164, template);
   }
