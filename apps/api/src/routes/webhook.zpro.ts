@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import type { FastifyInstance } from 'fastify';
-import { normalizeZproWebhook, zproEventId, isZproStatusEcho, extractZproDeliverySignal } from '@iasaude/whatsapp';
+import { normalizeZproWebhook, zproEventId, isZproStatusEcho, extractZproDeliverySignal, describeShape } from '@iasaude/whatsapp';
 import { db, writeLog, redactPII } from '@iasaude/db';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { processInboundSupplierFromWebhook } from '../handlers/inbound-supplier.js';
@@ -132,6 +132,12 @@ export async function webhookZproRoute(app: FastifyInstance) {
               }),
             );
           }
+          // 🔬 O eco carrega ticketId? Ainda não sabemos — e é isso que decidirá se dá pra
+          // correlacionar entrega POR MENSAGEM (hoje a atribuição é por telefone+recência).
+          // Loga só as CHAVES, nunca valores (o corpo tem telefone = PII). É a mesma
+          // disciplina que revelou que a resposta de envio do zpro não traz wamid: observar
+          // antes de construir, pra não repetir o parser que procurava campo inexistente.
+          await writeLog('info', 'webhook', `zpro echo de status — shape=${describeShape(body)}`, { traceId, instance: instanceName });
           return reply.send({ ok: true, skipped: 'status_echo' });
         }
         // Mensagem de verdade que não normalizou: registra o shape redatado

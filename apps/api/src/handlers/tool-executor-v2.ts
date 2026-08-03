@@ -844,7 +844,10 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
         ? ` Plano: ${q.plan_accepted}.`
         : ` (Particular.)`;
       const msg = `Oi! Fechei aqui${patientFirst ? ` com o ${patientFirst}` : ''} — pode marcar pra ${dt}?${planLine} Consegue reservar esse horário pra mim? Obrigada! 🙂`;
-      await sendOutboundToClinic(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId);
+      // Reservar horário é o passo em que NÃO alcançar a clínica custa a consulta inteira:
+      // o paciente ouve "fechei" e o consultório nunca soube. Assunto pro template sem PII.
+      await sendOutboundToClinic(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId,
+        'a reserva de um horário de consulta que preciso confirmar com vocês');
     }
   }
 
@@ -941,7 +944,10 @@ export async function handleCancelConsultation(args: { consultation_id: string; 
       const clinicPhone = conv?.whatsapp_jid?.replace('@s.whatsapp.net', '');
       if (clinicPhone) {
         const msg = `Oi! Infelizmente vou precisar cancelar essa consulta que marquei 😕 Desculpa o transtorno e obrigada pela atenção!`;
-        await sendOutboundToClinic(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId);
+        // Cancelamento que não chega deixa a clínica com um horário bloqueado à espera de
+        // alguém que não vai aparecer. Vale um template pra alcançar.
+        await sendOutboundToClinic(q.conversation_id, `+${clinicPhone}`, msg, ctx.traceId,
+          'o cancelamento de um horário de consulta que eu tinha marcado com vocês');
       }
     }
   }

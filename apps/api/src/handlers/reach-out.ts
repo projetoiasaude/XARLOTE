@@ -415,7 +415,15 @@ export async function handleNudgeConsultation(ctx: ReachCtx): Promise<void> {
     }
     let poked = false;
     try {
-      await sendOutboundToClinic(q.conversation_id, clinicPhone, 'Oi! Só passando pra saber se conseguiu ver um horário — o paciente tá bem interessado 🙂 obrigada!', ctx.traceId);
+      // `templateSubject`: este é o caso que expôs o buraco (Ciro/Rita 03/08). Cutucar uma
+      // clínica calada há dias é EXATAMENTE quando a janela de 24h está fechada — sem
+      // assunto pro template de reabertura, o alô sai no vácuo e nós nem sabemos.
+      await sendOutboundToClinic(
+        q.conversation_id, clinicPhone,
+        'Oi! Só passando pra saber se conseguiu ver um horário — o paciente tá bem interessado 🙂 obrigada!',
+        ctx.traceId,
+        `a disponibilidade de horário${doctor ? ` do ${doctor}` : ''} pra marcar a consulta de um paciente`,
+      );
       poked = true;
     } catch { /* best-effort: a falha vira observation honesta abaixo */ }
     if (poked) {

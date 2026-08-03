@@ -1829,7 +1829,10 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
   }
 
   // Envia pela FILA do agente (ban-safe). A `message` pode conter PII (endereço) → NÃO logar.
-  await sendOutboundToSupplier(target.conversationId, target.phoneE164, message, ctx.traceId);
+  // O assunto do template é genérico DE PROPÓSITO: `message` pode carregar endereço do
+  // paciente, e variável de template vai pra Meta — PII não entra ali.
+  await sendOutboundToSupplier(target.conversationId, target.phoneE164, message, ctx.traceId,
+    'o pedido de medicamento de um paciente que estou ajudando');
   // ✅ ÚNICO ponto onde uma mensagem REALMENTE sai pra farmácia. É este sinal (não o nome da
   // tool) que autoriza a Xarlote a dizer "falei com a farmácia" — incidente Vadivino 17/07:
   // 15 message_supplier, 0 envios, e ela afirmou "Falei com as 5 redes".
