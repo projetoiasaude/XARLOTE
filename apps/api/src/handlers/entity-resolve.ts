@@ -36,6 +36,28 @@ export class ToolFailure extends Error {
 /** Consultas "vivas" — as que uma tool pode confirmar/cancelar. */
 export const LIVE_CONSULTATION_STATUSES = ['searching', 'quoting', 'quoted', 'confirming', 'scheduled'] as const;
 
+/**
+ * Estados TERMINAIS de consulta. Definir o fim (fechado e pequeno) em vez do meio é o que
+ * garante cobertura por CONSTRUÇÃO: o vigilante consulta "tudo que NÃO é terminal", então
+ * um status novo — ou um que ninguém escreve mais, como `quoting`/`drafting` — nasce
+ * vigiado em vez de nascer buraco negro.
+ *
+ * Foi um desses buracos que prendeu a consulta do Ciro por 9 dias: `quoting` é honrado por
+ * 20+ leitores como estado vivo (inclusive o guard que bloqueia nova busca), mas nenhum
+ * vigilante o olhava e, hoje, nenhum código o escreve.
+ */
+export const TERMINAL_CONSULTATION_STATUSES = ['scheduled', 'completed', 'cancelled', 'failed'] as const;
+
+/** Expressão pro PostgREST: `.not('status','in', NOT_TERMINAL_FILTER)`. */
+export const NOT_TERMINAL_FILTER = `(${TERMINAL_CONSULTATION_STATUSES.join(',')})`;
+
+/**
+ * Status vivo que NENHUM código escreve mais, mas que todo leitor honra. Precisa ser dobrado
+ * num estado real pra que a maquinaria existente volte a valer — `consolidateConsultationQuotes`
+ * tem CAS travado em `searching`, então com `quoting` ela é no-op silencioso.
+ */
+export const PHANTOM_CONSULTATION_STATUSES = ['quoting', 'drafting'] as const;
+
 interface ConsultationRow {
   id: string;
   status: string;

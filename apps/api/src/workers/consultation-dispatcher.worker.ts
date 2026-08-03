@@ -16,7 +16,7 @@
  */
 import { db, writeLog } from '@iasaude/db';
 import { initiateClinicNegotiation } from '../handlers/agent-clinic.js';
-import { scheduleConsultationTimeout, rescueStalledConsultations, expireStaleConsultationOffers } from '../handlers/consultation-consolidation.js';
+import { scheduleConsultationTimeout, rescueStalledConsultations, expireStaleConsultationOffers, normalizePhantomConsultationStates } from '../handlers/consultation-consolidation.js';
 import { rescueOrphanedPharmacyQuotes } from '../handlers/quote-consolidation.js';
 import { withCronLock } from '../middleware/cron-lock.js';
 
@@ -31,6 +31,11 @@ async function runOnce(): Promise<void> {
 
   // Fase 4: resgate durável de CONSULTAS presas em 'searching' (timers in-process
   // que morreram OU consolidação adiada pelo gate de clarificação que não re-disparou).
+  // 🧹 ANTES do rescue: dobra status FANTASMA (vivo, sem vigilante, sem escritor) em
+  // 'searching', pra que o rescue logo abaixo já o enxergue no mesmo tick. É o que destrava
+  // uma consulta que ficaria presa pra sempre.
+  await normalizePhantomConsultationStates();
+
   // Idempotente: consolidateConsultationQuotes faz transição atômica + re-checa o gate.
   await rescueStalledConsultations();
 

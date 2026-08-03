@@ -12,6 +12,7 @@
  */
 import { db, writeLog, writeAudit, writeEvent } from '@iasaude/db';
 import { pickValidOffers, isOfferStillValid } from '@iasaude/shared';
+import { NOT_TERMINAL_FILTER, PHANTOM_CONSULTATION_STATUSES } from './entity-resolve.js';
 import { sendOutbound } from './outbound.js';
 import { hasPendingClinicClarification } from './clarification.js';
 
@@ -332,6 +333,56 @@ export async function closeConsultationQuotes(consultationId: string, reason: st
   await db.from('consultation_quotes')
     .update({ status: 'unavailable', notes: `[encerrada] ${reason}`.slice(0, 200), responded_at: new Date().toISOString() })
     .eq('consultation_id', consultationId).in('status', ['pending', 'offered']);
+}
+
+/**
+ * 🧹 COBERTURA DO ESTADO VIVO — nenhuma consulta pode ficar imortal nem invisível.
+ *
+ * ## A raiz
+ * Os vigilantes foram escritos POR STATUS, ad hoc, conforme cada incidente aparecia:
+ * `searching` tem o rescue, `confirming` tem o rescueStuckConfirming, `quoted` tem o
+ * nudge-stalled-flows, `scheduled` tem o feedback. Nunca existiu o invariante "todo estado
+ * não-terminal tem prazo e dono". Resultado: `quoting` e `drafting` ficaram sem vigilante
+ * nenhum — e `quoting` é honrado por 20+ leitores como estado vivo, incluindo o guard que
+ * BLOQUEIA nova busca. Uma consulta que chegasse lá ficava presa pra sempre, e o paciente
+ * nunca era avisado (caso Ciro: 9 dias, 4 deles sem nenhuma palavra a ele).
+ *
+ * ## A correção
+ * Esta função varre o COMPLEMENTO do conjunto terminal, não uma lista de status vivos. Um
+ * status novo passa a ser coberto sem ninguém lembrar de adicioná-lo.
+ *
+ * Ela NÃO duplica a lógica dos vigilantes existentes: para o status fantasma, ela apenas o
+ * dobra em `searching` (via CAS) e deixa a maquinaria que já existe agir. Reusar em vez de
+ * reimplementar é o que evita duas verdades sobre o mesmo estado.
+ */
+export async function normalizePhantomConsultationStates(): Promise<void> {
+  try {
+    const { data: rows } = await db
+      .from('consultations')
+      .select('id, status, updated_at')
+      .not('status', 'in', NOT_TERMINAL_FILTER)
+      .limit(50);
+    if (!rows?.length) return;
+
+    for (const c of rows) {
+      const status = c.status as string;
+      // Status vivo COM vigilante próprio: não é da conta desta função.
+      if (!(PHANTOM_CONSULTATION_STATUSES as readonly string[]).includes(status)) continue;
+      const { data: folded } = await db.from('consultations')
+        .update({ status: 'searching' })
+        .eq('id', c.id as string).eq('status', status).select('id');
+      if (!folded?.length) continue;
+      await writeLog('warn', 'consultation', `Consulta em status FANTASMA '${status}' (sem vigilante e sem escritor no código) dobrada em 'searching' — o rescue passa a enxergá-la`, {
+        consultationId: c.id as string,
+      });
+      await writeEvent({
+        eventName: 'consultation.phantom_state_normalized',
+        payload: { consultation_id: c.id, from: status, to: 'searching', stale_since: c.updated_at },
+      }).catch(() => { /* best-effort */ });
+    }
+  } catch (err) {
+    await writeLog('warn', 'consultation', `normalizePhantomConsultationStates falhou: ${String(err).slice(0, 160)}`, {});
+  }
 }
 
 /**
