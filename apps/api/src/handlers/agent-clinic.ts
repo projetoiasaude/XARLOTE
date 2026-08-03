@@ -183,17 +183,38 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     return;
   }
 
-  // 4. Turn limit (12 turnos = 24 msgs) — CONTA SÓ ESTA NEGOCIAÇÃO. A conversa de
-  // clínica é compartilhada por telefone e reusada entre consultas; contar a vida
-  // inteira matava a 2ª negociação com a mesma clínica logo na 1ª resposta.
+  // 4. Turn limit (12 turnos = 24 msgs) — freio contra conversa em LOOP com a recepção.
+  //
+  // 🔴 INCIDENTE Rita/Ciro (03/08): este freio virou um BURACO NEGRO MUDO. A âncora era
+  // `quote.created_at`, e o comentário original dizia que isso contava "só esta negociação"
+  // — mas a cotação do Ciro foi criada em 25/07 e revivida 3×, então a contagem acumulou 9
+  // DIAS de conversa: 31 mensagens contra o teto de 24. Resultado: `finalize('timeout')` +
+  // `return` MUDO. E como `timeout` é revivível, a mensagem seguinte da secretária revivia a
+  // cotação, batia no mesmo teto e era silenciada de novo — a Rita respondeu três vezes e
+  // falou com uma parede, enquanto o paciente não sabia de nada.
+  //
+  // A âncora certa é TEMPO, não vida da cotação: um loop de verdade acontece em MINUTOS
+  // (bot ecoando bot), nunca em dias. Contar as últimas 24h mede VELOCIDADE — que é o que
+  // "runaway" significa — em vez de longevidade, que é o que uma negociação saudável tem.
   const { count: msgCount } = await db
     .from('messages')
     .select('*', { count: 'exact', head: true })
     .eq('conversation_id', conversationId)
-    .gte('created_at', (quote as { created_at: string }).created_at);
+    .gte('created_at', turnLimitAnchor((quote as { created_at: string }).created_at, Date.now()));
 
   if ((msgCount ?? 0) > 24) {
-    await finalizeConsultationQuote(quote.id, quote.consultation_id, 'timeout', traceId);
+    // E quando o freio PEGA, ele FALA — pelo menos com quem está do outro lado esperando
+    // resposta. Um guard silencioso é indistinguível de um bug; foi literalmente essa a lição
+    // do dia. `unavailable` (terminal) e não `timeout`: senão a próxima mensagem revive a
+    // cotação e o loop mudo recomeça.
+    // O PACIENTE não é avisado aqui de propósito: "batemos um limite de turnos" é problema
+    // nosso, não notícia dele. Quem cuida dele é o rescue (nudge em 45min, desistência
+    // honesta em 6h), que é o caminho que já sabe falar com ele sem vazar detalhe interno.
+    await writeLog('warn', 'clinic', `Limite de turnos batido (${msgCount} msgs em 24h) — negociação encerrada com cortesia à clínica; o paciente fica com o rescue`, { traceId, conversationId, quoteId: quote.id });
+    await sendOutboundToClinic(conversationId, clinicPhone,
+      'Obrigada pela atenção! Vou confirmar tudo aqui com o paciente e retorno pra fechar, tá?', traceId,
+      'o agendamento de uma consulta que estamos tentando fechar com vocês');
+    await finalizeConsultationQuote(quote.id, quote.consultation_id, 'unavailable', traceId);
     return;
   }
 
@@ -841,6 +862,32 @@ async function finalizeConsultationQuote(
 
     await consolidateConsultationQuotes(consultationId, c.conversation_id, `+${userPhone}`, traceId);
   }
+}
+
+/** Janela do freio de turnos: um loop de verdade acontece em minutos, não em dias. */
+export const TURN_LIMIT_WINDOW_MS = 24 * 60 * 60_000;
+
+/**
+ * Âncora da contagem de turnos com a clínica — decisão PURA (testada em
+ * tests/clinic-turn-limit.test.ts).
+ *
+ * Nasceu do incidente Rita/Ciro (03/08): a âncora era `quote.created_at`, e o comentário
+ * dizia que isso contava "só esta negociação". Mas cotação revivida NÃO tem `created_at`
+ * resetado — a do Ciro era de 25/07 e já tinha sido revivida 3×, então a contagem somou 9
+ * DIAS de conversa: 31 mensagens contra o teto de 24. O freio pegou, finalizou como
+ * `timeout` e retornou MUDO; como `timeout` é revivível, cada nova mensagem da secretária
+ * repetia o ciclo. Ela respondeu três vezes e falou com uma parede.
+ *
+ * A âncora certa é a MAIS RECENTE entre a criação da cotação e a janela de 24h: mede
+ * VELOCIDADE (que é o que "runaway" quer dizer) em vez de longevidade, que é o que uma
+ * negociação saudável naturalmente acumula.
+ */
+export function turnLimitAnchor(quoteCreatedAt: string, nowMs: number, windowMs: number = TURN_LIMIT_WINDOW_MS): string {
+  const janela = new Date(nowMs - windowMs).toISOString();
+  const criada = Date.parse(quoteCreatedAt);
+  // `created_at` ilegível → cai na janela de tempo (nunca conta a conversa inteira).
+  if (!Number.isFinite(criada)) return janela;
+  return quoteCreatedAt > janela ? quoteCreatedAt : janela;
 }
 
 /** Formata CPF pra exibição no prompt (NÃO loga — PII). "12345678901" → "123.456.789-01". */
