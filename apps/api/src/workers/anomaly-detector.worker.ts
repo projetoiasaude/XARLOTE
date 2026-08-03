@@ -346,12 +346,46 @@ async function detectUndeliveredCriticalReminders(): Promise<void> {
   } catch {}
 }
 
+/**
+ * 🔴 Aviso ÚNICO que o paciente nunca recebeu, em definitivo (consulta, exame, quimio).
+ *
+ * O `error` que o reminder-dispatcher emite nesse caso é o desfecho mais grave daquele
+ * worker — e não tinha consumidor nenhum: `detectSendFailureSpike` só conta
+ * `category='outbound'`, então esse erro gritava no vazio desde sempre. Diferente do
+ * bloqueio de janela (que ainda pode ser reaberto e re-tentado), aqui as 8 tentativas
+ * acabaram: só um humano recupera.
+ */
+async function detectAbandonedOneShots(): Promise<void> {
+  try {
+    const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
+    const { data, count } = await db
+      .from('event_log')
+      .select('user_id, payload', { count: 'exact' })
+      .eq('event_name', 'reminder.one_shot_abandoned')
+      .gte('occurred_at', cutoff)
+      .limit(50);
+    const n = count ?? 0;
+    if (!n) return;
+    const titulos = (data ?? [])
+      .map((r) => String((r.payload as Record<string, unknown> | null)?.['title'] ?? '?'))
+      .slice(0, 3).join(', ');
+    const affected = new Set((data ?? []).map((r) => String(r.user_id))).size;
+    await sendTelegramAlert({
+      title: '🔴 Aviso único PERDIDO em definitivo',
+      body: `${n} lembrete(s) de dose única desistiram após todas as tentativas e o paciente NUNCA recebeu (${affected} paciente(s)): ${titulos}. Não há re-tentativa — isso exige contato humano.`,
+      severity: 'high',
+      throttleKey: 'abandoned_one_shots',
+    });
+  } catch {}
+}
+
 async function runOnce(): Promise<void> {
   try {
     await Promise.all([
       detectUntreatedRedFlags(),
       detectToolFailureSpike(),
       detectUndeliveredCriticalReminders(),
+      detectAbandonedOneShots(),
       detectLLMLatencyDegradation(),
       detectStuckConversations(),
       detectOrderFailureRate(),

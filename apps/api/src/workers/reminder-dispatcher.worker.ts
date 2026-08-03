@@ -19,7 +19,7 @@ import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBod
 import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
-import { reengageTemplateEnabled, buildReengageTemplate, reengageReasonForReminder, REENGAGE_REASON_SILENT, reengageIntervalMs, reminderTemplatePriority } from '../config/template-registry.js';
+import { reengageTemplateEnabled, buildReengageTemplate, reengageReasonForReminder, REENGAGE_REASON_SILENT, reengageIntervalMs, reminderTemplatePriority, isCriticalReminderType, isLowUrgencyReminderType } from '../config/template-registry.js';
 
 /** One-shot bloqueado re-tenta a cada 20min, no máx 8x (~2h40) antes de desistir com alerta. */
 const ONE_SHOT_RETRY_MS = 20 * 60_000;
@@ -295,7 +295,11 @@ export async function dispatchReminders(): Promise<void> {
     // água das 8h/10h30/13h consumia a cota e o REMÉDIO das 15h era cortado por excesso de…
     // água. O cap de PUSH logo abaixo já aplica essa distinção (só corta hydration/exercise/
     // custom); o cap de MENSAGEM não aplicava. Mesma regra nos dois agora: nunca cortar dose.
-    const capExempt = reminder.type === 'medication' || reminder.type === 'appointment';
+    // Uma definição só de "crítico" (ver isCriticalReminderType) — antes esta linha era uma
+    // das quatro codificações paralelas do mesmo conceito. Vale pro cap, pro nível de log e
+    // pro sinal do evento.
+    const isCritical = isCriticalReminderType(reminder.type);
+    const capExempt = isCritical;
     let pushCapReached = false; // flood de PUSH no app pra usuário pouco responsivo (ver abaixo)
     if (reminder.rrule && !isConditionalBackup && !capExempt) {
       const cap = user.reminder_max_per_day ?? 6;
@@ -334,7 +338,7 @@ export async function dispatchReminders(): Promise<void> {
       // O template de re-engajamento (outro caminho, com back-off próprio) NÃO é afetado.
       // SÓ corta push de tipo de BAIXA urgência (água/exercício/custom). Medicação/consulta/sono
       // NUNCA têm o push cortado — o usuário mudo que depende do app precisa do alerta de remédio.
-      if (['hydration', 'exercise', 'custom'].includes(reminder.type)) {
+      if (isLowUrgencyReminderType(reminder.type)) {
         const { count: allDispatched } = await db
           .from('event_log')
           .select('id', { count: 'exact', head: true })
@@ -498,7 +502,21 @@ export async function dispatchReminders(): Promise<void> {
         // Fora da janela e sem template aprovado: NÃO queima texto livre (a Meta rejeitaria).
         // Honestidade: registra o não-entregue por WhatsApp — visível pro fundador agir.
         deliveryStatus = 'window_blocked';
-        await writeLog('warn', 'reminder', `lembrete "${reminder.title}" NÃO entregue por WhatsApp — janela de 24h fechada (usuário mudo) e ${reengageTemplateEnabled() ? 'template em cooldown de re-engajamento (back-off por silêncio)' : 'sem template de re-engajamento aprovado'}`, {});
+        // 🔔 SEVERIDADE PELA CONSEQUÊNCIA, não pelo caminho de código. Antes tudo aqui era
+        // `warn`: no fim de semana 01-03/08 isso gerou 24 warns, quase todos de lembrete de
+        // ÁGUA, afogando o único que importava (um anti-hipertensivo). Remédio ou consulta
+        // que não chega é `warn`; hidratação/exercício que não chega é `info`.
+        // O ALERTA de verdade não depende deste nível — vem do evento
+        // `reminder.wa_window_closed`, que o anomaly-detector já filtra por `critical`.
+        // E o metadata deixa de ser `{}`: sem ele nada nesta linha era consultável.
+        await writeLog(isCritical ? 'warn' : 'info', 'reminder', `lembrete "${reminder.title}" NÃO entregue por WhatsApp — janela de 24h fechada (usuário mudo) e ${reengageTemplateEnabled() ? 'template em cooldown de re-engajamento (back-off por silêncio)' : 'sem template de re-engajamento aprovado'}`, {
+          reminderId: reminder.id,
+          reminderType: reminder.type,
+          userId: reminder.user_id,
+          critical: isCritical,
+          recurring: Boolean(reminder.rrule),
+          silentDays: Number.isFinite(windowSilentMs) ? Math.round(windowSilentMs / 86_400_000) : null,
+        });
 
         // 🛟 RESGATE DO ONE-SHOT (auditoria 26/07). O claim no topo já marcou `status:'sent'`
         // pra one-shot — mas ele NÃO chegou. Um aviso único (consulta, quimio, exame) marcado
@@ -537,7 +555,21 @@ export async function dispatchReminders(): Promise<void> {
               await writeLog('info', 'reminder', `one-shot "${reminder.title}" bloqueado — re-tentativa ${attempts}/${ONE_SHOT_MAX_ATTEMPTS} em ${ONE_SHOT_RETRY_MS / 60000}min`, {});
             }
           } else {
-            await writeLog('error', 'reminder', `one-shot "${reminder.title}" DESISTIDO após ${ONE_SHOT_MAX_ATTEMPTS} tentativas — paciente nunca recebeu (janela fechada)`, {});
+            // ⚠️ É o desfecho MAIS GRAVE deste worker: um aviso único (consulta, exame,
+            // quimio) que o paciente nunca recebeu, em definitivo. E até agora nenhum alerta
+            // o consumia — `detectSendFailureSpike` exige `category='outbound'`, então este
+            // `error` gritava no vazio. Agora emite evento próprio, com severity alta, pra
+            // que o anomaly-detector possa acordar alguém.
+            await writeLog('error', 'reminder', `one-shot "${reminder.title}" DESISTIDO após ${ONE_SHOT_MAX_ATTEMPTS} tentativas — paciente nunca recebeu (janela fechada)`, {
+              reminderId: reminder.id, reminderType: reminder.type, userId: reminder.user_id, critical: isCritical,
+            });
+            void writeEvent({
+              eventName: 'reminder.one_shot_abandoned',
+              userId: reminder.user_id,
+              conversationId: conv?.id,
+              severity: isCritical ? 'critical' : 'warn',
+              payload: { reminder_id: reminder.id, type: reminder.type, title: reminder.title, attempts: ONE_SHOT_MAX_ATTEMPTS },
+            });
           }
         }
 
@@ -552,7 +584,7 @@ export async function dispatchReminders(): Promise<void> {
             // Sinais pro anomaly-detector priorizar: one-shot em retry ainda tem chance;
             // medicação bloqueada é o que exige ação humana.
             retrying: oneShotRetrying,
-            critical: reminder.type === 'medication' || reminder.type === 'appointment',
+            critical: isCritical,
             silent_days: Number.isFinite(windowSilentMs) ? Math.round(windowSilentMs / 86_400_000) : null,
           },
         });

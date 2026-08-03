@@ -159,6 +159,28 @@ export const SILENT_ASK_DAYS = 2;
  * "beber água às 8h" consumia o template que o anti-hipertensivo das 7h precisava — o
  * Arthur ficou 2 dias sem NENHUM lembrete do Neblock. Remédio e consulta ganham sempre.
  */
+/**
+ * CRÍTICO = a não-entrega tem consequência clínica (remédio, consulta médica).
+ *
+ * Existia em QUATRO codificações paralelas do mesmo conceito — `capExempt`, um array
+ * literal `['hydration','exercise','custom']`, o campo `critical:` do evento, e a própria
+ * `reminderTemplatePriority`. Quatro definições de "crítico" que podiam divergir sem que
+ * ninguém percebesse. Esta é derivada da prioridade, então há UMA fonte.
+ */
+export function isCriticalReminderType(type?: string | null): boolean {
+  return reminderTemplatePriority(type) >= reminderTemplatePriority('appointment');
+}
+
+/**
+ * BAIXA URGÊNCIA = água, exercício, custom. Limiar DIFERENTE de `isCriticalReminderType`, e
+ * de propósito: `sleep` não é crítico (não corta a cota de medicação) mas também não é
+ * descartável (o push dele não é cortado). São dois degraus reais, derivados da mesma
+ * prioridade — o que não pode existir é cada call-site inventar o seu.
+ */
+export function isLowUrgencyReminderType(type?: string | null): boolean {
+  return reminderTemplatePriority(type) === 0;
+}
+
 export function reminderTemplatePriority(type?: string | null): number {
   switch (type) {
     case 'medication': return 3;
