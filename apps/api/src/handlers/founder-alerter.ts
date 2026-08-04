@@ -135,9 +135,10 @@ export async function sendFounderAlert(opts: FounderAlertOpts): Promise<boolean>
   const texto = `${emoji} ${tituloSeguro}\n\n${corpoSeguro}`.slice(0, 900);
 
   const nowMs = Date.now();
-  const { open } = await founderWindow(phone);
+  // UMA leitura só: `founderWindow` faz 2 queries e o resultado serve pro canal E pro espelho.
+  const janela = await founderWindow(phone);
   const canal = chooseFounderChannel({
-    windowOpen: open,
+    windowOpen: janela.open,
     templatesOn: reengageTemplateEnabled(),
     templatesUsedToday: templatesLast24h(nowMs),
     cap: FOUNDER_TEMPLATE_DAILY_CAP,
@@ -153,9 +154,29 @@ export async function sendFounderAlert(opts: FounderAlertOpts): Promise<boolean>
     return false;
   }
 
+  // 📝 ESPELHO + VERDADE DE ENTREGA. Sem isto o alerta saía sem `messageId`, então
+  // `stampDelivery` era no-op e "enviado" significava só "o POST não lançou" — exatamente
+  // a mentira que esta base passou um mês eliminando. E sem linha em `messages` o alerta
+  // não existia em lugar nenhum consultável além do log. Só espelha se a conversa JÁ
+  // existe: um canal de alerta não deve criar paciente nem poluir a base.
+  const conversationId = janela.conversationId;
+  let mirrorId: string | undefined;
+  if (conversationId) {
+    const { data: mirror } = await db.from('messages').insert({
+      conversation_id: conversationId,
+      direction: 'out',
+      sender_role: 'assistant',
+      content_type: 'text',
+      content: canal === 'template' ? buildReengageTemplate(FOUNDER_FIRST_NAME, texto).text : texto,
+      trace_id: `alert-${sev}`,
+    }).select('id').maybeSingle();
+    mirrorId = (mirror?.id as string | undefined) ?? undefined;
+    await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversationId);
+  }
+
   try {
     if (canal === 'text') {
-      await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: phone, text: texto });
+      await dispatchOutbound({ kind: 'text', instance: SARA_INSTANCE, phoneE164: phone, text: texto, messageId: mirrorId });
     } else {
       // O template é o MESMO aprovado do re-engajamento: {{1}} nome, {{2}} o motivo —
       // e é no motivo que o alerta viaja. Funciona fora da janela, que é o ponto.
@@ -163,6 +184,7 @@ export async function sendFounderAlert(opts: FounderAlertOpts): Promise<boolean>
       await dispatchOutbound({
         kind: 'template', instance: SARA_INSTANCE, phoneE164: phone,
         templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text,
+        messageId: mirrorId,
       });
       templateSentAt.push(nowMs);
     }
