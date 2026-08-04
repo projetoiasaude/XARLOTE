@@ -1,7 +1,8 @@
 import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, type OnboardingTopic } from '@iasaude/shared';
+import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -709,6 +710,23 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
   // existiu linha em `consultations`: a intenção morreu na conversa, fora do alcance de
   // qualquer vigilante. Perdemos o evento mais escasso do produto por duas palavras.
   // O bloco é DETERMINÍSTICO — não depende do modelo perceber a ambiguidade sozinho.
+  // ⚠️ INTENÇÃO DE CONSULTA ABERTA (auditoria 04/08 — caso Glauber).
+  // Ele pediu cardiologista em 01/08 e a busca NUNCA foi aberta: como não existiu linha em
+  // `consultations`, e todos os vigilantes varrem TABELA, aquela intenção era invisível por
+  // construção — morreu sem ninguém poder notar. O bloco abaixo é o "estado vazio precisa
+  // FALAR" ao contrário: estado que EXISTE tem que ser dito em voz alta, todo turno, até
+  // ser atendido. Não depende do modelo lembrar sozinho do que ficou pendente.
+  {
+    const aberta = (user.metadata as Record<string, unknown> | null | undefined)?.['open_consultation_intent'] as
+      | { specialty?: string | null; at?: string; nudged?: number }
+      | undefined;
+    if (aberta?.at) {
+      const dias = Math.max(0, Math.round((Date.now() - Date.parse(aberta.at)) / 86_400_000));
+      const qual = aberta.specialty ? `de **${aberta.specialty}**` : '(ele ainda não disse a especialidade)';
+      systemPrompt += `\n\n## ⚠️ INTENÇÃO ABERTA: ELE PEDIU UMA CONSULTA E A BUSCA NUNCA FOI ABERTA\nO paciente pediu uma consulta ${qual} há ${dias === 0 ? 'poucas horas' : `${dias} dia(s)`} e **nenhuma busca foi criada até agora**. Isso está pendente por nossa causa, não por dele.\n\n**O que fazer:** se você já sabe a especialidade, chame \`start_consultation_search\` AGORA — cidade e plano são OPCIONAIS e saem do cadastro, então **não faça nenhuma pergunta antes de abrir a busca**. Se você ainda não sabe a especialidade, pergunte SÓ isso, em uma linha. Se ele disser de forma clara que não quer mais, use \`cancel_consultation\` ou registre a desistência — mas nunca conclua isso de uma resposta curta e ambígua.`;
+    }
+  }
+
   if (isAmbiguousNegation(inbound.text ?? '')) {
     systemPrompt += `\n\n## ⚠️ A ÚLTIMA MENSAGEM DELE É UMA NEGAÇÃO CURTA E AMBÍGUA\nO paciente escreveu "${(inbound.text ?? '').trim().slice(0, 40)}". Isso pode ser (a) a resposta à SUA última pergunta — se você perguntou "plano ou particular?", "não precisa" quer dizer *não precisa de plano* — ou (b) ele desistindo de algo.\n\n**NÃO ENCERRE NADA e NÃO cancele nada com base nisso.** Se houver qualquer fluxo em andamento (consulta, pedido, lembrete), ele CONTINUA. Se a leitura (a) fizer sentido pela sua última pergunta, siga por ela. Se você não tiver certeza, pergunte de forma direta e curta a qual das duas coisas ele se refere. Desistência só vale quando ele diz de forma inequívoca ("não quero mais", "desisti", "cancela").`;
   }
@@ -1185,6 +1203,78 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
    * lembrete inexistente. Agora só o sucesso conta.
    */
   const toolRanOk = (...names: string[]) => executedToolCalls.some((t) => names.includes(t.name) && t.ok);
+
+  // 11z. 🔴 CAPTURA DA INTENÇÃO DE CONSULTA (auditoria 04/08 — caso Glauber).
+  // A raiz do caso dele não foi o "Não precisa" mal lido; foi que **entre o pedido e o
+  // registro existia uma janela de conversa onde a intenção não era vigiável por ninguém**.
+  // `start_consultation_search` nunca rodou → nenhuma linha em `consultations` → e todos os
+  // vigilantes varrem tabela. Aqui essa janela fecha: se ele pediu e nada foi registrado, a
+  // intenção passa a EXISTIR como estado, e o bloco do prompt + o worker cuidam do resto.
+  // Roda depois das tools de propósito: só marca o que de fato NÃO foi atendido no turno.
+  {
+    const abriuBusca = toolRanOk('start_consultation_search', 'confirm_consultation_selection');
+    const desistiu = toolRanOk('cancel_consultation');
+    const metaAtual = (user.metadata as Record<string, unknown> | null | undefined) ?? {};
+    const jaAberta = metaAtual['open_consultation_intent'] as
+      | { specialty?: string | null; at?: string; nudged?: number; evidence?: string }
+      | undefined;
+
+    const gravaMeta = async (novo: Record<string, unknown> | null) => {
+      // Relê o metadata AGORA: entre o início do turno e aqui rodaram tools que fazem
+      // merge nele (`save_user_profile_fact`). Merge sobre snapshot velho apagaria o que
+      // elas gravaram — o mesmo erro de dois escritores do mesmo JSONB.
+      const { data: fresh } = await db.from('users').select('metadata').eq('id', user.id).maybeSingle();
+      const base = (fresh?.metadata as Record<string, unknown> | null) ?? {};
+      if (novo === null) {
+        const { open_consultation_intent: _drop, ...resto } = base;
+        await db.from('users').update({ metadata: resto }).eq('id', user.id);
+      } else {
+        await db.from('users').update({ metadata: { ...base, open_consultation_intent: novo } }).eq('id', user.id);
+      }
+    };
+
+    if (abriuBusca || desistiu) {
+      // Atendida (ou encerrada pelo próprio paciente): a intenção deixa de existir.
+      if (jaAberta) {
+        await gravaMeta(null);
+        await writeLog('info', 'consultation', `intenção de consulta encerrada (${abriuBusca ? 'busca aberta' : 'paciente desistiu'})`, {
+          traceId, userId: user.id,
+        });
+      }
+    } else {
+      const hit = detectConsultationIntent(inbound.text ?? '');
+      // Só marca se NÃO existe consulta viva: com uma em andamento, o pedido dele é sobre
+      // ELA (o fluxo normal cuida), e marcar intenção aberta faria a Xarlote oferecer uma
+      // busca nova em cima de uma que já está rodando.
+      const { data: vivas } = await db
+        .from('consultations')
+        .select('id')
+        .eq('user_id', user.id)
+        .in('status', LIVE_CONSULTATION_STATUSES)
+        .limit(1);
+      const temViva = (vivas ?? []).length > 0;
+
+      if (hit && !temViva) {
+        // Preserva `at`/`nudged` de uma intenção que já estava aberta (senão cada mensagem
+        // dele zeraria o relógio e a cobrança nunca venceria), mas melhora a especialidade
+        // quando ela finalmente aparece — foi o caso do "Cardiologista" do Glauber.
+        await gravaMeta({
+          specialty: hit.specialty ?? jaAberta?.specialty ?? null,
+          at: jaAberta?.at ?? new Date().toISOString(),
+          nudged: jaAberta?.nudged ?? 0,
+          evidence: jaAberta?.evidence ?? hit.evidence,
+        });
+        if (!jaAberta) {
+          await writeLog('warn', 'consultation', `paciente pediu consulta${hit.specialty ? ` de ${hit.specialty}` : ''} e NENHUMA busca foi aberta neste turno — intenção registrada como ABERTA`, {
+            traceId, userId: user.id,
+          });
+        }
+      } else if (jaAberta && temViva) {
+        // Uma consulta nasceu por outro caminho: a intenção foi atendida.
+        await gravaMeta(null);
+      }
+    }
+  }
 
   // 11a. BACKSTOP DE CONSOLIDAÇÃO SOB DEMANDA (auditoria 1º pedido 14/07): o usuário disse
   // "pode pedir" com uma farmácia já precificada, mas o pedido ainda estava 'quoting' (NÃO

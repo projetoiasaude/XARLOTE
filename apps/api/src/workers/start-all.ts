@@ -23,6 +23,7 @@ import { startInventoryTrackerWorker } from './inventory-tracker.worker.js';
 import { startAdherenceScorerWorker } from './adherence-scorer.worker.js';
 import { startConsultationFeedbackWorker } from './consultation-feedback.worker.js';
 import { startAppointmentIntegrityWorker } from './appointment-integrity.worker.js';
+import { startOpenIntentChaserWorker } from './open-intent-chaser.worker.js';
 import { startConsultationDispatcherWorker } from './consultation-dispatcher.worker.js';
 import { startKnowledgeGraphBuilderWorker } from './knowledge-graph-builder.worker.js';
 import { startSkillExtractorWorker } from './skill-extractor.worker.js';
@@ -78,6 +79,7 @@ export function startAllWorkers(log: WorkerLogger): void {
   startAdherenceScorerWorker();
   startConsultationFeedbackWorker();
   startAppointmentIntegrityWorker();
+  startOpenIntentChaserWorker();
   startConsultationDispatcherWorker();
   startKnowledgeGraphBuilderWorker();
   startSkillExtractorWorker();
