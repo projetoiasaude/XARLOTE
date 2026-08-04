@@ -71,6 +71,45 @@ const REMINDER_KINDS = [
   { kind: '2h_before', offsetMs: -2 * 3_600_000 },
 ] as const;
 
+/**
+ * Quão perto um lembrete existente tem que estar da âncora pra considerá-la COBERTA.
+ *
+ * Por que por PROXIMIDADE e não por `payload.kind` (achado ao verificar o deploy ao vivo,
+ * 04/08): os lembretes que o MODELO cria via `create_reminder` têm
+ * `payload = {"event_at": "..."}` — sem `consultation_id` e sem `kind`. A primeira versão
+ * deste reconciliador só reconhecia os que ELE mesmo (ou o handler de confirmação) tinha
+ * criado, então recriou o "amanhã" do Ciro ao lado do que o modelo já havia feito: ele
+ * receberia DUAS mensagens iguais em 25/08, às 09h e às 10h.
+ *
+ * A pergunta certa não é "existe um lembrete com a minha etiqueta?", é "o paciente já vai
+ * ser avisado por volta desta hora?". Proximidade responde isso independente de quem criou.
+ */
+export const ANCHOR_COVER_TOLERANCE_MS = 3 * 3_600_000;
+
+/**
+ * Quais âncoras de lembrete faltam pra uma consulta — considerando só as que AINDA cabem
+ * no tempo, e tratando como coberta a âncora que já tem QUALQUER lembrete de consulta por
+ * perto (venha ele de onde vier).
+ *
+ * A janela importa: numa consulta a 3h de distância o lembrete de 1 dia é impossível, e
+ * cobrá-lo faria o vigilante "reparar" a mesma linha a cada 20 minutos, pra sempre.
+ */
+export function anchorsMissing(
+  scheduledMs: number,
+  nowMs: number,
+  existingRunMs: number[],
+  toleranceMs = ANCHOR_COVER_TOLERANCE_MS,
+): string[] {
+  const faltando: string[] = [];
+  for (const { kind, offsetMs } of REMINDER_KINDS) {
+    const alvo = scheduledMs + offsetMs;
+    if (alvo <= nowMs) continue;
+    const coberta = existingRunMs.some((t) => Number.isFinite(t) && Math.abs(t - alvo) <= toleranceMs);
+    if (!coberta) faltando.push(kind);
+  }
+  return faltando;
+}
+
 function fmtBr(iso: string): string {
   try {
     const d = new Date(iso);
@@ -113,7 +152,7 @@ export async function reconcileAppointmentReminders(args: {
 
   const { data: existentes, error } = await db
     .from('reminders')
-    .select('id, status, payload')
+    .select('id, status, next_run_at, payload')
     .eq('user_id', args.userId)
     .eq('type', 'appointment');
   if (error) {
@@ -127,6 +166,13 @@ export async function reconcileAppointmentReminders(args: {
     const p = (r.payload ?? {}) as Record<string, unknown>;
     return p['consultation_id'] === args.consultationId;
   });
+  // Cobertura por PROXIMIDADE, sobre tudo que ainda vai disparar — inclusive lembrete que
+  // o modelo criou via `create_reminder`, cujo payload não tem `consultation_id` nem `kind`.
+  const jaAvisamPorPerto = (existentes ?? [])
+    .filter((r) => r.status === 'pending' || r.status === 'sent')
+    .map((r) => Date.parse(r.next_run_at as string))
+    .filter((t) => Number.isFinite(t));
+  const faltantes = new Set(anchorsMissing(alvo, now, jaAvisamPorPerto));
 
   const especialidade = args.specialty ?? 'consulta';
   let created = 0;
@@ -135,10 +181,9 @@ export async function reconcileAppointmentReminders(args: {
   for (const { kind, offsetMs } of REMINDER_KINDS) {
     const quando = alvo + offsetMs;
     if (quando <= now) { skipped.push(`${kind}: âncora já passou`); continue; }
+    if (!faltantes.has(kind)) { skipped.push(`${kind}: o paciente já é avisado por volta dessa hora`); continue; }
 
     const irmao = doMesmo.find((r) => ((r.payload ?? {}) as Record<string, unknown>)['kind'] === kind);
-    if (irmao && irmao.status === 'pending') { skipped.push(`${kind}: já existe`); continue; }
-    if (irmao && irmao.status === 'sent') { skipped.push(`${kind}: já enviado`); continue; }
     if (irmao && irmao.status === 'cancelled') {
       const p = (irmao.payload ?? {}) as Record<string, unknown>;
       if (p['cancel_reason'] === 'patient_request') { skipped.push(`${kind}: paciente pediu pra cancelar`); continue; }

@@ -28,7 +28,7 @@
  */
 import { db, writeLog } from '@iasaude/db';
 import { withCronLock } from '../middleware/cron-lock.js';
-import { commitAppointment } from '../handlers/appointment-commit.js';
+import { commitAppointment, anchorsMissing } from '../handlers/appointment-commit.js';
 
 const POLL_INTERVAL_MS = 20 * 60_000;
 
@@ -54,19 +54,6 @@ interface Row {
   updated_at: string;
 }
 
-/**
- * Quais âncoras de lembrete faltam — considerando só as que AINDA cabem no tempo.
- *
- * Numa consulta a 3h de distância o lembrete de 1 dia é impossível; cobrá-lo faria o
- * worker "reparar" a mesma linha a cada 20 minutos, pra sempre.
- */
-export function faltandoAncoras(alvoMs: number, nowMs: number, cobertura: Set<string>): string[] {
-  const faltando: string[] = [];
-  if (alvoMs - 24 * 3_600_000 > nowMs && !cobertura.has('1d_before')) faltando.push('1d_before');
-  if (alvoMs - 2 * 3_600_000 > nowMs && !cobertura.has('2h_before')) faltando.push('2h_before');
-  return faltando;
-}
-
 export async function runAppointmentIntegrityOnce(nowMs = Date.now()): Promise<{ checked: number; repaired: number }> {
   const { data, error } = await db
     .from('consultations')
@@ -89,19 +76,23 @@ export async function runAppointmentIntegrityOnce(nowMs = Date.now()): Promise<{
   const userIds = [...new Set(rows.map((r) => r.user_id))];
   const { data: lembretes } = await db
     .from('reminders')
-    .select('user_id, status, payload')
+    .select('user_id, status, next_run_at')
     .in('user_id', userIds)
     .eq('type', 'appointment')
     .in('status', ['pending', 'sent']);
 
-  const cobertura = new Map<string, Set<string>>();
+  // Cobertura por HORÁRIO e por PACIENTE — não por `payload.kind`. Lembrete criado pelo
+  // modelo via `create_reminder` não carrega `consultation_id` nem `kind`, e a primeira
+  // versão deste worker por isso recriou o "amanhã" do Ciro ao lado do que já existia:
+  // ele receberia duas mensagens iguais em 25/08. A pergunta certa é "o paciente já vai
+  // ser avisado perto dessa hora?", e essa não depende de quem criou o lembrete.
+  const avisosPorUsuario = new Map<string, number[]>();
   for (const l of lembretes ?? []) {
-    const p = (l.payload ?? {}) as Record<string, unknown>;
-    const cid = p['consultation_id'] as string | undefined;
-    const kind = p['kind'] as string | undefined;
-    if (!cid || !kind) continue;
-    if (!cobertura.has(cid)) cobertura.set(cid, new Set());
-    cobertura.get(cid)!.add(kind);
+    const t = Date.parse(l.next_run_at as string);
+    if (!Number.isFinite(t)) continue;
+    const uid = l.user_id as string;
+    if (!avisosPorUsuario.has(uid)) avisosPorUsuario.set(uid, []);
+    avisosPorUsuario.get(uid)!.push(t);
   }
 
   let repaired = 0;
@@ -119,7 +110,7 @@ export async function runAppointmentIntegrityOnce(nowMs = Date.now()): Promise<{
 
     const prefs = r.preferences ?? {};
     const commit = (prefs['_commit'] ?? null) as { notified_at?: string } | null;
-    const temCobertura = cobertura.get(r.id) ?? new Set<string>();
+    const avisos = avisosPorUsuario.get(r.user_id) ?? [];
 
     // 🕰️ CONSULTA ANTERIOR A ESTE CÓDIGO (`_commit` inexistente): NÃO reanuncia.
     // Revisão adversarial desta própria correção: sem esta guarda, a consulta do Ciro —
@@ -135,7 +126,7 @@ export async function runAppointmentIntegrityOnce(nowMs = Date.now()): Promise<{
       await db.from('consultations')
         .update({ preferences: { ...prefs, _commit: { at: new Date(nowMs).toISOString(), iso: r.scheduled_at, source: 'legacy_backfill', notified_at: 'presumido-legado' } } })
         .eq('id', r.id);
-      if (faltandoAncoras(alvo, nowMs, temCobertura).length > 0) {
+      if (anchorsMissing(alvo, nowMs, avisos).length > 0) {
         await commitAppointment({
           consultationId: r.id,
           confirmedIso: r.scheduled_at,
@@ -154,7 +145,7 @@ export async function runAppointmentIntegrityOnce(nowMs = Date.now()): Promise<{
       continue;
     }
 
-    const faltando = faltandoAncoras(alvo, nowMs, temCobertura);
+    const faltando = anchorsMissing(alvo, nowMs, avisos);
     const semAviso = !commit.notified_at;
 
     if (faltando.length === 0 && !semAviso) continue;
