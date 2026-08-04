@@ -19,7 +19,13 @@ import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBod
 import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
-import { reengageTemplateEnabled, buildReengageTemplate, reengageReasonForReminder, REENGAGE_REASON_SILENT, reengageIntervalMs, reminderTemplatePriority, isCriticalReminderType, isLowUrgencyReminderType } from '../config/template-registry.js';
+import { reengageTemplateEnabled, buildReengageTemplate, reengageReasonForReminder, REENGAGE_REASON_SILENT, reengageIntervalMs, reengageCooldownElapsed, localDayKey, nextBlockedStreak, shouldPauseUndeliverable, reminderTemplatePriority, isCriticalReminderType, isLowUrgencyReminderType } from '../config/template-registry.js';
+
+/**
+ * Dias SEGUIDOS de não-entrega a partir dos quais um lembrete recorrente NÃO-crítico para
+ * de tentar (ver o bloco de pausa no dispatcher). Nunca se aplica a medicação/consulta.
+ */
+const UNDELIVERABLE_PAUSE_DAYS = 7;
 
 /** One-shot bloqueado re-tenta a cada 20min, no máx 8x (~2h40) antes de desistir com alerta. */
 const ONE_SHOT_RETRY_MS = 20 * 60_000;
@@ -439,8 +445,12 @@ export async function dispatchReminders(): Promise<void> {
     // Remédio/consulta recuam no máximo até 1×/dia (ver reengageIntervalMs) — pro resto o
     // back-off por silêncio vale integral.
     const cooldownMs = reengageIntervalMs(windowSilentMs, capExempt);
+    // 🔴 Cooldown de CRÍTICO por DIA LOCAL, não por milissegundos (ver a doc de
+    // `reengageCooldownElapsed`). O `>= cooldownMs` cru comparava 24h exatas contra um
+    // carimbo gravado no instante do envio → um lembrete diário ficava 23h59m e alternava
+    // entregue/bloqueado pra sempre. Foi 44% de não-entrega do anti-hipertensivo do Arthur.
     let reengageTplAllowed =
-      now.getTime() - lastTplMs >= cooldownMs
+      reengageCooldownElapsed({ nowMs: now.getTime(), lastTemplateMs: lastTplMs, cooldownMs, critical: capExempt, timeZone: userTz || 'America/Sao_Paulo' })
       && !templateSentThisTick.has(reminder.user_id)
       && (templateOwner.get(reminder.user_id) ?? reminder.id) === reminder.id;
 
@@ -460,8 +470,21 @@ export async function dispatchReminders(): Promise<void> {
       }
     }
 
+    // 📉 CONTAGEM DE DIAS SEGUIDOS SEM ENTREGAR — calculada ANTES dos ramos de envio porque
+    // DOIS deles precisam dela (o bloqueado e o pausado) e só UM pode gravar o payload.
+    // Na primeira versão desta correção eu incrementava só no ramo bloqueado: com a pausa
+    // ativa o contador congelava em 7 e o log "a cada 7 dias" (`% 7`) voltava a sair em
+    // TODA ocorrência — reintroduzindo exatamente o ruído que a correção existe pra tirar.
+    const prevPl = (reminder.payload ?? {}) as Record<string, unknown>;
+    const { day: diaLocal, streak, firstToday: primeiraVezHoje } = nextBlockedStreak(
+      { day: prevPl['blocked_log_day'] as string | undefined, streak: Number(prevPl['blocked_streak'] ?? 0) },
+      now.getTime(),
+      userTz || 'America/Sao_Paulo',
+    );
+
     // 3. WhatsApp real, SEMPRE pela fila (rate-limit anti-ban).
     let whatsappDelivered = false;
+    let naoEntregouHoje = false; // bloqueado OU pausado → conta pro streak
     let deliveryStatus: 'delivered' | 'window_blocked' | 'suppressed' = 'suppressed';
     // One-shot que voltou pra fila de re-tentativa (ver RESGATE abaixo): não repete o push
     // do app a cada tentativa — senão 8 tentativas viram 8 notificações do mesmo aviso.
@@ -503,6 +526,44 @@ export async function dispatchReminders(): Promise<void> {
         if (mirroredMessageId) await db.from('messages').update({ content: tpl.text }).eq('id', mirroredMessageId);
         await db.from('users').update({ metadata: { ...uMeta, reengage_template_at: now.toISOString() } }).eq('id', reminder.user_id);
         await writeLog('info', 'reminder', `fora da janela 24h → template de re-engajamento enviado ("${reminder.title}")`, {});
+      } else if (shouldPauseUndeliverable({
+        recurring: Boolean(reminder.rrule),
+        critical: isCritical,
+        blockedStreakDays: Number(prevPl['blocked_streak'] ?? 0),
+        pauseAfterDays: UNDELIVERABLE_PAUSE_DAYS,
+      })) {
+        // 😴 PAUSA POR INDELIVERABILIDADE CRÔNICA (auditoria 04/08 — caso Antônia).
+        // Ela tem 8 lembretes de hidratação por dia e está muda desde 30/07: 100% bloqueados,
+        // indefinidamente. A 1000 pacientes mudos isso é ~8.000 tentativas/dia que a Meta
+        // rejeitaria de qualquer forma. Depois de UNDELIVERABLE_PAUSE_DAYS dias seguidos sem
+        // conseguir entregar, para de tentar.
+        //
+        // "Pausa" aqui NÃO muda o status do lembrete: ele continua `pending` e a ocorrência é
+        // consumida normalmente. O que suspende é a TENTATIVA de envio — e a condição inclui
+        // `!windowOpen`, avaliada a cada tick. Então a retomada é automática e instantânea no
+        // momento em que a paciente responder: nada precisa "despausar", porque nada foi
+        // travado. Era o requisito mais importante — pausar por status arriscaria silenciar
+        // pra sempre algo que ela pediu, se a retomada falhasse.
+        //
+        // NUNCA vale pra medicação/consulta (`isCritical`) nem pra one-shot: uma dose ou um
+        // aviso de consulta que não chega precisa de tentativa E de alerta, não de pausa.
+        deliveryStatus = 'suppressed';
+        naoEntregouHoje = true;
+        // Uma linha por SEMANA: só na PRIMEIRA ocorrência do dia e só quando o streak
+        // cruza um múltiplo de 7. Sem o `primeiraVezHoje`, os 8 lembretes/dia da Antônia
+        // logariam 8 vezes no dia em que o streak fosse 7, 14, 21…
+        if (primeiraVezHoje && streak % UNDELIVERABLE_PAUSE_DAYS === 0) {
+          await writeLog('info', 'reminder', `lembrete "${reminder.title}" com envio PAUSADO — ${streak} dias seguidos sem conseguir entregar (paciente mudo). Volta sozinho no instante em que ela responder; quem resolve de verdade é contato humano.`, {
+            reminderId: reminder.id, reminderType: reminder.type, userId: reminder.user_id,
+            blockedStreakDays: streak,
+          });
+          void writeEvent({
+            eventName: 'reminder.delivery_paused',
+            userId: reminder.user_id,
+            conversationId: conv?.id,
+            payload: { reminder_id: reminder.id, type: reminder.type, blocked_streak_days: streak },
+          });
+        }
       } else {
         // Fora da janela e sem template aprovado: NÃO queima texto livre (a Meta rejeitaria).
         // Honestidade: registra o não-entregue por WhatsApp — visível pro fundador agir.
@@ -514,13 +575,23 @@ export async function dispatchReminders(): Promise<void> {
         // O ALERTA de verdade não depende deste nível — vem do evento
         // `reminder.wa_window_closed`, que o anomaly-detector já filtra por `critical`.
         // E o metadata deixa de ser `{}`: sem ele nada nesta linha era consultável.
-        await writeLog(isCritical ? 'warn' : 'info', 'reminder', `lembrete "${reminder.title}" NÃO entregue por WhatsApp — janela de 24h fechada (usuário mudo) e ${reengageTemplateEnabled() ? 'template em cooldown de re-engajamento (back-off por silêncio)' : 'sem template de re-engajamento aprovado'}`, {
+        naoEntregouHoje = true;
+        // 📉 UMA LINHA POR DIA, NÃO POR OCORRÊNCIA (auditoria 04/08 — caso Antônia).
+        // Ela tem 8 lembretes de hidratação por dia e está muda desde 30/07: eram 8 linhas
+        // idênticas por dia, indefinidamente, e a 1000 pacientes mudos isso é ~8.000
+        // linhas/dia de ruído puro. A partir da SEGUNDA ocorrência não-crítica do mesmo
+        // dia, o registro cai pra `debug` — o fato já está contado no evento abaixo.
+        // CRÍTICO nunca colapsa: uma dose que não chegou é sempre `warn`, todas as vezes.
+        const nivel = isCritical ? 'warn' : (primeiraVezHoje ? 'info' : 'debug');
+
+        await writeLog(nivel, 'reminder', `lembrete "${reminder.title}" NÃO entregue por WhatsApp — janela de 24h fechada (usuário mudo) e ${reengageTemplateEnabled() ? 'template em cooldown de re-engajamento (back-off por silêncio)' : 'sem template de re-engajamento aprovado'}${streak > 1 ? ` · ${streak}º dia seguido` : ''}`, {
           reminderId: reminder.id,
           reminderType: reminder.type,
           userId: reminder.user_id,
           critical: isCritical,
           recurring: Boolean(reminder.rrule),
           silentDays: Number.isFinite(windowSilentMs) ? Math.round(windowSilentMs / 86_400_000) : null,
+          blockedStreakDays: streak,
         });
 
         // 🛟 RESGATE DO ONE-SHOT (auditoria 26/07). O claim no topo já marcou `status:'sent'`
@@ -594,9 +665,34 @@ export async function dispatchReminders(): Promise<void> {
             retrying: oneShotRetrying,
             critical: isCritical,
             silent_days: Number.isFinite(windowSilentMs) ? Math.round(windowSilentMs / 86_400_000) : null,
+            // Dias SEGUIDOS sem conseguir entregar ESTE lembrete. Depois de muitos dias, o
+            // que resolve não é outra tentativa automática — é alguém ligar pro paciente.
+            // O número é o que torna essa decisão possível (e o alerta, priorizável).
+            blocked_streak_days: streak,
           },
         });
       }
+    }
+
+    // ✅ ENTREGOU → ZERA O CONTADOR DE DIAS BLOQUEADOS.
+    // Sem isto, um `blocked_streak` velho de 7+ continuaria valendo depois da paciente
+    // voltar e o bloco de pausa suprimiria um lembrete PERFEITAMENTE entregável — o
+    // exato risco de "silenciar pra sempre algo que ela pediu". O contador tem que
+    // significar "dias seguidos sem entregar", e uma entrega quebra a sequência.
+    if (whatsappDelivered) {
+      if (prevPl['blocked_streak'] || prevPl['blocked_log_day']) {
+        const { blocked_streak: _s, blocked_log_day: _d, ...resto } = prevPl;
+        await db.from('reminders').update({ payload: resto }).eq('id', reminder.id);
+      }
+    } else if (naoEntregouHoje && reminder.rrule && primeiraVezHoje) {
+      // ⚠️ SÓ RECORRENTE, e SÓ na primeira ocorrência do dia. Num one-shot o bloco de
+      // RESGATE faz outro `update({payload})` mergeando do MESMO snapshot — rodaria depois
+      // e apagaria estes campos em silêncio (revisão adversarial desta própria correção:
+      // dois escritores do mesmo JSONB partindo da mesma leitura). E é no recorrente que
+      // está o problema: os 8 lembretes/dia da Antônia, não o one-shot que encerra em 2h40.
+      await db.from('reminders')
+        .update({ payload: { ...prevPl, blocked_log_day: diaLocal, blocked_streak: streak } })
+        .eq('id', reminder.id);
     }
 
     // Carimba no espelho o que REALMENTE aconteceu no canal. `delivered_at` null +
@@ -699,8 +795,10 @@ export async function dispatchReminders(): Promise<void> {
               0, // check-in genérico = prioridade mínima por definição
               reengageIntervalMs(silentMs),
             );
+            // Mesma tolerância do caminho por-lembrete: sem ela, "faltou um segundinho"
+            // adiava o check-in de novo e de novo (o check-in é genérico, nunca crítico).
             const tplAllowed = !isSimulatorMode() && !canFreeText && reengageTemplateEnabled()
-              && now.getTime() - lastTplMsFresh >= reengageIntervalMs(silentMs)
+              && reengageCooldownElapsed({ nowMs: now.getTime(), lastTemplateMs: lastTplMsFresh, cooldownMs: reengageIntervalMs(silentMs), critical: false, timeZone: userTz || 'America/Sao_Paulo' })
               && !templateSentThisTick.has(reminder.user_id)
               && !criticalWaiting;
 

@@ -136,6 +136,116 @@ export function reengageIntervalMs(silentMs: number, critical = false): number {
 }
 
 /**
+ * 🔴 O COOLDOWN DE LEMBRETE CRÍTICO É POR DIA DO CALENDÁRIO, NÃO POR MILISSEGUNDOS.
+ *
+ * Raiz do caso Arthur (auditoria 04/08), e é aritmética, não azar. O Neblock 5mg dele
+ * (anti-hipertensivo) dispara todo dia às 10:00Z. `reengageIntervalMs` devolve
+ * EXATAMENTE 24h pra lembrete crítico. E o carimbo `reengage_template_at` é gravado no
+ * instante do ENVIO — 10:00:25, não 10:00:00. No dia seguinte, às 10:00:0X, o teste
+ * `agora - carimbo >= 24h` dá 23h59m3Xs: FALHA. Um dia depois o carimbo tem 2 dias:
+ * PASSA, e volta a gravar ~10:00:2X. Alterna pra sempre.
+ *
+ * Números reais do banco: 7 dos últimos 16 dias `window_blocked`, 44% de não-entrega de
+ * um remédio de pressão, num paciente que nunca respondeu (janela WABA fechada pra
+ * sempre → o template é o ÚNICO canal). E o alerta que gritaria está mudo por falta de
+ * token do Telegram.
+ *
+ * Baixar o teto pra 23h só desloca a colisão pra outro horário. A intenção declarada no
+ * comentário do teto sempre foi "no máximo 1×/dia" — então é isso que se mede: o DIA
+ * LOCAL do paciente. Imune a deriva de latência, a rrule que anda alguns segundos e a
+ * qualquer duração de envio.
+ *
+ * O piso absoluto existe pro caso patológico: dois lembretes críticos às 23h50 e 00h10
+ * são dias diferentes, mas 20 minutos de intervalo não é "1×/dia".
+ */
+export const CRITICAL_TEMPLATE_MIN_GAP_MS = 6 * 60 * 60_000;
+
+/** Dia local (YYYY-MM-DD) de um instante, no fuso do paciente. */
+export function localDayKey(ms: number, timeZone = 'America/Sao_Paulo'): string {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date(ms));
+  } catch {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date(ms));
+  }
+}
+
+/**
+ * O cooldown de re-engajamento liberou?
+ *
+ * CRÍTICO (medicação/consulta): dia local diferente do último template + piso de 6h.
+ * NÃO-CRÍTICO: back-off por silêncio em ms (a economia de template pago faz sentido
+ * pra hidratação) + tolerância de 5 min, que mata a mesma classe de "faltou um
+ * segundinho" pra qualquer cadência.
+ */
+export const COOLDOWN_TOLERANCE_MS = 5 * 60_000;
+
+/**
+ * Dias SEGUIDOS em que este lembrete não conseguiu ser entregue.
+ *
+ * A sutileza: o dispatcher roda a cada 30s e a Antônia tem 8 lembretes de hidratação por
+ * dia — então a mesma linha é avaliada muitas vezes no mesmo dia. O contador tem que
+ * andar UMA vez por dia local, e uma entrega bem-sucedida quebra a sequência (isso é
+ * feito zerando o campo no ponto de entrega, não aqui).
+ *
+ * `firstToday` é o que permite logar 1×/dia em vez de 1×/ocorrência.
+ */
+export function nextBlockedStreak(
+  prev: { day?: string | undefined; streak?: number | undefined },
+  nowMs: number,
+  timeZone?: string,
+): { day: string; streak: number; firstToday: boolean } {
+  const day = localDayKey(nowMs, timeZone);
+  const ontem = localDayKey(nowMs - 86_400_000, timeZone);
+  const anterior = prev.day;
+  const streakAnterior = Number(prev.streak ?? 0);
+  if (anterior === day) return { day, streak: streakAnterior || 1, firstToday: false };
+  // Sequência só continua se o último bloqueio foi ONTEM. Qualquer buraco reinicia.
+  const streak = anterior === ontem ? streakAnterior + 1 : 1;
+  return { day, streak, firstToday: true };
+}
+
+/**
+ * Este lembrete deve PARAR de tentar ser entregue?
+ *
+ * Só lembrete RECORRENTE e NÃO-CRÍTICO, e só depois de `pauseAfterDays` dias seguidos de
+ * não-entrega. Medicação e consulta NUNCA pausam: uma dose que não chega precisa de
+ * tentativa e de alerta, não de silêncio. One-shot também não (ele tem o próprio resgate).
+ *
+ * A "pausa" não muda o status do lembrete — suspende apenas a tentativa de envio, e a
+ * decisão é reavaliada a cada tick. É isso que faz a retomada ser automática no instante
+ * em que o paciente responder, sem depender de nada "despausar".
+ */
+export function shouldPauseUndeliverable(args: {
+  recurring: boolean;
+  critical: boolean;
+  blockedStreakDays: number;
+  pauseAfterDays: number;
+}): boolean {
+  if (!args.recurring || args.critical) return false;
+  return args.blockedStreakDays >= args.pauseAfterDays;
+}
+
+export function reengageCooldownElapsed(args: {
+  nowMs: number;
+  lastTemplateMs: number;
+  cooldownMs: number;
+  critical: boolean;
+  timeZone?: string;
+}): boolean {
+  const { nowMs, lastTemplateMs, cooldownMs, critical, timeZone } = args;
+  if (!lastTemplateMs) return true; // nunca mandou template pra esta pessoa
+  if (critical) {
+    const diaDiferente = localDayKey(nowMs, timeZone) !== localDayKey(lastTemplateMs, timeZone);
+    return diaDiferente && nowMs - lastTemplateMs >= CRITICAL_TEMPLATE_MIN_GAP_MS;
+  }
+  return nowMs - lastTemplateMs >= cooldownMs - COOLDOWN_TOLERANCE_MS;
+}
+
+/**
  * Sanitiza um valor pra variável de template da Meta: sem quebra de linha/tab e sem
  * espaços múltiplos (a API REJEITA o parâmetro com esses caracteres) + teto de tamanho.
  */
