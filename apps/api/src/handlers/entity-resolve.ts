@@ -123,7 +123,7 @@ export async function resolveConsultationForUser(
   return row;
 }
 
-interface QuoteRow {
+export interface QuoteRow {
   id: string;
   clinic_id: string | null;
   prescriber_id: string | null;

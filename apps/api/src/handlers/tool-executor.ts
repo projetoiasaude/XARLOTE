@@ -228,7 +228,7 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
         await handleStartConsultationSearch(tc.args as unknown as StartConsultationArgs, ctx);
         break;
       case 'confirm_consultation_selection':
-        await handleConfirmConsultation(tc.args as unknown as { consultation_id: string; quote_id: string }, ctx);
+        await handleConfirmConsultation(tc.args as unknown as { consultation_id: string; quote_id?: string; requested_datetime?: string }, ctx);
         break;
       case 'cancel_consultation':
         await handleCancelConsultation(tc.args as unknown as { consultation_id: string; reason: string }, ctx);
@@ -2069,35 +2069,84 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
     await writeLog('warn', 'tool', 'cancel_reminders sem title_query e sem all — ignorado', { traceId: ctx.traceId, userId: ctx.userId });
     throw new ToolFailure('NENHUM lembrete foi cancelado: você não disse QUAL (title_query) nem pediu todos (all). Pergunte ao paciente qual lembrete ele quer cancelar — e não diga que cancelou.');
   }
-  let query = db.from('reminders')
-    .update({ status: 'cancelled' })
+  // 🔴 SELECIONA ANTES DE CANCELAR (auditoria 04/08 — caso Ciro).
+  // Antes isto era um UPDATE direto com `ilike('title', '%…%')`. Em 03/08 o Ciro pediu
+  // "me lembra na semana da consulta" — um ADICIONAR — e o modelo, seguindo a própria
+  // instrução do prompt ("cancele antes de criar os novos"), chamou
+  // `cancel_reminders({title_query: "Consulta"})`. O curinga casou os DOIS lembretes da
+  // consulta e apagou o de "Consulta em 2 horas", o único que avisaria no dia. O handler
+  // devolveu ao modelo apenas a CONTAGEM ("2 cancelados"), jogando os títulos no lixo —
+  // então o modelo não soube o que destruiu, não avisou o paciente e não recriou.
+  // Agora: lê os candidatos, PROTEGE o que pertence a uma consulta viva, e devolve ao
+  // modelo os títulos exatos do que caiu e do que foi preservado.
+  const CANDIDATE_CAP = 200;
+  const { data: pendentes, error } = await db.from('reminders')
+    .select('id, title, type, payload')
     .eq('user_id', ctx.userId)
-    .eq('status', 'pending');
-  if (!args.all) query = query.ilike('title', `%${escapeLike(q)}%`);
-  const { data: cancelled, error } = await query.select('id, title');
+    .eq('status', 'pending')
+    .limit(CANDIDATE_CAP);
+  // Teto silencioso é indistinguível de "considerei tudo" — se encostar, diz.
+  if ((pendentes?.length ?? 0) >= CANDIDATE_CAP) {
+    await writeLog('warn', 'tool', `cancel_reminders: teto de ${CANDIDATE_CAP} candidatos atingido — pode haver lembrete fora da varredura`, {
+      traceId: ctx.traceId, userId: ctx.userId,
+    });
+  }
 
   if (error) {
     await writeLog('error', 'tool', `cancel_reminders falhou: ${error.message}`, { traceId: ctx.traceId, userId: ctx.userId });
-    throw new ToolFailure('NENHUM lembrete foi cancelado (falha técnica ao gravar) — eles vão continuar disparando. NÃO diga que cancelou; avise que deu um problema e que ele pode pedir de novo.');
+    throw new ToolFailure('NENHUM lembrete foi cancelado (falha técnica ao ler seus lembretes) — eles vão continuar disparando. NÃO diga que cancelou; avise que deu um problema e que ele pode pedir de novo.');
   }
-  let count = cancelled?.length ?? 0;
 
-  // FALLBACK ACENTO-INSENSÍVEL: ILIKE do Postgres não dobra diacríticos — a LLM
-  // manda "agua" (sem acento) ou sinônimo e casava 0 rows EM SILÊNCIO, reabrindo o
-  // E3 (planos duplicados) com falsa sensação de resolvido. Refaz o match em JS.
-  if (count === 0 && !args.all && q) {
-    const { data: pend } = await db.from('reminders')
-      .select('id, title').eq('user_id', ctx.userId).eq('status', 'pending').limit(50);
-    const qn = foldAccents(q);
-    const ids = (pend ?? []).filter((r) => foldAccents(r.title ?? '').includes(qn)).map((r) => r.id);
-    if (ids.length) {
-      const { data: c2 } = await db.from('reminders').update({ status: 'cancelled' }).in('id', ids).select('id');
-      count = c2?.length ?? 0;
+  // Match acento-insensível em JS: o ILIKE do Postgres não dobra diacríticos, e a LLM
+  // manda "agua" sem acento — casava 0 rows EM SILÊNCIO (o antigo E3, planos duplicados).
+  const qn = foldAccents(q);
+  const casaram = (pendentes ?? []).filter((r) => args.all || foldAccents(r.title ?? '').includes(qn));
+
+  // 🛡️ INVARIANTE: lembrete de consulta VIVA pertence ao ciclo de vida da consulta, não
+  // ao curinga de título. Pra parar de ser lembrado de uma consulta o caminho é
+  // `cancel_consultation` (que cancela os lembretes dela e avisa o consultório).
+  const idsConsultaViva = new Set<string>();
+  const consultaDe = (r: { payload: unknown }) => ((r.payload ?? {}) as Record<string, unknown>)['consultation_id'] as string | undefined;
+  const candidatasConsulta = casaram.filter((r) => r.type === 'appointment' && consultaDe(r));
+  if (candidatasConsulta.length > 0) {
+    const ids = [...new Set(candidatasConsulta.map((r) => consultaDe(r)!))];
+    const { data: vivas } = await db.from('consultations')
+      .select('id, status')
+      .in('id', ids)
+      .in('status', ['confirming', 'scheduled']);
+    const vivasSet = new Set((vivas ?? []).map((c) => c.id as string));
+    for (const r of candidatasConsulta) {
+      if (vivasSet.has(consultaDe(r)!)) idsConsultaViva.add(r.id as string);
     }
   }
 
+  const protegidos = casaram.filter((r) => idsConsultaViva.has(r.id as string));
+  const aCancelar = casaram.filter((r) => !idsConsultaViva.has(r.id as string));
+
+  let count = 0;
+  if (aCancelar.length > 0) {
+    const { data: c2, error: upErr } = await db.from('reminders')
+      .update({ status: 'cancelled' })
+      .in('id', aCancelar.map((r) => r.id))
+      .select('id');
+    if (upErr) {
+      await writeLog('error', 'tool', `cancel_reminders: update falhou: ${upErr.message}`, { traceId: ctx.traceId, userId: ctx.userId });
+      throw new ToolFailure('NENHUM lembrete foi cancelado (falha técnica ao gravar) — eles vão continuar disparando. NÃO diga que cancelou; avise que deu um problema e que ele pode pedir de novo.');
+    }
+    count = c2?.length ?? 0;
+  }
+  const cancelled = aCancelar;
+
+  if (protegidos.length > 0) {
+    await writeLog('warn', 'tool', `cancel_reminders: ${protegidos.length} lembrete(s) de consulta VIVA protegidos do curinga "${args.all ? '*' : q}"`, {
+      traceId: ctx.traceId, userId: ctx.userId, protegidos: protegidos.map((r) => r.title),
+    });
+  }
+
   // AINDA 0: NÃO fica em silêncio (a LLM já pode ter dito "cancelei"). Fala a verdade.
-  if (count === 0 && !args.all) {
+  // Mas se houve PROTEGIDOS, "não achei lembrete com X" seria mentira — achamos e
+  // preservamos de propósito. Nesse caso quem fala é o modelo, com a nota da observation.
+  if (count === 0 && !args.all && protegidos.length === 0) {
     const { data: ativos } = await db.from('reminders')
       .select('title').eq('user_id', ctx.userId).eq('status', 'pending').limit(15);
     if (ativos?.length) {
@@ -2109,12 +2158,18 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
     }
   }
 
-  // Loop ReAct: 0 cancelados é um resultado REAL e o modelo precisa vê-lo — senão ele diz
-  // "cancelei" pra um lembrete que continua ativo e vai disparar de novo amanhã.
+  // Loop ReAct: o modelo precisa ver O QUE caiu, não só QUANTOS. Devolver apenas a
+  // contagem foi o que permitiu o modelo apagar o lembrete do dia da consulta do Ciro
+  // sem perceber, sem avisar e sem recriar. Título é o único jeito de ele conferir se o
+  // que ele cancelou é o que ele quis cancelar.
   if (ctx.observation) {
+    const lista = cancelled.map((r) => `"${r.title}"`).join(', ');
+    const protegidosTxt = protegidos.length > 0
+      ? ` ATENÇÃO: ${protegidos.length} lembrete(s) NÃO foram cancelados porque pertencem a uma consulta que está de pé — ${protegidos.map((r) => `"${r.title}"`).join(', ')}. Eles continuam ativos de propósito: perder o aviso do dia da consulta faz o paciente faltar. Se ele quer DESMARCAR a consulta, use \`cancel_consultation\`; se ele só não quer o aviso, explique que mantive pra ele não perder o horário.`
+      : '';
     ctx.observation.note = count > 0
-      ? `${count} lembrete(s) cancelado(s) de verdade.`
-      : `NENHUM lembrete foi cancelado (nada casou com "${args.all ? '*' : q}"). NÃO diga que cancelou. O paciente já recebeu a lista dos ativos pra escolher.`;
+      ? `${count} lembrete(s) cancelado(s) de verdade: ${lista}. Confira se é isso que o paciente pediu — se você apagou algo que ele NÃO pediu pra apagar, recrie agora e conte a ele.${protegidosTxt}`
+      : `NENHUM lembrete foi cancelado (nada casou com "${args.all ? '*' : q}").${protegidosTxt || ' NÃO diga que cancelou. O paciente já recebeu a lista dos ativos pra escolher.'}`;
   }
   await writeLog('info', 'tool', `cancel_reminders: ${count} lembrete(s) cancelado(s) (query="${args.all ? '*' : q}")`, {
     traceId: ctx.traceId, userId: ctx.userId,

@@ -16,13 +16,14 @@
  *   - Side-effects em transação quando possível
  */
 import { db, writeAudit, writeLog, writeEvent } from '@iasaude/db';
-import { nextOccurrence, isOfferStillValid } from '@iasaude/shared';
+import { nextOccurrence, isOfferStillValid, pickFutureBrDateTimes, sameSlot, isAmbiguousNegation } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { discoverClinics } from './clinic-discovery.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
 import { scheduleConsultationTimeout } from './consultation-consolidation.js';
 import { sendOutboundToClinic } from './outbound-agent.js';
-import { ToolFailure, resolveConsultationForUser, resolveConsultationQuote, resolveOrderForUser, LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
+import { ToolFailure, resolveConsultationForUser, resolveConsultationQuote, resolveOrderForUser, LIVE_CONSULTATION_STATUSES, type QuoteRow } from './entity-resolve.js';
+import { reconcileAppointmentReminders } from './appointment-commit.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TIPOS
@@ -65,7 +66,12 @@ export interface LogSymptomArgs {
 
 export interface StartConsultationArgs {
   specialty: string;
-  urgency: 'rotina' | '72h' | '24h' | 'urgente';
+  /**
+   * Opcional desde 04/08: `urgency` deixou de ser obrigatória na tool porque exigi-la
+   * forçava uma pergunta extra antes de abrir a busca — e foi numa dessas perguntas
+   * extras que a consulta do Glauber morreu. Ausente = `rotina`, o caso comum.
+   */
+  urgency?: 'rotina' | '72h' | '24h' | 'urgente';
   modality?: 'presencial' | 'telemedicina' | 'indiferente';
   city?: string;
   plan?: string;
@@ -573,6 +579,7 @@ export async function handleSetDefaultAddress(args: { address_label: string }, c
  *  ou status searching/quoted, retorna esse status em vez de criar nova.
  */
 export async function handleStartConsultationSearch(args: StartConsultationArgs, ctx: BaseToolCtx): Promise<void> {
+  const urgency = args.urgency ?? 'rotina';
   // 1. Idempotência — já tem consultation ativa?
   const { data: existing } = await db
     .from('consultations')
@@ -662,7 +669,7 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
     conversation_id: ctx.conversationId,
     status: 'searching',
     specialty: args.specialty,
-    urgency: args.urgency,
+    urgency,
     modality: args.modality ?? 'indiferente',
     city: city,
     preferences: { ...(args.preferences ?? {}), plan: args.plan } as never,
@@ -684,7 +691,7 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
     targetId: c.id,
     conversationId: ctx.conversationId,
     traceId: ctx.traceId,
-    metadata: { specialty: args.specialty, urgency: args.urgency, modality: args.modality, city, plan: args.plan, lat, lng },
+    metadata: { specialty: args.specialty, urgency, modality: args.modality, city, plan: args.plan, lat, lng },
   });
 
   // 4. Notifica paciente
@@ -750,7 +757,7 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
             clinicWhatsApp: candidate.whatsapp_e164,
             ctx: {
               specialty: args.specialty,
-              urgency: args.urgency,
+              urgency,
               modality: args.modality ?? 'indiferente',
               patientCity: city,
               plan: args.plan ?? null,
@@ -779,7 +786,7 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
  *   - Pede confirmação à clínica via agent-clinic (separate convo)
  *   - Cria reminders: 1 dia antes + 2h antes
  */
-export async function handleConfirmConsultation(args: { consultation_id: string; quote_id: string }, ctx: BaseToolCtx): Promise<void> {
+export async function handleConfirmConsultation(args: { consultation_id: string; quote_id?: string; requested_datetime?: string }, ctx: BaseToolCtx): Promise<void> {
   // ⚠️ Os ids vêm do MODELO e não são confiáveis (30/07: chegou `consultation_id:'Nilo
   // Machado Junior'` e `quote_id:'13/08/2026 09:00'`). Resolver ANTES de tocar em qualquer
   // coisa — e sempre dentro do que pertence a ESTE paciente. Referência insalvável lança
@@ -796,9 +803,18 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
   if (before.status === 'confirming' || before.status === 'scheduled') {
     throw new ToolFailure('Essa consulta JÁ está confirmada (aguardando/tendo a clínica reservado) — NÃO confirmei de novo e nenhuma mensagem nova foi enviada. Se o paciente quer OUTRO horário, fale com a clínica usando `nudge_consultation` com `message` (message_supplier é de FARMÁCIA) em vez de confirmar de novo.');
   }
-  const q = await resolveConsultationQuote(args.quote_id, consultationId, {
-    action: 'confirmado', traceId: ctx.traceId, preferences: consultation.preferences,
-  });
+  // 🔴 CONTRAPROPOSTA DO PACIENTE (auditoria 04/08 — o caminho que NÃO EXISTIA).
+  // Em 03/08 o Ciro respondeu "Vou sair de viagem, não vai dar tempo. Marca dia 26 quarta
+  // feira as 10h" — uma data que a clínica NUNCA tinha oferecido. Como confirmar exigia um
+  // `quote_id` existente, o modelo não teve tool nenhuma pra usar: tentou `nudge_consultation`
+  // vazio, depois `message_supplier` (que é de FARMÁCIA) e disse ao paciente "não achei
+  // pedido em farmácias". A consulta nunca entrou em `confirming`, então quando a recepção
+  // aceitou o dia 26 o detector de confirmação (teste de ESTADO) estava cego, e o
+  // agendamento foi registrado à mão por um humano.
+  // Negociar contraproposta é o caso NORMAL de agendamento — não uma exceção. Aqui ela
+  // vira uma cotação de verdade, e todo o resto do fluxo (avisar a clínica, `confirming`,
+  // lembretes, reconfirmação) funciona sem nenhum caminho paralelo.
+  const q = await resolveConsultationQuoteOrCounterProposal(args, consultationId, consultation, ctx);
   const quoteId = q.id;
   // 🔒 CINTO E SUSPENSÓRIO. O resolvedor já filtra oferta vencida, mas confirmar é o passo
   // IRREVERSÍVEL: aqui as irmãs viram `rejected`, a clínica recebe mensagem real e, se ela
@@ -858,51 +874,19 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
     }
   }
 
-  // 5. Cria reminders (1d antes + 2h antes) se proposed_datetime válido
+  // 5. Lembretes 1d/2h — agora pelo reconciliador ÚNICO (`appointment-commit`), o mesmo
+  // que o lado da clínica e o worker de integridade usam. Antes era um bloco de inserts
+  // solto aqui: sem idempotência (reconfirmar duplicava), sem restauração (o curinga do
+  // `cancel_reminders` apagava o de 2h e nada recriava — foi o que o Ciro perdeu) e
+  // divergindo do lado clínica, que não criava lembrete nenhum.
   if (q.proposed_datetime) {
-    const consultDate = new Date(q.proposed_datetime);
-    if (!isNaN(consultDate.getTime())) {
-      const oneDayBefore = new Date(consultDate.getTime() - 24 * 3600 * 1000);
-      const twoHoursBefore = new Date(consultDate.getTime() - 2 * 3600 * 1000);
-      const now = new Date();
-
-      // type='appointment' (o enum reminder_type_t NÃO tem 'consultation' → o insert
-      // antigo falhava em silêncio e os lembretes NUNCA eram criados).
-      if (oneDayBefore > now) {
-        const { error: e1 } = await db.from('reminders').insert({
-          user_id: ctx.userId,
-          type: 'appointment',
-          title: `Consulta de ${before.specialty} amanhã`,
-          body: `Sua consulta com a clínica está marcada pra amanhã às ${consultDate.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' })}.`,
-          scheduled_at: oneDayBefore.toISOString(),
-          next_run_at: oneDayBefore.toISOString(),
-          status: 'pending',
-          payload: { consultation_id: consultationId, quote_id: quoteId, kind: '1d_before' },
-        });
-        if (e1) await writeLog('error', 'consultation', `lembrete 1d_before falhou: ${e1.message}`, { traceId: ctx.traceId });
-      }
-      if (twoHoursBefore > now) {
-        const { error: e2 } = await db.from('reminders').insert({
-          user_id: ctx.userId,
-          type: 'appointment',
-          title: `Consulta em 2 horas`,
-          body: `Sua consulta de ${before.specialty} é hoje em 2 horas. Não esquece! 💙`,
-          scheduled_at: twoHoursBefore.toISOString(),
-          next_run_at: twoHoursBefore.toISOString(),
-          status: 'pending',
-          payload: { consultation_id: consultationId, quote_id: quoteId, kind: '2h_before' },
-        });
-        if (e2) await writeLog('error', 'consultation', `lembrete 2h_before falhou: ${e2.message}`, { traceId: ctx.traceId });
-      }
-      // Consulta confirmada SEM nenhum lembrete criado (horário tão próximo que as duas
-      // âncoras já passaram) deixava de ser registrado em qualquer lugar. Era o único sinal
-      // temporal do handler, e era silencioso: o paciente "tem consulta" e nada o avisa.
-      if (oneDayBefore <= now && twoHoursBefore <= now) {
-        await writeLog('warn', 'consultation', `Consulta confirmada mas NENHUM lembrete criado — o horário está a menos de 2h, as duas âncoras (1d/2h) já passaram`, {
-          traceId: ctx.traceId, consultationId,
-        });
-      }
-    }
+    await reconcileAppointmentReminders({
+      consultationId,
+      userId: ctx.userId,
+      specialty: before.specialty ?? null,
+      scheduledIso: q.proposed_datetime,
+      traceId: ctx.traceId,
+    });
   }
 
   await writeLog('info', 'consultation', `Consulta confirmada — esperando clínica reconfirmar`, {
@@ -910,8 +894,131 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
   });
 }
 
+/**
+ * Resolve a cotação escolhida — e, se o paciente pediu um horário que a clínica NÃO
+ * ofertou, cria a cotação que representa essa CONTRAPROPOSTA.
+ *
+ * Por que uma cotação de verdade, e não um caminho paralelo: tudo a jusante (avisar a
+ * clínica, `confirming`, lembretes 1d/2h, detector de reconfirmação, card do paciente)
+ * já funciona sobre uma cotação. Sem ela, cada uma dessas etapas precisaria de um "e se
+ * for contraproposta" — seis lugares pra divergir. Com ela, zero.
+ *
+ * A cotação nasce marcada como proposta NOSSA (`notes`), nunca como oferta da clínica:
+ * a clínica ainda vai dizer se aceita, e essa distinção é o que impede a Xarlote de
+ * afirmar ao paciente que a clínica ofereceu algo que ela não ofereceu.
+ */
+async function resolveConsultationQuoteOrCounterProposal(
+  args: { consultation_id: string; quote_id?: string; requested_datetime?: string },
+  consultationId: string,
+  consultation: { preferences?: Record<string, unknown> | null; specialty?: string | null },
+  ctx: BaseToolCtx,
+): Promise<QuoteRow> {
+  // Caminho normal primeiro: o paciente escolheu uma das opções apresentadas.
+  if (args.quote_id) {
+    try {
+      return await resolveConsultationQuote(args.quote_id, consultationId, {
+        action: 'confirmado', traceId: ctx.traceId, preferences: consultation.preferences ?? null,
+      });
+    } catch (err) {
+      // Sem `requested_datetime` não há contraproposta pra tentar: o erro original é o
+      // que o modelo precisa ler (ele explica ao paciente que nada foi confirmado).
+      if (!args.requested_datetime) throw err;
+      await writeLog('info', 'consultation', 'quote_id não resolveu, mas há requested_datetime — tentando contraproposta', { traceId: ctx.traceId, consultationId });
+    }
+  }
+
+  const pedido = (args.requested_datetime ?? '').trim();
+  if (!pedido) {
+    // Nenhum dos dois: cai no resolvedor pra ele lançar a ToolFailure com a lista de
+    // opções reais (mensagem escrita pro modelo ler).
+    return resolveConsultationQuote(args.quote_id, consultationId, {
+      action: 'confirmado', traceId: ctx.traceId, preferences: consultation.preferences ?? null,
+    });
+  }
+
+  // O horário vem do MODELO → nunca confiar no formato. Aceita ISO e, se não for ISO,
+  // lê o português (é o que o paciente escreveu: "dia 26 quarta feira as 10h").
+  const direto = Date.parse(pedido);
+  const iso = Number.isFinite(direto) && /^\d{4}-\d{2}-\d{2}/.test(pedido)
+    ? new Date(direto).toISOString()
+    : (pickFutureBrDateTimes(pedido, Date.now())[0]?.iso ?? null);
+  if (!iso) {
+    throw new ToolFailure(`NADA FOI CONFIRMADO: não consegui entender "${pedido}" como data e hora. Pergunte ao paciente o dia e a hora exatos (ex.: "26/08 às 10h") e NÃO diga que confirmou.`);
+  }
+  if (!isOfferStillValid(iso, Date.now())) {
+    throw new ToolFailure('NADA FOI CONFIRMADO: esse horário já passou. Peça ao paciente uma data futura e NÃO diga que confirmou.');
+  }
+
+  // A qual clínica propor. Uma cotação irmã dá o contexto comercial (preço, plano,
+  // formas de pagamento) e a conversa por onde falar com a recepção.
+  const { data: irmas } = await db
+    .from('consultation_quotes')
+    .select('id, clinic_id, prescriber_id, proposed_datetime, alternative_datetimes, modality, price_brl, plan_accepted, conversation_id, notes, clinics(name)')
+    .eq('consultation_id', consultationId)
+    .not('clinic_id', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(5);
+  const base = (irmas ?? []).find((r) => r.conversation_id) ?? (irmas ?? [])[0] ?? null;
+  if (!base?.clinic_id) {
+    throw new ToolFailure('NADA FOI CONFIRMADO: essa consulta ainda não tem nenhuma clínica em negociação, então não há com quem confirmar esse horário. Use `nudge_consultation` com `message` pra falar com o consultório, ou abra uma busca nova.');
+  }
+
+  // Já existe cotação nesse MESMO horário? Reusa (idempotência: o paciente repetir
+  // "marca dia 26 às 10" não pode criar duas cotações e duas mensagens à clínica).
+  const igual = (irmas ?? []).find((r) => sameSlot(r.proposed_datetime as string | null, iso));
+  if (igual) {
+    await writeLog('info', 'consultation', 'contraproposta já tinha cotação nesse horário — reusando', { traceId: ctx.traceId, consultationId, quoteId: igual.id });
+    return igual as unknown as QuoteRow;
+  }
+
+  const { data: nova, error } = await db.from('consultation_quotes').insert({
+    consultation_id: consultationId,
+    clinic_id: base.clinic_id,
+    prescriber_id: base.prescriber_id,
+    conversation_id: base.conversation_id,
+    status: 'offered',
+    proposed_datetime: iso,
+    price_brl: base.price_brl,
+    plan_accepted: base.plan_accepted,
+    modality: base.modality ?? 'presencial',
+    notes: [base.notes, 'horário pedido PELO PACIENTE (contraproposta) — a clínica ainda vai confirmar'].filter(Boolean).join(' · '),
+  }).select('id, clinic_id, prescriber_id, proposed_datetime, alternative_datetimes, modality, price_brl, plan_accepted, conversation_id, clinics(name)').single();
+
+  if (error || !nova) {
+    await writeLog('error', 'consultation', `contraproposta: insert da cotação falhou (${error?.message.slice(0, 120)})`, { traceId: ctx.traceId, consultationId });
+    throw new ToolFailure('NADA FOI CONFIRMADO: deu um problema técnico ao registrar o horário que o paciente pediu. Avise que houve uma falha e que ele pode pedir de novo — NÃO diga que confirmou.');
+  }
+
+  await writeLog('info', 'consultation', `contraproposta do paciente registrada como cotação (${iso}) — vou pedir a reserva à clínica`, {
+    traceId: ctx.traceId, consultationId, quoteId: nova.id,
+  });
+  await writeAudit({
+    actorType: 'xarlote',
+    action: 'consultation_quote.counter_proposal',
+    userId: ctx.userId,
+    targetTable: 'consultation_quotes',
+    targetId: nova.id,
+    conversationId: ctx.conversationId,
+    traceId: ctx.traceId,
+    metadata: { proposed_datetime: iso, clinic_id: base.clinic_id, raw: pedido.slice(0, 80) },
+  });
+  return nova as unknown as QuoteRow;
+}
+
 /** Cancela consulta marcada/em busca. */
-export async function handleCancelConsultation(args: { consultation_id: string; reason: string }, ctx: BaseToolCtx): Promise<void> {
+export async function handleCancelConsultation(
+  args: { consultation_id: string; reason: string },
+  ctx: BaseToolCtx & { inbound?: { text?: string | null } },
+): Promise<void> {
+  // 🛡️ AMBIGUIDADE NUNCA ENCERRA (auditoria 04/08 — caso Glauber). Em 02/08 ele respondeu
+  // "Não precisa" à pergunta "vai usar plano ou é particular?" — quer dizer "não precisa de
+  // PLANO" — e a Xarlote encerrou a busca de cardiologista. Assimetria de custo: encerrar
+  // por engano custa a consulta; perguntar de novo custa uma frase. Então uma negação curta
+  // e ambígua NÃO cancela: o modelo é mandado desambiguar primeiro.
+  const falaDoPaciente = ctx.inbound?.text ?? '';
+  if (falaDoPaciente && isAmbiguousNegation(falaDoPaciente)) {
+    throw new ToolFailure(`NADA FOI CANCELADO. A última mensagem do paciente ("${falaDoPaciente.trim().slice(0, 40)}") é uma negação CURTA e AMBÍGUA: ela pode estar respondendo à SUA última pergunta (ex.: "não preciso de plano, é particular") e não desistindo da consulta. NÃO encerre nada e NÃO diga que cancelou. Pergunte de forma direta a qual das duas coisas ele se refere.`);
+  }
   // 🔴 INCIDENTE 30/07 18:52 (Glauber): o modelo mandou um `consultation_id` inventado, o
   // `.single()` não achou nada, o handler fez `return` MUDO, a task foi carimbada `success`
   // e a Xarlote anunciou "Pronto, cancelei a consulta com o Dr. Marco Elísio" — com a
@@ -939,13 +1046,32 @@ export async function handleCancelConsultation(args: { consultation_id: string; 
     throw new ToolFailure('Essa consulta JÁ estava cancelada — nada mudou agora. Não anuncie um cancelamento novo; se o paciente perguntou, apenas confirme que ela já não está mais de pé.');
   }
 
-  // Cancela reminders relacionados
-  await db.from('reminders')
-    .update({ status: 'cancelled' })
-    .eq('user_id', ctx.userId)
-    .eq('type', 'consultation')
-    .eq('status', 'pending')
-    .filter('payload->>consultation_id', 'eq', consultationId);
+  // 🔴 Cancela os lembretes DESTA consulta.
+  // O filtro era `type='consultation'` — tipo que NÃO EXISTE no enum `reminder_type_t`
+  // (o lembrete de consulta é `appointment`; está anotado no próprio handler que os cria).
+  // Ou seja: cancelar a consulta NUNCA cancelou lembrete nenhum, e o paciente que desmarcou
+  // continuava recebendo "Consulta em 2 horas". Exatamente o inverso do bug do Ciro, e a
+  // mesma classe: string de tipo que não casa com nada, falhando em silêncio.
+  // O `cancel_reason` é o que diz ao reconciliador que isto foi PEDIDO — ele não recria.
+  {
+    const { data: alvos } = await db.from('reminders')
+      .select('id, payload')
+      .eq('user_id', ctx.userId)
+      .eq('type', 'appointment')
+      .eq('status', 'pending')
+      .filter('payload->>consultation_id', 'eq', consultationId);
+    for (const r of alvos ?? []) {
+      const prev = (r.payload ?? {}) as Record<string, unknown>;
+      await db.from('reminders')
+        .update({ status: 'cancelled', payload: { ...prev, cancel_reason: 'patient_request' } })
+        .eq('id', r.id);
+    }
+    if ((alvos ?? []).length > 0) {
+      await writeLog('info', 'consultation', `${alvos!.length} lembrete(s) da consulta cancelados junto com ela`, {
+        traceId: ctx.traceId, consultationId,
+      });
+    }
+  }
 
   // Avisa a clínica se já tinha marcação confirmada
   if (before.status === 'confirming' || before.status === 'scheduled') {

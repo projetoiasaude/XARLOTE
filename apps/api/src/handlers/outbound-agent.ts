@@ -273,6 +273,12 @@ export async function sendOutboundToClinic(
   traceId: string,
   /** Assunto curto pro template de reabertura, se a janela de 24h estiver fechada. */
   templateSubject?: string,
+  /**
+   * Modelo/tokens que GERARAM este texto. Auditoria 04/08: as 60 mensagens outbound a
+   * clínicas do banco tinham `llm_model = null`, então não havia como distinguir o que a
+   * Xarlote gerou do que um humano mandou no terminal — nem qual modelo escreveu o quê.
+   */
+  llmMeta?: { model?: string; tokensIn?: number; tokensOut?: number; latencyMs?: number },
 ): Promise<boolean> {
   text = humanizeSupplierText(text); // paridade com a farmácia: sem emoji, sem travessão
   {
@@ -289,6 +295,10 @@ export async function sendOutboundToClinic(
     content_type: 'text',
     content: text,
     trace_id: traceId,
+    llm_model: llmMeta?.model ?? null,
+    llm_tokens_in: llmMeta?.tokensIn ?? null,
+    llm_tokens_out: llmMeta?.tokensOut ?? null,
+    llm_latency_ms: llmMeta?.latencyMs ?? null,
   }).select('id').single();
   await db.from('conversations')
     .update({ last_message_at: new Date().toISOString() })

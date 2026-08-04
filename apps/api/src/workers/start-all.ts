@@ -22,6 +22,7 @@ import { compactStaleConversations } from './conversation-compactor.worker.js';
 import { startInventoryTrackerWorker } from './inventory-tracker.worker.js';
 import { startAdherenceScorerWorker } from './adherence-scorer.worker.js';
 import { startConsultationFeedbackWorker } from './consultation-feedback.worker.js';
+import { startAppointmentIntegrityWorker } from './appointment-integrity.worker.js';
 import { startConsultationDispatcherWorker } from './consultation-dispatcher.worker.js';
 import { startKnowledgeGraphBuilderWorker } from './knowledge-graph-builder.worker.js';
 import { startSkillExtractorWorker } from './skill-extractor.worker.js';
@@ -76,6 +77,7 @@ export function startAllWorkers(log: WorkerLogger): void {
   startInventoryTrackerWorker();
   startAdherenceScorerWorker();
   startConsultationFeedbackWorker();
+  startAppointmentIntegrityWorker();
   startConsultationDispatcherWorker();
   startKnowledgeGraphBuilderWorker();
   startSkillExtractorWorker();

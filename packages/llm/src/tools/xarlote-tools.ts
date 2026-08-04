@@ -499,13 +499,19 @@ export const xarloteTools: ToolDefinition[] = [
         type: 'object',
         properties: {
           specialty: { type: 'string', description: 'Especialidade médica (ex: "cardiologia", "endocrinologia", "clínico geral")' },
-          urgency: { type: 'string', enum: ['rotina', '72h', '24h', 'urgente'], description: 'Pra rotina pode esperar semanas; urgente é pra hoje/amanhã' },
-          modality: { type: 'string', enum: ['presencial', 'telemedicina', 'indiferente'], description: 'Se o paciente quer pessoalmente ou online' },
-          city: { type: 'string', description: 'Cidade onde quer marcar — usa default address do user se omitido' },
-          plan: { type: 'string', description: 'Plano de saúde do paciente (ex: "Unimed", "Bradesco Saúde"). Omita se for particular.' },
+          urgency: { type: 'string', enum: ['rotina', '72h', '24h', 'urgente'], description: 'Pra rotina pode esperar semanas; urgente é pra hoje/amanhã. OMITA se ele não disse — assume rotina.' },
+          modality: { type: 'string', enum: ['presencial', 'telemedicina', 'indiferente'], description: 'Se o paciente quer pessoalmente ou online. Omita se ele não disse.' },
+          city: { type: 'string', description: 'Cidade onde quer marcar. NÃO PERGUNTE: se omitido, usa o endereço/cidade que já está no cadastro dele.' },
+          plan: { type: 'string', description: 'Plano de saúde (ex: "Unimed"). NÃO PERGUNTE antes de abrir a busca — omita se for particular ou se ele não disse; dá pra confirmar depois com a clínica na linha.' },
           preferences: { type: 'object', description: 'Preferências extras: { genero_medico: "feminino", horario_pref: "manhã" }', properties: {} },
         },
-        required: ['specialty', 'urgency'],
+        // 🔴 Só `specialty` é obrigatório (auditoria 04/08 — caso Glauber). Ele disse
+        // "Cardiologista" e a Xarlote fez DUAS perguntas antes de abrir a busca (cidade e
+        // plano) — nenhuma necessária: cidade vem do cadastro e plano é opcional. Uma das
+        // respostas veio ambígua ("Não precisa") e a intenção morreu ali, sem nunca virar
+        // linha no banco. Cada pergunta extra antes de criar o registro é uma chance de
+        // perder o paciente; abrir a busca primeiro deixa o fluxo visível aos vigilantes.
+        required: ['specialty'],
       },
     },
   },
@@ -513,14 +519,15 @@ export const xarloteTools: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'confirm_consultation_selection',
-      description: 'Após o paciente escolher uma das opções de consulta cotadas, confirma com a clínica e agenda. Espelho de confirm_order_selection.',
+      description: 'Fecha o horário da consulta com a clínica. Use nos DOIS casos: (a) o paciente escolheu uma das opções cotadas → passe `quote_id`; (b) o paciente pediu um horário que a clínica NÃO ofereceu (ex: "não dá essa semana, marca dia 26 às 10h") → passe `requested_datetime` com o que ele pediu. Nunca deixe de fechar só porque o horário não estava na lista — contrapropor é normal.',
       parameters: {
         type: 'object',
         properties: {
           consultation_id: { type: 'string' },
-          quote_id: { type: 'string' },
+          quote_id: { type: 'string', description: 'Id da opção que o paciente escolheu, quando ele escolheu uma das cotadas.' },
+          requested_datetime: { type: 'string', description: 'Dia e hora que o PACIENTE pediu, quando não é nenhuma das opções cotadas. Aceita ISO ("2026-08-26T10:00:00-03:00") ou o português dele ("dia 26/08 às 10h").' },
         },
-        required: ['consultation_id', 'quote_id'],
+        required: ['consultation_id'],
       },
     },
   },

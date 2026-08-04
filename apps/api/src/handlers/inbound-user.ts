@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -700,6 +700,17 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
     // no histórico da conversa e não no corpo do lembrete).
     // A ausência de informação estava sendo lida como confirmação. Agora o vazio FALA.
     systemPrompt += `\n\n## ⏰ LEMBRETES ATIVOS DESTE USUÁRIO (0)\nEste usuário **NÃO tem NENHUM lembrete ativo agora**. Esta é a VERDADE do banco de dados neste instante.\n\n⚠️ O histórico da conversa pode conter você dizendo que criou lembretes em dias anteriores — **aqueles JÁ DISPARARAM e não existem mais**. NUNCA use o histórico pra afirmar que existe lembrete: se ele perguntar "tenho lembrete?"/"vai me avisar?", a resposta honesta é que NÃO há nenhum ativo, e ofereça criar agora. Um lembrete que você "lembra" de ter criado ontem para "hoje" era para o dia ANTERIOR.`;
+  }
+
+  // 🛡️ NEGAÇÃO CURTA E AMBÍGUA (auditoria 04/08 — caso Glauber).
+  // 02/08: à pergunta "vai usar algum plano de saúde ou é particular?" ele respondeu
+  // "Não precisa" — ou seja, "não precisa de plano". A Xarlote leu como "não precisa da
+  // consulta" e encerrou a busca de cardiologista com um "então deixo pra lá?". Nunca
+  // existiu linha em `consultations`: a intenção morreu na conversa, fora do alcance de
+  // qualquer vigilante. Perdemos o evento mais escasso do produto por duas palavras.
+  // O bloco é DETERMINÍSTICO — não depende do modelo perceber a ambiguidade sozinho.
+  if (isAmbiguousNegation(inbound.text ?? '')) {
+    systemPrompt += `\n\n## ⚠️ A ÚLTIMA MENSAGEM DELE É UMA NEGAÇÃO CURTA E AMBÍGUA\nO paciente escreveu "${(inbound.text ?? '').trim().slice(0, 40)}". Isso pode ser (a) a resposta à SUA última pergunta — se você perguntou "plano ou particular?", "não precisa" quer dizer *não precisa de plano* — ou (b) ele desistindo de algo.\n\n**NÃO ENCERRE NADA e NÃO cancele nada com base nisso.** Se houver qualquer fluxo em andamento (consulta, pedido, lembrete), ele CONTINUA. Se a leitura (a) fizer sentido pela sua última pergunta, siga por ela. Se você não tiver certeza, pergunte de forma direta e curta a qual das duas coisas ele se refere. Desistência só vale quando ele diz de forma inequívoca ("não quero mais", "desisti", "cancela").`;
   }
 
   // Fix #5 — desfecho REAL das tools do turno anterior (anti-contradição). O loop é

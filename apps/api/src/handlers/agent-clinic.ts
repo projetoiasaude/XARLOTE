@@ -18,8 +18,17 @@ import {
   trimHistory,
   type AgentClinicContext,
 } from '@iasaude/llm';
-import { AGENT_INSTANCE, whatsappJidVariants, specialtyPhrase } from '@iasaude/shared';
+import {
+  AGENT_INSTANCE,
+  whatsappJidVariants,
+  specialtyPhrase,
+  readClinicSlotMessage,
+  resolveCommittedSlot,
+  isBareAffirmation,
+  isOfferStillValid,
+} from '@iasaude/shared';
 import type { NormalizedInbound, Message } from '@iasaude/shared';
+import { commitAppointment } from './appointment-commit.js';
 import { loadPrompts } from '../config/prompts.js';
 import { sendOutboundToClinic, sendTemplateOpeningToClinic } from './outbound-agent.js';
 import { templatesEnabled } from '../config/template-registry.js';
@@ -49,6 +58,42 @@ export function pickClinicFallbackMessage(flags: {
   if (flags.appointmentConfirmed) return 'Perfeito, muito obrigada! Tá tudo certo então 🙂';
   if (flags.clarificationRequested) return 'Deixa eu confirmar isso aqui rapidinho e já te respondo, tá? Obrigada!';
   return 'Anotei o horário! Deixa eu confirmar aqui e já te retorno pra fechar, tá? 🙂';
+}
+
+/**
+ * Cortesia pro turno em que o modelo não produziu NADA (nem texto nem tool).
+ *
+ * Em 03/08 a MESMA frase — "Perfeito, obrigada! Deixa eu confirmar aqui rapidinho e já
+ * te retorno" — saiu 3× pra Rita, duas delas com 2 minutos de diferença (18:20 e 18:22).
+ * Do lado dela isso é um robô travado, e "vou confirmar e já retorno" repetido sem
+ * nunca retornar é pior que silêncio: promete e não entrega.
+ *
+ * Regras: (1) nunca repetir a última frase enviada; (2) na terceira vez a cortesia
+ * PARA de prometer retorno e faz uma pergunta concreta, que é o que destrava a conversa.
+ * Puro/testável — `lastSent` e `acksRecentes` vêm do chamador.
+ */
+export const CLINIC_ACK_VARIANTS = [
+  'Perfeito, obrigada! Deixa eu confirmar aqui rapidinho e já te retorno 🙂',
+  'Obrigada pela informação! Só um instante que eu verifico aqui e te respondo.',
+  'Anotado, obrigada! Já estou vendo isso aqui e volto pra você em seguida.',
+] as const;
+
+/** Depois de 2 cortesias genéricas seguidas, prometer de novo não ajuda — pergunta. */
+export const CLINIC_ACK_ESCALATION =
+  'Obrigada! Só pra eu não te deixar esperando: precisa de mais alguma informação do paciente pra fechar o horário, ou já está tudo certo do seu lado?';
+
+export function pickClinicAck(lastSent: string | null | undefined, genericAcksInARow: number): string {
+  if (genericAcksInARow >= 2) return CLINIC_ACK_ESCALATION;
+  const last = (lastSent ?? '').trim();
+  const first = CLINIC_ACK_VARIANTS.find((v) => v !== last);
+  return first ?? CLINIC_ACK_ESCALATION;
+}
+
+/** `true` se o texto é uma das cortesias genéricas (pra contar repetição). */
+export function isGenericClinicAck(text: string | null | undefined): boolean {
+  const t = (text ?? '').trim();
+  if (!t) return false;
+  return (CLINIC_ACK_VARIANTS as readonly string[]).includes(t);
 }
 
 export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void> {
@@ -327,6 +372,37 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     return;
   }
 
+  // 🔁 TURNO VAZIO → UMA RE-TENTATIVA (auditoria 04/08). Em 03/08 o modelo voltou
+  // COMPLETAMENTE vazio — sem texto E sem tool — em 3 dos ~8 turnos com a Rita (~38%),
+  // inclusive no turno que confirmava a consulta. Vazio não é resposta: é falha de
+  // geração, e falha de geração se re-tenta. Uma vez só, com instrução explícita, para
+  // não dobrar custo/latência quando o modelo está genuinamente sem o que dizer.
+  if (!llmResponse.text.trim() && llmResponse.toolCalls.length === 0) {
+    await writeLog('warn', 'llm', `Agente clínica voltou VAZIO (0 tools, 0 texto) — re-tentando uma vez [${llmResponse.model}] ${llmResponse.tokensIn}in/${llmResponse.tokensOut}out`, {
+      traceId, conversationId, model: llmResponse.model, tokensIn: llmResponse.tokensIn, tokensOut: llmResponse.tokensOut,
+    });
+    try {
+      const retry = await chat(text, {
+        model: cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
+        apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'],
+        systemInstruction: `${systemPrompt}\n\n## ⚠️ ATENÇÃO — SUA RESPOSTA ANTERIOR VEIO VAZIA\nVocê não gerou texto NEM chamou tool. Isso deixa a recepção falando com uma parede. Nesta tentativa é OBRIGATÓRIO: se a mensagem dela traz horário, chame \`record_consultation_quote\`; se ela CONFIRMOU um agendamento, chame \`record_appointment_confirmation\`; em qualquer caso, escreva a resposta pra recepção.`,
+        history: trimHistory(messagesToHistory(history.slice(0, -1) as Message[]), 12),
+        tools: agentClinicTools,
+        temperature: 0.3,
+        maxOutputTokens: 400,
+        timeoutMs: 30_000,
+      });
+      if (retry.text.trim() || retry.toolCalls.length > 0) {
+        await writeLog('info', 'llm', `Re-tentativa do agente clínica RESOLVEU — tools: [${retry.toolCalls.map((t) => t.name).join(', ') || 'nenhuma'}]`, { traceId, conversationId });
+        llmResponse = retry;
+      } else {
+        await writeLog('warn', 'llm', 'Re-tentativa do agente clínica também voltou vazia — caem os backstops determinísticos', { traceId, conversationId });
+      }
+    } catch (err) {
+      await writeLog('error', 'llm', `Re-tentativa do agente clínica falhou: ${String(err).slice(0, 140)}`, { traceId, conversationId });
+    }
+  }
+
   const durationMs = Date.now() - t0;
   await writeEvent({
     eventName: 'agent_clinic.completion',
@@ -340,9 +416,43 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     },
   });
 
-  await writeLog('info', 'agent-clinic', `Agente clínica respondeu — tools: [${llmResponse.toolCalls.map((t) => t.name).join(', ') || 'nenhuma'}] texto: ${llmResponse.text.trim() ? `"${llmResponse.text.trim().slice(0, 80)}"` : '(vazio)'}`, {
-    traceId, conversationId, durationMs,
+  // 🔍 OBSERVABILIDADE DA PERNA DO ESTABELECIMENTO (auditoria 04/08). Antes esta linha
+  // não dizia modelo nem tokens — e as 60 mensagens outbound a clínicas do banco tinham
+  // `llm_model = null`. Sem isso eu não conseguia distinguir o que a Xarlote gerou do que
+  // um humano mandou no terminal, nem diagnosticar POR QUE o turno voltava vazio.
+  await writeLog('info', 'agent-clinic', `Agente clínica respondeu [${llmResponse.model}] ${llmResponse.tokensIn}in/${llmResponse.tokensOut}out ${durationMs}ms — tools: [${llmResponse.toolCalls.map((t) => t.name).join(', ') || 'nenhuma'}] texto: ${llmResponse.text.trim() ? `"${llmResponse.text.trim().slice(0, 80)}"` : '(vazio)'}`, {
+    traceId, conversationId, durationMs, model: llmResponse.model, tokensIn: llmResponse.tokensIn, tokensOut: llmResponse.tokensOut,
   });
+
+  // Registra as tool calls do agente-clínica em `assistant_tasks` (regra 7 do CLAUDE.md).
+  // Até 04/08 NENHUMA tool desta perna era registrada: o histórico só tinha tools da Sara,
+  // então "a clínica respondeu e nada aconteceu" era indistinguível de "nada foi chamado".
+  // A chave é o ÍNDICE DA CHAMADA no turno, não a ordem de inserção: se um insert falhar,
+  // usar o tamanho do Map desalinharia todas as chaves seguintes e as tools seguintes
+  // ficariam eternamente `running` — contabilidade errada é pior que contabilidade nenhuma.
+  const clinicTaskIds = new Map<number, string>();
+  for (const [idx, tc] of llmResponse.toolCalls.entries()) {
+    const { data: task } = await db.from('assistant_tasks').insert({
+      conversation_id: conversationId,
+      user_id: consultation.user_id,
+      tool_name: tc.name,
+      tool_input: tc.args as never,
+      status: 'running',
+      trace_id: traceId,
+      started_at: new Date().toISOString(),
+    }).select('id').maybeSingle();
+    if (task?.id) clinicTaskIds.set(idx, task.id as string);
+  }
+  /** Fecha a task registrada pra esta tool (índice = ordem de chamada no turno). */
+  const finishClinicTask = async (_name: string, idx: number, ok: boolean, err?: string) => {
+    const id = clinicTaskIds.get(idx);
+    if (!id) return;
+    await db.from('assistant_tasks').update({
+      status: ok ? 'success' : 'error',
+      ...(err ? { error: err.slice(0, 400) } : {}),
+      completed_at: new Date().toISOString(),
+    }).eq('id', id);
+  };
 
   // 8. Executa tool calls
   let shouldFinalize = false;
@@ -355,7 +465,8 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   let singleTargetDeadEnd = false;   // alvo único deu beco sem saída → paciente avisado, clínica recebe cortesia
   let repliedToClinic = false;       // já mandamos algo à clínica dentro do loop de tools (não duplicar no passo 9)
 
-  for (const tc of llmResponse.toolCalls) {
+  for (const [tcIdx, tc] of llmResponse.toolCalls.entries()) {
+    try {
     switch (tc.name) {
       case 'record_consultation_quote': {
         const a = tc.args as {
@@ -571,42 +682,166 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
         // (quote.proposed_datetime, ISO válido do record_consultation_quote) — senão
         // a consulta ficava presa em 'confirming', sem virar 'scheduled' nem gerar lembrete.
         const confISO = safeParseISO(a.confirmed_datetime) ?? (quote.proposed_datetime as string | null);
-        const updates: Record<string, unknown> = {
-          notes: [quote.notes, a.notes, a.arrival_instructions, a.confirmation_code ? `Código: ${a.confirmation_code}` : null]
-            .filter(Boolean).join(' · '),
-        };
-        if (confISO) updates['proposed_datetime'] = confISO;
-        await db.from('consultation_quotes').update(updates).eq('id', quote.id);
+        const notes = [quote.notes, a.notes, a.arrival_instructions, a.confirmation_code ? `Código: ${a.confirmation_code}` : null]
+          .filter(Boolean).join(' · ');
+        if (notes) await db.from('consultation_quotes').update({ notes }).eq('id', quote.id);
 
-        // Marca consultation como 'scheduled' (handoff completo)
-        if (confISO) {
-          await db.from('consultations').update({
-            status: 'scheduled',
-            scheduled_at: confISO,
-            scheduled_clinic_id: clinicId,
-            scheduled_prescriber_id: quote.prescriber_id,
-          }).eq('id', quote.consultation_id);
+        if (!confISO) {
+          // Sem horário nem na tool nem na cotação não há o que fechar. Antes isso
+          // marcava `appointmentConfirmed = true` mesmo assim — e o flag DESLIGAVA o
+          // backstop de repasse, então a clínica confirmava e o paciente não sabia de nada.
+          await writeLog('error', 'consultation', 'record_appointment_confirmation SEM horário (nem na tool nem na cotação) — nada foi fechado, o repasse ao paciente segue ligado', {
+            traceId, quoteId: quote.id, consultationId: quote.consultation_id,
+          });
+          break;
         }
 
-        await writeAudit({
-          actorType: 'agent_clinic',
-          actorId: 'agent-clinic',
-          action: 'consultation.scheduled',
-          userId: consultation.user_id,
-          targetTable: 'consultations',
-          targetId: quote.consultation_id,
-          conversationId,
+        // 🎯 FUNIL ÚNICO: estado + cotação + lembretes 1d/2h + PACIENTE AVISADO, tudo ou
+        // nada. Antes este case marcava `scheduled` e ia embora: não criava lembrete
+        // nenhum e não avisava ninguém — e ainda silenciava o backstop de repasse.
+        const commit = await commitAppointment({
+          consultationId: quote.consultation_id,
+          confirmedIso: confISO,
+          clinicId,
+          prescriberId: quote.prescriber_id ?? null,
+          quoteId: quote.id,
+          source: 'clinic_tool',
           traceId,
-          metadata: { confirmed_datetime: confISO, code: a.confirmation_code },
+          notes: a.notes ?? a.arrival_instructions ?? null,
         });
-
-        await writeLog('info', 'consultation', `✅ Consulta confirmada pela clínica — ${confISO}`, { traceId, quoteId: quote.id });
-        appointmentConfirmed = true;
+        // Só declara confirmado se REALMENTE fechou — senão o repasse ao paciente
+        // continua ligado (falha nunca vira sucesso).
+        appointmentConfirmed = commit.ok;
+        if (!commit.ok) {
+          await writeLog('warn', 'consultation', `clínica confirmou mas o fechamento NÃO foi aceito (${commit.reason}) — repasse ao paciente segue ligado`, {
+            traceId, consultationId: quote.consultation_id,
+          });
+        }
         break;
       }
 
       default:
         await writeLog('warn', 'agent-clinic', `Tool desconhecida chamada: ${tc.name}`, { traceId });
+    }
+    await finishClinicTask(tc.name, tcIdx, true);
+    } catch (err) {
+      // A contabilidade não pode engolir o erro (e nem escondê-lo): marca a task como
+      // `error` e propaga, preservando o comportamento anterior à instrumentação.
+      await finishClinicTask(tc.name, tcIdx, false, String(err));
+      throw err;
+    }
+  }
+
+  // ─── 8b. BACKSTOPS DETERMINÍSTICOS (auditoria 04/08) ────────────────────────
+  // O LLM não é o único caminho. O que a recepção escreveu em português claro TEM que
+  // ser lido por código, porque em 03/08 o modelo voltou vazio nos dois turnos que mais
+  // importavam: os três horários da Rita (nada registrado) e a confirmação da consulta
+  // (nada registrado). Um turno vazio de um modelo nunca mais pode custar uma consulta.
+  const leitura = readClinicSlotMessage(text, Date.now());
+
+  // (i) FECHAMENTO. A recepção afirmou um agendamento como FATO.
+  if (!appointmentConfirmed && leitura.kind === 'commitment') {
+    const naMesa = [
+      quote.proposed_datetime as string | null,
+      ...(((quote.alternative_datetimes ?? []) as string[]) ?? []),
+    ];
+    const slot = resolveCommittedSlot(leitura, naMesa, (quote.proposed_datetime as string | null) ?? null);
+    // 🛑 FECHAMENTO SEM DATA NO TEXTO exige ESTADO (revisão adversarial desta correção).
+    // Verbo de fechamento também aparece em anotação: "Marquei aqui que ele é paciente
+    // novo" casa `marquei`, não tem data, e cairia na âncora — fechando uma consulta que
+    // ninguém confirmou e dizendo "Confirmado! 🎉" ao paciente. Quando a data está NO
+    // TEXTO a prova é forte o suficiente; quando não está, só vale se nós estávamos
+    // explicitamente esperando a reconfirmação daquele slot (`confirming`).
+    if (slot && slot.source === 'anchor' && !isAppointmentConfirmation) {
+      await writeLog('info', 'agent-clinic', `texto da clínica tem verbo de fechamento ("${leitura.matched}") mas SEM data, e a consulta não está aguardando reconfirmação — não fecho por inferência fraca`, {
+        traceId, conversationId, consultationId: quote.consultation_id,
+      });
+    } else if (slot) {
+      await writeLog('warn', 'agent-clinic', `🛟 BACKSTOP DE FECHAMENTO: a clínica CONFIRMOU ("${leitura.matched}") e nenhuma tool registrou — fechando por detecção determinística (origem do horário: ${slot.source})`, {
+        traceId, conversationId, consultationId: quote.consultation_id,
+      });
+      const commit = await commitAppointment({
+        consultationId: quote.consultation_id,
+        confirmedIso: slot.iso,
+        clinicId,
+        prescriberId: quote.prescriber_id ?? null,
+        quoteId: slot.source === 'text-new' ? null : quote.id,
+        source: 'clinic_detected',
+        traceId,
+        evidence: leitura.datetimes[0]?.evidence ?? leitura.matched,
+      });
+      appointmentConfirmed = commit.ok;
+    } else {
+      await writeLog('warn', 'agent-clinic', `clínica parece ter CONFIRMADO ("${leitura.matched}") mas não há horário nem no texto nem na cotação — não invento data; o repasse ao paciente cobre`, {
+        traceId, conversationId, consultationId: quote.consultation_id,
+      });
+    }
+  }
+
+  // (ii) "Ok"/"Isso" SECO só fecha somado a ESTADO — estávamos explicitamente esperando
+  // a reconfirmação daquele slot. Texto sozinho nunca basta: às 18:21 de 03/08 a Rita
+  // mandou um "Ok" que era conversa fiada, não agendamento.
+  if (!appointmentConfirmed && isAppointmentConfirmation && isBareAffirmation(text)) {
+    const ancora = quote.proposed_datetime as string | null;
+    if (ancora && isOfferStillValid(ancora, Date.now())) {
+      await writeLog('warn', 'agent-clinic', '🛟 BACKSTOP: afirmação seca da recepção com a consulta em `confirming` — fechando o slot que estava na mesa', {
+        traceId, conversationId, consultationId: quote.consultation_id,
+      });
+      const commit = await commitAppointment({
+        consultationId: quote.consultation_id,
+        confirmedIso: ancora,
+        clinicId,
+        prescriberId: quote.prescriber_id ?? null,
+        quoteId: quote.id,
+        source: 'clinic_detected',
+        traceId,
+        evidence: text.slice(0, 60),
+      });
+      appointmentConfirmed = commit.ok;
+    }
+  }
+
+  // (iii) OFERTA. A recepção pôs horários na mesa e nenhuma tool os registrou. Grava o
+  // primeiro como proposto e os demais em `alternative_datetimes` — a coluna existe
+  // desde o schema inicial e ficou `[]` justamente no dia em que a Rita ofereceu TRÊS.
+  if (!quoteRecorded && !appointmentConfirmed && leitura.kind === 'offer') {
+    const futuros = leitura.datetimes.filter((h) => isOfferStillValid(h.iso, Date.now()));
+    const primeiro = futuros[0];
+    if (primeiro) {
+      const alternativos = futuros.slice(1).map((h) => h.iso);
+      const { data: gravou } = await db.from('consultation_quotes').update({
+        status: 'offered',
+        proposed_datetime: primeiro.iso,
+        alternative_datetimes: alternativos.length > 0 ? alternativos : null,
+        responded_at: new Date().toISOString(),
+      }).eq('id', quote.id).in('status', ['pending', 'offered', 'withdrawn']).select('id');
+
+      if (gravou && gravou.length > 0) {
+        quoteRecorded = true;
+        shouldFinalize = true;
+        outcome = 'offered';
+        await writeLog('warn', 'agent-clinic', `🛟 BACKSTOP DE OFERTA: a clínica passou ${futuros.length} horário(s) e nenhuma tool registrou — gravado por detecção determinística ("${primeiro.evidence}")`, {
+          traceId, conversationId, quoteId: quote.id, total: futuros.length,
+        });
+        await writeAudit({
+          actorType: 'agent_clinic',
+          actorId: 'agent-clinic-backstop',
+          action: 'consultation_quote.offered',
+          userId: consultation.user_id,
+          targetTable: 'consultation_quotes',
+          targetId: quote.id,
+          conversationId,
+          traceId,
+          metadata: { proposed_datetime: primeiro.iso, alternative_datetimes: alternativos, source: 'deterministic_backstop', evidence: primeiro.evidence },
+        });
+        if (!llmResponse.toolCalls.some((t) => t.name === 'request_clarification')) {
+          await notifyUserConsultationQuoteArrived(
+            quote.consultation_id,
+            (quote.clinics as { name?: string } | null)?.name ?? 'clínica',
+            traceId,
+          ).catch((e) => writeLog('warn', 'consultation', `Backstop de oferta: falha ao notificar paciente: ${String(e)}`, { traceId }));
+        }
+      }
     }
   }
 
@@ -621,7 +856,11 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     // mandar a cortesia genérica agora seria mensagem dupla pra recepção.
     await writeLog('info', 'agent-clinic', 'Resposta à clínica já enviada no loop de tools — pulando o passo 9', { traceId, conversationId });
   } else if (llmResponse.text.trim() && !silentOutcome) {
-    await sendOutboundToClinic(conversationId, clinicPhone, llmResponse.text.trim(), traceId);
+    // llmMeta carimbado: texto GERADO por modelo fica distinguível de cortesia
+    // determinística e de mensagem manual (todas as três existiam no dia 03/08).
+    await sendOutboundToClinic(conversationId, clinicPhone, llmResponse.text.trim(), traceId, undefined, {
+      model: llmResponse.model, tokensIn: llmResponse.tokensIn, tokensOut: llmResponse.tokensOut, latencyMs: llmResponse.latencyMs,
+    });
   } else if (!llmResponse.text.trim() && !silentOutcome && (quoteRecorded || appointmentConfirmed || clarificationRequested || singleTargetDeadEnd)) {
     // FALLBACK DETERMINÍSTICO (paridade c/ farmácia): o gpt-4.1-mini às vezes chama
     // a tool (registrou horário / confirmou / mandou pergunta ao paciente) SEM gerar
@@ -636,13 +875,27 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     // vazio (sem texto e sem tool) e a recepção — que acabou de escrever — ficava no vácuo,
     // exatamente o comportamento que faz um humano concluir "é robô / desistiu". A farmácia
     // já tratava esse caso; a clínica não. Agora nunca deixamos a clínica sem resposta.
-    await writeLog('warn', 'agent-clinic', 'Agente clínica retornou resposta vazia — enviando cortesia determinística', { traceId, conversationId });
-    await sendOutboundToClinic(
-      conversationId,
-      clinicPhone,
-      'Perfeito, obrigada! Deixa eu confirmar aqui rapidinho e já te retorno 🙂',
-      traceId,
-    );
+    // Não repete a MESMA frase (03/08: a mesma cortesia 3× pra Rita, 2 delas com 2 min
+    // de diferença) e, na terceira, para de prometer retorno e faz uma pergunta concreta.
+    const { data: ultimas } = await db
+      .from('messages')
+      .select('content')
+      .eq('conversation_id', conversationId)
+      .eq('direction', 'out')
+      .order('created_at', { ascending: false })
+      .limit(3);
+    const ultimoTexto = (ultimas?.[0]?.content as string | null) ?? null;
+    const seguidas = (() => {
+      let n = 0;
+      for (const m of ultimas ?? []) {
+        if (!isGenericClinicAck(m.content as string | null)) break;
+        n += 1;
+      }
+      return n;
+    })();
+    const ack = pickClinicAck(ultimoTexto, seguidas);
+    await writeLog('warn', 'agent-clinic', `Agente clínica retornou resposta vazia — cortesia determinística (genéricas seguidas: ${seguidas}${seguidas >= 2 ? ' → escalando pra pergunta concreta' : ''})`, { traceId, conversationId });
+    await sendOutboundToClinic(conversationId, clinicPhone, ack, traceId);
   }
 
   // 9b. 🛟 BACKSTOP DE REPASSE AO PACIENTE (auditoria 30/07 — caso Glauber/Dr. Marco Elísio).
