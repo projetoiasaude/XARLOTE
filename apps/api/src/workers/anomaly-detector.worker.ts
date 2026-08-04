@@ -15,6 +15,27 @@
  */
 import { db, writeLog, writeEvent } from '@iasaude/db';
 import { sendTelegramAlert } from '../handlers/telegram-alerter.js';
+import { sendFounderAlert, type FounderAlertOpts } from '../handlers/founder-alerter.js';
+
+/**
+ * Alerta ao fundador pelos canais disponíveis.
+ *
+ * O WhatsApp é o PRIMÁRIO (04/08): o Telegram nunca teve token configurado, então os 12
+ * pontos de alerta deste worker gritavam no vazio — inclusive o de anti-hipertensivo não
+ * entregue, que é o mais grave que existe aqui. O Telegram continua sendo tentado pra
+ * quando/se o token existir; nenhum dos dois derruba o outro nem a varredura.
+ */
+async function alertFounder(opts: FounderAlertOpts): Promise<void> {
+  const [wa, tg] = await Promise.allSettled([sendFounderAlert(opts), sendTelegramAlert(opts)]);
+  const okWa = wa.status === 'fulfilled' && wa.value === true;
+  const okTg = tg.status === 'fulfilled' && tg.value === true;
+  if (!okWa && !okTg) {
+    // Alerta que não chegou por NENHUM canal é, ele mesmo, o incidente mais grave.
+    await writeLog('error', 'anomaly', `🆘 alerta "${opts.title}" NÃO chegou por nenhum canal (WhatsApp nem Telegram)`, {
+      severity: opts.severity ?? 'warn',
+    });
+  }
+}
 import { estimateCostUsd } from '@iasaude/llm';
 import { withCronLock } from '../middleware/cron-lock.js';
 
@@ -45,7 +66,7 @@ async function detectUntreatedRedFlags(): Promise<void> {
       if ((msgs ?? []).length === 0) {
         // Sem resposta!
         const ageMin = Math.floor((Date.now() - new Date(f.occurred_at).getTime()) / 60_000);
-        await sendTelegramAlert({
+        await alertFounder({
           title: 'Red flag SEM follow-up',
           body: `Red flag detectado há ${ageMin}min sem resposta outbound.\nUser: ${(f.user_id ?? 'anon').slice(0, 8)}\nMotivo: ${f.reason ?? 'sem motivo'}\nConv: ${f.conversation_id}`,
           severity: 'critical',
@@ -71,7 +92,7 @@ async function detectToolFailureSpike(): Promise<void> {
 
     const n = count ?? 0;
     if (n >= 10) {
-      await sendTelegramAlert({
+      await alertFounder({
         title: 'Tool failure spike',
         body: `${n} tool.failed nos últimos 10 min. Investigar.`,
         severity: 'high',
@@ -104,7 +125,7 @@ async function detectLLMLatencyDegradation(): Promise<void> {
     const p95 = durations[p95Idx]!;
 
     if (p95 > 30_000) {
-      await sendTelegramAlert({
+      await alertFounder({
         title: 'LLM p95 alto',
         body: `Últimos 30min: p95=${(p95 / 1000).toFixed(1)}s sobre ${durations.length} chamadas. (Esperado <10s)`,
         severity: 'high',
@@ -142,7 +163,7 @@ async function detectStuckConversations(): Promise<void> {
     }
 
     if (stuck >= 5) {
-      await sendTelegramAlert({
+      await alertFounder({
         title: 'Conversas paradas',
         body: `${stuck} conversas user com última inbound há >2h sem resposta da Xarlote.`,
         severity: 'warn',
@@ -168,7 +189,7 @@ async function detectOrderFailureRate(): Promise<void> {
     const rate = failed / total;
 
     if (rate > 0.3) {
-      await sendTelegramAlert({
+      await alertFounder({
         title: 'Order failure rate alto',
         body: `Nas últimas 24h: ${failed}/${total} (${(rate * 100).toFixed(0)}%) orders failed. Esperado <10%.`,
         severity: 'high',
@@ -201,7 +222,7 @@ async function detectCostBudget(): Promise<void> {
       );
     }
     if (cost > limit) {
-      await sendTelegramAlert({
+      await alertFounder({
         title: 'Custo de LLM acima do teto',
         body: `~US$ ${cost.toFixed(2)} na última hora (teto US$ ${limit.toFixed(2)}). Checar volume/abuso.`,
         severity: 'high',
@@ -229,7 +250,7 @@ async function detectSendFailureSpike(): Promise<void> {
       .gte('created_at', cutoff);
     const n = count ?? 0;
     if (n >= 5) {
-      await sendTelegramAlert({
+      await alertFounder({
         title: 'Falhas de envio WhatsApp (possível ban/limite)',
         body: `${n} erros de envio (outbound) nos últimos 10min. Pode ser ban/rate-limit da uazapi — checar a instância.`,
         severity: 'high',
@@ -266,7 +287,7 @@ async function detectBrokenOutboundContent(): Promise<void> {
     const n = count ?? 0;
     if (n > 0) {
       const sample = (data ?? [])[0]?.content?.slice(0, 120) ?? '';
-      await sendTelegramAlert({
+      await alertFounder({
         title: '🐛 Mensagem QUEBRADA enviada a usuário',
         body: `${n} mensagem(ns) com "undefined"/"[object Object]"/"NaN"/"null" nos últimos 10min. Ex: "${sample}". Interpolação/tool quebrada — investigar já.`,
         severity: 'critical',
@@ -328,7 +349,7 @@ async function detectUndeliveredCriticalReminders(): Promise<void> {
       );
       // `count` é o TOTAL (PostgREST ignora o limit na contagem); `sample` é o que veio.
       const affectedLabel = n > sample.length ? `${affected}+` : String(affected);
-      await sendTelegramAlert({
+      await alertFounder({
         title: '💊 Remédio/consulta NÃO entregue (janela fechada)',
         body: `${n} lembrete(s) CRÍTICO(s) de ${affectedLabel} paciente(s) não chegaram nos últimos 10min — janela de 24h fechada e template em cooldown. Silêncio máximo: ${maxSilent}d. Esses pacientes estão sem lembrete de medicação; pode exigir contato humano.`,
         // 'high' (não 'critical') DE PROPÓSITO: é o que ativa o throttle por chave no
@@ -375,7 +396,7 @@ async function detectAbandonedOneShots(): Promise<void> {
     const sample = data ?? [];
     const affected = new Set(sample.map((r) => String(r.user_id))).size;
     const affectedLabel = n > sample.length ? `${affected}+` : String(affected);
-    await sendTelegramAlert({
+    await alertFounder({
       title: '🔴 Aviso único PERDIDO em definitivo',
       body: `${n} lembrete(s) de dose única desistiram após todas as tentativas e o paciente NUNCA recebeu (${affectedLabel} paciente(s), tipo: ${tipos}). Não há re-tentativa — isso exige contato humano. Ver /logs categoria reminder.`,
       severity: 'high',
