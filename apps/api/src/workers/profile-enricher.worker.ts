@@ -32,12 +32,61 @@ const MIN_CONFIDENCE = 0.7;
 
 // Config de modelos pela MESMA via da API (loadPrompts resolve o prompts.json
 // via __dirname — process.cwd() quebrava quando o worker não roda da raiz do repo).
-function loadModels(): { model: string; apiKey: string } {
+function loadModels(): { model: string; apiKey: string; fallbackModel: string | null } {
   const cfg = loadPrompts();
+  const model = cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini';
+  // Modelo de SEGUNDA tentativa. Re-tentar o mesmo que acabou de devolver vazio é esperar que
+  // o dado mude sozinho — em 05/08 as duas tentativas voltaram vazias com 10s de intervalo.
+  // `gpt-4.1-mini` é o que já está configurado pra visão neste projeto, então não introduz
+  // dependência nova; se o primário JÁ for ele, não há fallback a oferecer.
+  const alternativo = cfg.vision_model || 'openai/gpt-4.1-mini';
   return {
-    model: cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
+    model,
     apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'] || '',
+    fallbackModel: alternativo && alternativo !== model ? alternativo : null,
   };
+}
+
+/**
+ * Extrai o objeto JSON de uma resposta de LLM, tolerando o que o modelo faz de verdade.
+ *
+ * Cobre (auditoria 05/08): cerca markdown (```json), prosa antes/depois, e — o caso que
+ * mais dói — JSON **TRUNCADO** pelo teto de tokens, que morria no parse com o dado quase
+ * pronto. Fechar chaves/colchetes pendentes recupera os `facts` já emitidos em vez de
+ * jogar o turno inteiro no lixo.
+ */
+export function extractJsonObject(text: string): string | null {
+  const t = (text ?? '').trim();
+  if (!t) return null;
+  const semCerca = t.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/,'');
+  const ini = semCerca.indexOf('{');
+  if (ini < 0) return null;
+
+  // Varre equilibrando, respeitando string e escape — chave dentro de texto não conta.
+  let prof = 0;
+  const pilha: string[] = [];
+  let emString = false;
+  let escape = false;
+  let fim = -1;
+  for (let i = ini; i < semCerca.length; i += 1) {
+    const c = semCerca[i]!;
+    if (escape) { escape = false; continue; }
+    if (c === '\\') { escape = true; continue; }
+    if (c === '"') { emString = !emString; continue; }
+    if (emString) continue;
+    if (c === '{' || c === '[') { pilha.push(c === '{' ? '}' : ']'); prof += 1; }
+    else if (c === '}' || c === ']') { pilha.pop(); prof -= 1; if (prof === 0) { fim = i; break; } }
+  }
+  if (fim >= 0) return semCerca.slice(ini, fim + 1);
+
+  // TRUNCADO: fecha o que ficou aberto. Remove cauda parcial (vírgula/chave/valor pela metade)
+  // pra não gerar JSON inválido de propósito.
+  let corpo = semCerca.slice(ini);
+  if (emString) corpo += '"';
+  corpo = corpo.replace(/,\s*$/, '').replace(/:\s*$/, ': null');
+  const fecho = pilha.reverse().join('');
+  const candidato = corpo + fecho;
+  try { JSON.parse(candidato); return candidato; } catch { return null; }
 }
 
 async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
@@ -71,7 +120,7 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
 
   if (!transcript.trim()) return;
 
-  const { model, apiKey } = loadModels();
+  const { model, apiKey, fallbackModel } = loadModels();
   if (!apiKey) {
     await writeLog('warn', 'enrichment', 'Profile enricher sem API key — pulando', { traceId });
     return;
@@ -91,15 +140,34 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
             ? PROFILE_ENRICHER_SYSTEM
             : `${PROFILE_ENRICHER_SYSTEM}\n\nIMPORTANTE: responda APENAS com o objeto JSON válido, sem nenhum texto, explicação ou markdown antes ou depois.`,
         temperature: 0.1,
-        maxOutputTokens: 800,
+        // 800 era apertado: uma resposta longa era CORTADA no meio do JSON e o parse morria
+        // com o dado quase pronto. O custo de 1200 é irrelevante perto de perder a memória.
+        maxOutputTokens: 1200,
         timeoutMs: 30_000,
+        // 🔴 JSON pelo PROTOCOLO, não pelo pedido (auditoria 05/08). Nas 8 falhas registradas,
+        // 7 tinham `preview: ''` — o modelo devolveu VAZIO, não JSON quebrado. A instrução
+        // firme no prompt da 2ª tentativa não mudou nada: às 13:20 as duas tentativas voltaram
+        // vazias, 10 segundos uma da outra. Quando a saída TEM que ser JSON, pedir no protocolo
+        // é mais forte que pedir no prompt.
+        jsonMode: true,
+        // Cross-model na 2ª tentativa: re-tentar o MESMO modelo que acabou de voltar vazio é
+        // esperar que o dado mude sozinho. Foi a lição do turno vazio do agente-clínica.
+        ...(attempt === 2 && fallbackModel ? { model: fallbackModel } : {}),
       });
-      const jsonMatch = resp.text.match(/\{[\s\S]*\}/);
+      // Vazio e malformado são falhas DIFERENTES e precisam ser distinguíveis no log: uma é
+      // do modelo, a outra é do parser, e confundi-las custou uma investigação inteira.
+      if (!resp.text.trim()) {
+        await writeLog(attempt === 1 ? 'info' : 'warn', 'enrichment', `Enricher: modelo devolveu VAZIO (tentativa ${attempt}/2) [${resp.model}] ${resp.tokensIn}in/${resp.tokensOut}out`, {
+          traceId, model: resp.model, tokensOut: resp.tokensOut,
+        });
+        continue;
+      }
+      const jsonMatch = extractJsonObject(resp.text);
       if (!jsonMatch) {
-        await writeLog(attempt === 1 ? 'info' : 'warn', 'enrichment', `Enricher: sem JSON na resposta (tentativa ${attempt}/2)`, { traceId, preview: resp.text.slice(0, 200) });
+        await writeLog(attempt === 1 ? 'info' : 'warn', 'enrichment', `Enricher: resposta sem JSON reconhecível (tentativa ${attempt}/2)`, { traceId, preview: resp.text.slice(0, 200) });
         continue; // re-tenta com a instrução firme
       }
-      parsed = JSON.parse(jsonMatch[0]) as EnrichOutput;
+      parsed = JSON.parse(jsonMatch) as EnrichOutput;
     } catch (err) {
       // JSON.parse malformado OU o chat lançou (timeout/rede). Re-tenta na 1ª; na 2ª, desiste.
       await writeLog(attempt === 1 ? 'info' : 'error', 'enrichment', `Enricher parse/LLM falhou (tentativa ${attempt}/2): ${String(err).slice(0, 160)}`, { traceId });

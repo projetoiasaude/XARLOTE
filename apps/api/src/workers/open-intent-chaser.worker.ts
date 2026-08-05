@@ -102,6 +102,38 @@ async function chaseOpenIntents(nowMs: number): Promise<number> {
     const verdict = shouldNudgeIntent(intent, nowMs, { hasLiveConsultation: false, quietHours: isQuietHourBrt(nowMs) });
     if (!verdict.nudge) continue;
 
+    // 🔴 LER A FICHA ANTES DE COBRAR (auditoria 05/08). O Glauber tem um lembrete ativo
+    // "Contatar cardiologista Dr. Heleno de Souza" pra 01/10 — ele JÁ tem esse assunto
+    // encaminhado por conta própria. A Xarlote cobrou ele duas vezes sobre cardiologista como
+    // se não existisse nada, e isso faz ela parecer que não conhece o paciente.
+    // Cobrar o que a pessoa já resolveu é pior que não cobrar: quebra a confiança de que ela
+    // sabe o que está acontecendo. Se já existe lembrete sobre a mesma especialidade, a
+    // intenção não está órfã — encerra em silêncio em vez de insistir.
+    if (intent.specialty) {
+      const { data: agenda } = await db
+        .from('reminders')
+        .select('id, title')
+        .eq('user_id', u.id)
+        .eq('status', 'pending')
+        .in('type', ['appointment', 'custom']);
+      const esp = intent.specialty.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      // Casa pelo RADICAL: "cardiologista" na intenção contra "cardiologia"/"cardiolog" no
+      // título — o paciente e o modelo escrevem as duas formas.
+      const radical = esp.replace(/(logista|logia|iatra|pedista)$/, '');
+      const jaNaAgenda = (agenda ?? []).find((r) => {
+        const t = String(r.title ?? '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        return radical.length >= 5 && t.includes(radical);
+      });
+      if (jaNaAgenda) {
+        const { open_consultation_intent: _d2, ...resto2 } = (u.metadata as Record<string, unknown>) ?? {};
+        await db.from('users').update({ metadata: resto2 }).eq('id', u.id);
+        await writeLog('info', 'open-intent', `intenção de consulta encerrada SEM cobrar — o paciente já tem "${jaNaAgenda.title}" na agenda dele`, {
+          userId: u.id, reminderId: jaNaAgenda.id,
+        });
+        continue;
+      }
+    }
+
     const convId = await conversationOf(u.id as string);
     const phone = convId ? await phoneOf(convId) : null;
     if (!convId || !phone) continue;

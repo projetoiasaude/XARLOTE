@@ -103,6 +103,15 @@ export interface ChatOptions {
    * o modelo re-decide já ENXERGANDO o que suas ferramentas devolveram.
    */
   priorMessages?: ChatMessage[];
+  /**
+   * Força a resposta a ser um objeto JSON válido (`response_format: json_object`).
+   *
+   * Existe por causa do enricher de memória (auditoria 05/08): em 7 de 8 falhas o modelo
+   * devolveu texto VAZIO — não JSON malformado, NADA. Instrução no prompt ("responda apenas
+   * com JSON") não resolveu, e re-tentar com o mesmo modelo devolveu vazio de novo 10s depois.
+   * Quando a saída TEM que ser JSON, pedir no protocolo é mais forte que pedir no prompt.
+   */
+  jsonMode?: boolean;
 }
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
@@ -208,7 +217,8 @@ async function callOpenRouter(
   tools: ToolDefinition[] | undefined,
   temperature: number,
   maxTokens: number,
-  timeoutMs: number
+  timeoutMs: number,
+  jsonMode?: boolean,
 ): Promise<ChatResponse> {
   const start = Date.now();
 
@@ -233,6 +243,8 @@ async function callOpenRouter(
     body['tools'] = tools;
     body['tool_choice'] = 'auto';
   }
+  // Só faz sentido sem tools (tool call e json_object são saídas mutuamente exclusivas).
+  if (jsonMode && !tools?.length) body['response_format'] = { type: 'json_object' };
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -342,7 +354,7 @@ export async function chat(
   while (true) {
     try {
       return await breaker.execute(() =>
-        callOpenRouter(apiKey, modelName, messages, opts.tools, temperature, maxTokens, timeoutMs),
+        callOpenRouter(apiKey, modelName, messages, opts.tools, temperature, maxTokens, timeoutMs, opts.jsonMode),
       );
     } catch (err) {
       // Circuito aberto: não adianta retentar — propaga já pro caller degradar.
