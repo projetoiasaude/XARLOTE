@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -1448,6 +1448,7 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
   // pede cancelamento CLARO, há pedido ATIVO e o LLM não cancelou (nem tratou como troca),
   // cancelamos determinístico + mensagem honesta. Não confunde com cancelar LEMBRETE.
   let backstopCancelled = false;
+  let resolvedElsewhereTurn = false;
   {
     // Amplia o "já tratou": qualquer ação de progresso de pedido no turno significa que o
     // LLM NÃO leu como cancelamento — não força cancel (review 12/07: "não quero mais o
@@ -1469,7 +1470,15 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
       || /^\s*desisti\.?\s*$/i.test(uText);
     const deixaPraLa = /(^|\b)deixa\s+pra?\s+l[áa](\b|$)/i.test(uText) && uText.length < 25;
     const naoQueroMais = /\bn[ãa]o\s+quero\s+mais\s+(o\s+pedido|a\s+compra|o\s+rem[ée]dio|o\s+medicamento|a\s+entrega|nada)\b/i.test(uText);
-    const cancelIntent = (cancelWord || desistOrder || deixaPraLa || naoQueroMais)
+    // 🔴 RESOLVEU POR FORA (auditoria 05/08 — Ludmila): "Eu fiz o pedido na pacheco,
+    // Xarlote. Obrigada". Não é desistência, é RESOLUÇÃO — e nenhum dos quatro padrões
+    // acima a alcança. A Xarlote respondeu "que bom que fechou na Pacheco" e não cancelou:
+    // 3 min depois disse "sigo insistindo", 8 min depois mandou cotação de algo já comprado,
+    // e 5h30 depois o pedido ainda estava aberto. É a forma mais EDUCADA de encerrar, e por
+    // isso a mais comum: ele agradece enquanto avisa.
+    const resolveuPorFora = resolvedElsewhere(uText);
+    resolvedElsewhereTurn = resolveuPorFora;
+    const cancelIntent = (cancelWord || desistOrder || deixaPraLa || naoQueroMais || resolveuPorFora)
       && !/\blembrete|lembra|alarme|despertador\b/i.test(uText)  // cancelar LEMBRETE é outro caminho
       && !/\btroca(r)?\b/i.test(uText)                            // troca de remédio é outro fluxo
       && !/\b(essa|dessa|aquela|outra)\s+farm[áa]cia\b/i.test(uText); // "cancela ESSA farmácia" = trocar farmácia, não o pedido
@@ -1483,7 +1492,7 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
       });
       try {
         await handleToolCall(
-          { id: randomUUID(), name: 'cancel_order', args: { order_id: activeOrderId, reason: 'cancelado pelo usuário' } } as unknown as Parameters<typeof handleToolCall>[0],
+          { id: randomUUID(), name: 'cancel_order', args: { order_id: activeOrderId, reason: resolveuPorFora ? 'paciente resolveu por fora (comprou/pediu em outro lugar)' : 'cancelado pelo usuário' } } as unknown as Parameters<typeof handleToolCall>[0],
           turnToolCtx,
         );
         backstopCancelled = true;
@@ -1690,6 +1699,44 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
   // A exceção existe pra quando NINGUÉM falou sobre a falha; se um handler já falou, ele tem
   // a palavra final (a observação da tool que falhou segue visível no contexto do próximo turno).
   const anyToolFailed = executedToolCalls.some((t) => !t.ok);
+
+  // 🔴 UMA VOZ POR TURNO, POR CONSTRUÇÃO (auditoria 05/08 — conversa da Ludmila).
+  //
+  // Às 13:20 ela recebeu QUATRO mensagens em 20 segundos, e a terceira repetia a segunda:
+  //   (handler) "Achei 5 farmácias aqui na sua região e JÁ ENTREI EM CONTATO com elas"
+  //   (modelo)  "JÁ ESTOU ENTRANDO EM CONTATO com as farmácias da sua região, me dá uns
+  //              minutinhos… E me confirma: esse endereço é sua casa, trabalho ou outro?"
+  // `handleStartPharmacyOrder` manda 7 mensagens e nunca setou `suppressLlmText`. E a
+  // pergunta do endereço, que veio de carona, foi repetida pelo turno seguinte 8s depois:
+  // ela respondeu "Casa" e um minuto depois se corrigiu ("Perdão, lá é trabalho").
+  //
+  // Por que DETECTAR em vez de confiar na flag: a flag depende de cada autor futuro lembrar
+  // dela, e foi esquecê-la que produziu o incidente. Aqui a regra passa a valer por
+  // construção — se um handler falou com o paciente neste turno, ele tem a palavra, e vale
+  // pra todo handler que existir daqui pra frente sem ninguém precisar cadastrar nada.
+  //
+  // Uma query por TURNO (não por tool). O custo de suprimir uma resposta secundária é o
+  // paciente reperguntar; o custo de duas vozes é ele receber mensagens que se contradizem.
+  if (!turnToolCtx.turnFlags.suppressLlmText && executedToolCalls.length > 0) {
+    // Filtro por `trace_id` DESTE turno: sem ele, um lembrete disparando no mesmo instante
+    // (worker, trace próprio) contaria como "handler falou" e engoliria a resposta ao
+    // paciente. Handler sempre manda com `ctx.traceId`; worker nunca.
+    const { count: faladasPorHandler, error: contErr } = await db
+      .from('messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('conversation_id', conversation.id)
+      .eq('direction', 'out')
+      .eq('trace_id', traceId)
+      .gte('created_at', new Date(llmStart).toISOString());
+    // Erro de query NÃO pode suprimir a resposta: ficar mudo é pior que repetir.
+    if (!contErr && (faladasPorHandler ?? 0) > 0) {
+      turnToolCtx.turnFlags.suppressLlmText = true;
+      await writeLog('info', 'outbound', `voz única: ${faladasPorHandler} mensagem(ns) já enviada(s) por handler neste turno — texto do modelo suprimido pra não repetir`, {
+        traceId, conversationId: conversation.id, tools: executedToolCalls.map((t) => t.name),
+      });
+    }
+  }
+
   const lastRoundIsHonestyRecovery = agentRounds > 1 && llmResponseFinalHadNoTools && anyToolFailed
     && !turnToolCtx.turnFlags.suppressLlmText;
   const suppressReply = !lastRoundIsHonestyRecovery && (
@@ -1704,9 +1751,16 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
   // se o LLM também narrou outra ação (lembrete etc.), ANEXA sem engolir a narração dela.
   if (backstopCancelled) {
     const itemName = orderState?.items?.map((i) => itemDisplayName(i.name, i.dosage)).filter(Boolean).join(', ');
-    const cancelMsg = itemName
-      ? `Pronto, cancelei seu pedido de ${itemName} 💙`
-      : `Pronto, cancelei seu pedido 💙`;
+    // Tom diferente pra quem RESOLVEU (não desistiu): "cancelei seu pedido" soa como perda,
+    // e ele acabou de resolver o problema dele. E o desfazer explícito torna um falso
+    // positivo barato — é o que autoriza este backstop a agir sem perguntar antes.
+    const cancelMsg = resolvedElsewhereTurn
+      ? (itemName
+        ? `Que bom que você já resolveu! Encerrei a busca do ${itemName} aqui pra não te encher 💙 Se precisar que eu procure de novo, é só falar.`
+        : `Que bom que você já resolveu! Encerrei a busca aqui pra não te encher 💙 Se precisar que eu procure de novo, é só falar.`)
+      : (itemName
+        ? `Pronto, cancelei seu pedido de ${itemName} 💙`
+        : `Pronto, cancelei seu pedido 💙`);
     replyText = onlyCancelTurn || !replyText ? `${cancelMsg} Se precisar de mais alguma coisa, é só falar!` : `${cancelMsg}\n\n${replyText}`;
   }
 

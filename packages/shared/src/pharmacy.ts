@@ -433,6 +433,62 @@ export function isOrderAcceptance(text: string | null | undefined): boolean {
   return acceptRe.test(t) || superlative.test(t) || shortYes.test(t);
 }
 
+/**
+ * O paciente resolveu POR FORA — já comprou/pediu em outro lugar e o nosso pedido não faz
+ * mais sentido.
+ *
+ * ─── POR QUE ISTO EXISTE (auditoria 05/08, conversa da Ludmila) ───────────────
+ * 13:20 — ela pede a Pietra. Contatamos 5 farmácias, gastamos 5 templates HSM.
+ * 13:27 — ela escreve: **"Casa. Eu fiz o pedido na pacheco, Xarlote. Obrigada"**.
+ * 13:27 — a Xarlote responde "Que bom que fechou na Pacheco, Lud!" — e NÃO cancela nada.
+ * 13:30 — "As farmácias ainda não responderam, **sigo insistindo** aqui"
+ * 13:35 — "**Consegui cotações pra você!** 🎉 DROGALOBO R$63,99" — de algo já comprado.
+ * 5h30 depois o pedido seguia `quoted`, aberto.
+ *
+ * O detector de cancelamento que já existia cobria "cancela", "desisti", "deixa pra lá" e
+ * "não quero mais o pedido" — nenhum casa "fiz o pedido na pacheco". É uma FORMA DIFERENTE
+ * de encerrar: não é desistência, é resolução. E é a forma mais educada e mais comum, porque
+ * o paciente está agradecendo enquanto avisa.
+ *
+ * ─── DIREÇÃO DO CUIDADO ──────────────────────────────────────────────────────
+ * Encerrar um pedido que ele AINDA quer é pior que manter um que ele não quer — ele ficaria
+ * esperando uma entrega que ninguém vai fazer. Então exige-se verbo no PASSADO + objeto de
+ * compra, e "vou comprar"/"quero comprar" nunca casam. Quem chama isto avisa o paciente com
+ * desfazer fácil, o que torna um falso positivo barato.
+ */
+export function resolvedElsewhere(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const raw = text.trim();
+  const t = fold(raw);
+  // Pergunta nunca encerra ("já comprei aí antes?").
+  if (/\?\s*$/.test(raw)) return false;
+  // FUTURO/INTENÇÃO não é resolução — é o oposto, é o pedido começando.
+  if (/\b(vou|quero|queria|preciso|pretendo|posso|poderia)\s+(comprar|pedir|encomendar|buscar)\b/.test(t)) return false;
+  // Compra ANTIGA sendo mencionada como histórico, não como este pedido.
+  if (/\b(antes|outras vezes|da ultima vez|semana passada|mes passado|ano passado|sempre)\b/.test(t)) return false;
+
+  // Verbo de compra CONCLUÍDA em 1ª pessoa (ou impessoal de conclusão).
+  const compraFeita =
+    /\b(ja\s+)?(comprei|compramos|pedi|pedimos|encomendei|consegui|conseguimos|peguei|pegamos|adquiri)\b/.test(t)
+    || /\bfiz\s+o\s+pedido\b/.test(t)
+    || /\b(ja\s+)?(esta|ta|foi)\s+(comprado|pedido|encomendado|resolvido)\b/.test(t)
+    || /\bja\s+(resolvi|resolvemos|tenho|temos)\b/.test(t);
+  if (!compraFeita) return false;
+
+  // Precisa referir-se ao OBJETO/LUGAR: "comprei na pacheco", "já comprei o remédio",
+  // "fiz o pedido", "já resolvi". Sem isso, "consegui" solto (consegui dormir, consegui
+  // falar com o médico) encerraria um pedido por engano.
+  const temObjeto =
+    /\b(na|no|em|pela|pelo|numa|num)\s+\w{3,}/.test(t)          // "na pacheco", "no site"
+    || /\b(rem[ée]dio|medicamento|caixa|pietra|generico|farmacia|drogaria|pedido|compra|produto)\b/.test(t)
+    || /\bfiz\s+o\s+pedido\b/.test(t)
+    || /\bja\s+resolv/.test(t)
+    // "já está comprado" / "foi pedido": o particípio JÁ é a afirmação do objeto — não há
+    // outro complemento a exigir, e exigi-lo deixava passar a forma mais curta de todas.
+    || /\b(esta|ta|foi)\s+(comprado|pedido|encomendado|resolvido)\b/.test(t);
+  return temObjeto;
+}
+
 /** Palavra distintiva mais longa de um nome de farmácia (pra casar por nome). */
 function distinctiveWords(name: string): string[] {
   return fold(name)
