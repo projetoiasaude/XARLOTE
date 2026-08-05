@@ -282,6 +282,71 @@ export function isCriticalReminderType(type?: string | null): boolean {
 }
 
 /**
+ * 🔴 REMÉDIO NÃO É SUPLEMENTO (auditoria 05/08).
+ *
+ * `type='medication'` é carimbado pelo modelo em tudo que o paciente toma todo dia. Em
+ * produção, os SEIS lembretes `medication` existentes eram:
+ *
+ *   Neblock 5mg (anti-hipertensivo) ← o único remédio de verdade
+ *   Loção da barba · Creatina · Creatina backup · Creatina · Whey
+ *
+ * E os seis, igualmente: furavam o cap diário, disputavam o único template do dia e
+ * disparavam o alerta "💊 Remédio/consulta NÃO entregue" no WhatsApp do fundador.
+ * Consequências MEDIDAS em 24h:
+ *   • a loção da barba (08:30) ganhou o template do Glauber e a creatina (09:30) e o backup
+ *     (12:00) foram bloqueados — se ele tomasse um remédio real, a loção teria o slot dele;
+ *   • o whey do Ciro disparou um alerta crítico no WhatsApp do fundador.
+ *
+ * É o mesmo padrão que já corrigimos um nível abaixo (a água afogando o anti-hipertensivo),
+ * agora um nível acima: dentro de `medication`, o suplemento afoga o remédio. E agora afoga
+ * num canal PAGO e limitado, onde fadiga de alerta destrói o valor do canal.
+ *
+ * DIREÇÃO DO CUIDADO: na dúvida é `clinical`. Perder um alerta de dose real é irreversível;
+ * um alerta a mais sobre suplemento custa atenção. Então a lista é de EXCLUSÃO — só sai de
+ * clínico o que é reconhecidamente suplemento/cosmético.
+ */
+const ROTINA_NAO_CLINICA = [
+  // suplementos e nutrição esportiva
+  'whey', 'creatina', 'creatine', 'bcaa', 'glutamina', 'albumina', 'maltodextrina',
+  'hipercalorico', 'pre treino', 'pre-treino', 'pos treino', 'termogenico', 'colageno',
+  'caseina', 'dextrose', 'palatinose', 'beta alanina', 'taurina', 'arginina',
+  // cosméticos e higiene
+  'locao', 'shampoo', 'condicionador', 'sabonete', 'hidratante', 'protetor solar',
+  'creme facial', 'creme corporal', 'desodorante', 'perfume', 'oleo capilar',
+  'minoxidil topico', 'barba', 'cabelo', 'unha',
+  // chás e naturais sem dose clínica
+  'cha ', 'agua de coco', 'suco verde',
+];
+
+/** Suplemento/cosmético continua sendo lembrado — só não compete com dose de remédio. */
+export type ReminderCriticality = 'clinical' | 'routine';
+
+/**
+ * Criticidade REAL do lembrete: o tipo diz o fluxo, o TÍTULO diz o que está em jogo.
+ *
+ * `appointment` é sempre clínico (perder consulta custa a consulta). `medication` é clínico
+ * a menos que o título seja reconhecidamente suplemento/cosmético. Todo o resto é rotina.
+ */
+export function reminderCriticality(title?: string | null, type?: string | null): ReminderCriticality {
+  if (!isCriticalReminderType(type)) return 'routine';
+  if (type === 'appointment') return 'clinical'; // consulta nunca é rotina
+  const t = (title ?? '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+  if (!t.trim()) return 'clinical'; // sem título, assume o pior
+  // Dose explícita (mg/ml/UI/mcg) é sinal FORTE de medicamento e vence a lista de exclusão:
+  // "colágeno 10g" é suplemento, mas "Puran T4 50mcg" jamais deve cair em rotina.
+  if (/\b\d+\s?(mg|mcg|µg|ml|ui|g\/ml)\b/.test(t)) return 'clinical';
+  return ROTINA_NAO_CLINICA.some((w) => t.includes(w)) ? 'routine' : 'clinical';
+}
+
+/** Atalho: este lembrete merece acordar o fundador se não for entregue? */
+export function deservesFounderAlert(title?: string | null, type?: string | null): boolean {
+  return reminderCriticality(title, type) === 'clinical';
+}
+
+/**
  * BAIXA URGÊNCIA = água, exercício, custom. Limiar DIFERENTE de `isCriticalReminderType`, e
  * de propósito: `sleep` não é crítico (não corta a cota de medicação) mas também não é
  * descartável (o push dele não é cortado). São dois degraus reais, derivados da mesma

@@ -19,7 +19,7 @@ import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBod
 import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
-import { reengageTemplateEnabled, buildReengageTemplate, reengageReasonForReminder, REENGAGE_REASON_SILENT, reengageIntervalMs, reengageCooldownElapsed, localDayKey, nextBlockedStreak, shouldPauseUndeliverable, reminderTemplatePriority, isCriticalReminderType, isLowUrgencyReminderType } from '../config/template-registry.js';
+import { reengageTemplateEnabled, buildReengageTemplate, reengageReasonForReminder, REENGAGE_REASON_SILENT, reengageIntervalMs, reengageCooldownElapsed, localDayKey, nextBlockedStreak, shouldPauseUndeliverable, reminderCriticality, reminderTemplatePriority, isCriticalReminderType, isLowUrgencyReminderType } from '../config/template-registry.js';
 
 /**
  * Dias SEGUIDOS de não-entrega a partir dos quais um lembrete recorrente NÃO-crítico para
@@ -48,20 +48,30 @@ const CRITICAL_LOOKAHEAD_CAP_MS = 12 * 60 * 60_000;
  * gastar o template, olhamos à frente (até o fim do cooldown, no máx 12h) e, se houver
  * medicação/consulta vindo, seguramos o slot pra ela.
  */
-async function criticalReminderComingSoon(userId: string, currentPriority: number, lookaheadMs: number): Promise<boolean> {
-  if (currentPriority >= reminderTemplatePriority('appointment')) return false; // já é crítico
+async function criticalReminderComingSoon(
+  userId: string,
+  amClinical: boolean,
+  lookaheadMs: number,
+): Promise<boolean> {
+  // "Já sou crítico" passou a significar CLÍNICO, não "meu tipo é alto" (revisão adversarial
+  // 05/08). Com o teste antigo, um WHEY — `type='medication'`, prioridade alta — retornava
+  // aqui na primeira linha e NUNCA cedia o slot pro anti-hipertensivo do mesmo paciente.
+  if (amClinical) return false;
   const until = new Date(Date.now() + Math.min(lookaheadMs, CRITICAL_LOOKAHEAD_CAP_MS)).toISOString();
+  // `title` no select: sem ele, um WHEY vindo em 30min "segurava" o template que a água
+  // poderia usar — e depois o whey também não o usava, porque perdia pra outro. Ceder o slot
+  // só faz sentido pra quem é CLÍNICO de verdade.
   const { data, error } = await db
     .from('reminders')
-    .select('id')
+    .select('id, title, type')
     .eq('user_id', userId)
     .eq('status', 'pending')
     .in('type', ['medication', 'appointment'])
     .lte('next_run_at', until)
-    .limit(1);
+    .limit(10);
   // Fail-open: erro de query NÃO pode segurar o template (melhor mandar algo que nada).
   if (error) return false;
-  return (data?.length ?? 0) > 0;
+  return (data ?? []).some((r) => reminderCriticality(r.title as string | null, r.type as string | null) === 'clinical');
 }
 
 /** A perna do usuário (SARA) é WhatsApp oficial (zpro) → a janela de 24h se aplica? */
@@ -162,7 +172,13 @@ export async function dispatchReminders(): Promise<void> {
   {
     const best = new Map<string, { id: string; prio: number; at: number }>();
     for (const r of due as unknown as DueReminder[]) {
-      const prio = reminderTemplatePriority(r.type);
+      // 🔴 Criticidade entra na prioridade (revisão adversarial 05/08). Só o `type` empatava
+      // "Loção da barba" com "Losartana 50mg" — os dois `medication` — e o desempate era por
+      // horário, então o cosmético das 08:30 levava o template que o remédio das 09:30
+      // precisava. Clínico ganha de rotina SEMPRE, e o horário só desempata dentro do mesmo
+      // degrau.
+      const prio = reminderTemplatePriority(r.type) * 2
+        + (reminderCriticality(r.title, r.type) === 'clinical' ? 1 : 0);
       const at = new Date(r.next_run_at).getTime();
       const cur = best.get(r.user_id);
       if (!cur || prio > cur.prio || (prio === cur.prio && at < cur.at)) {
@@ -171,6 +187,35 @@ export async function dispatchReminders(): Promise<void> {
     }
     for (const [uid, b] of best) templateOwner.set(uid, b.id);
   }
+  // 🔴 FUNDIR LEMBRETES DA MESMA JANELA (auditoria 05/08).
+  //
+  // O Ciro tem Creatina e Whey às 10:20 — mesmo minuto, mesmo paciente. Só UM template por
+  // paciente/dia, então a creatina saía e o whey era bloqueado. TODO DIA, indefinidamente.
+  // O Vadivino idem: "Exercício matinal" 08:00 entrega, "(reforço)" 08:05 bloqueia.
+  //
+  // Não era falta de slot — era não tentarmos juntar. Os dois cabem numa mensagem: o template
+  // carrega o MOTIVO numa variável, e "Creatina e Whey" ocupa o mesmo espaço que "Creatina".
+  // Um template, os dois entregues, zero custo adicional.
+  const COALESCE_WINDOW_MS = 15 * 60_000;
+  /** dono do slot → títulos de todos os lembretes que vão na mesma mensagem (dono incluído) */
+  const coalescedTitles = new Map<string, string[]>();
+  /** lembrete que viaja DENTRO da mensagem do dono (não manda a sua própria) */
+  const coalescedInto = new Map<string, string>();
+  {
+    for (const r of due as unknown as DueReminder[]) {
+      const ownerId = templateOwner.get(r.user_id);
+      if (!ownerId) continue;
+      const owner = (due as unknown as DueReminder[]).find((x) => x.id === ownerId);
+      if (!owner) continue;
+      const perto = Math.abs(new Date(r.next_run_at).getTime() - new Date(owner.next_run_at).getTime()) <= COALESCE_WINDOW_MS;
+      if (!perto) continue;
+      const lista = coalescedTitles.get(ownerId) ?? [];
+      if (r.title && !lista.includes(r.title)) lista.push(r.title);
+      coalescedTitles.set(ownerId, lista);
+      if (r.id !== ownerId) coalescedInto.set(r.id, ownerId);
+    }
+  }
+
   /** Libera o slot quando o dono é pulado (staleness/cap/condicional) — senão ninguém usa. */
   const releaseTemplateSlot = (userId: string, reminderId: string) => {
     if (templateOwner.get(userId) === reminderId) templateOwner.delete(userId);
@@ -304,8 +349,17 @@ export async function dispatchReminders(): Promise<void> {
     // Uma definição só de "crítico" (ver isCriticalReminderType) — antes esta linha era uma
     // das quatro codificações paralelas do mesmo conceito. Vale pro cap, pro nível de log e
     // pro sinal do evento.
-    const isCritical = isCriticalReminderType(reminder.type);
-    const capExempt = isCritical;
+    // 🔴 CRITICIDADE PELO QUE ESTÁ EM JOGO, NÃO PELO TIPO (auditoria 05/08). Dos 6 lembretes
+    // `medication` da produção, 1 era remédio (Neblock 5mg) — os outros eram loção da barba,
+    // creatina (3x) e whey. E os seis disparavam o alerta "Remédio NÃO entregue" no WhatsApp
+    // do fundador e disputavam o único template do dia: a loção venceu a creatina do Glauber,
+    // e o whey do Ciro acordou o fundador. Suplemento afogando remédio, um nível acima do
+    // caso da água afogando o anti-hipertensivo.
+    const criticality = reminderCriticality(reminder.title, reminder.type);
+    const isCritical = criticality === 'clinical';
+    // O cap segue isento pra TODO `medication`/`appointment`: suplemento que o paciente pediu
+    // não deve ser cortado por flood. O que muda é só quem ganha o template e quem alerta.
+    const capExempt = isCriticalReminderType(reminder.type);
     let pushCapReached = false; // flood de PUSH no app pra usuário pouco responsivo (ver abaixo)
     if (reminder.rrule && !isConditionalBackup && !capExempt) {
       const cap = user.reminder_max_per_day ?? 6;
@@ -461,7 +515,7 @@ export async function dispatchReminders(): Promise<void> {
     if (reengageTplAllowed && needsWindow && !windowOpen) {
       const yieldToCritical = await criticalReminderComingSoon(
         reminder.user_id,
-        reminderTemplatePriority(reminder.type),
+        isCritical, // clínico não cede; rotina cede
         cooldownMs,
       );
       if (yieldToCritical) {
@@ -515,7 +569,17 @@ export async function dispatchReminders(): Promise<void> {
         // janela: template do negócio NÃO abre janela de 24h — só a resposta do paciente abre.
         // Sem esse pedido, o paciente ficava preso recebendo 1 lembrete/dia pra sempre.
         const silentDays = Number.isFinite(windowSilentMs) ? windowSilentMs / 86_400_000 : 999;
-        const tpl = buildReengageTemplate(name.split(' ')[0] ?? name, reengageReasonForReminder(reminder, whenLabel, silentDays));
+        // Título COMBINADO: o dono fala por todos os lembretes da mesma janela.
+        const juntos = coalescedTitles.get(reminder.id) ?? [reminder.title];
+        const tituloCombinado = juntos.length > 1
+          ? `${juntos.slice(0, -1).join(', ')} e ${juntos[juntos.length - 1]}`
+          : reminder.title;
+        const tpl = buildReengageTemplate(name.split(' ')[0] ?? name, reengageReasonForReminder({ type: reminder.type, title: tituloCombinado }, whenLabel, silentDays));
+        if (juntos.length > 1) {
+          await writeLog('info', 'reminder', `${juntos.length} lembretes da mesma janela fundidos num template só — ${juntos.join(' + ')}`, {
+            userId: reminder.user_id, reminderId: reminder.id,
+          });
+        }
         await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text, messageId: mirroredMessageId ?? undefined });
         whatsappDelivered = true;
         deliveryStatus = 'delivered';
@@ -526,6 +590,15 @@ export async function dispatchReminders(): Promise<void> {
         if (mirroredMessageId) await db.from('messages').update({ content: tpl.text }).eq('id', mirroredMessageId);
         await db.from('users').update({ metadata: { ...uMeta, reengage_template_at: now.toISOString() } }).eq('id', reminder.user_id);
         await writeLog('info', 'reminder', `fora da janela 24h → template de re-engajamento enviado ("${reminder.title}")`, {});
+      } else if (coalescedInto.has(reminder.id) && templateSentThisTick.has(reminder.user_id)) {
+        // Foi ENTREGUE — dentro do template do dono do slot, que saiu neste mesmo tick com o
+        // título dele incluído. Marcar como bloqueado aqui seria mentir sobre uma entrega que
+        // aconteceu (e reacenderia o alerta de "remédio não entregue" sem motivo).
+        whatsappDelivered = true;
+        deliveryStatus = 'delivered';
+        await writeLog('info', 'reminder', `lembrete "${reminder.title}" entregue JUNTO com o template do mesmo horário — não gasta um segundo template`, {
+          reminderId: reminder.id, userId: reminder.user_id,
+        });
       } else if (shouldPauseUndeliverable({
         recurring: Boolean(reminder.rrule),
         critical: isCritical,
@@ -792,7 +865,7 @@ export async function dispatchReminders(): Promise<void> {
             // carimbava `reengage_template_at` e o remédio do mesmo paciente ficava sem canal.
             const criticalWaiting = await criticalReminderComingSoon(
               reminder.user_id,
-              0, // check-in genérico = prioridade mínima por definição
+              false, // check-in genérico nunca é clínico — sempre cede
               reengageIntervalMs(silentMs),
             );
             // Mesma tolerância do caminho por-lembrete: sem ela, "faltou um segundinho"
