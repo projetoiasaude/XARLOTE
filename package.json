@@ -19,7 +19,7 @@
     "start:prod": "concurrently --kill-others-on-fail --names api,worker --prefix-colors blue,green \"PORT=3001 ROLE=api pnpm --filter @iasaude/api start\" \"PORT=3010 ROLE=worker pnpm --filter @iasaude/api start\""
   },
   "devDependencies": {
-    "@types/node": "^20.14.0",
+    "@types/node": "^26.1.0",
     "concurrently": "^9.0.0",
     "prettier": "^3.3.0",
     "typescript": "^5.4.0",
