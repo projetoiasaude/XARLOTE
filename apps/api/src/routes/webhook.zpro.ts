@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { constantTimeEquals } from '../middleware/auth.js';
 import type { FastifyInstance } from 'fastify';
 import { normalizeZproWebhook, zproEventId, isZproStatusEcho, extractZproDeliverySignal, describeShape } from '@iasaude/whatsapp';
 import { db, writeLog, redactPII } from '@iasaude/db';
@@ -90,7 +91,9 @@ export async function webhookZproRoute(app: FastifyInstance) {
       const expectedSecret = process.env['ZPRO_WEBHOOK_SECRET'];
       if (expectedSecret) {
         const provided = req.query?.key || req.headers['x-zpro-secret'];
-        if (provided !== expectedSecret) {
+        // Comparação constant-time (auditoria 05/08): `!==` vaza timing do prefixo do
+        // segredo — irrelevante em LAN, relevante numa API pública na internet.
+        if (typeof provided !== 'string' || !constantTimeEquals(provided, expectedSecret)) {
           return reply.code(401).send({ error: 'Unauthorized' });
         }
       }

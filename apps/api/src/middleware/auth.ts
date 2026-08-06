@@ -14,7 +14,8 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
  *   - dev/local → permite, com aviso no log (pra não travar o desenvolvimento).
  */
 
-function constantTimeEquals(a: string, b: string): boolean {
+/** Comparação constant-time de segredos — exportada pra webhooks e demo-OTP reusarem. */
+export function constantTimeEquals(a: string, b: string): boolean {
   // hash em comprimento fixo evita vazar tamanho e satisfaz timingSafeEqual
   const ha = createHash('sha256').update(a).digest();
   const hb = createHash('sha256').update(b).digest();

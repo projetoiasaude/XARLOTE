@@ -100,6 +100,26 @@ export function reengageTemplateEnabled(): boolean {
   return process.env['ZPRO_TEMPLATE_REENGAGE_APPROVED'] === 'true';
 }
 
+// ─── OTP de login do APP (fora da janela de 24h) ─────────────────────────────
+// Login por código via WhatsApp: dentro da janela vai texto livre; fora, a Meta só
+// aceita template — e template de código é categoria AUTHENTICATION, com corpo
+// padronizado pela própria Meta ("{{1}} é seu código de verificação."). O nome vem
+// de env porque o fundador cria/aprova no zpro (mesmo modelo dos demais templates).
+// Sem env setada = ainda não aprovado → o caller responde 503 orientando o paciente
+// a mandar um oi pra Xarlote (o que abre a janela e libera o texto livre).
+export function buildOtpTemplate(code: string): { name: string; language: string; variables: string[]; text: string } | null {
+  const name = process.env['ZPRO_TEMPLATE_OTP_CODE']?.trim();
+  if (!name) return null;
+  return {
+    name,
+    language: templateLanguage(),
+    variables: [code],
+    // Espelho local do corpo AUTHENTICATION padrão da Meta (não alterar sem conferir
+    // o template aprovado — o texto persistido tem que bater com o que o paciente lê).
+    text: `${code} é seu código de verificação.`,
+  };
+}
+
 /**
  * BACK-OFF do template de re-engajamento por tempo de silêncio (auditoria 20/07).
  *

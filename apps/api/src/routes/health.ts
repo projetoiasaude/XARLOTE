@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { isPushConfigured } from '@iasaude/integrations';
 import { db } from '@iasaude/db';
 import { providerFor } from '@iasaude/whatsapp';
 import { SARA_INSTANCE, AGENT_INSTANCE } from '@iasaude/shared';
@@ -84,6 +85,9 @@ export async function healthRoute(app: FastifyInstance) {
       whatsapp_mode: process.env['WHATSAPP_MODE'] ?? 'live',
       wa_provider_sara: providerFor(SARA_INSTANCE),
       wa_provider_agent: providerFor(AGENT_INSTANCE),
+      // Push silenciosamente morto era INVISÍVEL (auditoria 05/08: isPushConfigured
+      // existia e ninguém chamava) — agora o /health conta a verdade.
+      push_configured: isPushConfigured(),
       uptime_s: Math.round(process.uptime()),
       ts: new Date().toISOString(),
     });

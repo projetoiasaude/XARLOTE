@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { db, findUserByPhone, writeEvent, registerDeviceToken, unregisterDeviceToken } from '@iasaude/db';
 import { buildSimulatedInbound } from '@iasaude/whatsapp';
-import { SARA_INSTANCE, nextOccurrence } from '@iasaude/shared';
+import { SARA_INSTANCE, nextOccurrence, reminderActionPatch } from '@iasaude/shared';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { loadPrompts } from '../config/prompts.js';
 import { requireAppToken } from '../middleware/auth.js';
@@ -290,27 +290,22 @@ export async function appRoute(app: FastifyInstance) {
     if (reminder.user_id !== user.id) return reply.code(403).send({ error: 'forbidden' });
 
     const action = parsed.data.action;
-    // Cancelado é terminal: done/snooze não ressuscitam (cancel de novo é no-op OK).
-    if (reminder.status === 'cancelled' && action !== 'cancel') {
+    // Máquina de estados EXTRAÍDA pra @iasaude/shared (F0 do app nativo): app RN, web
+    // e esta rota decidem pela MESMA função pura testada (tests/reminder-actions.test.ts).
+    // Comportamento idêntico ao anterior: cancelado é terminal; done em recorrente
+    // reagenda e segue pending; last_confirmed_at destrava o backup condicional (0020).
+    const nextRecurring = reminder.rrule ? nextOccurrence(reminder.rrule) : null;
+    const decision = reminderActionPatch(
+      { status: reminder.status as string, rrule: reminder.rrule as string | null, nextRecurringIso: nextRecurring?.toISOString() ?? null },
+      action,
+      parsed.data.minutes,
+      Date.now(),
+    );
+    if (decision.kind === 'reject') {
       return reply.code(409).send({ error: 'reminder_cancelled' });
     }
-    // "done" num recorrente = concluiu o de HOJE → reagenda o próximo e segue
-    // pending (acknowledged mataria a recorrência). One-shot → acknowledged.
-    const nextRecurring = reminder.rrule ? nextOccurrence(reminder.rrule) : null;
-    const patch: Record<string, unknown> =
-      action === 'done'
-        // last_confirmed_at (0020): botão "done" = confirmação → destrava o gate do backup condicional.
-        ? nextRecurring
-          ? { status: 'pending', next_run_at: nextRecurring.toISOString(), last_run_at: new Date().toISOString(), last_confirmed_at: new Date().toISOString() }
-          : { status: 'acknowledged', last_confirmed_at: new Date().toISOString() }
-        : action === 'cancel'
-          ? { status: 'cancelled' }
-          : {
-              status: 'pending',
-              next_run_at: new Date(Date.now() + (parsed.data.minutes ?? 30) * 60_000).toISOString(),
-            };
 
-    const { error } = await db.from('reminders').update(patch).eq('id', reminder.id);
+    const { error } = await db.from('reminders').update(decision.patch).eq('id', reminder.id);
     if (error) return reply.code(500).send({ error: error.message });
 
     void writeEvent({

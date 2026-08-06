@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
 import multipart from '@fastify/multipart';
 import { healthRoute } from './routes/health.js';
 import { simulateRoute } from './routes/simulate.js';
@@ -8,6 +9,7 @@ import { webhookRoute } from './routes/webhook.uazapi.js';
 import { webhookZproRoute } from './routes/webhook.zpro.js';
 import { adminRoute } from './routes/admin.js';
 import { appRoute } from './routes/app.js';
+import { appPatientRoutes } from './routes/app/index.js';
 import { startAllWorkers } from './workers/start-all.js';
 import { closeOutbound } from './queues/outbound.queue.js';
 import { flushSupplierTurnBuffer } from './handlers/inbound-supplier.js';
@@ -74,6 +76,9 @@ async function main() {
   }
 
   const app = Fastify({
+    // Atrás do proxy do Railway, req.ip era o IP do PROXY — o fallback de rate limit
+    // por IP virava um bucket global (auditoria 05/08). trustProxy devolve o IP real.
+    trustProxy: true,
     logger: {
       level: process.env['LOG_LEVEL'] ?? 'info',
       // Nunca logar segredos/cabeçalhos sensíveis no logger HTTP do Fastify.
@@ -105,6 +110,9 @@ async function main() {
   });
 
   await app.register(cors, { origin: corsOrigins() });
+  // Headers de segurança (auditoria 05/08: não havia NENHUM). CSP desligada — isto é
+  // uma API JSON, não serve HTML; os demais (nosniff, frame-deny, HSTS) valem.
+  await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } });
 
   // Sentry (F1.B1): captura toda exceção de request/webhook (no-op se sem DSN).
@@ -126,6 +134,9 @@ async function main() {
     app.register(adminRoute, { prefix: '/admin' });
     // Rotas do Xarlote App (cliente final) — ativas também em produção.
     app.register(appRoute, { prefix: '/app' });
+    // Rotas NOVAS do app (auth OTP + JWT de paciente) — convivem com as legadas
+    // até o cutover do web (F5); depois o legado morre junto com as anon_read_*.
+    app.register(appPatientRoutes, { prefix: '/app' });
   }
 
   const port = Number(process.env['PORT'] ?? 3001);

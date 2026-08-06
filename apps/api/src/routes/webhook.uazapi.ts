@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { constantTimeEquals } from '../middleware/auth.js';
 import type { FastifyInstance } from 'fastify';
 import { normalizeWebhookPayload } from '@iasaude/whatsapp';
 import { db, writeLog, redactPII } from '@iasaude/db';
@@ -25,7 +26,7 @@ export async function webhookRoute(app: FastifyInstance) {
 
     // Verify secret when configured
     const expectedSecret = process.env['UAZAPI_WEBHOOK_SECRET'];
-    if (expectedSecret && secret !== expectedSecret) {
+    if (expectedSecret && (typeof secret !== 'string' || !constantTimeEquals(secret, expectedSecret))) {
       return reply.code(401).send({ error: 'Unauthorized' });
     }
 
