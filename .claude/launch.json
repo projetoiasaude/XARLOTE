@@ -2,6 +2,13 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "// mobile-preview": "Serve o export WEB do app nativo (apps/mobile) só pra CONFERIR layout sem simulador. Gere antes com: pnpm --filter @iasaude/mobile exec expo export --platform web --output-dir dist-web",
+      "name": "xarlote-mobile-preview",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "3006", "-d", "apps/mobile/dist-web", "--bind", "127.0.0.1"],
+      "port": 3006
+    },
+    {
       "name": "xarlote-site",
       "runtimeExecutable": "python3",
       "runtimeArgs": ["-m", "http.server", "3005", "-d", "site", "--bind", "127.0.0.1"],

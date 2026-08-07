@@ -13,7 +13,22 @@
     "jsx": "preserve",
     "incremental": true,
     "plugins": [{ "name": "next" }],
-    "paths": { "@/*": ["./*"] }
+    "paths": {
+      "@/*": ["./*"],
+      // Este app é React 18; o apps/mobile é React 19. O pnpm põe UMA das duas
+      // versões de @types/react no hoist oculto (.pnpm/node_modules), e ganhou a 19.
+      // O .d.ts interno do Next importa 'react' e cai justamente lá — aí o namespace
+      // global `React` deste programa vira uma fusão de 18+19 e tipos que mudaram
+      // entre as versões (RefObject, por exemplo) passam a não bater com o que o
+      // useRef daqui devolve. Fixar o caminho resolve TODO import de 'react' do
+      // programa nos tipos deste app, inclusive os de dentro de dependências.
+      "react": ["./node_modules/@types/react"],
+      "react-dom": ["./node_modules/@types/react-dom"]
+    },
+    // `paths` só governa import/require. O Next puxa os tipos do React também por
+    // `/// <reference types="react/experimental" />`, que resolve por typeRoots —
+    // e sem esta linha o walk-up parte de dentro do .pnpm e acha a 19 do hoist.
+    "typeRoots": ["./node_modules/@types", "../../node_modules/@types"]
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
   "exclude": ["node_modules"]
