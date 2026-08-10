@@ -4,6 +4,7 @@ import { synthesizeSpeech, humanizeForVoice } from '@iasaude/integrations';
 import { SARA_INSTANCE } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
+import { publishMessageEvent } from '../lib/app-publish.js';
 import { uploadPublicAudio } from './audio-host.js';
 
 interface LlmMeta {
@@ -83,6 +84,19 @@ export async function sendOutbound(
 
   // Update last_message_at
   await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversationId);
+
+  // Tempo real do app nativo: a resposta da Xarlote aparece na tela sem polling.
+  // Fica DEPOIS do insert (o evento carrega o id da linha, que é o que deixa o
+  // cliente idempotente) e é best-effort por construção — `publishAppEvent` engole
+  // qualquer erro, porque Redis fora NÃO pode emudecer a Xarlote no WhatsApp.
+  if (inserted?.id) {
+    publishMessageEvent(conversationId, {
+      id: inserted.id as string,
+      direction: 'out',
+      contentType: 'text',
+      text,
+    });
+  }
 
   // In simulator mode, do not call uazapi
   if (isSimulatorMode()) {
@@ -182,7 +196,7 @@ export async function sendOutboundAudio(
   }
 
   // Persiste mensagem outbound como áudio (transcrição = texto original).
-  await db.from('messages').insert({
+  const { data: insertedAudio } = await db.from('messages').insert({
     conversation_id: conversationId,
     direction: 'out',
     sender_role: 'assistant',
@@ -195,8 +209,19 @@ export async function sendOutboundAudio(
     llm_tokens_in: llmMeta.tokensIn ?? null,
     llm_tokens_out: llmMeta.tokensOut ?? null,
     llm_latency_ms: llmMeta.latencyMs ?? null,
-  });
+  }).select('id').single();
   await db.from('conversations').update({ last_message_at: new Date().toISOString() }).eq('id', conversationId);
+
+  // Tempo real: o app recebe o áudio com a transcrição junto (é o `text`), então a
+  // bolha já nasce legível mesmo antes de o paciente tocar o play.
+  if (insertedAudio?.id) {
+    publishMessageEvent(conversationId, {
+      id: insertedAudio.id as string,
+      direction: 'out',
+      contentType: 'audio',
+      text,
+    });
+  }
 
   // Em simulador não chama uazapi (mensagem já foi persistida pra aparecer no dashboard)
   if (isSimulatorMode()) return true;

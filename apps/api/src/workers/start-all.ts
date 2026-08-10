@@ -33,6 +33,7 @@ import { startRedFlagEscalatorWorker } from './red-flag-escalator.worker.js';
 import { startNudgeWorker, stopNudgeWorker } from './nudge-stalled-flows.worker.js';
 import { startOrderFollowupWorker, stopOrderFollowupWorker } from './order-followup.worker.js';
 import { startOutboundWorkers } from '../queues/outbound.queue.js';
+import { startAppInboundWorker, stopAppInboundWorker } from './app-inbound.worker.js';
 import { onShutdown } from '../lifecycle.js';
 import { withCronLock } from '../middleware/cron-lock.js';
 
@@ -92,6 +93,9 @@ export function startAllWorkers(log: WorkerLogger): void {
   // ── Consumidores das filas outbound (rate-limit de envio WhatsApp, F0.7) ──
   startOutboundWorkers();
 
+  // ── Mensagens do app nativo: o turno da LLM saiu do request HTTP (F2) ──
+  startAppInboundWorker();
+
   // ── Disposers específicos dos workers (na ordem de registro) ──
   onShutdown('cron intervals', () => {
     clearInterval(reminderTimer);
@@ -99,12 +103,13 @@ export function startAllWorkers(log: WorkerLogger): void {
     stopNudgeWorker();
     stopOrderFollowupWorker();
   });
+  onShutdown('app-inbound worker', () => stopAppInboundWorker());
   onShutdown('profile-enricher worker', () => enricherWorker.close());
 
   log.info(
     'Workers ON: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h), ' +
       'inventory-tracker (6h), adherence-scorer (24h), consultation-feedback (1h), consultation-dispatcher (30s), ' +
       'kg-builder (6h), skill-extractor (24h), anomaly-detector (10min), metrics-aggregator (1h), ' +
-      'red-flag-escalator (10s), order-followup (2min), outbound-whatsapp (queue)',
+      'red-flag-escalator (10s), order-followup (2min), outbound-whatsapp (queue), app-inbound (queue)',
   );
 }

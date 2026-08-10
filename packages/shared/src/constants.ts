@@ -66,6 +66,8 @@ export const QUEUE_NAMES = {
   QUOTE_CONSOLIDATION: 'quote-consolidation',
   REMINDER_DISPATCHER: 'reminder-dispatcher',
   PROFILE_ENRICHER: 'profile-enricher',
+  /** Mensagens vindas do app nativo — o turno da LLM sai do request HTTP. */
+  APP_INBOUND: 'app-inbound',
 } as const;
 
 export const SARA_INSTANCE = 'sara';

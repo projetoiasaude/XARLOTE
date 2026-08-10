@@ -41,6 +41,8 @@ import { sendMenu, isSimulatorMode, fetchInboundMedia } from '@iasaude/whatsapp'
 import { transcribeAudio } from '@iasaude/integrations';
 import { Queue } from 'bullmq';
 import { loadPrompts } from '../config/prompts.js';
+import { publishMessageEvent } from '../lib/app-publish.js';
+import { extractAppClientId } from '../lib/app-inbound.js';
 import { sendOutbound, sendOutboundAudio } from './outbound.js';
 import { handleToolCall, type ToolResult } from './tool-executor.js';
 import { uploadInboundMedia } from './media-host.js';
@@ -220,6 +222,23 @@ async function processInboundUserInner(
     // quem sumiu. Agora todo inbound carimba "ativo agora" (dashboard + sinais de engajamento).
     db.from('users').update({ last_active_at: new Date().toISOString() }).eq('id', user.id),
   ]);
+
+  // Tempo real do app: publica a bolha do PRÓPRIO paciente. Parece redundante (ele
+  // acabou de digitar), e não é — é isto que fecha o eco do envio otimista. O app
+  // desenhou a bolha na hora, com o `clientId` dele; quando este evento chega com o
+  // mesmo clientId, ele troca "enviando…" pela definitiva. Sem o evento, a bolha fica
+  // eternamente em "enviando" mesmo com a mensagem já salva e respondida.
+  // Também serve ao caso multi-aparelho: escrever no celular aparece no tablet.
+  if (inboundMsg?.id) {
+    const clientId = extractAppClientId(inbound.externalId);
+    publishMessageEvent(conversation.id, {
+      id: inboundMsg.id,
+      direction: 'in',
+      contentType: inbound.contentType,
+      text: inbound.text ?? null,
+      ...(clientId ? { clientId } : {}),
+    });
+  }
 
   // 5a. Comando especial @teste — zera tudo e reinicia Xarlote.
   // SÓ em modo simulador (dev local): em produção isso apagaria o banco INTEIRO
