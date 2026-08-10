@@ -100,6 +100,14 @@ async function performRefresh(): Promise<string | null> {
   }
 }
 
+/**
+ * O access token vigente, pra quem NÃO passa por `apiFetch` — hoje só o SSE, que
+ * precisa mandar o header na abertura da conexão e é gerenciado por outra biblioteca.
+ */
+export function currentAccessToken(): string | null {
+  return bridge?.getAccessToken() ?? null;
+}
+
 /** Garante um access token novo, com no máximo uma rotação em voo por vez. */
 export function refreshAccessToken(): Promise<string | null> {
   if (!inflightRefresh) {
