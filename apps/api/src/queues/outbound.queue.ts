@@ -40,6 +40,12 @@ export interface OutboundJob {
   templateLanguage?: string;
   templateVariables?: string[];
   /**
+   * Só em template de AUTENTICAÇÃO com botão "Copiar código": a Meta exige o código
+   * repetido num componente de botão além do corpo. Ausente nos demais templates —
+   * mandar componente de botão pra template sem botão aprovado é recusado.
+   */
+  templateCopyCode?: string;
+  /**
    * Token único do ENFILEIRAMENTO (idempotência de envio — ver sendDedupKey). Preenchido
    * automaticamente pelo `dispatchOutbound`; os callers não passam.
    */
@@ -332,6 +338,7 @@ async function sendClaimed(job: OutboundJob): Promise<void> {
         name: job.templateName ?? '',
         language: job.templateLanguage ?? 'pt_BR',
         variables: job.templateVariables ?? [],
+        ...(job.templateCopyCode ? { copyCode: job.templateCopyCode } : {}),
       });
       // Loga o SUCESSO também (não só a falha) — senão o admin via só erros e fica
       // sem saber se a abertura fria REALMENTE saiu (visibilidade assimétrica).

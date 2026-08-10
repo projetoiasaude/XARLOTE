@@ -172,7 +172,8 @@ export async function appAuthRoutes(app: FastifyInstance): Promise<void> {
       }
       await dispatchOutbound({
         kind: 'template', instance: SARA_INSTANCE, phoneE164: phone,
-        templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text,
+        templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables,
+        templateCopyCode: tpl.copyCode, text: tpl.text,
       });
     }
 

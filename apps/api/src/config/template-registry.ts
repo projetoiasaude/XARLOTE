@@ -107,16 +107,25 @@ export function reengageTemplateEnabled(): boolean {
 // de env porque o fundador cria/aprova no zpro (mesmo modelo dos demais templates).
 // Sem env setada = ainda não aprovado → o caller responde 503 orientando o paciente
 // a mandar um oi pra Xarlote (o que abre a janela e libera o texto livre).
-export function buildOtpTemplate(code: string): { name: string; language: string; variables: string[]; text: string } | null {
+export function buildOtpTemplate(
+  code: string,
+): { name: string; language: string; variables: string[]; copyCode: string; text: string } | null {
   const name = process.env['ZPRO_TEMPLATE_OTP_CODE']?.trim();
   if (!name) return null;
   return {
     name,
     language: templateLanguage(),
     variables: [code],
-    // Espelho local do corpo AUTHENTICATION padrão da Meta (não alterar sem conferir
-    // o template aprovado — o texto persistido tem que bater com o que o paciente lê).
-    text: `${code} é seu código de verificação.`,
+    // O MESMO código de novo, pro componente de botão. Não é redundância nossa: a
+    // documentação oficial da Meta exige que, em template de autenticação com botão
+    // "Copiar código", o valor apareça duas vezes no payload — no corpo e no botão.
+    // Sem isso o envio é recusado.
+    copyCode: code,
+    // Espelho do corpo REAL do template `autenticacao` aprovado em 10/08/2026
+    // (conferido no preview da Meta), usado só como fallback de texto livre quando o
+    // envio do template falha E há janela de 24h aberta. Se o template for editado,
+    // este texto tem que ser editado junto — é o que o paciente leria no lugar.
+    text: `Seu código de verificação é ${code}. Para sua segurança, não o compartilhe.`,
   };
 }
 

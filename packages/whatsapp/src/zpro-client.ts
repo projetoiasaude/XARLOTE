@@ -311,7 +311,7 @@ export async function zproSendAudio(
 export async function zproSendTemplate(
   instance: string,
   phoneE164: string,
-  template: { name: string; language: string; variables: string[] },
+  template: { name: string; language: string; variables: string[]; copyCode?: string },
 ): Promise<SendResult> {
   const cfg = buildZproConfig(instance);
   const path = process.env['ZPRO_TEMPLATE_PATH']?.trim() || '/template';
@@ -321,12 +321,29 @@ export async function zproSendTemplate(
     name: template.name,
     language: { code: template.language },
   };
+  const components: Record<string, unknown>[] = [];
   if (template.variables.length) {
     // variáveis do CORPO na ORDEM dos slots {{1}},{{2}},… (aprovados na Meta)
-    tpl['components'] = [
-      { type: 'body', parameters: template.variables.map((text) => ({ type: 'text', text })) },
-    ];
+    components.push({
+      type: 'body',
+      parameters: template.variables.map((text) => ({ type: 'text', text })),
+    });
   }
+  if (template.copyCode) {
+    // Template de AUTENTICAÇÃO com botão "Copiar código": a documentação oficial da
+    // Meta exige que o código apareça DUAS VEZES no payload — no corpo e no botão.
+    // Sem este componente o envio é recusado (ou chega com o botão sem código).
+    // `sub_type: 'url'` e `index: '0'` não são escolha nossa: é o contrato da Meta
+    // pro botão de OTP, mesmo sendo um botão de copiar e não de abrir URL.
+    // Ref.: developers.facebook.com → templates de autenticação com botão de cópia.
+    components.push({
+      type: 'button',
+      sub_type: 'url',
+      index: '0',
+      parameters: [{ type: 'text', text: template.copyCode }],
+    });
+  }
+  if (components.length) tpl['components'] = components;
 
   const body = {
     number,

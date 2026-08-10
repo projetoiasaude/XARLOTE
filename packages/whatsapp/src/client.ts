@@ -201,7 +201,13 @@ export async function sendAudio(
 export async function sendTemplate(
   instance: string,
   phoneE164: string,
-  template: { name: string; language: string; variables: string[] },
+  /**
+   * `copyCode` só existe em template de AUTENTICAÇÃO com botão "Copiar código": a
+   * Meta exige o código repetido num componente de botão além do corpo. Os templates
+   * de utilidade (cotação, clínica, coringa) NÃO passam isto — mandar um componente
+   * de botão pra quem não tem botão aprovado faz o envio ser recusado.
+   */
+  template: { name: string; language: string; variables: string[]; copyCode?: string },
 ): Promise<SendResult> {
   if (providerFor(instance) === 'zpro') {
     return zproSendTemplate(instance, phoneE164, template);
