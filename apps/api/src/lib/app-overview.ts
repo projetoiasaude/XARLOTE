@@ -28,12 +28,16 @@ function safe<T>(p: PromiseLike<{ data: T | null }>): Promise<{ data: T | null }
   );
 }
 
+/**
+ * O usuário que já foi RESOLVIDO por quem chama.
+ *
+ * Só `id` é exigido — o resto é repassado inteiro na resposta. A assinatura é frouxa
+ * de propósito: as duas rotas trazem o usuário de `select('*')` por caminhos
+ * diferentes (a legada por telefone, a nova pelo JWT), e apertar o tipo aqui obrigaria
+ * uma delas a converter, o que é justamente onde campo se perde no caminho.
+ */
 export interface OverviewUser {
   id: string;
-  phone_e164?: string;
-  preferred_name?: string | null;
-  full_name?: string | null;
-  [k: string]: unknown;
 }
 
 export async function buildOverview(user: OverviewUser): Promise<Record<string, unknown>> {

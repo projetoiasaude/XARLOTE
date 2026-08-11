@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { db, findUserByPhone, writeEvent, registerDeviceToken, unregisterDeviceToken } from '@iasaude/db';
 import { buildSimulatedInbound } from '@iasaude/whatsapp';
+import { buildOverview } from '../lib/app-overview.js';
 import { SARA_INSTANCE, nextOccurrence, reminderActionPatch } from '@iasaude/shared';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { loadPrompts } from '../config/prompts.js';
@@ -103,108 +104,13 @@ export async function appRoute(app: FastifyInstance) {
     const user = await findAppUser(phoneE164);
     if (!user) return reply.code(404).send({ error: 'user_not_found' });
 
-    const uid = user.id;
-    // Tabelas que podem não existir em ambientes parciais → fallback tolerante,
-    // mesmo padrão do /admin/users/:id.
-    const safe = <T>(p: PromiseLike<{ data: T | null }>): Promise<{ data: T | null }> =>
-      Promise.resolve(p).then(
-        (r) => r,
-        () => ({ data: null }),
-      );
-
-    const [
-      conv,
-      cond,
-      allg,
-      meds,
-      inv,
-      treat,
-      presc,
-      rem,
-      ords,
-      consults,
-      mem,
-      sympt,
-      medlog,
-    ] = await Promise.all([
-      safe(
-        db
-          .from('conversations')
-          .select('id')
-          .eq('party_type', 'user')
-          .eq('user_id', uid)
-          .eq('whatsapp_instance', SARA_INSTANCE)
-          .order('last_message_at', { ascending: false, nullsFirst: false })
-          .limit(1)
-          .maybeSingle(),
-      ),
-      safe(db.from('user_health_conditions').select('*').eq('user_id', uid).order('created_at', { ascending: false })),
-      safe(db.from('user_allergies').select('*').eq('user_id', uid).order('created_at', { ascending: false })),
-      safe(db.from('user_medications').select('*').eq('user_id', uid).eq('active', true).order('created_at', { ascending: false })),
-      safe(db.from('medication_inventory').select('*').eq('user_id', uid).order('updated_at', { ascending: false }).limit(40)),
-      safe(db.from('treatments').select('*').eq('user_id', uid).order('created_at', { ascending: false }).limit(20)),
-      safe(db.from('prescribers').select('id, name, crm, crm_state, specialty, clinic_id, created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(20)),
-      safe(
-        db
-          .from('reminders')
-          .select('id, type, title, body, scheduled_at, rrule, next_run_at, status, payload, medication_id, created_at')
-          .eq('user_id', uid)
-          .order('next_run_at', { ascending: true, nullsFirst: false })
-          .limit(60),
-      ),
-      safe(
-        db
-          .from('orders')
-          .select(
-            `id, status, items, payment_method, delivery_address, created_at, updated_at, selected_quote_id,
-             quotes ( id, status, total, subtotal, delivery_fee, eta_minutes, payment_methods, pix_key,
-                      payment_link, notes, distance_km, conversation_id, created_at,
-                      suppliers ( id, name, address, city, state, rating ) )`,
-          )
-          .eq('user_id', uid)
-          .order('created_at', { ascending: false })
-          .limit(10),
-      ),
-      safe(
-        db
-          .from('consultations')
-          .select(
-            `id, status, specialty, urgency, modality, city, scheduled_at, created_at,
-             consultation_quotes ( id, status, proposed_datetime, price_brl, modality, notes, created_at,
-                                   clinics ( id, name, city, rating ) )`,
-          )
-          .eq('user_id', uid)
-          .order('created_at', { ascending: false })
-          .limit(5),
-      ),
-      safe(
-        db
-          .from('memory_cards_index')
-          .select('id, kind, text, tags, confidence, source, last_seen_at, created_at')
-          .eq('user_id', uid)
-          .order('last_seen_at', { ascending: false })
-          .limit(80),
-      ),
-      safe(db.from('symptoms_log').select('id, name, intensity, duration_hours, context, red_flag_triggered, created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(20)),
-      safe(db.from('medication_log').select('id, status, scheduled_at, responded_at, medication_id, created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(30)),
-    ]);
-
-    return reply.send({
-      user,
-      conversationId: (conv.data as { id: string } | null)?.id ?? null,
-      conditions: cond.data ?? [],
-      allergies: allg.data ?? [],
-      medications: meds.data ?? [],
-      inventory: inv.data ?? [],
-      treatments: treat.data ?? [],
-      prescribers: presc.data ?? [],
-      reminders: rem.data ?? [],
-      orders: ords.data ?? [],
-      consultations: consults.data ?? [],
-      memoryCards: mem.data ?? [],
-      symptoms: sympt.data ?? [],
-      medicationLog: medlog.data ?? [],
-    });
+    // MESMA função que a rota autenticada `GET /app/overview` usa (lib/app-overview.ts).
+    // Antes eram duas cópias das 14 consultas: qualquer ajuste em uma fazia o web e o
+    // app nativo mostrarem coisas diferentes pro MESMO paciente — e ninguém saberia
+    // qual das duas telas está certa. `user` vem de `select('*')`, então a resposta
+    // segue com todos os campos que o web já lia (adherence_score_30d, preferred_name,
+    // phone_e164); `examResults` entra como campo NOVO, e campo novo o web ignora.
+    return reply.send(await buildOverview(user));
   };
 
   app.post('/overview', async (req, reply) => {
