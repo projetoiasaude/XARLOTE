@@ -6,6 +6,8 @@
   "build": {
     "base": {
       "node": "20.18.0",
+      "//pnpm": "TEM que casar com o packageManager da raiz do monorepo. Sem esta linha o build do EAS morre em 'Failed to install pnpm' — ele não adivinha a versão, e o lockfile v9 não é aceito por outra major.",
+      "pnpm": "9.15.9",
       "env": {
         "NODE_ENV": "production"
       }

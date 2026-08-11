@@ -15,6 +15,7 @@ import { appMeRoutes } from './me.js';
 import { appConsentRoutes } from './consent.js';
 import { appMessagesRoutes } from './messages.js';
 import { appStreamRoutes } from './stream.js';
+import { appDevicesRoutes } from './devices.js';
 
 export async function appPatientRoutes(app: FastifyInstance): Promise<void> {
   await appAuthRoutes(app);
@@ -22,4 +23,5 @@ export async function appPatientRoutes(app: FastifyInstance): Promise<void> {
   await appConsentRoutes(app);
   await appMessagesRoutes(app);
   await appStreamRoutes(app);
+  await appDevicesRoutes(app);
 }

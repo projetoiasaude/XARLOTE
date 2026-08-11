@@ -29,6 +29,18 @@ export async function unregisterDeviceToken(token: string): Promise<void> {
   await db.from('device_tokens').delete().eq('token', token);
 }
 
+/**
+ * Remove um token SÓ SE ele pertencer a este usuário.
+ *
+ * Existe porque `unregisterDeviceToken` apaga por token, sem dono — e numa rota
+ * autenticada isso seria uma negação de notificação: quem descobrisse o token de push
+ * de outro paciente poderia desligar os lembretes de remédio DELE. O `.eq('user_id')`
+ * é o que torna a operação inofensiva contra terceiros.
+ */
+export async function unregisterDeviceTokenForUser(userId: string, token: string): Promise<void> {
+  await db.from('device_tokens').delete().eq('token', token).eq('user_id', userId);
+}
+
 /** Remove tokens que o FCM reportou como mortos. */
 export async function deleteDeviceTokens(tokens: string[]): Promise<void> {
   if (!tokens.length) return;
