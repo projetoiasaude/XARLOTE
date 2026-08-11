@@ -15,6 +15,12 @@ const API_URL = process.env['EXPO_PUBLIC_API_URL'] ?? 'https://ia-da-saude-api-p
 const config: ExpoConfig = {
   name: 'Xarlote',
   slug: 'xarlote',
+  /**
+   * Conta dona do projeto no EAS. Fixado porque a sessão do fundador tem DUAS contas
+   * (`xarlote` e `xarlote.ai`) — sem isto, um build pode resolver pra conta errada e
+   * criar um projeto paralelo, com outro histórico de versões e outras credenciais.
+   */
+  owner: 'xarlote.ai',
   version: '1.0.0',
   scheme: 'xarlote',
   orientation: 'portrait',
@@ -72,6 +78,16 @@ const config: ExpoConfig = {
   },
   extra: {
     apiUrl: API_URL,
+    /**
+     * Projeto no EAS, criado em 11/08/2026.
+     *
+     * Escrito à MÃO de propósito: o `eas init` sabe gravar isto sozinho em `app.json`,
+     * mas não em config dinâmica (`app.config.ts`) — ele não reescreve TypeScript. Se
+     * este id sumir, o build passa a reclamar de projeto não vinculado.
+     */
+    eas: {
+      projectId: '49761909-0aa3-49e1-98e9-bdb70809f965',
+    },
   },
 };
 
