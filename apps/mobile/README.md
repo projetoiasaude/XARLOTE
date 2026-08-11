@@ -71,6 +71,21 @@ Domínio compartilhado vem de `@iasaude/shared` (workspace, source TS direto).
 6. **`app.json` é lixo.** A config é o `app.config.ts`. O `expo install` às vezes
    recria o estático ao lado; está no `.gitignore`, apague se aparecer.
 
+7. **`eas.json` — as três coisas que derrubaram o primeiro build**, em ordem:
+   (a) o perfil `development` tem `developmentClient: true`, o que **exige o pacote
+   `expo-dev-client` instalado** — sem ele o EAS recusa antes de subir nada;
+   (b) `"pnpm": "9.15.9"` no perfil `base` é **obrigatório** e tem que casar com o
+   `packageManager` da raiz do monorepo — o EAS não adivinha a versão e morre em
+   "Failed to install pnpm" (lockfile v9 não é aceito por outra major);
+   (c) o `eas.json` é validado por **schema estrito e NÃO aceita comentários** —
+   nem a convenção `"//campo"`. É por isso que esta explicação está aqui e não lá.
+
+8. **`projectId` e `owner` vão à mão no `app.config.ts`.** O `eas init` grava sozinho
+   em `app.json`, mas não reescreve config dinâmica em TypeScript. E o `owner`
+   (`xarlote.ai`) é fixado porque a conta do fundador tem DUAS organizações — sem ele
+   um build pode ir pra conta errada e criar um projeto paralelo, com outro histórico
+   de versões e outras credenciais.
+
 ## Portão do Hermes
 
 `src/lib/shared-smoke.ts` roda no boot em desenvolvimento e compara `Intl` com
