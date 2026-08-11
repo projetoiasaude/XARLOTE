@@ -15,4 +15,5 @@ export * from './intent-guard.js';
 export * from './consultation-intent.js';
 export * from './reminder-actions.js';
 export * from './phone.js';
+export * from './adherence.js';
 export * from './pharmacy.js';
