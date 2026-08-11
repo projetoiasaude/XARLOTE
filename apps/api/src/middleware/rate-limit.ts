@@ -53,6 +53,23 @@ export async function checkKeyedRateLimit(
     if (count === 1) await redis.expire(rk, opts.windowS);
     return { allowed: count <= opts.max, count, limit: opts.max };
   } catch {
+    // `count: -1` é o SINAL de "não deu pra checar", e não de "estourou o teto".
+    // Quem chama tem que distinguir os dois: negar é certo, mas dizer ao paciente
+    // "muitos pedidos de código" quando ele não fez nenhum é mentir — e mascara uma
+    // queda de Redis como se fosse abuso de usuário. Ver rateLimiterBlind().
     return { allowed: false, count: -1, limit: opts.max };
   }
+}
+
+/**
+ * O limitador ficou CEGO (Redis fora), em vez de o teto ter sido atingido?
+ *
+ * Descoberto rodando o app de verdade em 11/08: com o Redis inalcançável, a primeira
+ * tentativa de login da vida devolvia 429 "Muitos pedidos de código. Aguarda uns
+ * minutos" — para quem não havia pedido nenhum. Em produção isso seria pior que
+ * confuso: uma queda de Redis apareceria no painel como um pico de 429, que se lê
+ * como gente abusando do login, e não como infraestrutura caída.
+ */
+export function rateLimiterBlind(...results: RateLimitResult[]): boolean {
+  return results.some((r) => r.count === -1);
 }

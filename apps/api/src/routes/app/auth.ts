@@ -20,7 +20,7 @@ import { db, findUserByPhone, writeAudit, writeEvent, writeLog } from '@iasaude/
 import { SARA_INSTANCE, brPhoneVariants, isWabaWindowOpen, whatsappJidVariants } from '@iasaude/shared';
 import { dispatchOutbound } from '../../queues/outbound.queue.js';
 import { buildOtpTemplate } from '../../config/template-registry.js';
-import { checkKeyedRateLimit } from '../../middleware/rate-limit.js';
+import { checkKeyedRateLimit, rateLimiterBlind } from '../../middleware/rate-limit.js';
 import { requirePatient } from '../../middleware/patient-auth.js';
 import { constantTimeEquals } from '../../middleware/auth.js';
 import { generateOtpCode, hashOtp, evaluateOtpAttempt, OTP_TTL_MS, OTP_MAX_ATTEMPTS } from '../../lib/otp.js';
@@ -125,6 +125,18 @@ export async function appAuthRoutes(app: FastifyInstance): Promise<void> {
       checkKeyedRateLimit(`otp:p24:${phone}`, { max: 6, windowS: 24 * 3600 }),
       checkKeyedRateLimit(`otp:ip:${req.ip}`, { max: 10, windowS: 3600 }),
     ]);
+    // Limitador CEGO (Redis fora) não é a mesma coisa que teto atingido. Negar está
+    // certo nos dois casos — o custo de liberar sem teto é enumeração e spam de
+    // WhatsApp pago — mas o paciente e o painel precisam da verdade: 503 diz "problema
+    // meu, tenta de novo", 429 diz "você pediu demais". Trocar um pelo outro faz uma
+    // queda de Redis se disfarçar de abuso de usuário no gráfico de erros.
+    if (rateLimiterBlind(p15, p24, ip)) {
+      await writeLog('error', 'app-auth', 'rate limiter cego (Redis indisponível) — login do app negado por precaução', {});
+      return reply.code(503).send({
+        error: 'otp_unavailable',
+        message: 'Não consegui te mandar o código agora. Tenta de novo em instantes 💙',
+      });
+    }
     if (!p15.allowed || !p24.allowed || !ip.allowed) {
       return reply.code(429).send({ error: 'rate_limited', message: 'Muitos pedidos de código. Aguarda uns minutos e tenta de novo.' });
     }
