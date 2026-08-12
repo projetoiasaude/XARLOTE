@@ -20,8 +20,9 @@
  *   um aviso. Uma tela que jura estar ao vivo e está morta é pior que uma que admite
  *   estar atualizando de tempos em tempos.
  */
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  AppState,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -38,6 +39,7 @@ import { LiquidCore } from '@/components/xarlote/LiquidCore';
 import { useChat } from '@/features/chat/use-chat';
 import { Bubble } from '@/features/chat/Bubble';
 import type { ChatItem } from '@/features/chat/merge';
+import { horaBrt } from '@/lib/br-format';
 import { useMe } from '@/lib/api/use-me';
 import { useSession } from '@/lib/auth/session';
 import { colors, radii } from '@/theme';
@@ -45,6 +47,13 @@ import { colors, radii } from '@/theme';
 /** Altura do orb + folga: o compositor nunca fica embaixo dele. */
 const ORB_GAP = 84;
 
+/**
+ * A saudação lê a hora de BRASÍLIA, não a do aparelho.
+ *
+ * O aparelho quase sempre está no fuso certo — mas "quase sempre" numa saudação é o
+ * mesmo tipo de aposta que fazia a dose das 22h migrar de dia no gráfico. Mesma regra
+ * pra tudo que tem hora no app: `horaBrt` (ver src/lib/br-format.ts).
+ */
 function saudacao(hour: number): string {
   if (hour < 12) return 'Bom dia';
   if (hour < 18) return 'Boa tarde';
@@ -84,6 +93,22 @@ export default function ChatScreen() {
   const primeiroNome = (me?.user.preferredName ?? user?.preferredName ?? '').split(' ')[0];
   const vazio = !carregando && items.length === 0;
 
+  /**
+   * A saudação REAVALIA quando o app volta do background.
+   *
+   * Sem isto ela é calculada uma única vez, na montagem: o app aberto às 22h e trazido
+   * de volta às 9h da manhã seguinte continuava dizendo "Boa noite" — foi exatamente o
+   * que apareceu no simulador. Um app que dá bom dia à noite é um app que não parece
+   * estar prestando atenção, e essa é a única coisa que a Xarlote vende.
+   */
+  const [horaAtual, setHoraAtual] = useState(() => horaBrt(Date.now()));
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (estado) => {
+      if (estado === 'active') setHoraAtual(horaBrt(Date.now()));
+    });
+    return () => sub.remove();
+  }, []);
+
   return (
     <KeyboardAvoidingView
       style={styles.root}
@@ -93,7 +118,7 @@ export default function ChatScreen() {
       <View style={[styles.header, { paddingTop: insets.top + 10 }]}>
         <View style={styles.headerTexto}>
           <Text style={styles.saudacao}>
-            {saudacao(new Date().getHours())}
+            {saudacao(horaAtual)}
             {primeiroNome ? `, ${primeiroNome}` : ''}
           </Text>
           {degradado ? (

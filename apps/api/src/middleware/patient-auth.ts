@@ -26,6 +26,31 @@ declare module 'fastify' {
 
 let warnedMissingSecret = false;
 
+/**
+ * Tenta identificar o paciente pelo JWT SEM responder nada.
+ *
+ * Existe para as rotas de auth DUPLA — hoje só `POST /app/reminders/:id/action`, que
+ * atende o app nativo (JWT) e o web legado (token compartilhado + telefone no corpo)
+ * na MESMA rota, porque o caminho é um só e Fastify não registra duas.
+ *
+ * O `requirePatient` não serve aí: ele responde 401 e encerra, o que mataria o web
+ * legado antes de a segunda credencial ser tentada. Aqui a ausência de JWT é uma
+ * resposta legítima (`null`), não um erro — quem chama decide o que fazer com isso.
+ *
+ * Volta `null` também quando `APP_JWT_SECRET` falta: sem segredo não há como afirmar
+ * identidade, e afirmar identidade sem prova é justamente o buraco que a F0 fechou.
+ */
+export function tryPatient(req: FastifyRequest): PatientIdentity | null {
+  const secret = process.env['APP_JWT_SECRET'];
+  if (!secret) return null;
+
+  const auth = req.headers['authorization'];
+  if (typeof auth !== 'string' || !auth.startsWith('Bearer ')) return null;
+
+  const v = verifyAppJwt(auth.slice(7), secret, Date.now());
+  return v.ok ? { userId: v.claims.sub, sessionId: v.claims.sid } : null;
+}
+
 export async function requirePatient(req: FastifyRequest, reply: FastifyReply): Promise<void> {
   const secret = process.env['APP_JWT_SECRET'];
   if (!secret) {

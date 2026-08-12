@@ -89,9 +89,16 @@ export async function buildOverview(user: OverviewUser): Promise<Record<string, 
     safe(db.from('medication_log').select('id, status, scheduled_at, responded_at, medication_id, created_at').eq('user_id', uid).order('created_at', { ascending: false }).limit(180)),
     // NOVO no app nativo: a biblioteca de exames. A tabela existe desde a 0014 e
     // alimentava só a memória da Xarlote — nunca teve superfície pro paciente ver.
+    //
+    // ⚠️ As colunas são `title/summary/findings` — NÃO `values/notes`. Escrevi `values,
+    // notes` na primeira versão e o PostgREST devolveu erro de coluna inexistente, que
+    // o `safe()` converteu em lista vazia: a biblioteca de exames ficaria PERMANENTEMENTE
+    // vazia, com 8 exames no banco, e sem nenhum erro em log. É o preço do fail-soft —
+    // ele protege a tela de uma tabela ausente e esconde um select errado. Conferir nome
+    // de coluna contra o banco não é zelo, é a única defesa que sobra aqui.
     safe(
       db.from('user_exam_results')
-        .select('id, exam_type, exam_date, values, notes, source, created_at')
+        .select('id, exam_type, title, summary, findings, exam_date, source, confidence, created_at')
         .eq('user_id', uid).order('exam_date', { ascending: false, nullsFirst: false }).limit(60),
     ),
   ]);

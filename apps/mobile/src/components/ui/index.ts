@@ -9,5 +9,6 @@ export { StatusPing } from './status-ping';
 export { Avatar } from './avatar';
 export { SectionHeader } from './section-header';
 export { EmptyState } from './empty-state';
+export { LoadFailure } from './load-failure';
 export { Skeleton } from './skeleton';
 export { Stat } from './stat';

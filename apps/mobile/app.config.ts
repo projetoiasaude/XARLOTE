@@ -72,6 +72,28 @@ const config: ExpoConfig = {
       },
     ],
   ],
+  /**
+   * OTA (expo-updates) — a promessa central do plano: tudo que é JS/TS pode ser
+   * corrigido em minutos, sem passar por revisão da Apple. Num app de saúde isso é
+   * segurança, não conveniência: um bug numa tela de medicação não pode esperar
+   * cinco dias de fila da App Store.
+   *
+   * `fallbackToCacheTimeout: 0` — o boot NUNCA espera a rede. A atualização baixa
+   * em segundo plano e vale na abertura seguinte. O contrário (esperar o download
+   * na splash) transformaria rede ruim de ônibus em app que não abre.
+   */
+  updates: {
+    url: 'https://u.expo.dev/49761909-0aa3-49e1-98e9-bdb70809f965',
+    fallbackToCacheTimeout: 0,
+  },
+  /**
+   * `fingerprint`, e não `appVersion`: a versão de runtime é derivada do código
+   * NATIVO do projeto. É o que impede o acidente clássico de OTA — publicar um JS
+   * que chama um módulo nativo (Firebase, câmera) num binário que não o tem, e o
+   * app fechar na cara do paciente. Com fingerprint, esse update simplesmente não
+   * é oferecido àquele binário; com `appVersion`, seria.
+   */
+  runtimeVersion: { policy: 'fingerprint' },
   experiments: {
     typedRoutes: true,
     reactCompiler: true,

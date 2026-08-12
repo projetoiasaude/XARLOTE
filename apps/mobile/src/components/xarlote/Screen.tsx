@@ -6,8 +6,16 @@
  * esconde o botão final da lista, que é o tipo de bug que só aparece no aparelho de
  * alguém.
  */
-import { type ReactNode } from 'react';
-import { ScrollView, StyleSheet, Text, View, type StyleProp, type ViewStyle } from 'react-native';
+import { type ReactElement, type ReactNode } from 'react';
+import {
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+  type RefreshControlProps,
+  type StyleProp,
+  type ViewStyle,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors } from '@/theme';
 
@@ -19,11 +27,17 @@ interface Props {
   subtitle?: string;
   /** Sem rolagem — pra telas que gerenciam a própria lista (chat, por exemplo). */
   scroll?: boolean;
+  /**
+   * Puxar-pra-atualizar. Fica na moldura porque TODA tela de dados quer o gesto, e
+   * porque o `tintColor` errado (o padrão é claro) desaparece contra o fundo escuro —
+   * um spinner invisível faz o paciente puxar de novo achando que não funcionou.
+   */
+  refreshControl?: ReactElement<RefreshControlProps>;
   contentStyle?: StyleProp<ViewStyle>;
   children?: ReactNode;
 }
 
-export function Screen({ title, subtitle, scroll = true, contentStyle, children }: Props) {
+export function Screen({ title, subtitle, scroll = true, refreshControl, contentStyle, children }: Props) {
   const insets = useSafeAreaInsets();
 
   const header = title ? (
@@ -51,6 +65,7 @@ export function Screen({ title, subtitle, scroll = true, contentStyle, children 
         contentStyle,
       ]}
       showsVerticalScrollIndicator={false}
+      {...(refreshControl ? { refreshControl } : {})}
     >
       {header}
       {children}

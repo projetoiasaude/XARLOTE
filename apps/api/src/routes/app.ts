@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { db, findUserByPhone, writeEvent, registerDeviceToken, unregisterDeviceToken } from '@iasaude/db';
 import { buildSimulatedInbound } from '@iasaude/whatsapp';
 import { buildOverview } from '../lib/app-overview.js';
-import { SARA_INSTANCE, nextOccurrence, reminderActionPatch } from '@iasaude/shared';
+import { SARA_INSTANCE } from '@iasaude/shared';
 import { processInboundUser } from '../handlers/inbound-user.js';
 import { loadPrompts } from '../config/prompts.js';
 import { requireAppToken } from '../middleware/auth.js';
@@ -71,12 +71,6 @@ const PhoneSchema = z.object({ phone: z.string().min(8).max(20) });
 const InboundSchema = z.object({
   phone: z.string().min(8).max(20),
   text: z.string().min(1).max(4000),
-});
-
-const ReminderActionSchema = z.object({
-  phone: z.string().min(8).max(20),
-  action: z.enum(['done', 'snooze', 'cancel']),
-  minutes: z.number().int().min(5).max(24 * 60).optional(),
 });
 
 const PushRegisterSchema = z.object({
@@ -176,58 +170,12 @@ export async function appRoute(app: FastifyInstance) {
     return reply.send({ ok: true, traceId: result.traceId, conversationId: result.conversationId });
   });
 
-  // ─── Ações em lembretes (feito / adiar / cancelar) ────────────────────────────
-  app.post<{ Params: { id: string } }>('/reminders/:id/action', async (req, reply) => {
-    const parsed = ReminderActionSchema.safeParse(req.body);
-    if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
-
-    const phoneE164 = normalizePhone(parsed.data.phone);
-    if (!isValidPhone(phoneE164)) return reply.code(400).send({ error: 'invalid_phone' });
-    const user = await findAppUser(phoneE164);
-    if (!user) return reply.code(404).send({ error: 'user_not_found' });
-
-    const { data: reminder } = await db
-      .from('reminders')
-      .select('id, user_id, status, next_run_at, rrule')
-      .eq('id', req.params.id)
-      .maybeSingle();
-
-    if (!reminder) return reply.code(404).send({ error: 'reminder_not_found' });
-    if (reminder.user_id !== user.id) return reply.code(403).send({ error: 'forbidden' });
-
-    const action = parsed.data.action;
-    // Máquina de estados EXTRAÍDA pra @iasaude/shared (F0 do app nativo): app RN, web
-    // e esta rota decidem pela MESMA função pura testada (tests/reminder-actions.test.ts).
-    // Comportamento idêntico ao anterior: cancelado é terminal; done em recorrente
-    // reagenda e segue pending; last_confirmed_at destrava o backup condicional (0020).
-    const nextRecurring = reminder.rrule ? nextOccurrence(reminder.rrule) : null;
-    const decision = reminderActionPatch(
-      { status: reminder.status as string, rrule: reminder.rrule as string | null, nextRecurringIso: nextRecurring?.toISOString() ?? null },
-      action,
-      parsed.data.minutes,
-      Date.now(),
-    );
-    if (decision.kind === 'reject') {
-      return reply.code(409).send({ error: 'reminder_cancelled' });
-    }
-
-    const { error } = await db.from('reminders').update(decision.patch).eq('id', reminder.id);
-    if (error) return reply.code(500).send({ error: error.message });
-
-    void writeEvent({
-      eventName: 'app.reminder_action',
-      userId: user.id,
-      payload: { reminder_id: reminder.id, action, minutes: parsed.data.minutes ?? null },
-    });
-
-    const { data: updated } = await db
-      .from('reminders')
-      .select('id, type, title, body, scheduled_at, rrule, next_run_at, status, payload, medication_id, created_at')
-      .eq('id', reminder.id)
-      .single();
-
-    return reply.send({ ok: true, reminder: updated });
-  });
+  // ─── Ações em lembretes ────────────────────────────────────────────────────────
+  // MUDOU DE ARQUIVO, não de contrato: `POST /app/reminders/:id/action` agora vive em
+  // `routes/app/reminders.ts` com auth DUPLA (JWT do app nativo OU este token + phone).
+  // O path é o mesmo e Fastify não aceita dois handlers pra ele — quem chama daqui de
+  // fora (web /app) não precisa mudar nada. Os guardas deste plugin (requireAppToken e
+  // o anti-flood) são reaplicados à mão lá, no ramo legado.
 
   // ─── Push: registrar token do aparelho (app nativo) ───────────────────────────
   app.post('/push/register', async (req, reply) => {
