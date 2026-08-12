@@ -8,6 +8,7 @@
 import { type ReactNode } from 'react';
 import { StyleSheet, Text, View, type StyleProp, type ViewStyle } from 'react-native';
 import { colors, radii } from '@/theme';
+import { ehTextoCru } from './text-child';
 
 interface Props {
   icon?: ReactNode;
@@ -21,8 +22,8 @@ export function EmptyState({ icon, title, hint, action, style }: Props) {
   return (
     <View style={[styles.wrap, style]}>
       {icon && <View style={styles.iconBox}>{icon}</View>}
-      {typeof title === 'string' ? <Text style={styles.title}>{title}</Text> : title}
-      {typeof hint === 'string' ? <Text style={styles.hint}>{hint}</Text> : hint}
+      {ehTextoCru(title) ? <Text style={styles.title}>{title}</Text> : title}
+      {ehTextoCru(hint) ? <Text style={styles.hint}>{hint}</Text> : hint}
       {action && <View style={styles.action}>{action}</View>}
     </View>
   );

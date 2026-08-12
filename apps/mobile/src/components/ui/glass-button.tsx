@@ -20,6 +20,7 @@ import {
 import * as Haptics from 'expo-haptics';
 import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 import { colors, radii, shadows, springs } from '@/theme';
+import { ehTextoCru } from './text-child';
 
 type Variant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'success';
 type Size = 'xs' | 'sm' | 'md' | 'lg';
@@ -118,7 +119,7 @@ export function GlassButton({
         ) : (
           <>
             {icon && <View>{icon}</View>}
-            {typeof children === 'string' ? (
+            {ehTextoCru(children) ? (
               <Text style={[SIZE_TEXT[size], VARIANT_TEXT[variant], textStyle]} numberOfLines={1}>
                 {children}
               </Text>

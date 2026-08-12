@@ -3,6 +3,7 @@ import { type ReactNode } from 'react';
 import { StyleSheet, Text, View, type StyleProp, type ViewStyle } from 'react-native';
 import { colors } from '@/theme';
 import { GlassCard } from './glass-card';
+import { ehTextoCru } from './text-child';
 
 type Trend = 'up' | 'down' | 'neutral';
 
@@ -26,14 +27,14 @@ export function Stat({ label, value, hint, trend, icon, style }: Props) {
     <GlassCard style={[styles.card, style]}>
       <View style={styles.labelRow}>
         {icon}
-        {typeof label === 'string' ? <Text style={styles.label}>{label.toUpperCase()}</Text> : label}
+        {ehTextoCru(label) ? <Text style={styles.label}>{String(label).toUpperCase()}</Text> : label}
       </View>
-      {typeof value === 'string' || typeof value === 'number' ? (
+      {ehTextoCru(value) ? (
         <Text style={styles.value}>{value}</Text>
       ) : (
         value
       )}
-      {typeof hint === 'string' ? (
+      {ehTextoCru(hint) ? (
         <Text style={[styles.hint, { color: trend ? TREND_COLOR[trend] : colors.textFaint }]}>{hint}</Text>
       ) : (
         hint

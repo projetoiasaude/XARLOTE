@@ -3,6 +3,7 @@ import { type ReactNode } from 'react';
 import { StyleSheet, Text, View, type StyleProp, type TextStyle, type ViewStyle } from 'react-native';
 import { radii } from '@/theme';
 import { StatusPing } from './status-ping';
+import { ehTextoCru } from './text-child';
 
 export type BadgeTone = 'success' | 'warn' | 'danger' | 'info' | 'neutral' | 'accent' | 'live';
 
@@ -56,7 +57,7 @@ export function GlassBadge({ tone = 'neutral', size = 'sm', dot = false, style, 
       ]}
     >
       {dot && <StatusPing tone={PING_TONE[tone]} pulse={tone === 'live'} />}
-      {typeof children === 'string' ? <Text style={textStyle}>{children}</Text> : children}
+      {ehTextoCru(children) ? <Text style={textStyle}>{children}</Text> : children}
     </View>
   );
 }

@@ -64,7 +64,24 @@ async function resolveOwner(
   phone: string | undefined,
 ): Promise<string | null> {
   const patient = tryPatient(req);
-  if (patient) return patient.userId;
+  if (patient) {
+    /**
+     * Marcar `req.patient` NÃO é decoração — é o que a auditoria lê.
+     *
+     * A primeira versão devolvia só o `userId`, e o `writeEvent` logo abaixo grava
+     * `via: req.patient ? 'jwt' : 'legacy_token'`. Sem esta linha, TODA ação vinda do app
+     * nativo era registrada como `legacy_token`. Peguei no primeiro toque real: o
+     * lembrete foi adiado com sucesso pelo JWT e o log disse que veio do token do web.
+     *
+     * O campo existe pra sustentar UMA decisão específica — no F5, provar que ninguém
+     * mais chega por telefone antes de remover a rota legada. Um campo que sempre diz
+     * "legado" faria essa decisão em cima de dado falso, e a rota antiga ficaria viva
+     * pra sempre (ou seria removida às cegas). Detecção que não propaga é pior que
+     * ausência de detecção.
+     */
+    req.patient = patient;
+    return patient.userId;
+  }
 
   // Caminho legado. O plugin novo não tem hook global, então os dois guardas que o
   // legado aplicava (token do app + anti-flood) são chamados à mão — tirá-los junto

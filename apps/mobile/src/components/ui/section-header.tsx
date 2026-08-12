@@ -2,6 +2,7 @@
 import { type ReactNode } from 'react';
 import { StyleSheet, Text, View, type StyleProp, type ViewStyle } from 'react-native';
 import { colors, radii } from '@/theme';
+import { ehTextoCru } from './text-child';
 
 interface Props {
   icon?: ReactNode;
@@ -20,12 +21,12 @@ export function SectionHeader({ icon, title, subtitle, action, size = 'md', styl
       <View style={styles.left}>
         {icon && <View style={styles.iconBox}>{icon}</View>}
         <View style={styles.texts}>
-          {typeof title === 'string' ? (
+          {ehTextoCru(title) ? (
             <Text style={[styles.title, { fontSize: TITLE_SIZE[size] }]}>{title}</Text>
           ) : (
             title
           )}
-          {typeof subtitle === 'string' ? (
+          {ehTextoCru(subtitle) ? (
             <Text style={styles.subtitle}>{subtitle}</Text>
           ) : (
             subtitle
