@@ -20,6 +20,7 @@ import { sendText, sendAudio, sendMenu, sendTemplate, sendImage } from '@iasaude
 import { writeLog, db } from '@iasaude/db';
 import { AGENT_INSTANCE, QUEUE_NAMES, isPlaceholderPhone } from '@iasaude/shared';
 import { getRedisConnection, getRedisClient } from '../queue-config.js';
+import { quemFicouSemReceber } from '../config/template-registry.js';
 
 export interface OutboundJob {
   kind: 'text' | 'audio' | 'menu' | 'template' | 'image';
@@ -350,7 +351,7 @@ async function sendClaimed(job: OutboundJob): Promise<void> {
       // livre fora de janela). Então isto é ERRO ACIONÁVEL (anomaly-detector pega),
       // não um warn silencioso: o estabelecimento ficou sem receber a abertura. Ainda
       // tentamos o texto (se por acaso houver janela aberta, entrega; senão, já logamos).
-      await writeLog('error', 'outbound', `Abertura por template FALHOU (template=${job.templateName}) — estabelecimento pode não ter recebido: ${String(err).slice(0, 300)}`, {
+      await writeLog('error', 'outbound', `Abertura por template FALHOU (template=${job.templateName}) — ${quemFicouSemReceber(job.templateName)}: ${String(err).slice(0, 300)}`, {
         traceId: job.traceId, instance: job.instance, template: job.templateName,
       });
       // Se por acaso houver janela de 24h aberta, o texto livre entrega. Se ele

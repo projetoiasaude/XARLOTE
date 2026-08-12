@@ -187,6 +187,22 @@ export function reengageIntervalMs(silentMs: number, critical = false): number {
  * O piso absoluto existe pro caso patológico: dois lembretes críticos às 23h50 e 00h10
  * são dias diferentes, mas 20 minutos de intervalo não é "1×/dia".
  */
+/**
+ * Quem ficou sem receber, quando o envio de um template falha.
+ *
+ * Existe porque o log de falha de abertura fria dizia sempre *"estabelecimento pode não
+ * ter recebido"* — texto herdado de quando só havia templates de farmácia e clínica.
+ * Desde 10/08 o MESMO caminho envia o template `autenticacao`, e aí quem ficou sem
+ * receber é o **paciente tentando entrar no app** — um problema de natureza e urgência
+ * completamente diferentes. Log que descreve a vítima errada manda quem está de plantão
+ * investigar a perna errada do sistema.
+ */
+export function quemFicouSemReceber(templateName: string | null | undefined): string {
+  const otp = process.env['ZPRO_TEMPLATE_OTP_CODE']?.trim();
+  if (otp && templateName === otp) return 'o paciente pode não ter recebido o código de login';
+  return 'o estabelecimento pode não ter recebido';
+}
+
 export const CRITICAL_TEMPLATE_MIN_GAP_MS = 6 * 60 * 60_000;
 
 /** Dia local (YYYY-MM-DD) de um instante, no fuso do paciente. */

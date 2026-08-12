@@ -106,13 +106,22 @@ function Bubble({
       >
         <Icon size={20} color={active ? '#ffffff' : 'rgba(255,255,255,0.85)'} />
       </Pressable>
+      {/*
+        DOIS Views de propósito: o de fora só POSICIONA (transparente, mais largo que a
+        bolha), o de dentro é a pílula com fundo, que encolhe pro tamanho do texto.
+        Com um View só, o Yoga limitava a largura disponível à da bolha (48px) e o
+        `numberOfLines={1}` cortava tudo: no aparelho os rótulos apareciam como "Co…",
+        "Sa…", "Le…", "Ati…" — e só "Perfil" cabia inteiro.
+      */}
       <View
         pointerEvents="none"
-        style={[styles.label, labelAbove ? styles.labelAbove : styles.labelLeft]}
+        style={[styles.labelSlot, labelAbove ? styles.labelSlotAbove : styles.labelSlotLeft]}
       >
-        <Text style={[styles.labelText, active && { color: colors.accentHi }]} numberOfLines={1}>
-          {item.label}
-        </Text>
+        <View style={styles.label}>
+          <Text style={[styles.labelText, active && { color: colors.accentHi }]} numberOfLines={1}>
+            {item.label}
+          </Text>
+        </View>
       </View>
     </Animated.View>
   );
@@ -257,8 +266,11 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(124,135,255,0.6)',
     boxShadow: '0 0 24px -6px rgba(124,135,255,0.7)',
   } as never,
+  /** Só posiciona. Sem fundo, e largo o suficiente pro rótulo mais longo caber. */
+  labelSlot: { position: 'absolute', width: 120 },
+  labelSlotAbove: { bottom: BUBBLE + 6, left: (BUBBLE - 120) / 2, alignItems: 'center' },
+  labelSlotLeft: { right: BUBBLE + 8, top: BUBBLE / 2 - 13, alignItems: 'flex-end' },
   label: {
-    position: 'absolute',
     backgroundColor: 'rgba(10,10,36,0.95)',
     borderWidth: 1,
     borderColor: colors.glassBorder,
@@ -266,8 +278,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 4,
   },
-  labelAbove: { bottom: BUBBLE + 6, alignSelf: 'center' },
-  labelLeft: { right: BUBBLE + 8, top: BUBBLE / 2 - 13 },
   labelText: { color: 'rgba(255,255,255,0.85)', fontSize: 11, fontWeight: '600' },
   orb: {
     width: ORB,
