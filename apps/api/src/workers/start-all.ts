@@ -34,6 +34,7 @@ import { startNudgeWorker, stopNudgeWorker } from './nudge-stalled-flows.worker.
 import { startOrderFollowupWorker, stopOrderFollowupWorker } from './order-followup.worker.js';
 import { startOutboundWorkers } from '../queues/outbound.queue.js';
 import { startAppInboundWorker, stopAppInboundWorker } from './app-inbound.worker.js';
+import { startAccountForgetWorker, startDataExportWorker, stopLgpdWorkers } from './lgpd.worker.js';
 import { onShutdown } from '../lifecycle.js';
 import { withCronLock } from '../middleware/cron-lock.js';
 
@@ -96,6 +97,11 @@ export function startAllWorkers(log: WorkerLogger): void {
   // ── Mensagens do app nativo: o turno da LLM saiu do request HTTP (F2) ──
   startAppInboundWorker();
 
+  // ── LGPD (F4C): apagar conta e exportar dados. Segundos de trabalho que não cabem
+  // num request — e, no caso do apagamento, com retry porque "quase apagado" não vale.
+  startAccountForgetWorker();
+  startDataExportWorker();
+
   // ── Disposers específicos dos workers (na ordem de registro) ──
   onShutdown('cron intervals', () => {
     clearInterval(reminderTimer);
@@ -104,12 +110,14 @@ export function startAllWorkers(log: WorkerLogger): void {
     stopOrderFollowupWorker();
   });
   onShutdown('app-inbound worker', () => stopAppInboundWorker());
+  onShutdown('lgpd workers', () => stopLgpdWorkers());
   onShutdown('profile-enricher worker', () => enricherWorker.close());
 
   log.info(
     'Workers ON: reminder-dispatcher (30s), profile-enricher (queue), conversation-compactor (1h), ' +
       'inventory-tracker (6h), adherence-scorer (24h), consultation-feedback (1h), consultation-dispatcher (30s), ' +
       'kg-builder (6h), skill-extractor (24h), anomaly-detector (10min), metrics-aggregator (1h), ' +
-      'red-flag-escalator (10s), order-followup (2min), outbound-whatsapp (queue), app-inbound (queue)',
+      'red-flag-escalator (10s), order-followup (2min), outbound-whatsapp (queue), app-inbound (queue), ' +
+      'account-forget (queue), data-export (queue)',
   );
 }

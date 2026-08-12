@@ -41,6 +41,8 @@ import { sendMenu, isSimulatorMode, fetchInboundMedia } from '@iasaude/whatsapp'
 import { transcribeAudio } from '@iasaude/integrations';
 import { Queue } from 'bullmq';
 import { loadPrompts } from '../config/prompts.js';
+import { enqueueAccountForget } from '../queues/lgpd.queue.js';
+import { executeForgetMe } from './forget-me.js';
 import { publishMessageEvent } from '../lib/app-publish.js';
 import { extractAppClientId } from '../lib/app-inbound.js';
 import { sendOutbound, sendOutboundAudio } from './outbound.js';
@@ -1982,62 +1984,46 @@ async function resetAllData(dbClient: typeof db): Promise<void> {
   await dbClient.from('system_logs').delete().neq('id', '00000000-0000-0000-0000-000000000000');
 }
 
+/**
+ * O "CONFIRMO APAGAR" do chat — agora pelo MESMO caminho do app.
+ *
+ * Antes esta função tinha a própria lista de tabelas, inline. Ela envelheceu: cinco
+ * tabelas nascidas em migrations posteriores ficaram fora, sendo duas graves (a sessão do
+ * app e os links de médico continuavam válidos depois do apagamento). Hoje a decisão vive
+ * em `lib/lgpd-plan.ts`, com um teste que quebra quando uma tabela nova aparece, e a
+ * execução em `handlers/forget-me.ts`. Duas cópias divergem; esta é a lição de sempre.
+ *
+ * ## A ordem das três coisas
+ *
+ * 1. **O adeus sai primeiro.** `sendOutbound` grava a mensagem na conversa e enfileira o
+ *    envio. Como o apagamento agora DELETA a conversa (antes só limpava os memory cards),
+ *    mandar depois gravaria numa conversa que não existe mais. A entrega em si não se
+ *    perde: o job da fila carrega telefone e texto, não a linha.
+ * 2. **O acesso morre em seguida**, no mesmo request — sessões, aparelhos e links.
+ * 3. **A limpeza vai pra fila**, que é o que finalmente dá RETRY a este caminho. A versão
+ *    anterior logava `warn` numa falha de tabela e seguia, com o paciente já avisado de
+ *    que tudo tinha sido apagado.
+ */
 async function handleForgetMe(userId: string, conversationId: string, phoneE164: string, traceId: string) {
-  // Audit ANTES de executar — caso algo falhe no meio, sabemos que foi tentado
-  await writeAudit({
-    actorType: 'user',
-    action: 'user.forget_me.executing',
-    userId,
-    conversationId,
-    traceId,
-    reason: 'lgpd_article_18',
-    metadata: { phone_e164: phoneE164 },
-  });
-
-  // Record revocation
-  await db.from('consent_events').insert({ user_id: userId, event_type: 'revoke', policy_version: '1.0', channel: 'whatsapp' });
-
-  // LGPD Art.18 — apaga TODOS os dados clínicos/pessoais do usuário. Enumera TODAS
-  // as tabelas com user_id; filhos (quotes, consultation_quotes, prescription_items,
-  // etc) caem por ON DELETE CASCADE dos pais. Mantém só consent_events (prova do
-  // aceite/revogação) e audit_log (compliance append-only). system_logs já é redatado.
-  const FORGET_ME_TABLES = [
-    'symptoms_log', 'treatments', 'medication_inventory', 'medication_log',
-    'consultations', 'prescriptions', 'reminders', 'orders', 'assistant_tasks',
-    'red_flag_pending', 'feedback_events', 'agent_skills', 'entity_relations',
-    'device_tokens', 'event_log',
-    'user_health_conditions', 'user_allergies', 'user_medications', 'user_addresses', 'user_exam_results',
-  ] as const;
-
-  // Mensagens de TODAS as conversas do usuário (não só a atual).
-  const { data: userConvs } = await db.from('conversations').select('id').eq('user_id', userId);
-  for (const c of userConvs ?? []) await db.from('messages').delete().eq('conversation_id', c.id);
-
-  for (const t of FORGET_ME_TABLES) {
-    const { error } = await db.from(t as string).delete().eq('user_id', userId);
-    if (error) await writeLog('warn', 'lgpd', `forget-me: falha ao limpar ${t}: ${error.message}`, { traceId, userId });
-  }
-  await deleteUserMemory(userId);
-  // Fonte CANÔNICA dos memory cards é o JSONB da conversa — deleteUserMemory só
-  // limpa o índice; sem isto, dados de saúde sobreviviam ao apagamento LGPD.
-  await db.from('conversations').update({ memory_cards: [] }).eq('user_id', userId);
-  await db.from('users').update({ phone_e164: `deleted-${userId}`, full_name: null, preferred_name: null, deleted_at: new Date().toISOString() }).eq('id', userId);
-
-  await writeAudit({
-    actorType: 'user',
-    action: 'user.forget_me.executed',
-    userId,
-    conversationId,
-    traceId,
-    reason: 'lgpd_article_18',
-    metadata: {
-      phone_e164_anonymized: `deleted-${userId}`,
-      tables_cleared: ['messages', ...FORGET_ME_TABLES, 'memory_cards_index', 'conversations.memory_cards'],
-    },
-  });
-
-  const goodbye = 'Pronto, apaguei tudo. Se mudar de ideia, é só me chamar de novo.';
+  // 1. O adeus, enquanto a conversa ainda existe.
+  const goodbye = 'Pronto, tô apagando tudo agora. Se mudar de ideia, é só me chamar de novo.';
   await sendOutbound(conversationId, phoneE164, goodbye, traceId);
 
-  await writeLog('info', 'lgpd', 'User forget-me completed', { traceId, userId });
+  // 2. Fechar a porta. Se falhar, o apagamento nem começa — prometer sem fechar o acesso
+  // seria pior do que pedir pra tentar de novo.
+  await db.from('app_sessions').delete().eq('user_id', userId);
+  await db.from('share_grants').update({ revoked_at: new Date().toISOString() })
+    .eq('user_id', userId).is('revoked_at', null);
+
+  // 3. A limpeza, com retry.
+  const enfileirou = await enqueueAccountForget({ userId, canal: 'whatsapp', traceId, conversationId });
+  if (!enfileirou) {
+    // Redis fora. O paciente JÁ foi avisado — não apagar é inaceitável. Executa inline
+    // (sem retry, que é o melhor disponível) e registra que foi por este caminho.
+    await writeLog('warn', 'lgpd', 'fila indisponível: apagamento executado inline, sem retry', {
+      traceId,
+      userId,
+    });
+    await executeForgetMe(userId, { traceId, canal: 'whatsapp', conversationId });
+  }
 }

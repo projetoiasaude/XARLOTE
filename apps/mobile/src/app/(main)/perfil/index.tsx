@@ -14,8 +14,9 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Alert, StyleSheet, Switch, Text, View } from 'react-native';
+import { useRouter } from 'expo-router';
 import * as LocalAuthentication from 'expo-local-authentication';
-import { Brain, Fingerprint, LogOut } from 'lucide-react-native';
+import { Brain, ChevronRight, Fingerprint, LogOut, ShieldCheck } from 'lucide-react-native';
 import { Avatar, GlassBadge, GlassButton, GlassCard, SectionHeader } from '@/components/ui';
 import { Screen } from '@/components/xarlote/Screen';
 import { useMe } from '@/lib/api/use-me';
@@ -28,6 +29,7 @@ import { formatPhonePretty } from '@/lib/phone-input';
 import { colors } from '@/theme';
 
 export default function PerfilScreen() {
+  const router = useRouter();
   const { user, lockEnabled, setLockEnabled, signOut } = useSession();
   const { data } = useMe();
   const { data: overview } = useOverview();
@@ -115,6 +117,26 @@ export default function PerfilScreen() {
           trackColor={{ false: 'rgba(255,255,255,0.12)', true: 'rgba(124,135,255,0.6)' }}
           thumbColor="#ffffff"
         />
+      </GlassCard>
+
+      {/*
+        A porta pra exportar e apagar. Fica aqui, na seção de Privacidade, e não escondida
+        num submenu: a Apple exige que a exclusão de conta seja ACHÁVEL (Review 5.1.1(v)),
+        e a LGPD não vale muito se o caminho pro direito for difícil de encontrar.
+      */}
+      <GlassCard
+        style={styles.linha}
+        interactive
+        onPress={() => router.push('/perfil/privacidade')}
+      >
+        <View style={styles.linhaEsquerda}>
+          <ShieldCheck size={18} color={colors.info} />
+          <View style={styles.linhaTexto}>
+            <Text style={styles.linhaTitulo}>Meus dados</Text>
+            <Text style={styles.linhaHint}>Baixar tudo que eu guardo, ou apagar a conta.</Text>
+          </View>
+        </View>
+        <ChevronRight size={16} color={colors.textFaint} />
       </GlassCard>
 
       {/* ── O que eu lembro de você ───────────────────────────────────────── */}

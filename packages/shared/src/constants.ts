@@ -68,6 +68,15 @@ export const QUEUE_NAMES = {
   PROFILE_ENRICHER: 'profile-enricher',
   /** Mensagens vindas do app nativo — o turno da LLM sai do request HTTP. */
   APP_INBOUND: 'app-inbound',
+  /**
+   * Apagamento LGPD (art. 18). Fila e não inline porque o apagamento toca ~30 tabelas,
+   * mais Storage, mais uma função SQL — segundos de trabalho que não cabem num request.
+   * O acesso é revogado ANTES de enfileirar, então o paciente não espera pela fila pra
+   * deixar de ser alcançável.
+   */
+  ACCOUNT_FORGET: 'account-forget',
+  /** Exportação de dados (art. 18 II/V). Gera o JSON completo e avisa quando fica pronto. */
+  DATA_EXPORT: 'data-export',
 } as const;
 
 export const SARA_INSTANCE = 'sara';
