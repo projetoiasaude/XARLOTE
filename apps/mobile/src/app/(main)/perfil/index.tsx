@@ -16,7 +16,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Alert, StyleSheet, Switch, Text, View } from 'react-native';
 import { useRouter } from 'expo-router';
 import * as LocalAuthentication from 'expo-local-authentication';
-import { Brain, ChevronRight, Fingerprint, LogOut, ShieldCheck } from 'lucide-react-native';
+import { Brain, ChevronRight, Fingerprint, LogOut, ShieldCheck, Stethoscope } from 'lucide-react-native';
 import { Avatar, GlassBadge, GlassButton, GlassCard, SectionHeader } from '@/components/ui';
 import { Screen } from '@/components/xarlote/Screen';
 import { useMe } from '@/lib/api/use-me';
@@ -134,6 +134,25 @@ export default function PerfilScreen() {
           <View style={styles.linhaTexto}>
             <Text style={styles.linhaTitulo}>Meus dados</Text>
             <Text style={styles.linhaHint}>Baixar tudo que eu guardo, ou apagar a conta.</Text>
+          </View>
+        </View>
+        <ChevronRight size={16} color={colors.textFaint} />
+      </GlassCard>
+
+      {/*
+        O link do médico. Fica logo abaixo de "Meus dados" porque é da mesma família —
+        as duas coisas que o paciente faz com o próprio prontuário: levar embora e mostrar.
+      */}
+      <GlassCard
+        style={styles.linha}
+        interactive
+        onPress={() => router.push('/perfil/compartilhar')}
+      >
+        <View style={styles.linhaEsquerda}>
+          <Stethoscope size={18} color={colors.accentHi} />
+          <View style={styles.linhaTexto}>
+            <Text style={styles.linhaTitulo}>Mostrar ao meu médico</Text>
+            <Text style={styles.linhaHint}>Um link com seu resumo, que expira sozinho.</Text>
           </View>
         </View>
         <ChevronRight size={16} color={colors.textFaint} />

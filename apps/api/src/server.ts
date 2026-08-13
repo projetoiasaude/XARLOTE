@@ -10,6 +10,7 @@ import { webhookZproRoute } from './routes/webhook.zpro.js';
 import { adminRoute } from './routes/admin.js';
 import { appRoute } from './routes/app.js';
 import { appPatientRoutes } from './routes/app/index.js';
+import { sharePublicRoutes } from './routes/share-public.js';
 import { startAllWorkers } from './workers/start-all.js';
 import { closeOutbound } from './queues/outbound.queue.js';
 import { flushSupplierTurnBuffer } from './handlers/inbound-supplier.js';
@@ -137,6 +138,10 @@ async function main() {
     // Rotas NOVAS do app (auth OTP + JWT de paciente) — convivem com as legadas
     // até o cutover do web (F5); depois o legado morre junto com as anon_read_*.
     app.register(appPatientRoutes, { prefix: '/app' });
+
+    // Rota PÚBLICA do link do médico — sem prefixo `/app` de propósito: ela não é do
+    // app do paciente, é a superfície do PROFISSIONAL. Ver routes/share-public.ts.
+    app.register(sharePublicRoutes);
   }
 
   const port = Number(process.env['PORT'] ?? 3001);
