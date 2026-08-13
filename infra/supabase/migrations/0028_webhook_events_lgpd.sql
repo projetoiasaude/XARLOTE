@@ -120,14 +120,24 @@ comment on function public.purge_webhook_events_for_phone(text[]) is
 revoke all on function public.prune_webhook_events() from public, anon, authenticated;
 revoke all on function public.purge_webhook_events_for_phone(text[]) from public, anon, authenticated;
 
--- ── Agenda ────────────────────────────────────────────────────────────────────
--- 03:20 UTC = 00:20 em Brasília: fora do horário em que paciente manda mensagem, e 40
--- minutos ANTES do prune-system-logs (04:00 UTC, migration 0011b) para as duas podas não
--- competirem por I/O. `cron.schedule` faz upsert pelo nome do job, então é idempotente
--- por si — reexecutar esta migration com outro horário ATUALIZA a agenda, que é o
--- comportamento desejável.
-select cron.schedule(
-  'prune-webhook-events',
-  '20 3 * * *',
-  $$select public.prune_webhook_events();$$
-);
+-- ── A poda NÃO está agendada, e o motivo importa ──────────────────────────────
+--
+-- Eu agendei, e desagendei no mesmo dia. A premissa era que `webhook_events` fosse uma
+-- SEGUNDA CÓPIA do que já está em `messages`. O fundador questionou ("não é histórico das
+-- pessoas?") e a checagem provou que ele estava certo: comparando por TEXTO, 187
+-- mensagens de entrada não tinham linha em `messages` — 94 delas de 4 pacientes
+-- cadastrados, da era do uazapi (abr–mai), quando o leitor de entrada falhava.
+-- 185 seriam apagadas na primeira execução.
+--
+-- A migration 0029 recuperou as 94 que tinham dono identificável. Restam ~93 sem
+-- telefone no payload ou de números que nunca viraram paciente.
+--
+-- `prune_webhook_events()` continua existindo e NÃO roda sozinha. Antes de agendá-la,
+-- duas condições: (1) provar que não há mais mensagem cuja única cópia esteja aqui, e
+-- (2) decisão explícita do fundador sobre o prazo. A função de purga por titular
+-- (`purge_webhook_events_for_phone`) é outra coisa e SEGUE ativa — ela só roda quando
+-- alguém pede o apagamento da própria conta, e aí apagar é o objetivo.
+--
+-- Para agendar, quando for o caso:
+--   select cron.schedule('prune-webhook-events', '20 3 * * *',
+--                        $$select public.prune_webhook_events();$$);
