@@ -28,8 +28,8 @@ export function startAppInboundWorker(): void {
   worker = new Worker<AppInboundJob>(
     QUEUE_NAMES.APP_INBOUND,
     async (job) => {
-      const { phoneE164, clientId, text, sentAtMs } = job.data;
-      const inbound = buildAppInbound({ phoneE164, clientId, text, sentAtMs });
+      const { phoneE164, clientId, text, sentAtMs, media } = job.data;
+      const inbound = buildAppInbound({ phoneE164, clientId, text, sentAtMs, ...(media ? { media } : {}) });
       await processInboundUser(inbound);
     },
     { connection: getRedisConnection(), concurrency: 4 },

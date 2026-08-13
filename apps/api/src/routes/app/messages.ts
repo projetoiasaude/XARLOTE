@@ -34,12 +34,25 @@ const ListQuery = z.object({
   limit: z.coerce.number().int().min(1).max(PAGE_MAX).optional(),
 });
 
-const SendBody = z.object({
-  clientId: z.string(),
-  text: z.string().min(1).max(4000),
-  /** Carimbo do aparelho, opcional — sem ele o servidor usa o próprio relógio. */
-  sentAtMs: z.number().int().positive().optional(),
-});
+/**
+ * O corpo do envio.
+ *
+ * `text` deixou de ser obrigatório porque uma FOTO pode vir sem legenda — é o caso mais
+ * comum do wedge ("manda teu exame"). O que passou a ser obrigatório é ter ALGUMA coisa:
+ * texto ou mídia. Um envio com os dois vazios não é mensagem, é ruído — e viraria um
+ * turno de LLM sobre nada.
+ */
+const SendBody = z
+  .object({
+    clientId: z.string(),
+    text: z.string().max(4000).optional(),
+    mediaId: z.string().uuid().optional(),
+    /** Carimbo do aparelho, opcional — sem ele o servidor usa o próprio relógio. */
+    sentAtMs: z.number().int().positive().optional(),
+  })
+  .refine((b) => (b.text?.trim().length ?? 0) > 0 || !!b.mediaId, {
+    message: 'mande texto ou mídia',
+  });
 
 /** A conversa do paciente com a Xarlote (leg `sara`), por qualquer variante do 9º dígito. */
 async function findConversation(phoneE164: string): Promise<{ id: string } | null> {
@@ -171,11 +184,45 @@ export async function appMessagesRoutes(app: FastifyInstance): Promise<void> {
     const phone = await patientPhone(userId);
     if (!phone) return reply.code(404).send({ error: 'user_gone' });
 
+    /**
+     * A mídia é resolvida AQUI, não no worker.
+     *
+     * Duas razões: a checagem de dono acontece no request (o paciente descobre na hora
+     * que o `mediaId` não é dele, em vez de a mensagem sumir na fila), e a URL assinada
+     * nasce curta e é consumida em segundos. Emiti-la no worker significaria uma URL
+     * viva esperando na fila — que é onde ninguém olha.
+     */
+    let media: { url: string; mime: string; contentType: 'image' | 'audio' } | undefined;
+    if (parsed.data.mediaId) {
+      const { data: m } = await db
+        .from('app_media')
+        .select('id, user_id, storage_path, mime, kind')
+        .eq('id', parsed.data.mediaId)
+        .maybeSingle();
+
+      if (!m) return reply.code(404).send({ error: 'media_not_found' });
+      if (m.user_id !== userId) return reply.code(403).send({ error: 'forbidden' });
+
+      const { data: assinada, error } = await db.storage
+        .from('xarlote-app-media')
+        .createSignedUrl(m.storage_path as string, 600);
+      if (error || !assinada?.signedUrl) {
+        return reply.code(502).send({ error: 'media_url_falhou', message: 'Não consegui ler o arquivo. Tenta mandar de novo?' });
+      }
+
+      media = {
+        url: assinada.signedUrl,
+        mime: m.mime as string,
+        contentType: (m.kind as string) === 'audio' ? 'audio' : 'image',
+      };
+    }
+
     const resultado = await enqueueAppInbound({
       userId,
       phoneE164: phone,
       clientId: parsed.data.clientId,
-      text: parsed.data.text,
+      text: parsed.data.text ?? '',
+      ...(media ? { media } : {}),
       // Carimbo do aparelho, limitado ao presente: um relógio adiantado no celular
       // jogaria a bolha pro futuro e ela ficaria grudada no topo da lista pra sempre.
       sentAtMs: Math.min(parsed.data.sentAtMs ?? Date.now(), Date.now()),
@@ -192,7 +239,11 @@ export async function appMessagesRoutes(app: FastifyInstance): Promise<void> {
       eventName: 'app.message_sent',
       userId,
       // Só o tamanho: o conteúdo é clínico e já vive em `messages`.
-      payload: { channel: 'xarlote_app', length: parsed.data.text.length },
+      payload: {
+        channel: 'xarlote_app',
+        length: parsed.data.text?.length ?? 0,
+        ...(media ? { midia: media.contentType } : {}),
+      },
     });
 
     return reply.code(202).send({

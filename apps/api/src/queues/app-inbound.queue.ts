@@ -26,6 +26,8 @@ export interface AppInboundJob {
   clientId: string;
   text: string;
   sentAtMs: number;
+  /** Presente quando o paciente mandou foto, PDF ou áudio (ver routes/app/media.ts). */
+  media?: { url: string; mime: string; contentType: 'image' | 'audio' };
 }
 
 let queue: Queue<AppInboundJob> | null = null;

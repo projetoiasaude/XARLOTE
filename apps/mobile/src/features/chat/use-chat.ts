@@ -42,7 +42,8 @@ export interface UseChatResult {
   degradado: boolean;
   temMais: boolean;
   carregarMais: () => void;
-  enviar: (texto: string) => void;
+  /** `mediaId` vem de `POST /app/media`; texto pode ser vazio quando há mídia. */
+  enviar: (texto: string, mediaId?: string) => void;
   /** Reenvia uma pendente que falhou, com clientId NOVO. */
   reenviar: (clientId: string) => void;
   erro: string | null;
@@ -119,11 +120,18 @@ export function useChat(): UseChatResult {
   }, [pending.length]);
 
   const despachar = useCallback(
-    async (texto: string, clientId: string) => {
+    async (texto: string, clientId: string, mediaId?: string) => {
       try {
         await apiFetch('/app/messages', {
           method: 'POST',
-          body: { clientId, text: texto, sentAtMs: Date.now() },
+          body: {
+            clientId,
+            // Foto de exame costuma vir SEM legenda. O servidor exige texto OU mídia,
+            // e omitir a chave vazia é o que faz o schema aceitar.
+            ...(texto ? { text: texto } : {}),
+            ...(mediaId ? { mediaId } : {}),
+            sentAtMs: Date.now(),
+          },
         });
         // 202 só diz que entrou na fila. A bolha segue "enviando…" até o eco do SSE
         // (ou o resync) trazer a linha do banco — é o único sinal de que a Xarlote
@@ -148,16 +156,27 @@ export function useChat(): UseChatResult {
   );
 
   const enviar = useCallback(
-    (texto: string) => {
+    (texto: string, mediaId?: string) => {
       const t = texto.trim();
-      if (!t) return;
+      // Sem texto E sem mídia não é mensagem. Com mídia, texto vazio é legítimo.
+      if (!t && !mediaId) return;
       setErro(null);
       // `randomUUID` do expo-crypto, não `Math.random`: este id é a chave de
       // idempotência no banco e na fila — colisão aqui é mensagem de um paciente
       // sobrescrevendo a de outro.
       const clientId = Crypto.randomUUID();
-      setPending((p) => [...p, { clientId, text: t, createdAt: new Date().toISOString(), status: 'pending' }]);
-      void despachar(t, clientId);
+      setPending((p) => [
+        ...p,
+        {
+          clientId,
+          // A bolha otimista de uma mídia sem legenda precisa dizer ALGUMA coisa,
+          // senão aparece um balão vazio enquanto o servidor processa.
+          text: t || (mediaId ? '📎 enviando…' : ''),
+          createdAt: new Date().toISOString(),
+          status: 'pending',
+        },
+      ]);
+      void despachar(t, clientId, mediaId);
     },
     [despachar],
   );

@@ -16,8 +16,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Alert, Pressable, Share, StyleSheet, Text, View } from 'react-native';
 import { Stack, useRouter } from 'expo-router';
-import * as Clipboard from 'expo-clipboard';
-import { ArrowLeft, Ban, Copy, Eye, Link2, Share2, ShieldCheck } from 'lucide-react-native';
+import { ArrowLeft, Ban, Eye, Link2, Share2, ShieldCheck } from 'lucide-react-native';
 import { GlassBadge, GlassButton, GlassCard, GlassInput, SectionHeader } from '@/components/ui';
 import { Screen } from '@/components/xarlote/Screen';
 import { useCriarShare, useRevogarShare, useShares } from '@/features/share/use-shares';
@@ -45,12 +44,6 @@ export default function CompartilharScreen() {
   useEffect(() => () => esquecer(), [esquecer]);
 
   const podeCriar = !criando && (!usarPin || /^\d{4}$/.test(pin));
-
-  const copiar = useCallback(async () => {
-    if (!criado?.url) return;
-    await Clipboard.setStringAsync(criado.url);
-    Alert.alert('Copiado', 'O link está na área de transferência.');
-  }, [criado]);
 
   const compartilhar = useCallback(async () => {
     if (!criado?.url) return;
@@ -113,27 +106,27 @@ export default function CompartilharScreen() {
               {criado.url ?? criado.token}
             </Text>
             <Text style={styles.aviso}>
-              Copie agora: por segurança, eu não guardo o link — só sei conferir se ele é
-              válido. Se fechar sem copiar, é só criar outro.
+              Envie agora: por segurança, eu não guardo o link — só sei conferir se ele é
+              válido. Se sair desta tela sem enviar, é só criar outro.
             </Text>
-            <View style={styles.botoes}>
-              <GlassButton
-                variant="primary"
-                size="md"
-                onPress={() => void compartilhar()}
-                icon={<Share2 size={16} color="#fff" />}
-              >
-                Enviar
-              </GlassButton>
-              <GlassButton
-                variant="secondary"
-                size="md"
-                onPress={() => void copiar()}
-                icon={<Copy size={16} color={colors.textDim} />}
-              >
-                Copiar
-              </GlassButton>
-            </View>
+            {/*
+              Só "Enviar", sem um botão de copiar separado.
+
+              A folha de compartilhamento do sistema JÁ tem "Copiar" dentro dela, junto de
+              WhatsApp, e-mail e o resto. Um botão dedicado exigiria `expo-clipboard` — um
+              módulo NATIVO novo, e módulo nativo novo só existe depois de um build novo do
+              app. Não vale trocar a compatibilidade do binário atual por um atalho que o
+              sistema já oferece. (O texto acima é selecionável, então dá pra copiar à mão
+              também.)
+            */}
+            <GlassButton
+              variant="primary"
+              size="md"
+              onPress={() => void compartilhar()}
+              icon={<Share2 size={16} color="#fff" />}
+            >
+              Enviar pro meu médico
+            </GlassButton>
             <Text style={styles.corpoFraco}>
               Vale até {brQuando(criado.expiresAt, agora)}.
               {criado.comPin ? ' Pede o PIN que você escolheu.' : ''}
@@ -266,7 +259,6 @@ const styles = StyleSheet.create({
   badge: { alignSelf: 'flex-start' },
   url: { color: colors.text, fontSize: 12, lineHeight: 18 },
   aviso: { color: colors.warn, fontSize: 11, lineHeight: 17 },
-  botoes: { flexDirection: 'row', gap: 10 },
   erro: { color: colors.warn, fontSize: 12 },
   secao: { marginTop: 28, marginBottom: 12 },
   lista: { gap: 10 },

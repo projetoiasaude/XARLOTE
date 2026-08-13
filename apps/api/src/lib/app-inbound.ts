@@ -57,10 +57,18 @@ export function extractAppClientId(externalId: string | null | undefined): strin
 export interface AppInboundInput {
   phoneE164: string;
   clientId: string;
-  /** Texto do paciente. Em F4 entram `image`/`audio` com `mediaId`. */
+  /** Texto do paciente. Numa mídia, é a legenda (pode ser vazio). */
   text: string;
   /** Quando o APARELHO diz que a mensagem foi criada — não quando o servidor pegou. */
   sentAtMs: number;
+  /**
+   * Mídia já guardada por `POST /app/media`, quando houver.
+   *
+   * A URL é ASSINADA e curta: o worker a consome em segundos (visão ou transcrição) e
+   * ela morre. Guardar URL pública no job seria deixar um link de exame vivo dentro da
+   * fila, que é justamente onde ninguém olha.
+   */
+  media?: { url: string; mime: string; contentType: 'image' | 'audio' };
 }
 
 /**
@@ -79,8 +87,11 @@ export function buildAppInbound(input: AppInboundInput): NormalizedInbound {
     // Carimbo do APARELHO: numa fila com atraso, usar `now()` do worker embaralharia
     // a ordem das bolhas que o paciente já viu na tela dele.
     timestamp: new Date(input.sentAtMs),
-    contentType: 'text',
+    // O contentType decide o PIPELINE: 'image' vai pra visão, 'audio' pra transcrição.
+    // Os dois caminhos já existem e são os MESMOS do WhatsApp — nada aqui é paralelo.
+    contentType: input.media?.contentType ?? 'text',
     text: input.text,
+    ...(input.media ? { mediaUrl: input.media.url, mediaMime: input.media.mime } : {}),
     raw: { channel: 'xarlote_app', clientId: input.clientId },
   };
 }

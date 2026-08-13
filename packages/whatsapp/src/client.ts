@@ -298,6 +298,30 @@ export async function fetchInboundMedia(
     };
   }
 
+  /**
+   * URL que JÁ carrega a própria autorização (assinada) — baixa sem Bearer nenhum.
+   *
+   * A mídia do app nativo não vem do WhatsApp: ela é enviada por `POST /app/media` e
+   * mora no nosso Storage privado, alcançada por URL assinada. Sem esta saída, o
+   * download cairia no ramo do zpro e mandaria o TOKEN DO ZPRO como `Authorization`
+   * numa URL do Supabase — que interpreta o header e recusa. A foto de exame do app
+   * falharia em silêncio, e o modelo de visão receberia nada.
+   *
+   * A detecção é por PROPRIEDADE da URL (tem assinatura na query), não por host: o
+   * projeto pode trocar de domínio de Storage sem que isto precise saber.
+   */
+  const urlAssinada = inbound.mediaUrl;
+  if (urlAssinada && /[?&](token|X-Amz-Signature|sig)=/i.test(urlAssinada)) {
+    const got = await fetchUrlBuffer(urlAssinada);
+    return {
+      buffer: got.buffer,
+      mime:
+        !got.mime || got.mime === 'application/octet-stream'
+          ? cleanMime(inbound.mediaMime) ?? got.mime
+          : got.mime,
+    };
+  }
+
   if (providerFor(instance) === 'zpro') {
     const url = inbound.mediaUrl;
     if (!url) return null;

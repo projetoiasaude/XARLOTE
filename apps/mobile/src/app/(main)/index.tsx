@@ -20,24 +20,16 @@
  *   um aviso. Uma tela que jura estar ao vivo e está morta é pior que uma que admite
  *   estar atualizando de tempos em tempos.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  AppState,
-  KeyboardAvoidingView,
-  Platform,
-  Pressable,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
-} from 'react-native';
+import { useCallback, useEffect, useState } from 'react';
+import { AppState, KeyboardAvoidingView, Platform, StyleSheet, Text, View } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { ArrowUp, MessageCircle, WifiOff } from 'lucide-react-native';
+import { MessageCircle, WifiOff } from 'lucide-react-native';
 import { EmptyState, GlassBadge, Skeleton } from '@/components/ui';
 import { LiquidCore } from '@/components/xarlote/LiquidCore';
 import { useChat } from '@/features/chat/use-chat';
 import { Bubble } from '@/features/chat/Bubble';
+import { Compositor } from '@/features/media/Compositor';
 import type { ChatItem } from '@/features/chat/merge';
 import { horaBrt } from '@/lib/br-format';
 import { useMe } from '@/lib/api/use-me';
@@ -75,16 +67,6 @@ export default function ChatScreen() {
   const { data: me } = useMe();
   const { items, carregando, xarloteDigitando, degradado, temMais, carregarMais, enviar, reenviar, erro } =
     useChat();
-  const [rascunho, setRascunho] = useState('');
-  const input = useRef<TextInput>(null);
-
-  const submeter = useCallback(() => {
-    const t = rascunho.trim();
-    if (!t) return;
-    enviar(t);
-    setRascunho('');
-  }, [rascunho, enviar]);
-
   const renderItem = useCallback(
     ({ item }: { item: ChatItem }) => <Bubble item={item} onRetry={reenviar} />,
     [reenviar],
@@ -173,31 +155,11 @@ export default function ChatScreen() {
 
       {erro && <Text style={styles.erro}>{erro}</Text>}
 
-      <View style={[styles.compositor, { paddingBottom: insets.bottom + 10, paddingRight: ORB_GAP }]}>
-        <TextInput
-          ref={input}
-          value={rascunho}
-          onChangeText={setRascunho}
-          placeholder="Escreve pra Xarlote…"
-          placeholderTextColor={colors.textFaint}
-          selectionColor={colors.accentHi}
-          keyboardAppearance="dark"
-          multiline
-          // 6 linhas no máximo: acima disso o campo come a conversa inteira.
-          style={styles.campo}
-          onSubmitEditing={submeter}
-        />
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Enviar"
-          accessibilityState={{ disabled: rascunho.trim().length === 0 }}
-          disabled={rascunho.trim().length === 0}
-          onPress={submeter}
-          style={[styles.enviar, rascunho.trim().length === 0 && styles.enviarInerte]}
-        >
-          <ArrowUp size={19} color="#ffffff" />
-        </Pressable>
-      </View>
+      <Compositor
+        onEnviar={enviar}
+        paddingBottom={insets.bottom + 10}
+        paddingRight={ORB_GAP}
+      />
     </KeyboardAvoidingView>
   );
 }
@@ -217,37 +179,4 @@ const styles = StyleSheet.create({
   digitando: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 20, paddingVertical: 8 },
   digitandoTexto: { color: colors.textDim, fontSize: 12 },
   erro: { color: '#fda4af', fontSize: 12, paddingHorizontal: 20, paddingBottom: 6 },
-  compositor: {
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    gap: 8,
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    borderTopWidth: 1,
-    borderTopColor: colors.glassBorder,
-    backgroundColor: 'rgba(10,10,30,0.72)',
-  },
-  campo: {
-    flex: 1,
-    maxHeight: 132,
-    minHeight: 42,
-    backgroundColor: 'rgba(255,255,255,0.06)',
-    borderWidth: 1,
-    borderColor: colors.glassBorder,
-    borderRadius: radii.xl,
-    paddingHorizontal: 14,
-    paddingTop: 11,
-    paddingBottom: 11,
-    color: colors.text,
-    fontSize: 15,
-  },
-  enviar: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: colors.accent,
-  },
-  enviarInerte: { opacity: 0.35 },
 });
