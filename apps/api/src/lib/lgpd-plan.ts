@@ -303,22 +303,59 @@ export function destinoDoFio(outrosPacientes: number): DestinoConversaEstabeleci
 export const MARCA_REDIGIDO = '[removido a pedido do titular]';
 
 /**
+ * Um identificador é forte o bastante pra ser redigido num fio COMPARTILHADO?
+ *
+ * ## O erro que esta função impede
+ *
+ * A primeira versão redigia qualquer coisa com 4+ caracteres, incluindo o nome preferido.
+ * No teste com dado real, um paciente chamado "Sintetico" fez a redação comer
+ * "remédio **sintético**" — texto que descrevia o PEDIDO, não a pessoa. Num fio
+ * compartilhado, isso apaga informação do registro de OUTROS pacientes.
+ *
+ * Não é hipótese: uma paciente chamada **Rosa** faria "rosa mosqueta" sumir; **Dora**
+ * comeria "adora"; **Vera** comeria "verapamil" — um anti-hipertensivo.
+ *
+ * ## A regra
+ *
+ * · **Telefone** (10+ dígitos): sempre redige. É identificador forte e não colide com
+ *   palavra nenhuma.
+ * · **Nome com 2+ palavras** ("Maria Silva"): redige. A combinação é específica.
+ * · **Nome de uma palavra só**: NÃO redige. É fracamente identificante e altamente
+ *   colidente — o dano ao registro de terceiros supera o ganho.
+ *
+ * A limitação é deliberada e vale a pena declarar: num fio compartilhado, o primeiro nome
+ * isolado permanece. Ele sozinho não reidentifica (não há sobrenome, telefone nem
+ * documento junto), e a alternativa era corromper o histórico de quem não pediu nada.
+ */
+export function identificadorRedigivel(cru: string | null | undefined): string | null {
+  const alvo = cru?.trim();
+  if (!alvo) return null;
+
+  const digitos = alvo.replace(/\D/g, '');
+  if (digitos.length >= 10) return alvo; // telefone
+
+  // Nome: exige duas palavras de 2+ letras. "Ana P" não passa; "Ana Paula" passa.
+  const palavras = alvo.split(/\s+/).filter((p) => p.length >= 2);
+  if (palavras.length >= 2 && alvo.length >= 6) return alvo;
+
+  return null;
+}
+
+/**
  * Remove de um texto os identificadores de um paciente.
  *
  * Usado só nos fios compartilhados. Os identificadores vêm de quem chama (telefone em
- * todas as variantes do 9º dígito, nome completo, nome preferido) — esta função não
- * adivinha nada: ela substitui exatamente o que recebeu.
+ * todas as variantes do 9º dígito, nome completo) — esta função não adivinha nada: ela
+ * substitui exatamente o que recebeu, depois de filtrar por `identificadorRedigivel`.
  *
- * Casa sem diferenciar acento nem caixa, porque "José" aparece como "jose" no texto de
- * fornecedor com a mesma frequência. E ignora identificador curto demais (menos de 4
- * caracteres): um nome preferido "Zé" viraria uma substituição que come pedaço de outras
- * palavras — redigir de menos é um problema, redigir palavra alheia é outro.
+ * Casa sem diferenciar caixa, porque "José" aparece como "jose" no texto de fornecedor
+ * com a mesma frequência.
  */
 export function redigirIdentificadores(texto: string, identificadores: readonly string[]): string {
   let saida = texto;
   for (const cru of identificadores) {
-    const alvo = cru?.trim();
-    if (!alvo || alvo.length < 4) continue;
+    const alvo = identificadorRedigivel(cru);
+    if (!alvo) continue;
     // Escapa metacaracteres: telefone tem `+`, que em regex significa outra coisa.
     const escapado = alvo.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     saida = saida.replace(new RegExp(escapado, 'gi'), MARCA_REDIGIDO);
@@ -326,11 +363,16 @@ export function redigirIdentificadores(texto: string, identificadores: readonly 
   return saida;
 }
 
-/** O texto ainda contém algum dos identificadores? O vigilante da redação. */
+/**
+ * O texto ainda contém algum identificador REDIGÍVEL?
+ *
+ * Usa exatamente o mesmo filtro da redação — se divergissem, o vigilante reprovaria pra
+ * sempre um texto que a redação não tem como consertar.
+ */
 export function aindaContemIdentificador(texto: string, identificadores: readonly string[]): boolean {
   const t = texto.toLowerCase();
   return identificadores.some((i) => {
-    const alvo = i?.trim().toLowerCase();
-    return !!alvo && alvo.length >= 4 && t.includes(alvo);
+    const alvo = identificadorRedigivel(i);
+    return !!alvo && t.includes(alvo.toLowerCase());
   });
 }

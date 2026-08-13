@@ -106,12 +106,20 @@ export async function executeForgetMe(
     .eq('id', userId)
     .maybeSingle();
 
+  /**
+   * O que conta como identificador na redação dos fios compartilhados.
+   *
+   * O nome PREFERIDO fica de fora de propósito: ele costuma ser uma palavra só, e
+   * `identificadorRedigivel` recusaria mesmo se entrasse. A razão está lá — "Rosa"
+   * apagaria "rosa mosqueta"; "Vera" apagaria "verapamil". Num fio compartilhado isso
+   * corrompe o registro de OUTROS pacientes. Telefone (forte) e nome completo (2+
+   * palavras) bastam.
+   */
   const identificadores = [
     ...(userRow?.phone_e164 ? brPhoneVariants(userRow.phone_e164) : []),
     ...(userRow?.phone_e164 ? [userRow.phone_e164.replace(/\D/g, '')] : []),
     userRow?.full_name ?? '',
-    userRow?.preferred_name ?? '',
-  ].filter((s): s is string => typeof s === 'string' && s.trim().length >= 4);
+  ].filter((s): s is string => typeof s === 'string' && s.trim().length > 0);
 
   const { data: convsDoPaciente } = await db
     .from('conversations')

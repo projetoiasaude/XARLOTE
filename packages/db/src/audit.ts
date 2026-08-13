@@ -90,13 +90,54 @@ export interface EventInput {
  *     traceId, conversationId,
  *   });
  */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * `trace_id` só entra na coluna se for UUID de verdade.
+ *
+ * `audit_log.trace_id` e `event_log.trace_id` são `uuid` (conferido no schema em 13/08),
+ * e as RPCs declaram o parâmetro como `uuid`. Vários chamadores passam string livre — o
+ * `req.id` padrão do Fastify é `req-1`, `req-2`. O cast falhava, o fallback de INSERT
+ * falhava pelo mesmo motivo, e as duas falhas eram SILENCIOSAS: a RPC do supabase-js
+ * devolve `{error}` em vez de lançar, e o resultado do fallback era descartado.
+ *
+ * O efeito no pior lugar possível: **o audit do apagamento LGPD nunca era gravado** — e
+ * `audit_log` é exatamente a prova de que o apagamento aconteceu. Encontrado pelo
+ * `verify-forget-me`, que testa o efeito no banco em vez da intenção do código.
+ *
+ * O valor não-UUID não é descartado: quem chama guarda ele em `metadata.trace_ref`.
+ */
+export function traceComoUuid(traceId: string | null | undefined): string | null {
+  return traceId && UUID_RE.test(traceId) ? traceId : null;
+}
+
 export async function writeAudit(input: AuditInput): Promise<void> {
   // LGPD (CLAUDE.md #3): audit_log é append-only e o único caminho que preserva args
   // de tool → redige PII (telefone/CPF/endereço/lat-lng/valores clínicos) NA ESCRITA,
   // igual writeLog. Cobre TODOS os callers (incl. auditToolCall com args crus).
   const before = input.before ? redactPII(input.before) : null;
   const after = input.after ? redactPII(input.after) : null;
-  const metadata = input.metadata ? redactPII(input.metadata) : null;
+
+  /**
+   * `traceId` que NÃO é UUID vai pro metadata, não pra coluna.
+   *
+   * Achado em 13/08 pelo verify-forget-me: `trace_id` é `uuid` na RPC e na tabela, mas
+   * vários chamadores passam string livre — o `req.id` padrão do Fastify é `req-1`,
+   * `req-2`. O cast falhava, o fallback de INSERT falhava pelo mesmo motivo, e as duas
+   * falhas eram silenciosas (a RPC devolve `error` em vez de lançar, e o `.then()` do
+   * fallback descartava o resultado). Resultado: **o audit do apagamento LGPD não era
+   * gravado**, e o audit_log é justamente a prova de que o apagamento aconteceu.
+   *
+   * Descartar o valor não-UUID seria perder o rastro; então ele desce pro metadata, que
+   * é jsonb e aceita qualquer coisa. Nada se perde e a escrita passa.
+   */
+  const traceUuid = traceComoUuid(input.traceId);
+  const metadataBase =
+    input.traceId && !traceUuid
+      ? { ...(input.metadata ?? {}), trace_ref: input.traceId }
+      : input.metadata;
+  const metadata = metadataBase ? redactPII(metadataBase) : null;
+
   try {
     const { error } = await db.rpc('write_audit', {
       p_actor_type: input.actorType,
@@ -109,7 +150,7 @@ export async function writeAudit(input: AuditInput): Promise<void> {
       p_after: (after ?? null) as never,
       p_conversation_id: input.conversationId ?? null,
       p_message_id: input.messageId ?? null,
-      p_trace_id: input.traceId ?? null,
+      p_trace_id: traceUuid,
       p_task_id: input.taskId ?? null,
       p_reason: input.reason ?? null,
       p_metadata: (metadata ?? null) as never,
@@ -117,7 +158,7 @@ export async function writeAudit(input: AuditInput): Promise<void> {
     if (error) {
       // Fallback: tenta inserir DIRETO se a RPC não existir ainda
       // (durante deploys ou migrations pendentes)
-      await db.from('audit_log').insert({
+      const fallback = await db.from('audit_log').insert({
         actor_type: input.actorType,
         actor_id: input.actorId ?? null,
         action: input.action,
@@ -128,11 +169,18 @@ export async function writeAudit(input: AuditInput): Promise<void> {
         after,
         conversation_id: input.conversationId ?? null,
         message_id: input.messageId ?? null,
-        trace_id: input.traceId ?? null,
+        trace_id: traceUuid,
         task_id: input.taskId ?? null,
         reason: input.reason ?? null,
         metadata,
-      }).then(() => undefined);
+      });
+      // O fallback também falhando era a TERCEIRA camada silenciosa: `.then(() =>
+      // undefined)` descartava o erro, e como a RPC devolve `error` em vez de lançar, o
+      // catch abaixo nunca via nada. Auditoria que some sem avisar é pior que auditoria
+      // ausente — dá a impressão de que existe.
+      if (fallback.error) {
+        throw new Error(`rpc: ${error.message} | insert: ${fallback.error.message}`);
+      }
     }
   } catch (err) {
     // Auditar uma falha de auditoria — usa event_log direto (não-recursivo)
@@ -141,8 +189,13 @@ export async function writeAudit(input: AuditInput): Promise<void> {
         event_name: 'audit.write_failed',
         severity: 'error',
         user_id: input.userId ?? null,
-        trace_id: input.traceId ?? null,
-        payload: { intended_action: input.action, error: String(err).slice(0, 240) },
+        // Também uuid: sem isto, a auditoria da FALHA de auditoria falharia igual.
+        trace_id: traceUuid,
+        payload: {
+          intended_action: input.action,
+          ...(input.traceId && !traceUuid ? { trace_ref: input.traceId } : {}),
+          error: String(err).slice(0, 240),
+        },
       });
     } catch { /* ignore */ }
   }
@@ -161,14 +214,19 @@ export async function writeAudit(input: AuditInput): Promise<void> {
  *   });
  */
 export async function writeEvent(input: EventInput): Promise<void> {
-  const payload = input.payload ? redactPII(input.payload) : {}; // LGPD: sem PII em event_log
+  // Mesma armadilha do writeAudit: `event_log.trace_id` é uuid. Um `req.id` do Fastify
+  // fazia o evento inteiro sumir em silêncio — inclusive eventos de LGPD.
+  const traceUuid = traceComoUuid(input.traceId);
+  const payloadBase =
+    input.traceId && !traceUuid ? { ...(input.payload ?? {}), trace_ref: input.traceId } : input.payload;
+  const payload = payloadBase ? redactPII(payloadBase) : {}; // LGPD: sem PII em event_log
   try {
     const { error } = await db.rpc('write_event', {
       p_event_name: input.eventName,
       p_severity: input.severity ?? 'info',
       p_user_id: input.userId ?? null,
       p_conversation_id: input.conversationId ?? null,
-      p_trace_id: input.traceId ?? null,
+      p_trace_id: traceUuid,
       p_duration_ms: input.durationMs ?? null,
       p_tokens_in: input.tokensIn ?? null,
       p_tokens_out: input.tokensOut ?? null,
@@ -181,7 +239,7 @@ export async function writeEvent(input: EventInput): Promise<void> {
         severity: input.severity ?? 'info',
         user_id: input.userId ?? null,
         conversation_id: input.conversationId ?? null,
-        trace_id: input.traceId ?? null,
+        trace_id: traceUuid,
         duration_ms: input.durationMs ?? null,
         tokens_in: input.tokensIn ?? null,
         tokens_out: input.tokensOut ?? null,

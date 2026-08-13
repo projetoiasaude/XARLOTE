@@ -6,6 +6,7 @@ import {
   TABELAS_COM_USER_ID,
   aindaContemIdentificador,
   destinoDoFio,
+  identificadorRedigivel,
   patchAnonimizacaoUser,
   redigirIdentificadores,
   tabelasParaApagar,
@@ -262,20 +263,61 @@ describe('redigirIdentificadores', () => {
     expect(r).toBe(`contato ${MARCA_REDIGIDO} confirmado`);
   });
 
-  it('recusa identificador curto demais', () => {
-    // Um nome preferido "Zé" comeria pedaço de outras palavras ("Zélia", "fazê-lo").
-    const texto = 'Zé pediu dipirona';
-    expect(redigirIdentificadores(texto, ['Zé'])).toBe(texto);
-    expect(redigirIdentificadores(texto, ['', '  ', 'ab'])).toBe(texto);
+  it('NÃO redige nome de uma palavra só — colide com palavra comum', () => {
+    // O teste com dado real pegou isto: um paciente "Sintetico" fez a redação comer
+    // "remédio sintético", texto que descrevia o PEDIDO e não a pessoa. Num fio
+    // compartilhado, isso apaga informação do registro de OUTROS pacientes.
+    const texto = 'Rosa pediu rosa mosqueta e verapamil';
+    expect(redigirIdentificadores(texto, ['Rosa'])).toBe(texto);
+    expect(redigirIdentificadores(texto, ['Vera'])).toBe(texto);
+    expect(redigirIdentificadores('Zé pediu dipirona', ['Zé', '', '  ', 'ab'])).toBe('Zé pediu dipirona');
+  });
+
+  it('o REMÉDIO nunca é confundido com o paciente', () => {
+    // "Vera" comeria "verapamil" (anti-hipertensivo); "Dora" comeria "adora".
+    const r = redigirIdentificadores('paciente toma verapamil e adora caminhar', ['Vera', 'Dora']);
+    expect(r).toContain('verapamil');
+    expect(r).toContain('adora');
+  });
+
+  it('nome COMPLETO (2+ palavras) é redigido — a combinação identifica', () => {
+    const r = redigirIdentificadores('Rosa Mendonca pediu rosa mosqueta', ['Rosa Mendonca']);
+    expect(r).not.toContain('Rosa Mendonca');
+    expect(r).toContain('rosa mosqueta');
   });
 
   it('remove TODAS as ocorrências, não só a primeira', () => {
-    const r = redigirIdentificadores('Fulana, a Fulana pediu', ['Fulana']);
-    expect(r).not.toContain('Fulana');
+    // Nome COMPLETO: um nome de uma palavra só não é redigível (ver o teste acima).
+    const r = redigirIdentificadores('Fulana de Teste ligou; Fulana de Teste pediu', ['Fulana de Teste']);
+    expect(r).not.toContain('Fulana de Teste');
+    expect(r.match(new RegExp(MARCA_REDIGIDO.replace(/[[\]]/g, '\\$&'), 'g'))).toHaveLength(2);
   });
 
   it('a marca é legível — o fio não vira enigma pro fornecedor', () => {
     expect(MARCA_REDIGIDO).toMatch(/titular/);
+  });
+});
+
+describe('identificadorRedigivel — o filtro que separa forte de colidente', () => {
+  it('telefone é sempre forte', () => {
+    expect(identificadorRedigivel('+5562900000001')).toBe('+5562900000001');
+    expect(identificadorRedigivel('5562900000001')).toBe('5562900000001');
+  });
+
+  it('nome com 2+ palavras é forte', () => {
+    expect(identificadorRedigivel('Ana Paula')).toBe('Ana Paula');
+  });
+
+  it('nome de uma palavra, inicial ou vazio NÃO passa', () => {
+    expect(identificadorRedigivel('Rosa')).toBeNull();
+    expect(identificadorRedigivel('Ana P')).toBeNull();
+    expect(identificadorRedigivel('')).toBeNull();
+    expect(identificadorRedigivel(null)).toBeNull();
+  });
+
+  it('número curto não é confundido com telefone', () => {
+    // Um `like '%55%'` apagaria meio banco; o piso de 10 dígitos é a guarda.
+    expect(identificadorRedigivel('5562')).toBeNull();
   });
 });
 
@@ -290,9 +332,10 @@ describe('aindaContemIdentificador — o vigilante da redação', () => {
     expect(aindaContemIdentificador(redigido, ids)).toBe(false);
   });
 
-  it('não acusa por identificador curto, coerente com a redação', () => {
-    // Se a redação ignora <4 caracteres, o vigilante também precisa — senão ele
-    // reprovaria para sempre um texto que a redação não tem como consertar.
+  it('usa o MESMO filtro da redação', () => {
+    // Se divergissem, o vigilante reprovaria para sempre um texto que a redação não tem
+    // como consertar — e o apagamento entraria em retry infinito.
     expect(aindaContemIdentificador('Zé pediu', ['Zé'])).toBe(false);
+    expect(aindaContemIdentificador('Rosa pediu rosa mosqueta', ['Rosa'])).toBe(false);
   });
 });
