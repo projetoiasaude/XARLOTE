@@ -31,22 +31,60 @@ const URL_TTL_S = 600;
 
 export async function appMediaRoutes(app: FastifyInstance): Promise<void> {
   // ─── POST /app/media ──────────────────────────────────────────────────────
-  app.post('/media', { preHandler: requirePatient }, async (req, reply) => {
+  app.post(
+    '/media',
+    {
+      preHandler: requirePatient,
+      /**
+       * Teto de corpo APENAS desta rota.
+       *
+       * O default do Fastify é 1 MB — uma foto de exame em base64 (33% maior que o
+       * arquivo) seria recusada com 413 antes mesmo de o handler rodar, e o paciente
+       * veria "não consegui enviar" sem explicação. Subir o limite GLOBAL resolveria e
+       * abriria todas as outras rotas a corpos de 15 MB, que é superfície de abuso de
+       * graça. Aqui o limite acompanha o `MAX_BYTES` com folga pro overhead do base64.
+       */
+      bodyLimit: Math.ceil(MAX_BYTES * 1.4),
+    },
+    async (req, reply) => {
     const userId = req.patient!.userId;
 
-    if (!req.isMultipart()) {
-      return reply.code(400).send({ error: 'multipart_esperado' });
-    }
-
-    const arquivo = await req.file();
-    if (!arquivo) return reply.code(400).send({ error: 'arquivo_ausente' });
-
+    /**
+     * DUAS formas de subir o arquivo, e a segunda existe por um motivo medido.
+     *
+     * `multipart` é o caminho canônico e continua valendo (web, curl, futuros clientes).
+     * Mas no app nativo ele **não funciona**: com React Native 0.86 em modo bridgeless,
+     * `fetch` com um `FormData` contendo `{uri, name, type}` LANÇA antes de chegar à
+     * rede — verificado no simulador em 13/08, com a requisição nunca aparecendo no log
+     * do servidor. Alternativas nativas (expo-file-system) exigiriam um módulo novo, e
+     * módulo nativo novo só existe depois de um build novo do app.
+     *
+     * Então o app manda JSON com base64. Custa 33% a mais de bytes e funciona no binário
+     * que já está instalado. O servidor aceita os dois e o resto do fluxo é idêntico —
+     * o veredicto continua vindo dos BYTES, não do que o cliente declarou.
+     */
     let buf: Buffer;
-    try {
-      buf = await arquivo.toBuffer();
-    } catch {
-      // `@fastify/multipart` lança quando o arquivo estoura o `fileSize` do plugin.
-      return reply.code(413).send({ error: 'muito_grande', message: mensagemDeRecusa('muito_grande') });
+
+    if (req.isMultipart()) {
+      const arquivo = await req.file();
+      if (!arquivo) return reply.code(400).send({ error: 'arquivo_ausente' });
+      try {
+        buf = await arquivo.toBuffer();
+      } catch {
+        // `@fastify/multipart` lança quando o arquivo estoura o `fileSize` do plugin.
+        return reply.code(413).send({ error: 'muito_grande', message: mensagemDeRecusa('muito_grande') });
+      }
+    } else {
+      const corpo = req.body as { base64?: unknown } | undefined;
+      const b64 = typeof corpo?.base64 === 'string' ? corpo.base64 : null;
+      if (!b64) return reply.code(400).send({ error: 'arquivo_ausente' });
+
+      // O teto é checado ANTES de decodificar: base64 de 4 caracteres vira 3 bytes, então
+      // um corpo gigante seria materializado na memória só pra depois ser recusado.
+      if (b64.length > MAX_BYTES * 1.4) {
+        return reply.code(413).send({ error: 'muito_grande', message: mensagemDeRecusa('muito_grande') });
+      }
+      buf = Buffer.from(b64, 'base64');
     }
 
     // O veredicto vem dos BYTES. `arquivo.mimetype` é o que o cliente disse, e é
@@ -94,8 +132,9 @@ export async function appMediaRoutes(app: FastifyInstance): Promise<void> {
       payload: { tipo: v.tipo, mime: v.mime, bytes: buf.length },
     });
 
-    return reply.code(201).send({ mediaId: linha.id, tipo: v.tipo, mime: v.mime, bytes: buf.length });
-  });
+      return reply.code(201).send({ mediaId: linha.id, tipo: v.tipo, mime: v.mime, bytes: buf.length });
+    },
+  );
 
   // ─── GET /app/media/:id/url ───────────────────────────────────────────────
   app.get<{ Params: { id: string } }>('/media/:id/url', { preHandler: requirePatient }, async (req, reply) => {

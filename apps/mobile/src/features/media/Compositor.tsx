@@ -64,7 +64,7 @@ export function Compositor({ onEnviar, paddingRight, paddingBottom }: Props) {
   const pararEEnviar = useCallback(async () => {
     const arquivo = await gravador.parar();
     if (!arquivo) return;
-    const r = await midia.subirArquivo(arquivo.uri, arquivo.mime, arquivo.nome);
+    const r = await midia.subirArquivoLocal(arquivo.uri);
     if (r) onEnviar('', r.mediaId);
   }, [gravador, midia, onEnviar]);
 

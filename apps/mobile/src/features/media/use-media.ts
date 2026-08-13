@@ -8,12 +8,20 @@
  * 4 MB de ser jogado fora porque a segunda chamada falhou — o app repete só a parte
  * barata. A tela mostra o progresso das duas fases como uma coisa só.
  *
- * ## O upload NÃO passa por `apiFetch`
+ * ## Base64, e não multipart — uma decisão MEDIDA, não preferência
  *
- * `apiFetch` serializa o corpo em JSON. Aqui o corpo é `FormData` com bytes, e deixar o
- * `content-type` ser definido pelo runtime é obrigatório (o boundary do multipart é
- * gerado por ele). Definir o header à mão quebra o parse do lado do servidor — é o erro
- * clássico de upload em RN. Por isso o `fetch` cru, com o token pego do mesmo lugar.
+ * A primeira versão mandava `FormData` com `{uri, name, type}`, que é a receita padrão de
+ * upload em React Native. Ela **não funciona** neste app: com RN 0.86 em modo bridgeless,
+ * o `fetch` LANÇA antes de chegar à rede — a requisição nunca aparece no log do servidor.
+ * Verificado no simulador em 13/08, com instrumentação: o token estava presente e o
+ * `fetch` morria sem status.
+ *
+ * As saídas seriam `expo-file-system` (módulo NATIVO novo → exige build novo do app, e o
+ * binário instalado não teria) ou base64. O `expo-image-picker` já devolve base64 de
+ * graça, e ele JÁ está no binário. Custa 33% a mais de bytes numa foto de 1-3 MB, e
+ * funciona hoje.
+ *
+ * O servidor aceita as duas formas; o multipart segue valendo pro web e pra curl.
  */
 import { useCallback, useState } from 'react';
 import * as ImagePicker from 'expo-image-picker';
@@ -29,12 +37,6 @@ export interface MidiaEnviada {
   bytes: number;
 }
 
-/** Nome do arquivo no multipart. O servidor ignora — ele lê os BYTES. */
-function nomeDoArquivo(uri: string, fallback: string): string {
-  const ultimo = uri.split('/').pop();
-  return ultimo && ultimo.includes('.') ? ultimo : fallback;
-}
-
 /**
  * Sobe o arquivo e devolve o `mediaId`.
  *
@@ -42,18 +44,16 @@ function nomeDoArquivo(uri: string, fallback: string): string {
  * upload de 4 MB que falha por token vencido no meio seria a pior forma de perder um
  * exame que o paciente acabou de fotografar.
  */
-async function subir(uri: string, mimeSugerido: string, nome: string): Promise<MidiaEnviada> {
-  const enviar = async (token: string | null): Promise<Response> => {
-    const form = new FormData();
-    // O cast é a forma que o RN espera pra arquivo local em FormData.
-    form.append('file', { uri, name: nome, type: mimeSugerido } as unknown as Blob);
-    return fetch(`${API_BASE_URL}/app/media`, {
+async function subir(base64: string): Promise<MidiaEnviada> {
+  const enviar = async (token: string | null): Promise<Response> =>
+    fetch(`${API_BASE_URL}/app/media`, {
       method: 'POST',
-      // SEM `content-type`: o runtime precisa gerar o boundary do multipart.
-      headers: token ? { authorization: `Bearer ${token}` } : {},
-      body: form,
+      headers: {
+        'content-type': 'application/json',
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ base64 }),
     });
-  };
 
   let res = await enviar(currentAccessToken());
   if (res.status === 401) {
@@ -81,8 +81,10 @@ export interface EstadoMidia {
   fotografar: () => Promise<MidiaEnviada | null>;
   /** Abre a galeria. */
   escolherDaGaleria: () => Promise<MidiaEnviada | null>;
-  /** Sobe um arquivo já gravado no aparelho (usado pelo gravador de voz). */
-  subirArquivo: (uri: string, mime: string, nome: string) => Promise<MidiaEnviada | null>;
+  /** Sobe conteúdo já em base64. */
+  subirBase64: (base64: string) => Promise<MidiaEnviada | null>;
+  /** Sobe um arquivo local por URI (o áudio do gravador), convertendo pra base64. */
+  subirArquivoLocal: (uri: string) => Promise<MidiaEnviada | null>;
   limparErro: () => void;
 }
 
@@ -122,10 +124,25 @@ export function useMedia(): EstadoMidia {
       // valor que importa.
       allowsEditing: false,
       quality: 0.8,
+      base64: true,
+      /**
+       * Converte HEIC → JPEG no aparelho. Sem isto, o app NÃO funciona pra iPhone.
+       *
+       * Foto de iPhone é HEIC por padrão, e o modelo de visão só aceita jpeg, png, gif e
+       * webp. Medido no simulador em 13/08: a foto subiu (2,8 MB, `image/heic`), a
+       * mensagem foi criada, e a Xarlote respondeu "tive um probleminha" — porque o
+       * provedor recusou o formato. O caminho do WhatsApp nunca mostrou isso porque o
+       * próprio WhatsApp converte antes de entregar.
+       *
+       * `Compatible` pede a representação compatível do asset; o default `Automatic`
+       * devolve a atual, que no iPhone é HEIC.
+       */
+      preferredAssetRepresentationMode:
+        ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible,
     });
-    if (r.canceled || !r.assets[0]) return null;
-    const a = r.assets[0];
-    return comTratamento(() => subir(a.uri, a.mimeType ?? 'image/jpeg', nomeDoArquivo(a.uri, 'exame.jpg')));
+    if (r.canceled || !r.assets[0]?.base64) return null;
+    const b64 = r.assets[0].base64;
+    return comTratamento(() => subir(b64));
   }, [comTratamento]);
 
   const escolherDaGaleria = useCallback(async () => {
@@ -134,16 +151,62 @@ export function useMedia(): EstadoMidia {
       setErro('Preciso do acesso às fotos pra pegar o exame. Você pode liberar nos Ajustes.');
       return null;
     }
-    const r = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.8 });
-    if (r.canceled || !r.assets[0]) return null;
-    const a = r.assets[0];
-    return comTratamento(() => subir(a.uri, a.mimeType ?? 'image/jpeg', nomeDoArquivo(a.uri, 'exame.jpg')));
+    const r = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      quality: 0.8,
+      base64: true,
+      /**
+       * Converte HEIC → JPEG no aparelho. Sem isto, o app NÃO funciona pra iPhone.
+       *
+       * Foto de iPhone é HEIC por padrão, e o modelo de visão só aceita jpeg, png, gif e
+       * webp. Medido no simulador em 13/08: a foto subiu (2,8 MB, `image/heic`), a
+       * mensagem foi criada, e a Xarlote respondeu "tive um probleminha" — porque o
+       * provedor recusou o formato. O caminho do WhatsApp nunca mostrou isso porque o
+       * próprio WhatsApp converte antes de entregar.
+       *
+       * `Compatible` pede a representação compatível do asset; o default `Automatic`
+       * devolve a atual, que no iPhone é HEIC.
+       */
+      preferredAssetRepresentationMode:
+        ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible,
+    });
+    if (r.canceled || !r.assets[0]?.base64) return null;
+    const b64 = r.assets[0].base64;
+    return comTratamento(() => subir(b64));
   }, [comTratamento]);
 
-  const subirArquivo = useCallback(
-    (uri: string, mime: string, nome: string) => comTratamento(() => subir(uri, mime, nome)),
+  const subirBase64 = useCallback(
+    (base64: string) => comTratamento(() => subir(base64)),
     [comTratamento],
   );
 
-  return { fase, erro, fotografar, escolherDaGaleria, subirArquivo, limparErro: () => setErro(null) };
+  /**
+   * Sobe um arquivo local (o áudio do gravador), convertendo pra base64 antes.
+   *
+   * `expo-audio` devolve uma URI, não base64 — e `expo-file-system` seria um módulo
+   * nativo novo. `fetch` sobre `file://` + `FileReader` são polyfills de JS do React
+   * Native, então funcionam no binário atual. É um caminho diferente do `FormData`, que
+   * é o que falha aqui (ver o cabeçalho).
+   */
+  const subirArquivoLocal = useCallback(
+    (uri: string) =>
+      comTratamento(async () => {
+        const blob = await (await fetch(uri)).blob();
+        const b64 = await new Promise<string>((ok, falhou) => {
+          const leitor = new FileReader();
+          leitor.onerror = () => falhou(new Error('não consegui ler o áudio gravado'));
+          leitor.onload = () => {
+            const r = String(leitor.result);
+            // `readAsDataURL` devolve `data:audio/...;base64,XXXX` — só o depois da vírgula.
+            const virgula = r.indexOf(',');
+            ok(virgula >= 0 ? r.slice(virgula + 1) : r);
+          };
+          leitor.readAsDataURL(blob);
+        });
+        return subir(b64);
+      }),
+    [comTratamento],
+  );
+
+  return { fase, erro, fotografar, escolherDaGaleria, subirBase64, subirArquivoLocal, limparErro: () => setErro(null) };
 }
