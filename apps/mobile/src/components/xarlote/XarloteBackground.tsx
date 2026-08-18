@@ -132,7 +132,29 @@ export function XarloteBackground() {
   const animar = ANIMAR && !semMovimento;
 
   return (
-    <View pointerEvents="none" style={StyleSheet.absoluteFill}>
+    /*
+      `renderToHardwareTextureAndroid` — a correção que faltava, e a maior delas.
+     
+      Parar a animação não bastou (medido no aparelho em 18/08/2026: continuou lento).
+      O motivo é que o custo não era só a animação: o fundo são CINCO superfícies de tela
+      cheia empilhadas — o degradê de base, os três orbs e a vinheta — e o Android mistura
+      todas elas a cada quadro, animando ou não. Numa tela de 1080p isso é mais de 13
+      milhões de misturas de pixel por quadro, ANTES de desenhar qualquer conteúdo. O que
+      sobrava de preenchimento era o que a rolagem da lista tinha pra trabalhar.
+     
+      Com esta dica o Android desenha a pilha inteira UMA vez, guarda como uma textura só
+      na GPU, e a partir daí compõe um retângulo em vez de cinco camadas com transparência.
+      Custa ~10 MB de memória de vídeo e devolve a taxa de preenchimento pro app.
+     
+      Isto só é seguro porque o fundo é ESTÁTICO no Android (ver `ANIMAR` acima): conteúdo
+      que muda invalidaria a textura a cada quadro e o efeito se inverteria. As duas
+      decisões são uma só — separá-las quebra a segunda.
+    */
+    <View
+      pointerEvents="none"
+      renderToHardwareTextureAndroid={!animar}
+      style={StyleSheet.absoluteFill}
+    >
       {/* base navy — o mesmo gradiente vertical #04041a → #0a0830 do web */}
       <LinearGradient colors={['#04041a', '#070725', '#0a0830']} locations={[0, 0.45, 1]} style={StyleSheet.absoluteFill} />
 
