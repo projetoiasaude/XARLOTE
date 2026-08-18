@@ -16,6 +16,7 @@ import Svg, { Circle, Defs, RadialGradient, Stop } from 'react-native-svg';
 import Animated, {
   Easing,
   useAnimatedStyle,
+  useReducedMotion,
   useSharedValue,
   withRepeat,
   withTiming,
@@ -46,14 +47,21 @@ function Blob({ spec, u, mode }: { spec: BlobSpec; u: number; mode: CoreMode }) 
   const size = spec.size * u;
   const amp = AMPLITUDE[mode];
 
+  const semMovimento = useReducedMotion();
+
   useEffect(() => {
     t.value = 0;
+    // Quem pediu ao sistema para reduzir animações não quer a bolha respirando.
+    if (semMovimento) {
+      t.value = 0.5;
+      return;
+    }
     t.value = withRepeat(
       withTiming(1, { duration: spec.baseDurationMs * SPEED[mode], easing: Easing.inOut(Easing.ease) }),
       -1,
       true,
     );
-  }, [t, mode, spec.baseDurationMs]);
+  }, [t, mode, spec.baseDurationMs, semMovimento]);
 
   const style = useAnimatedStyle(() => {
     const x = spec.path.x[0] + (spec.path.x[1] - spec.path.x[0]) * t.value;
@@ -65,7 +73,19 @@ function Blob({ spec, u, mode }: { spec: BlobSpec; u: number; mode: CoreMode }) 
   const id = `blob-${spec.color.slice(1)}`;
 
   return (
-    <Animated.View style={[styles.blob, { width: size, height: size }, style]}>
+    /*
+      `renderToHardwareTextureAndroid`: o conteúdo do blob NUNCA muda — é sempre o mesmo
+      círculo com o mesmo degradê. Só o transform anima. Com esta dica o Android desenha
+      o SVG uma vez, guarda como textura na GPU e depois só a move e escala, em vez de
+      redesenhar o vetor a cada quadro. É exatamente o caso de uso do prop.
+
+      Ao contrário dos orbs do fundo, aqui a animação FICA: o blob tem dezenas de pixels
+      de lado, não milhares, e é o elemento que dá vida à Xarlote na tela.
+    */
+    <Animated.View
+      renderToHardwareTextureAndroid
+      style={[styles.blob, { width: size, height: size }, style]}
+    >
       <Svg width={size} height={size}>
         <Defs>
           <RadialGradient id={id} cx="35%" cy="35%" r="65%">

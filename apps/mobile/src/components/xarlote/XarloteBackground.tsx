@@ -9,16 +9,35 @@
  * dá a mesma difusão de graça, num único nó de desenho.
  */
 import { useEffect } from 'react';
-import { StyleSheet, View, useWindowDimensions } from 'react-native';
+import { Platform, StyleSheet, View, useWindowDimensions } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import Svg, { Defs, RadialGradient, Rect, Stop } from 'react-native-svg';
 import Animated, {
   Easing,
   useAnimatedStyle,
+  useReducedMotion,
   useSharedValue,
   withRepeat,
   withTiming,
 } from 'react-native-reanimated';
+
+/**
+ * A deriva dos orbs roda só no iOS — e o motivo é medido, não estético.
+ *
+ * Cada orb é uma camada de `1.5 × o maior lado da tela`: num aparelho comum, ~1370dp de
+ * lado, e são TRÊS, sobrepostas, embaixo de todas as telas do app. Animar `scale` sobre
+ * elas obriga o Android a REDESENHAR o SVG a cada quadro em vez de mover uma camada
+ * pronta — e isso rouba quadros de tudo que está por cima, inclusive da rolagem das
+ * listas. Verificado num Xiaomi em 18/08/2026: o app inteiro engasgava, em toda tela,
+ * com a bateria em modo normal.
+ *
+ * O que se perde é imperceptível: o ciclo completo da deriva leva de 32 a 48 SEGUNDOS.
+ * Parado no meio do caminho, o fundo é visualmente o mesmo em qualquer instante que
+ * alguém olhe. Trocar isso por um app fluido não é escolha difícil.
+ *
+ * Para religar no Android quando houver como medir de novo, é esta linha.
+ */
+const ANIMAR = Platform.OS === 'ios';
 
 interface Orb {
   color: string;
@@ -58,18 +77,26 @@ const ORBS: Orb[] = [
   },
 ];
 
-function OrbLayer({ orb, base }: { orb: Orb; base: number }) {
+function OrbLayer({ orb, base, animar }: { orb: Orb; base: number; animar: boolean }) {
   const t = useSharedValue(0);
   const size = base * orb.sizeFactor;
 
   useEffect(() => {
+    if (!animar) {
+      // Parado no meio do caminho: a composição das três cores fica igual à do meio da
+      // deriva, que é como o fundo passa a maior parte do tempo. Nada anima, e o valor
+      // nunca muda — então o estilo animado é calculado UMA vez e o Android guarda a
+      // camada pronta em vez de redesenhá-la a cada quadro.
+      t.value = 0.5;
+      return;
+    }
     // `withRepeat(..., true)` = vai-e-volta, o equivalente do `0%,100% / 50%` do CSS.
     t.value = withRepeat(
       withTiming(1, { duration: orb.durationMs, easing: Easing.inOut(Easing.ease) }),
       -1,
       true,
     );
-  }, [t, orb.durationMs]);
+  }, [t, orb.durationMs, animar]);
 
   const style = useAnimatedStyle(() => {
     const x = orb.from.x + (orb.to.x - orb.from.x) * t.value;
@@ -101,6 +128,8 @@ function OrbLayer({ orb, base }: { orb: Orb; base: number }) {
 export function XarloteBackground() {
   const { width, height } = useWindowDimensions();
   const base = Math.max(width, height);
+  const semMovimento = useReducedMotion();
+  const animar = ANIMAR && !semMovimento;
 
   return (
     <View pointerEvents="none" style={StyleSheet.absoluteFill}>
@@ -108,7 +137,7 @@ export function XarloteBackground() {
       <LinearGradient colors={['#04041a', '#070725', '#0a0830']} locations={[0, 0.45, 1]} style={StyleSheet.absoluteFill} />
 
       {ORBS.map((orb) => (
-        <OrbLayer key={orb.color} orb={orb} base={base} />
+        <OrbLayer key={orb.color} orb={orb} base={base} animar={animar} />
       ))}
 
       {/* vinheta — escurece as bordas e concentra o olho no centro */}

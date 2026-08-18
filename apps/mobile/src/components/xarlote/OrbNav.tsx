@@ -28,6 +28,7 @@ import {
 import Animated, {
   Easing,
   useAnimatedStyle,
+  useReducedMotion,
   useSharedValue,
   withDelay,
   withRepeat,
@@ -129,9 +130,18 @@ function Bubble({
 
 function Satellites({ visible }: { visible: boolean }) {
   const spin = useSharedValue(0);
+  const semMovimento = useReducedMotion();
+
   useEffect(() => {
+    // A órbita só gira quando está à vista. Antes ela girava SEMPRE — inclusive com a
+    // opacidade em 0, com o menu fechado, em toda tela do app. Era um quadro por frame
+    // gasto para desenhar algo que ninguém podia ver.
+    if (!visible || semMovimento) {
+      spin.value = 0;
+      return;
+    }
     spin.value = withRepeat(withTiming(360, { duration: 14_000, easing: Easing.linear }), -1, false);
-  }, [spin]);
+  }, [spin, visible, semMovimento]);
 
   const style = useAnimatedStyle(() => ({
     opacity: withTiming(visible ? 1 : 0, { duration: 220 }),
