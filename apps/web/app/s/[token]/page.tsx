@@ -20,6 +20,7 @@
  */
 'use client';
 
+import { dataBr } from '@/lib/br-data';
 import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { apiUrl } from '@/lib/utils';
@@ -39,16 +40,6 @@ type Estado =
   | { t: 'pin'; mensagem: string; restantes: number | null }
   | { t: 'ok'; resumo: Resumo }
   | { t: 'indisponivel'; mensagem: string };
-
-function dataBr(iso: string | null): string {
-  if (!iso) return '';
-  const ms = Date.parse(iso);
-  if (!Number.isFinite(ms)) return '';
-  // -3h fixo: mesmo raciocínio do app (o Brasil não tem horário de verão desde 2019).
-  const d = new Date(ms - 3 * 3_600_000);
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${p(d.getUTCDate())}/${p(d.getUTCMonth() + 1)}/${d.getUTCFullYear()}`;
-}
 
 export default function ResumoCompartilhado() {
   const { token } = useParams<{ token: string }>();
