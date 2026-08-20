@@ -2,6 +2,7 @@ import { parsePhoneNumber } from 'libphonenumber-js';
 import type { NormalizedInbound } from '@iasaude/shared';
 import type { UazapiWebhookPayload } from './types.js';
 import { extractSharedContacts } from './contacts.js';
+import { mimePorExtensao, nomeArquivoDoPayload } from './documento.js';
 
 export function normalizeWebhookPayload(payload: UazapiWebhookPayload): NormalizedInbound | null {
   const msg = payload.message;
@@ -149,13 +150,20 @@ export function normalizeWebhookPayload(payload: UazapiWebhookPayload): Normaliz
     };
   }
 
-  // Documento
-  if (type === 'document' || messageType.includes('document')) {
+  // Documento — PDF de laudo/receita, OU a mesma foto enviada como "arquivo" (opção
+  // que não comprime; é o que laboratório e clínica usam). `mediaType` também entra na
+  // condição porque a uazapi manda `type:'media'` com o tipo real só em `mediaType` —
+  // exatamente como já acontece na localização, logo acima. Sem isso o arquivo caía no
+  // fallback de texto e, sem texto, era DESCARTADO: o PDF do paciente virava silêncio.
+  if (type === 'document' || messageType.includes('document') || mediaType === 'document') {
+    const nome = nomeArquivoDoPayload(payload);
     return {
       ...base,
       contentType: 'document',
-      text: msg.text,
-      mediaMime: msg.mimetype,
+      text: msg.text || msg.content?.text,
+      // Mime declarado; na falta dele, a extensão do nome. Uma linha de mensagem com
+      // media_mime nulo desaparece do `resolveMediaMessageId` — ver mimePorExtensao.
+      mediaMime: msg.mimetype ?? mimePorExtensao(nome) ?? undefined,
       mediaUrl: msg.mediaUrl,
     };
   }

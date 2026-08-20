@@ -8,6 +8,7 @@ export { GlassBadge, type BadgeTone } from './glass-badge';
 export { StatusPing } from './status-ping';
 export { Avatar } from './avatar';
 export { SectionHeader } from './section-header';
+export { CollapsibleSection } from './collapsible-section';
 export { EmptyState } from './empty-state';
 export { LoadFailure } from './load-failure';
 export { Skeleton } from './skeleton';

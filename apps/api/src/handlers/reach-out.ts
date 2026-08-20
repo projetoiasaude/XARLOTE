@@ -11,7 +11,7 @@
  *    direcionado). Reaproveita os mesmos initiate*Negotiation dos fluxos normais
  *    (com relay bidirecional já pronto).
  */
-import { publicUrlForStoredMedia } from './media-host.js';
+import { signedUrlForStoredMedia } from './media-host.js';
 import { db, writeLog, writeAudit, saveMemoryCard } from '@iasaude/db';
 import { findPlacesByTextSearch, getPlacePhone } from '@iasaude/integrations';
 import { toE164BR, isPlaceholderPhone, brPhoneVariants, isServiceNumber, sameMedication, itemDisplayName, specialtyPhrase, isOfferStillValid, type OrderItem } from '@iasaude/shared';
@@ -847,7 +847,10 @@ export async function handleForwardMediaToEstablishment(
     if (ctx.observation) ctx.observation.note = 'NÃO há foto do paciente disponível pra encaminhar (nenhuma hospedada nesta conversa). Peça a ele pra enviar a foto de novo — NÃO diga que encaminhou.';
     return;
   }
-  const url = publicUrlForStoredMedia(media.media_storage_path as string);
+  // URL ASSINADA de 10 min, não pública: o arquivo aqui pode ser um laudo com nome, data
+  // de nascimento e CPF do paciente na primeira linha. Quem encaminha só precisa que o link
+  // valha no instante do envio — e é justamente o que o caminho do app já fazia.
+  const url = await signedUrlForStoredMedia(media.media_storage_path as string);
   if (!url) {
     if (ctx.observation) ctx.observation.note = 'A foto existe mas não consegui gerar o link pra enviar. Seja honesta: peça pro paciente reenviar.';
     return;

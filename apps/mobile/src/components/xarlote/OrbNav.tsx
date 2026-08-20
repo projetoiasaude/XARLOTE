@@ -58,8 +58,9 @@ import Animated, {
   withSpring,
   withTiming,
 } from 'react-native-reanimated';
-import { colors, radii, springs } from '@/theme';
+import { colors, FONTE_MINIMA, radii, springs } from '@/theme';
 import { LiquidCore } from './LiquidCore';
+import { useXarloteDigitando } from './typing-signal';
 
 interface NavItem {
   href: '/' | '/saude' | '/lembretes' | '/atividade' | '/perfil';
@@ -85,6 +86,27 @@ const BUBBLE = 52;
 const ORB = 68;
 const PONTO = 7;
 const PONTO_ATIVO = 10;
+
+/**
+ * O tempo de abertura — e por que ele é curto de propósito.
+ *
+ * A versão anterior usava `springs.orb` (rigidez 400) com 45ms de atraso por item: a
+ * última bolha só COMEÇAVA a se mover 180ms depois do toque, e a mola levava mais uns
+ * 250ms pra assentar. O efeito relatado no aparelho foi exato: "ela só clica assim que
+ * finaliza a animação". E é literal — o dedo acerta onde a bolha VAI estar, mas ela ainda
+ * está a caminho, a 30% do tamanho, perto do orb.
+ *
+ * Alvo de toque é posição, e posição é a animação. Enquanto ela roda, o botão não está
+ * onde a pessoa mira. Não dá pra "adiantar o toque" sem duplicar a área tocável num lugar
+ * invisível — o que quebraria o toque no véu atrás. O que dá é fazer a viagem ser tão
+ * curta que ninguém espera: com estes números a última bolha está no lugar em ~200ms, que
+ * é a fronteira do que se percebe como instantâneo.
+ *
+ * A animação continua — ela é o que explica que a constelação virou menu. Só deixou de
+ * cobrar pedágio.
+ */
+const MOLA_ABRIR = { stiffness: 560, damping: 34 } as const;
+const ATRASO_POR_ITEM = 16;
 
 /** Arco de 86° (topo) a 190° (esquerda) — folga de 52px entre bolhas, sem sobrepor. */
 const angleFor = (i: number, total: number) => 86 + (i * 104) / (total - 1);
@@ -122,8 +144,8 @@ function Destino({
     // `delay: i * 0.045` do web). Fechando: todos recolhem JUNTOS — escalonar a volta faz
     // o menu parecer que travou.
     t.value = open
-      ? withDelay(index * 45, withSpring(1, springs.orb))
-      : withSpring(0, springs.orb);
+      ? withDelay(index * ATRASO_POR_ITEM, withSpring(1, MOLA_ABRIR))
+      : withSpring(0, MOLA_ABRIR);
   }, [open, t, index, instantaneo]);
 
   /**
@@ -143,7 +165,9 @@ function Destino({
 
   const estiloBolha = useAnimatedStyle(() => ({
     opacity: Math.max(0, t.value * 1.4 - 0.4),
-    transform: [{ scale: 0.3 + 0.7 * t.value }],
+    // Nasce em 55% e não em 30%: a bolha vira alvo utilizável mais cedo no caminho,
+    // e o crescimento continua visível o suficiente pra leitura do gesto.
+    transform: [{ scale: 0.55 + 0.45 * t.value }],
   }));
 
   const estiloRotulo = useAnimatedStyle(() => ({ opacity: t.value }));
@@ -206,11 +230,19 @@ function Destino({
 }
 
 interface Props {
-  /** A Xarlote está digitando? O orb entra em modo `thinking`. */
+  /**
+   * A Xarlote está digitando? O orb entra em modo `thinking`.
+   *
+   * Quando não vem por prop, o orb LÊ o sinal (`typing-signal.ts`). O `_layout` monta o
+   * orb fora do Stack e não tem acesso ao estado do chat; o sinal é a ponte. A prop
+   * continua existindo pra quem quiser forçar (teste, storybook).
+   */
   typing?: boolean;
 }
 
-export function OrbNav({ typing = false }: Props) {
+export function OrbNav({ typing }: Props) {
+  const sinal = useXarloteDigitando();
+  const pensando = typing ?? sinal;
   const pathname = usePathname();
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -243,11 +275,27 @@ export function OrbNav({ typing = false }: Props) {
     setOpen((v) => !v);
   }, []);
 
+  /**
+   * `navigate` e NUNCA `push` — as cinco telas do orb são IRMÃS, não um caminho.
+   *
+   * `(main)/_layout.tsx` é um `Stack`. Com `push`, ir Conversa → Saúde → Conversa deixa
+   * DOIS chats montados, e o custo não é teórico: cada instância monta `useChat` →
+   * `useAppStream`, e `lib/stream.ts` abre um `EventSource` PRÓPRIO por hook. Seis idas e
+   * vindas pelo orb = quatro conexões SSE do mesmo paciente contra a API, quatro cópias
+   * da lista de mensagens na memória de um Android intermediário, e o botão voltar
+   * precisando de doze toques pra sair do app.
+   *
+   * Pior que o custo: `publicarXarloteDigitando` é estado de MÓDULO. A instância velha do
+   * chat, ao desmontar, publica `false` e apaga o "pensando" de um turno que ainda está em
+   * voo na instância nova.
+   *
+   * `navigate` volta pra instância que já está na pilha em vez de empilhar outra.
+   */
   const go = useCallback(
     (href: NavItem['href']) => {
       void Haptics.selectionAsync();
       setOpen(false);
-      if (href !== pathname) router.push(href);
+      if (href !== pathname) router.navigate(href);
     },
     [pathname, router],
   );
@@ -309,7 +357,7 @@ export function OrbNav({ typing = false }: Props) {
             }}
             style={styles.orb}
           >
-            <LiquidCore size={52} mode={typing ? 'thinking' : open ? 'active' : 'idle'} />
+            <LiquidCore size={52} mode={pensando ? 'thinking' : open ? 'active' : 'idle'} />
           </Pressable>
         </Animated.View>
       </View>
@@ -331,7 +379,17 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   ponto: { position: 'absolute', left: '50%', top: '50%' },
-  pontoAtivo: { boxShadow: '0 0 10px 0 rgba(255,255,255,0.55)' } as never,
+  /**
+   * Sem `boxShadow` aqui.
+   *
+   * Era `0 0 10px 0 rgba(255,255,255,0.55)` — pela mesma mecânica das sombras do vidro,
+   * um `BlurMaskFilter` vivo PERMANENTEMENTE em toda tela logada, porque sempre há um
+   * destino ativo. Era o único blur de máscara do app que nunca desligava.
+   *
+   * E era redundante: o ponto ativo já é maior (10 contra 7) e opaco (1 contra 0.7) que
+   * os irmãos. O "você está aqui" estava dito duas vezes e só uma delas custava.
+   */
+  pontoAtivo: { borderWidth: 2, borderColor: 'rgba(255,255,255,0.85)' },
   bubble: {
     width: BUBBLE,
     height: BUBBLE,
@@ -358,7 +416,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 4,
   },
-  labelText: { color: 'rgba(255,255,255,0.85)', fontSize: 11, fontWeight: '600' },
+  /**
+   * `FONTE_MINIMA`, e não 11.
+   *
+   * Este é o rótulo da ÚNICA navegação do app — o texto que decide se a paciente de 55
+   * anos acha a tela que quer. Piso de 12 vale ainda mais aqui do que em metadado
+   * descartável. "Lembretes" (o mais longo) cabe folgado nos 120 do `labelSlot`.
+   */
+  labelText: { color: 'rgba(255,255,255,0.85)', fontSize: FONTE_MINIMA, fontWeight: '600' },
   orb: {
     width: ORB,
     height: ORB,

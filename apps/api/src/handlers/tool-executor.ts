@@ -65,6 +65,25 @@ function extractDeliverySector(fullAddress: string | null): string | null {
   return result || null;
 }
 
+/**
+ * A mídia deste turno, já baixada UMA vez pelo inbound e classificada pelos BYTES.
+ *
+ * Por que o contrato mora aqui, e não no `NormalizedInbound`: o inbound descreve o que o
+ * provedor ENTREGOU (uma URL, um mime declarado); isto descreve o que o servidor JÁ APUROU
+ * sobre o arquivo. São coisas diferentes, e misturá-las é como uma tool acaba confiando na
+ * etiqueta de quem enviou.
+ *
+ * `tipo` vem de `sniffMidia` — 'document' é PDF, e nesse caso `texto` traz o que foi extraído.
+ */
+export interface MidiaDoTurno {
+  tipo: 'image' | 'document' | 'audio';
+  /** O mime REAL, lido dos bytes. */
+  mime: string;
+  buffer: Buffer;
+  /** Texto do PDF, ou transcrição do áudio. Vazio quando não deu pra ler. */
+  texto?: string;
+}
+
 interface ToolContext {
   userId: string;
   conversationId: string;
@@ -72,6 +91,11 @@ interface ToolContext {
   traceId: string;
   inboundMsg: Message;
   inbound: NormalizedInbound;
+  /**
+   * Mídia do turno (foto/PDF/áudio) já baixada e verificada. Opcional: turno de texto puro
+   * não tem nenhuma, e o backstop determinístico também chama tools sem mídia.
+   */
+  midiaDoTurno?: MidiaDoTurno | null;
   /**
    * IDs de pedidos CRIADOS neste turno (compartilhado entre as tools do mesmo turno).
    * Blindagem contra a ordem não-determinística das tool calls (review HIGH-1): se o
@@ -382,10 +406,26 @@ async function handleParsePrescription(_args: { message_id?: string }, ctx: Tool
   // uuids) e o `.single()` com texto inválido devolvia null → `return` mudo, sem o paciente
   // nem o modelo saberem por quê. Quem sabe qual é a imagem é o runtime.
   const messageId = await resolveMediaMessageId(ctx.conversationId, ctx.inboundMsg?.id, {
-    hasInboundMedia: !!ctx.inbound.mediaBase64,
+    hasInboundMedia: temMidiaNesteTurno(ctx),
   });
 
-  const base64 = ctx.inbound.mediaBase64 ?? null;
+  /**
+   * 🔴 A receita NUNCA foi lida em produção, e o defeito era este: o handler exigia
+   * `ctx.inbound.mediaBase64`, que só o SIMULADOR preenche. No WhatsApp (zpro/uazapi) e no
+   * app a mídia chega por URL. Então, para todo paciente de verdade, a tool caía neste `if`,
+   * respondia "não consegui processar, manda de novo" e falhava — e falhava outra vez na
+   * foto seguinte, para sempre. Uma falha permanente vestida de pedido de reenvio.
+   *
+   * Agora os bytes vêm do turno (baixados uma vez pelo inbound, `ctx.midiaDoTurno`).
+   */
+  const midia = ctx.midiaDoTurno;
+  if (midia?.tipo === 'document') {
+    // Receita em PDF: a visão não lê PDF, e o TEXTO dele já está na mensagem do paciente.
+    // Mandar tirar foto de um arquivo legível é o pior dos dois mundos — devolve o caminho
+    // certo ao modelo sem falar com o paciente.
+    throw new ToolFailure('Essa receita chegou em PDF, não em foto — parse_prescription_image só lê IMAGEM. O TEXTO do PDF já está na mensagem do paciente: liste os medicamentos a partir dele e confirme com ele, sem chamar esta ferramenta de novo.');
+  }
+  const base64 = midia?.tipo === 'image' ? midia.buffer.toString('base64') : ctx.inbound.mediaBase64 ?? null;
   if (!base64) {
     await sendOutbound(ctx.conversationId, ctx.phoneE164, 'Não consegui processar a imagem da receita. Pode mandar de novo? 📋', ctx.traceId);
     if (ctx.turnFlags) ctx.turnFlags.suppressLlmText = true;
@@ -400,7 +440,9 @@ async function handleParsePrescription(_args: { message_id?: string }, ctx: Tool
     raw_text?: string;
   }
 
-  const parsed = await extractStructured<OcrResult>(PRESCRIPTION_OCR_PROMPT, base64, ctx.inbound.mediaMime ?? 'image/jpeg');
+  // Mime dos BYTES quando existe (o declarado pelo provedor mente: a foto do iPhone chega
+  // anunciada como jpeg e é HEIC, e o modelo de visão recusa o par errado).
+  const parsed = await extractStructured<OcrResult>(PRESCRIPTION_OCR_PROMPT, base64, midia?.mime || ctx.inbound.mediaMime || 'image/jpeg');
 
   if (parsed.error === 'not_a_prescription') {
     await sendOutbound(ctx.conversationId, ctx.phoneE164, 'Não parece ser uma receita médica. Pode mandar a foto certinha? 📋', ctx.traceId);
@@ -437,6 +479,19 @@ interface SaveExamArgs {
   summary?: string;
   findings?: Array<{ marker: string; value: string; unit?: string; reference?: string }>;
   exam_date?: string;
+}
+
+/**
+ * Este turno TEM mídia? É o que decide se a mensagem do turno é a mensagem da mídia.
+ *
+ * Antes a pergunta era `!!ctx.inbound.mediaBase64` — verdadeira só no simulador. Com ela
+ * falsa, `resolveMediaMessageId` ia procurar no histórico a última mensagem com
+ * `media_mime` não-nulo: se o PDF de hoje chegou sem mime declarado (acontece), o exame era
+ * amarrado à FOTO DE OUTRO DIA. Vincular o resultado ao arquivo errado é pior que não
+ * vincular: o médico abre o exame e vê outra coisa.
+ */
+function temMidiaNesteTurno(ctx: ToolContext): boolean {
+  return !!(ctx.midiaDoTurno || ctx.inbound.mediaBase64 || ctx.inbound.mediaUrl);
 }
 
 /**
@@ -478,8 +533,18 @@ async function handleSaveExamResult(args: SaveExamArgs, ctx: ToolContext) {
   // O modelo nunca teve como saber esse uuid: agora o parâmetro nem existe no schema e o
   // runtime resolve a mensagem da mídia. Nunca peça ao LLM um dado que só o servidor tem.
   const messageId = await resolveMediaMessageId(ctx.conversationId, ctx.inboundMsg?.id, {
-    hasInboundMedia: !!ctx.inbound.mediaBase64,
+    hasInboundMedia: temMidiaNesteTurno(ctx),
   });
+  /**
+   * COMO o resultado foi lido, e por que isso vira coluna.
+   *
+   * 'vision' = valores lidos de uma FOTO pelo canal multimodal. 'pdf' = valores lidos do
+   * TEXTO de um PDF, que é uma leitura mais confiável (não passa por OCR). São graus de
+   * confiança diferentes no mesmo número, e o médico que abre o link do paciente precisa
+   * poder distinguir. Carimbar tudo como 'vision' seria afirmar que vimos uma imagem que
+   * nunca existiu.
+   */
+  const leitura: 'vision' | 'pdf' = ctx.midiaDoTurno?.tipo === 'document' ? 'pdf' : 'vision';
   const { data: row, error } = await db.from('user_exam_results').insert({
     user_id: ctx.userId,
     message_id: messageId,
@@ -489,7 +554,7 @@ async function handleSaveExamResult(args: SaveExamArgs, ctx: ToolContext) {
     summary: args.summary ?? null,
     findings,
     exam_date: examDate,
-    source: 'vision',
+    source: leitura,
   }).select('id').single();
 
   if (error) {

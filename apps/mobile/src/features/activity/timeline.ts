@@ -16,8 +16,8 @@
  * cotação de verdade na resposta. Uma barra de progresso que anda sozinha é a forma mais
  * rápida de o paciente perder confiança na única coisa que ele não pode conferir.
  */
-import type { Consultation, Order, Quote } from '@/features/health/overview';
-import { msDe } from '@/lib/br-format';
+import type { Consultation, ConsultationQuote, Order, Quote } from '@/features/health/overview';
+import { brDesde, brQuando, diffDiasBrt, msDe } from '@/lib/br-format';
 
 export type EstadoEtapa = 'feito' | 'agora' | 'esperando' | 'parado';
 
@@ -31,6 +31,33 @@ export interface Etapa {
 
 export type TipoAtividade = 'order' | 'consultation';
 
+/**
+ * Como isto acabou, em UMA palavra — o que faz um encerrado caber numa linha.
+ *
+ * Encerrado desenhado como cartão completo (título, resumo, quatro etapas com
+ * marcadores e detalhes) transforma o histórico numa parede de passos mortos entre o
+ * paciente e o único item que pede ação dele. Encerrado é linha; o `desfecho` é o que
+ * essa linha diz. Continua visível — esconder fracasso é o outro erro, e o mais grave.
+ */
+export interface Desfecho {
+  rotulo: string;
+  tom: 'success' | 'neutral' | 'warn';
+}
+
+/**
+ * A saída que o cartão oferece — derivada aqui pra ser testável, não decidida na tela.
+ *
+ * `retomar` existe porque `resumo` dizia "me chama no chat" em dois estados. A frase
+ * empurrava pro paciente um trabalho que o app pode fazer: montar o pedido de retomada
+ * com o nome do item dentro. `responder` não manda mensagem — as cotações chegaram como
+ * mensagens da Xarlote, e a escolha (endereço, forma de pagamento) é conversa; o que o
+ * botão faz é levar até lá em um toque, em vez de mandar o paciente encontrar o caminho.
+ */
+export type AcaoDaAtividade =
+  | { tipo: 'responder'; rotulo: string }
+  | { tipo: 'retomar'; rotulo: string; mensagem: string }
+  | null;
+
 export interface Atividade {
   id: string;
   tipo: TipoAtividade;
@@ -40,10 +67,28 @@ export interface Atividade {
   /** true = a Xarlote está trabalhando nisso agora (mostra o ping ao vivo). */
   viva: boolean;
   criadoEm: string | null;
+  /**
+   * Quando isto MEXEU pela última vez — sempre um carimbo do PASSADO.
+   *
+   * O defeito que esta anotação existe pra impedir de voltar: a consulta agendada
+   * carregava aqui o `scheduled_at`, que é FUTURO. A tela lê este campo como "atualizado
+   * há…", e `brDesde` devolve 'agora' pra qualquer diferença menor que um minuto —
+   * inclusive negativa, porque essa é a guarda de relógio adiantado. Resultado: a única
+   * consulta agendada que existe em produção dizia "atualizado agora", permanentemente,
+   * até o dia da consulta chegar. Status legítimo + tempo demais = mentira.
+   */
   atualizadoEm: string | null;
+  /**
+   * O compromisso MARCADO, que é futuro — em campo próprio justamente pra nunca
+   * disputar espaço com `atualizadoEm`. Null quando não há horário confirmado.
+   */
+  agendadoPara: string | null;
   etapas: Etapa[];
   /** Decisão pendente DO PACIENTE — o que ele precisa responder pra destravar. */
   esperandoVoce: boolean;
+  /** Null enquanto está vivo: só o que acabou tem desfecho. */
+  desfecho: Desfecho | null;
+  acao: AcaoDaAtividade;
 }
 
 function moeda(v: number | null | undefined): string | null {
@@ -199,7 +244,9 @@ export function atividadeDePedido(o: Order, nowMs: number): Atividade {
         : passadoAdiante
           ? 'Passei pra farmácia — o combinado seguiu com eles.'
           : frio
-            ? 'Isso ficou parado. Se ainda precisa, me chama no chat.'
+            ? // Sem "me chama no chat": o botão de retomar faz isso, e o app não devolve
+              // ao paciente um trabalho de redação que ele pode errar em silêncio.
+              'Isso ficou parado.'
             : esperandoVoce
               ? 'Tem cotação esperando sua escolha.'
               : escolhida
@@ -210,12 +257,88 @@ export function atividadeDePedido(o: Order, nowMs: number): Atividade {
     viva: !terminal && !frio,
     criadoEm: o.created_at ?? null,
     atualizadoEm,
+    // Pedido de farmácia não tem hora marcada — o `eta_minutes` é estimativa da
+    // farmácia, não compromisso, e vira detalhe da etapa de entrega.
+    agendadoPara: null,
     etapas,
     esperandoVoce,
+    desfecho: entregue
+      ? { rotulo: 'entregue', tom: 'success' }
+      : passadoAdiante
+        ? { rotulo: 'seguiu com a farmácia', tom: 'neutral' }
+        : frustrado
+          ? { rotulo: 'não seguiu', tom: 'warn' }
+          : frio
+            ? { rotulo: 'ficou parado', tom: 'warn' }
+            : null,
+    acao: esperandoVoce
+      ? { tipo: 'responder', rotulo: 'Ver as opções' }
+      : frio
+        ? { tipo: 'retomar', rotulo: 'Ainda preciso', mensagem: `Ainda preciso de ${titulo}. Pode retomar?` }
+        : null,
   };
 }
 
 const CONSULTA_TERMINAL = new Set(['completed', 'cancelled', 'failed', 'expired']);
+
+/**
+ * A proposta que virou o horário marcado — é ela que tem o nome da clínica.
+ *
+ * `consultations.selected_quote_id` NÃO vem no `GET /app/overview` (só `orders` traz o
+ * seu); o que vem é o `status` de cada `consultation_quotes`, e `tool-executor-v2` marca
+ * a escolhida como `'selected'` no mesmo passo em que grava
+ * `scheduled_at = q.proposed_datetime`. A segunda tentativa usa exatamente essa
+ * igualdade, pra uma linha antiga cujo status nunca foi atualizado: casar o instante é
+ * fato do banco, não palpite. Sem nenhuma das duas, fica sem nome — melhor calar do que
+ * dizer a clínica errada num compromisso.
+ */
+function propostaEscolhida(
+  propostas: readonly ConsultationQuote[],
+  scheduledAt: string | null | undefined,
+): ConsultationQuote | null {
+  const marcada = propostas.find((q) => q.status === 'selected');
+  if (marcada) return marcada;
+  const alvo = msDe(scheduledAt);
+  if (alvo === null) return null;
+  return propostas.find((q) => msDe(q.proposed_datetime) === alvo) ?? null;
+}
+
+/**
+ * Quanto FALTA, em dias de calendário — a segunda leitura do mesmo carimbo.
+ *
+ * A etapa 'escolha' diz QUANDO é ("qua, 26/08 às 10:00"); esta diz QUANTO falta. É o
+ * mesmo dado em duas funções diferentes, não o mesmo dado duas vezes: uma localiza no
+ * calendário, a outra dá a urgência sem obrigar ninguém a fazer a conta.
+ *
+ * Data já passada devolve null de propósito: "faltam -2 dias" é a mesma classe de
+ * mentira que o `atualizadoEm` no futuro. Consulta cuja hora passou e que ninguém
+ * fechou fica sem contagem, não com uma contagem negativa.
+ */
+function faltaQuanto(iso: string | null | undefined, agoraMs: number): string | null {
+  const ms = msDe(iso);
+  if (ms === null) return null;
+  const dias = diffDiasBrt(ms, agoraMs);
+  if (dias < 0) return null;
+  if (dias === 0) return 'é hoje';
+  if (dias === 1) return 'é amanhã';
+  return `faltam ${dias} dias`;
+}
+
+/**
+ * O carimbo de "atualizado …" que se recusa a falar do futuro.
+ *
+ * Cinto duplo do `atualizadoEm`: `brDesde` devolve 'agora' pra qualquer diferença menor
+ * que um minuto, incluindo negativa (é a guarda contra relógio adiantado), então uma
+ * data futura que escorregasse pra este campo viraria "atualizado agora" para sempre.
+ * Aqui um futuro DECLARADO — mais de um minuto à frente — não vira rótulo nenhum. A
+ * tela absorve um rótulo vazio; ela não absorve uma afirmação falsa sobre o presente.
+ */
+export function desdeNoPassado(iso: string | null | undefined, agoraMs: number): string {
+  const ms = msDe(iso);
+  if (ms === null) return '';
+  if (ms > agoraMs + 60_000) return '';
+  return brDesde(iso, agoraMs);
+}
 
 /**
  * Uma consulta como quatro etapas.
@@ -238,6 +361,23 @@ export function atividadeDeConsulta(c: Consultation, nowMs: number): Atividade {
     ? [...propostas].sort((a, b) => (a.price_brl ?? Infinity) - (b.price_brl ?? Infinity))[0]!
     : null;
 
+  /**
+   * O único fato acionável de uma consulta agendada: o dia, a hora e onde.
+   *
+   * A etapa dizia só "Horário confirmado", sem detalhe nenhum — um cartão que afirma
+   * estar tudo certo e não diz quando. `scheduled_at` e o nome da clínica já estavam
+   * nas mãos desta função; faltava dizê-los.
+   */
+  const escolhida = agendada ? propostaEscolhida(propostas, c.scheduled_at) : null;
+  const clinica = escolhida?.clinics?.name?.trim() || null;
+  const quandoMarcado = agendada ? brQuando(c.scheduled_at, nowMs) : '';
+  const detalheDoHorario = quandoMarcado
+    ? clinica
+      ? `${quandoMarcado} · ${clinica}`
+      : quandoMarcado
+    : null;
+  const contagem = agendada ? faltaQuanto(c.scheduled_at, nowMs) : null;
+
   const etapas: Etapa[] = [
     { chave: 'pedido', rotulo: 'Entendi o que você precisa', estado: 'feito', ...(c.specialty ? { detalhe: c.specialty } : {}) },
     {
@@ -256,32 +396,58 @@ export function atividadeDeConsulta(c: Consultation, nowMs: number): Atividade {
       chave: 'escolha',
       rotulo: agendada ? 'Horário confirmado' : 'Sua escolha de horário',
       estado: agendada ? 'feito' : cancelada ? 'parado' : 'esperando',
+      ...(detalheDoHorario ? { detalhe: detalheDoHorario } : {}),
     },
     {
       chave: 'consulta',
       rotulo: c.status === 'completed' ? 'Consulta realizada' : 'A consulta',
       estado: c.status === 'completed' ? 'feito' : cancelada ? 'parado' : agendada ? 'agora' : 'esperando',
+      ...(contagem && c.status !== 'completed' ? { detalhe: contagem } : {}),
     },
   ];
+
+  const titulo = c.specialty ? `Consulta — ${c.specialty}` : 'Consulta médica';
+  const esperandoVoce = temProposta && !agendada && !terminal && !frio;
 
   return {
     id: c.id,
     tipo: 'consultation',
-    titulo: c.specialty ? `Consulta — ${c.specialty}` : 'Consulta médica',
+    titulo,
     resumo: cancelada
       ? 'Essa busca não seguiu.'
       : agendada
         ? 'Horário marcado.'
         : frio
-          ? 'Essa busca ficou parada. Se ainda quer, me chama no chat.'
+          ? 'Essa busca ficou parada.'
           : temProposta
             ? 'Tem horário esperando você confirmar.'
             : 'Estou procurando clínicas.',
     viva: !terminal && !frio,
     criadoEm: c.created_at ?? null,
-    atualizadoEm: c.scheduled_at ?? c.created_at ?? null,
+    // `created_at`, NUNCA `scheduled_at`: este campo é fato do passado (ver o tipo).
+    atualizadoEm: c.created_at ?? null,
+    agendadoPara: c.scheduled_at ?? null,
     etapas,
-    esperandoVoce: temProposta && !agendada && !terminal && !frio,
+    esperandoVoce,
+    desfecho:
+      c.status === 'completed'
+        ? { rotulo: 'realizada', tom: 'success' }
+        : cancelada
+          ? { rotulo: 'não seguiu', tom: 'warn' }
+          : frio
+            ? { rotulo: 'ficou parada', tom: 'warn' }
+            : null,
+    acao: esperandoVoce
+      ? { tipo: 'responder', rotulo: 'Ver os horários' }
+      : frio
+        ? {
+            tipo: 'retomar',
+            rotulo: 'Ainda quero',
+            mensagem: c.specialty
+              ? `Ainda quero a consulta de ${c.specialty}. Pode retomar?`
+              : 'Ainda quero marcar aquela consulta. Pode retomar?',
+          }
+        : null,
   };
 }
 
@@ -292,6 +458,46 @@ export function atividadeDeConsulta(c: Consultation, nowMs: number): Atividade {
  * o estado vazio que não falava: o paciente conclui que nada aconteceu, quando o que
  * houve foi um fracasso que ele tem o direito de ver.
  */
+export interface ResumoAtividade {
+  /** A frase de estado — vai ANTES da lista, nunca depois dela. */
+  frase: string;
+  /** Quantos itens dependem de uma resposta do paciente. */
+  precisaDeVoce: number;
+  vivas: number;
+  encerradas: number;
+}
+
+/**
+ * O estado da tela em uma frase, calculado ANTES de desenhar qualquer cartão.
+ *
+ * O defeito que isto conserta: a tela mostrava a pilha de encerrados e só depois dela, no
+ * rodapé, a frase "Nada em andamento no momento". Quem abria via primeiro uma tela cheia
+ * de cartões e só descobria no fim que nenhum estava ativo — a informação que responde à
+ * pergunta da aba chegava depois do conteúdo que a contradiz. Frase de estado é herói, e
+ * herói fica no topo.
+ *
+ * A ordem das frases é a ordem da urgência: o que espera o PACIENTE vem primeiro, porque
+ * é o único caso em que a tela precisa de algo dele.
+ */
+export function resumoDaAtividade(atividades: readonly Atividade[]): ResumoAtividade {
+  const vivas = atividades.filter((a) => a.viva).length;
+  const precisaDeVoce = atividades.filter((a) => a.esperandoVoce).length;
+  const encerradas = atividades.length - vivas;
+
+  const frase =
+    precisaDeVoce > 0
+      ? precisaDeVoce === 1
+        ? 'Uma coisa está esperando você'
+        : `${precisaDeVoce} coisas estão esperando você`
+      : vivas > 0
+        ? vivas === 1
+          ? 'Estou cuidando de uma coisa agora'
+          : `Estou cuidando de ${vivas} coisas agora`
+        : 'Nada em andamento agora';
+
+  return { frase, precisaDeVoce, vivas, encerradas };
+}
+
 export function montarAtividades(
   orders: readonly Order[],
   consultas: readonly Consultation[],
@@ -304,6 +510,21 @@ export function montarAtividades(
   return todas.sort((a, b) => {
     if (a.viva !== b.viva) return a.viva ? -1 : 1;
     if (a.viva && a.esperandoVoce !== b.esperandoVoce) return a.esperandoVoce ? -1 : 1;
+    /**
+     * Compromisso marcado sobe entre os vivos — e por MÉRITO, não por acidente.
+     *
+     * Antes ele subia porque `atualizadoEm` carregava o `scheduled_at` (futuro), o que
+     * fazia a ordenação certa pelo motivo errado e o rótulo "atualizado agora" pelo
+     * mesmo motivo. Agora a regra é explícita: entre dois itens vivos que não esperam
+     * resposta do paciente, o que tem dia e hora vem primeiro, e entre dois marcados,
+     * o mais próximo.
+     */
+    if (a.viva) {
+      const ma = msDe(a.agendadoPara);
+      const mb = msDe(b.agendadoPara);
+      if ((ma === null) !== (mb === null)) return ma !== null ? -1 : 1;
+      if (ma !== null && mb !== null && ma !== mb) return ma - mb;
+    }
     return (msDe(b.atualizadoEm) ?? 0) - (msDe(a.atualizadoEm) ?? 0);
   });
 }

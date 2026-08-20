@@ -4,3 +4,4 @@ export * from './transcription.js';
 export * from './tts.js';
 export * from './push.js';
 export * from './pharmacy-platforms/index.js';
+export * from './pdf-texto.js';

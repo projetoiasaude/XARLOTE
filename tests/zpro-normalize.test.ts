@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { normalizeZproWebhook, zproEventId } from '../packages/whatsapp/src/zpro-normalize.js';
+import { nomeArquivoDeInbound } from '../packages/whatsapp/src/documento.js';
 
 // ⚠️ O payload de entrada do zpro NÃO é documentado. Estes testes travam a
 // TOLERÂNCIA do normalizador (vários shapes plausíveis: WABA-flat, Baileys-
@@ -108,6 +109,72 @@ describe('normalizeZproWebhook — shape real (WABA backhub)', () => {
   it('ignora eventos que não são mensagem recebida (status/ack)', () => {
     expect(normalizeZproWebhook({ method: 'messageAck', msg: { id: 'wamid.Z', from: '556291592150' } }, 'sara')).toBeNull();
     expect(normalizeZproWebhook({ method: 'messageStatus', ticket: { id: 1, contact: { number: '556291592150' } } }, 'sara')).toBeNull();
+  });
+
+  /**
+   * DOCUMENTO — o caminho mais provável de um exame chegar: o laboratório manda o PDF por
+   * e-mail e a pessoa encaminha aqui. O ramo é novo e não tinha um único caso.
+   */
+  it('PDF de laudo: contentType document, nome do arquivo e URL do Meta', () => {
+    const doc = {
+      method: 'message',
+      msg: {
+        id: 'wamid.D1',
+        from: '556200000000',
+        type: 'document',
+        document: {
+          filename: 'resultado_exame.pdf',
+          mime_type: 'application/pdf',
+          url: 'https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=1',
+          caption: 'chegou o resultado',
+        },
+        timestamp: '1750000000',
+      },
+      ticket: { id: 173743, contact: { number: '556200000000', name: 'Hiago' } },
+    };
+    const n = normalizeZproWebhook(doc, 'sara');
+    expect(n).not.toBeNull();
+    expect(n!.contentType).toBe('document');
+    expect(n!.text).toBe('chegou o resultado');
+    expect(n!.mediaMime).toBe('application/pdf');
+    expect(n!.mediaUrl).toContain('lookaside.fbsbx.com');
+    // O nome não vive em `NormalizedInbound`; quem o extrai lê o `raw` (documento.ts).
+    expect(nomeArquivoDeInbound(n!)).toBe('resultado_exame.pdf');
+  });
+
+  it('sem `type` reconhecível, a PRESENÇA do objeto document já decide o ramo', () => {
+    // Sem isto o payload caía no ramo de texto, ficava sem texto e era DESCARTADO — o PDF
+    // do paciente virava silêncio absoluto.
+    const semTipo = {
+      method: 'message',
+      msg: {
+        id: 'wamid.D2',
+        from: '556200000000',
+        document: { filename: 'pedido_medico.PDF', url: 'https://lookaside.fbsbx.com/x' },
+      },
+      ticket: { id: 173743, contact: { number: '556200000000' } },
+    };
+    const n = normalizeZproWebhook(semTipo, 'sara');
+    expect(n).not.toBeNull();
+    expect(n!.contentType).toBe('document');
+    // Sem `mime_type` declarado, a extensão do nome. `media_mime` nulo faz a linha sumir do
+    // `resolveMediaMessageId` — e aí o exame não acha o próprio arquivo.
+    expect(n!.mediaMime).toBe('application/pdf');
+  });
+
+  it('documento sem nome NEM mime declarado: mediaMime fica undefined, sem chute', () => {
+    const n = normalizeZproWebhook(
+      {
+        method: 'message',
+        msg: { id: 'wamid.D3', from: '556200000000', type: 'document', document: { url: 'https://lookaside.fbsbx.com/y' } },
+        ticket: { id: 1, contact: { number: '556200000000' } },
+      },
+      'sara',
+    );
+    expect(n).not.toBeNull();
+    expect(n!.contentType).toBe('document');
+    expect(n!.mediaMime).toBeUndefined();
+    expect(nomeArquivoDeInbound(n!)).toBeNull();
   });
 
   it('resposta de botão WABA (interactive.button_reply) vira texto com o título', () => {

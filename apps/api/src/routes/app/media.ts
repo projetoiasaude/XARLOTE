@@ -18,16 +18,72 @@
  * `GET /app/media/:id/url`, que confere o dono e emite uma URL assinada de 10 minutos.
  * Um bucket público com nome de arquivo adivinhável seria prontuário aberto por
  * enumeração — e nomes "aleatórios" não são um controle de acesso.
+ *
+ * ## PDF: o TEXTO é lido aqui, no upload
+ *
+ * Laudo de laboratório é texto, não desenho. Mandar o PDF pro modelo de visão seria
+ * repetir a armadilha do HEIC (formato que sobe e o provedor recusa) e ainda pagar token
+ * de imagem por página pra receber um chute onde existe certeza: `extrairTextoDePdf` lê
+ * "Hemoglobina 13,2 g/dL" dos bytes.
+ *
+ * A leitura acontece no upload e não no turno da LLM por dois motivos:
+ * · o buffer já está na memória aqui — no worker ele teria que ser baixado de novo;
+ * · o app precisa da resposta ANTES de enviar, pra mostrar a prévia ("2 páginas, 1.842
+ *   caracteres lidos") e deixar o paciente conferir que mandou o arquivo certo.
+ *
+ * Quando o PDF é uma folha escaneada, ou está cifrado, ou usa fonte sem mapa de unicode,
+ * a resposta traz `motivo` e `aviso` em vez de texto. Ela nunca traz texto vazio como se
+ * tivesse dado certo — o app precisa saber a diferença pra oferecer a foto da folha.
+ *
+ * ## Sim, o worker lê o mesmo PDF de novo — e as duas leituras têm dono
+ *
+ * Esta aqui alimenta a PRÉVIA: é o que o app mostra ao paciente antes de a mensagem
+ * existir (`features/media/pdf-documento.ts`), inclusive a frase que diz, com todas as
+ * letras, que o conteúdo NÃO pôde ser lido. A do worker alimenta o PROMPT, com teto maior
+ * (6000 contra 3000) e o embrulho que separa conteúdo de arquivo de instrução. Apagar uma
+ * delas não é economia: é ou uma prévia que mente, ou um laudo cortado no prompt.
+ *
+ * O custo dessa leitura é limitado no extrator, não aqui: `extrairTextoDePdf` para de
+ * inflar ao somar ~32 MB no total (não só 8 MB por stream), o que é o que impede um upload
+ * de 10 MB declarando 400 streams compressíveis de virar gigabytes de `inflateSync`
+ * síncrono na thread que atende todo mundo.
  */
 import type { FastifyInstance } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import { db, writeEvent } from '@iasaude/db';
+import { extrairTextoDePdf, mensagemDePdfIlegivel, type LeituraDePdf } from '@iasaude/integrations';
 import { requirePatient } from '../../middleware/patient-auth.js';
 import { MAX_BYTES, mensagemDeRecusa, sniffMidia } from '../../lib/media-sniff.js';
 
 const BUCKET = 'xarlote-app-media';
 /** Validade da URL assinada: tempo de carregar a imagem, não de circular por aí. */
 const URL_TTL_S = 600;
+
+/**
+ * O que o app recebe sobre um PDF. Ou tem texto, ou tem motivo — nunca os dois vazios.
+ */
+type RespostaDocumento =
+  | { texto: string; paginas: number; caracteres: number; truncado: boolean }
+  | { texto: null; paginas: number; motivo: string; aviso: string };
+
+/**
+ * O extrator é puro e não deve lançar. O `try` existe porque este caminho segura o exame
+ * que o paciente acabou de mandar: se um PDF exótico achar um caso que o parser não
+ * previu, o arquivo TEM que continuar guardado e a resposta tem que dizer o que houve.
+ * Perder o upload por causa da leitura seria trocar um problema pequeno por um grande.
+ */
+function lerPdf(buf: Buffer, log: { error: (o: object, m: string) => void }): LeituraDePdf {
+  try {
+    return extrairTextoDePdf(buf);
+  } catch (err) {
+    // Sem o texto no log: é dado clínico. Só o tamanho e a mensagem do erro.
+    log.error(
+      { err: err instanceof Error ? err.message.slice(0, 160) : String(err).slice(0, 160), bytes: buf.length },
+      'extração de texto do PDF lançou',
+    );
+    return { ok: false, motivo: 'falha_ao_ler', paginas: 0 };
+  }
+}
 
 export async function appMediaRoutes(app: FastifyInstance): Promise<void> {
   // ─── POST /app/media ──────────────────────────────────────────────────────
@@ -114,6 +170,13 @@ export async function appMediaRoutes(app: FastifyInstance): Promise<void> {
 
     const { data: linha, error: errLinha } = await db
       .from('app_media')
+      /**
+       * `kind` guarda 'image' pro PDF porque a coluna tem `check (kind in ('image',
+       * 'audio'))` desde a 0025 — 'document' exigiria migration, que não é desta frente.
+       * O tipo REAL não se perde: ele está em `mime` (`application/pdf`), que é o que o
+       * apagamento e a exportação leem. Enquanto a migration não vier, `kind` é uma pista,
+       * nunca a chave — e é por isso que quem quiser saber se é PDF olha o mime.
+       */
       .insert({ user_id: userId, storage_path: caminho, mime: v.mime, bytes: buf.length, kind: v.tipo === 'audio' ? 'audio' : 'image' })
       .select('id')
       .single();
@@ -125,14 +188,58 @@ export async function appMediaRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(500).send({ error: 'registro_falhou' });
     }
 
+    /**
+     * A leitura do PDF vem DEPOIS de o arquivo estar guardado e registrado, de propósito.
+     * Nesta ordem, qualquer coisa que aconteça na extração acontece sobre um exame que
+     * já está a salvo — a ordem inversa faria uma falha de leitura custar o upload.
+     */
+    let documento: RespostaDocumento | undefined;
+    if (v.tipo === 'document') {
+      const leitura = lerPdf(buf, req.log);
+      documento = leitura.ok
+        ? {
+            texto: leitura.texto,
+            paginas: leitura.paginas,
+            caracteres: leitura.caracteres,
+            truncado: leitura.truncado,
+          }
+        : {
+            texto: null,
+            paginas: leitura.paginas,
+            motivo: leitura.motivo,
+            aviso: mensagemDePdfIlegivel(leitura.motivo),
+          };
+    }
+
     void writeEvent({
       eventName: 'app.media_uploaded',
       userId,
-      // Sem nome de arquivo e sem conteúdo: só o formato e o tamanho.
-      payload: { tipo: v.tipo, mime: v.mime, bytes: buf.length },
+      // Sem nome de arquivo e sem conteúdo: só o formato e o tamanho. Do PDF vão os
+      // NÚMEROS (páginas, caracteres) e o motivo da falha — nunca um trecho do laudo.
+      payload: {
+        tipo: v.tipo,
+        mime: v.mime,
+        bytes: buf.length,
+        ...(documento
+          ? documento.texto === null
+            ? { pdfLido: false, pdfMotivo: documento.motivo, paginas: documento.paginas }
+            : {
+                pdfLido: true,
+                paginas: documento.paginas,
+                caracteres: documento.caracteres,
+                truncado: documento.truncado,
+              }
+          : {}),
+      },
     });
 
-      return reply.code(201).send({ mediaId: linha.id, tipo: v.tipo, mime: v.mime, bytes: buf.length });
+      return reply.code(201).send({
+        mediaId: linha.id,
+        tipo: v.tipo,
+        mime: v.mime,
+        bytes: buf.length,
+        ...(documento ? { documento } : {}),
+      });
     },
   );
 

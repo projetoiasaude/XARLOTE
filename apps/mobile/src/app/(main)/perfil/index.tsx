@@ -1,45 +1,63 @@
 /**
- * Perfil 360 — identidade, a tranca do aparelho, e **o que a Xarlote lembra de você**.
+ * Perfil — "quem sou eu, e quem manda nos meus dados?"
  *
- * ## Por que a memória aparece aqui, com a origem de cada item
+ * ## A tela cabe numa tela — e a conta foi feita, não estimada
  *
- * A memória é o que faz a Xarlote parecer que conhece o paciente — e é justamente por
- * isso que ela não pode ser invisível. Cada card mostra se veio de algo que a pessoa
- * DISSE (`self_reported`) ou de algo que nós DEDUZIMOS (`inferred`), porque a diferença
- * importa: uma dedução errada que a pessoa nunca vê é uma dedução que nunca é corrigida.
- * É também a metade legível da portabilidade LGPD — o export completo entra na F4.
+ * A versão anterior desenhava os até 80 memory cards aqui dentro, um cartão de vidro
+ * cada, e por isso o botão "Sair da conta" ficava no fim de uma rolagem que crescia com o
+ * tempo de uso do paciente. Agora são: a identidade (editável), TRÊS linhas de controle,
+ * a memória atrás de UM cabeçalho recolhido com contador, e sair.
  *
- * Apagar conta e exportar dados também são da F4; até lá o caminho é pelo chat
- * ("CONFIRMO APAGAR"), que já funciona e está testado.
+ * A primeira tentativa de recolher ainda não cabia: o bloco de memória abria com o seu
+ * próprio cabeçalho, o campo de busca e QUATRO subseções, ~370pt entre a última linha de
+ * privacidade e o "Sair da conta" — que voltava pra fora do viewport de um Android
+ * intermediário (~740–800pt). Somando as alturas declaradas hoje: 105 de topo + 76 da
+ * identidade + 79 do cabeçalho de seção + 234 das três linhas + 92 da memória recolhida +
+ * 84 do sair ≈ 670. Sair fica visível sem rolagem; a memória continua a um toque, e
+ * aberta ela rola — o que rola é o acervo, nunca o controle da conta.
+ *
+ * ## O que saiu de texto morto
+ *
+ * O rodapé antigo mandava resolver duas coisas no chat que esta mesma tela já resolve uma
+ * polegada acima ("Meus dados"), e anunciava uma frase mágica que não é a frase
+ * ("APAGAR MEUS DADOS" — o app pede "APAGAR MINHA CONTA", e o chat pede "CONFIRMO
+ * APAGAR"). Quem seguisse a instrução digitava no WhatsApp, recebia um pedido de OUTRA
+ * frase, e concluía que apagar dados é difícil de propósito — exatamente o dano que a
+ * tela de privacidade foi construída pra evitar.
+ *
+ * ## Por que o Perfil re-pergunta quem você é ao voltar
+ *
+ * O nome é gravado pela Xarlote, no chat (ver `features/profile/nome.ts`). Quem pede a
+ * mudança sai desta tela pro chat e volta — e as abas do expo-router ficam MONTADAS, então
+ * sem invalidar `me` no foco o paciente voltaria e veria o nome antigo, concluindo que o
+ * pedido não pegou.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Alert, StyleSheet, Switch, Text, View } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useCallback, useEffect, useState } from 'react';
+import { Alert, RefreshControl, StyleSheet, Switch, Text, View } from 'react-native';
+import { useFocusEffect, useRouter } from 'expo-router';
+import * as Haptics from 'expo-haptics';
 import * as LocalAuthentication from 'expo-local-authentication';
-import { Brain, ChevronRight, Fingerprint, LogOut, ShieldCheck, Stethoscope } from 'lucide-react-native';
-import { Avatar, GlassBadge, GlassButton, GlassCard, SectionHeader } from '@/components/ui';
+import { useQueryClient } from '@tanstack/react-query';
+import { ChevronRight, Fingerprint, LogOut, ShieldCheck, Stethoscope } from 'lucide-react-native';
+import { GlassCard, LoadFailure, SectionHeader } from '@/components/ui';
 import { Screen } from '@/components/xarlote/Screen';
 import { useMe } from '@/lib/api/use-me';
-import { useOverview } from '@/features/health/use-overview';
-import { agruparMemoria } from '@/features/health/overview';
+import { useAgora } from '@/features/health/use-agora';
+import { CartaoIdentidade } from '@/features/profile/CartaoIdentidade';
+import { BlocoMemoria } from '@/features/profile/BlocoMemoria';
+import { useMemoria } from '@/features/profile/use-memoria';
 import { rotuloDeVersao } from '@/lib/app-version';
-import { brDesde } from '@/lib/br-format';
 import { useSession } from '@/lib/auth/session';
-import { formatPhonePretty } from '@/lib/phone-input';
-import { colors } from '@/theme';
+import { colors, FONTE_CLINICA, FONTE_MINIMA } from '@/theme';
 
 export default function PerfilScreen() {
   const router = useRouter();
+  const qc = useQueryClient();
   const { user, lockEnabled, setLockEnabled, signOut } = useSession();
   const { data } = useMe();
-  const { data: overview } = useOverview();
+  const memoria = useMemoria();
+  const agora = useAgora();
   const [biometriaDisponivel, setBiometriaDisponivel] = useState(false);
-  const [agora] = useState(() => Date.now());
-
-  const gruposMemoria = useMemo(
-    () => (overview ? agruparMemoria(overview.memoryCards) : []),
-    [overview],
-  );
 
   useEffect(() => {
     void (async () => {
@@ -51,8 +69,17 @@ export default function PerfilScreen() {
     })();
   }, []);
 
+  // Voltou do chat (talvez com o nome novo): re-pergunta quem é. É a chamada mais barata
+  // do app — só identidade e flags, sem prontuário.
+  useFocusEffect(
+    useCallback(() => {
+      void qc.invalidateQueries({ predicate: (q) => q.queryKey[0] === 'me' });
+    }, [qc]),
+  );
+
   const alternarCadeado = useCallback(
     async (ligar: boolean) => {
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       if (ligar) {
         // Confirma o dedo ANTES de ligar. Sem isso dá pra trancar o app com uma
         // biometria que não funciona — e aí o dono não entra mais nos próprios dados.
@@ -79,26 +106,52 @@ export default function PerfilScreen() {
     ]);
   }, [signOut]);
 
+  const atualizar = useCallback(() => {
+    memoria.recarregar();
+    void qc.invalidateQueries({ predicate: (q) => q.queryKey[0] === 'me' });
+    // Háptico no FIM do gesto: é o que diz "acabei", num gesto que não tem outro fim
+    // visível quando nada mudou.
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, [memoria, qc]);
+
   const nome = data?.user.preferredName ?? data?.user.fullName ?? user?.preferredName ?? null;
   const telefone = data?.user.phoneE164 ?? user?.phoneE164 ?? '';
+  // Sem resposta do `/me` ainda, assume LIGADA: o pessimismo aqui esconderia o único
+  // caminho de editar o nome por causa de meio segundo de rede.
+  const xarloteLigada = data?.flags.xarloteEnabled !== false;
 
   return (
-    <Screen title="Perfil">
-      <GlassCard style={styles.identidade}>
-        <Avatar name={nome ?? telefone} size="lg" />
-        <View style={styles.identidadeTexto}>
-          <Text style={styles.nome}>{nome ?? 'Sem nome ainda'}</Text>
-          <Text style={styles.telefone}>{formatPhonePretty(telefone)}</Text>
-        </View>
-      </GlassCard>
+    <Screen
+      title="Perfil"
+      refreshControl={
+        <RefreshControl
+          refreshing={memoria.recarregando}
+          onRefresh={atualizar}
+          tintColor={colors.accentHi}
+          colors={[colors.accentHi]}
+        />
+      }
+    >
+      <CartaoIdentidade nome={nome} telefone={telefone} xarloteLigada={xarloteLigada} />
 
       <SectionHeader
-        title="Privacidade"
-        subtitle="quem pode abrir o app neste aparelho"
+        title="Privacidade e dados"
+        subtitle="quem abre este app, e o que sai dele"
         style={styles.secao}
       />
 
-      <GlassCard style={styles.linha}>
+      {/*
+        A linha inteira é o interruptor.
+
+        O `Switch` sozinho tem ~31pt de alvo, abaixo do piso de 44 — e é o controle que
+        tranca o prontuário de alguém. Com `pointerEvents="none"` ele passa a ser só o
+        INDICADOR: quem recebe o toque é a linha de 68pt. Isso também elimina o risco de
+        toque duplo (linha + switch disparando a mesma troca).
+      */}
+      <GlassCard
+        style={styles.linha}
+        {...(biometriaDisponivel ? { onPress: () => void alternarCadeado(!lockEnabled) } : {})}
+      >
         <View style={styles.linhaEsquerda}>
           <Fingerprint size={18} color={colors.accentHi} />
           <View style={styles.linhaTexto}>
@@ -110,13 +163,14 @@ export default function PerfilScreen() {
             </Text>
           </View>
         </View>
-        <Switch
-          value={lockEnabled}
-          disabled={!biometriaDisponivel}
-          onValueChange={(v) => void alternarCadeado(v)}
-          trackColor={{ false: 'rgba(255,255,255,0.12)', true: 'rgba(124,135,255,0.6)' }}
-          thumbColor="#ffffff"
-        />
+        <View pointerEvents="none">
+          <Switch
+            value={lockEnabled}
+            disabled={!biometriaDisponivel}
+            trackColor={{ false: 'rgba(255,255,255,0.12)', true: 'rgba(124,135,255,0.6)' }}
+            thumbColor={colors.textOnFill}
+          />
+        </View>
       </GlassCard>
 
       {/*
@@ -124,11 +178,7 @@ export default function PerfilScreen() {
         num submenu: a Apple exige que a exclusão de conta seja ACHÁVEL (Review 5.1.1(v)),
         e a LGPD não vale muito se o caminho pro direito for difícil de encontrar.
       */}
-      <GlassCard
-        style={styles.linha}
-        interactive
-        onPress={() => router.push('/perfil/privacidade')}
-      >
+      <GlassCard style={styles.linha} onPress={() => router.push('/perfil/privacidade')}>
         <View style={styles.linhaEsquerda}>
           <ShieldCheck size={18} color={colors.info} />
           <View style={styles.linhaTexto}>
@@ -136,18 +186,14 @@ export default function PerfilScreen() {
             <Text style={styles.linhaHint}>Baixar tudo que eu guardo, ou apagar a conta.</Text>
           </View>
         </View>
-        <ChevronRight size={16} color={colors.textFaint} />
+        <ChevronRight size={18} color={colors.textDim} />
       </GlassCard>
 
       {/*
         O link do médico. Fica logo abaixo de "Meus dados" porque é da mesma família —
         as duas coisas que o paciente faz com o próprio prontuário: levar embora e mostrar.
       */}
-      <GlassCard
-        style={styles.linha}
-        interactive
-        onPress={() => router.push('/perfil/compartilhar')}
-      >
+      <GlassCard style={styles.linha} onPress={() => router.push('/perfil/compartilhar')}>
         <View style={styles.linhaEsquerda}>
           <Stethoscope size={18} color={colors.accentHi} />
           <View style={styles.linhaTexto}>
@@ -155,67 +201,37 @@ export default function PerfilScreen() {
             <Text style={styles.linhaHint}>Um link com seu resumo, que expira sozinho.</Text>
           </View>
         </View>
-        <ChevronRight size={16} color={colors.textFaint} />
+        <ChevronRight size={18} color={colors.textDim} />
       </GlassCard>
 
-      {/* ── O que eu lembro de você ───────────────────────────────────────── */}
-      <SectionHeader
-        icon={<Brain size={16} color={colors.accentHi} />}
-        title="O que eu lembro de você"
-        subtitle={
-          gruposMemoria.length > 0
-            ? 'tudo isso influencia como eu falo com você'
-            : 'ainda estou te conhecendo'
-        }
-        style={styles.secao}
-      />
-      {gruposMemoria.length === 0 ? (
-        <GlassCard style={styles.memoriaVazia}>
-          <Text style={styles.linhaHint}>
-            Conforme conversamos, eu guardo o que importa — o que você toma, do que tem
-            medo, como prefere ser chamado. Aparece aqui, e você pode me pedir pra
-            esquecer qualquer coisa.
-          </Text>
-        </GlassCard>
+      {/*
+        Erro NÃO é vazio.
+
+        Se o overview falhou, desenhar as seções de memória com contador zero afirmaria
+        que a Xarlote não lembra de nada — no lugar onde essa afirmação é mais assustadora.
+        Falha vira tela de falha, com o motivo separado (rede x servidor) e um botão.
+      */}
+      {memoria.erro && memoria.cards.length === 0 ? (
+        <View style={styles.blocoFalha}>
+          <LoadFailure
+            erro={memoria.erro}
+            onTentarDeNovo={memoria.recarregar}
+            oQue="o que eu lembro de você"
+            tentando={memoria.recarregando}
+          />
+        </View>
+      ) : memoria.carregando ? (
+        // Sem shimmer: um esqueleto varrendo degradê é animação de fundo justamente
+        // quando a rede está ruim. Uma linha parada diz a mesma coisa e custa zero.
+        <Text style={styles.carregando}>Abrindo minhas anotações sobre você…</Text>
       ) : (
-        gruposMemoria.map((g) => (
-          <View key={g.kind} style={styles.grupoMemoria}>
-            <Text style={styles.grupoRotulo}>{g.rotulo}</Text>
-            <View style={styles.cardsMemoria}>
-              {g.cards.map((c) => (
-                <GlassCard key={c.id} style={styles.cardMemoria}>
-                  <Text style={styles.memoriaTexto}>{c.text}</Text>
-                  <View style={styles.memoriaMeta}>
-                    {/* `inferred` é dito com todas as letras: "eu percebi" convida a
-                        corrigir; um card sem origem seria lido como fato dado por ele. */}
-                    <GlassBadge tone={c.source === 'self_reported' ? 'accent' : 'neutral'} size="xs">
-                      {c.source === 'self_reported' ? 'você me disse' : 'eu percebi'}
-                    </GlassBadge>
-                    {c.last_seen_at ? (
-                      <Text style={styles.memoriaQuando}>{brDesde(c.last_seen_at, agora)}</Text>
-                    ) : null}
-                  </View>
-                </GlassCard>
-              ))}
-            </View>
-          </View>
-        ))
+        <BlocoMemoria cards={memoria.cards} resumo={memoria.resumo} agoraMs={agora} />
       )}
 
-      <Text style={styles.avisoMemoria}>
-        Quer que eu esqueça algo? Me fala no chat — “esquece que eu…”. Pra apagar tudo,
-        é “APAGAR MEUS DADOS”.
-      </Text>
-
-      <GlassButton
-        variant="ghost"
-        size="md"
-        onPress={sair}
-        style={styles.sair}
-        icon={<LogOut size={16} color={colors.textDim} />}
-      >
-        Sair da conta
-      </GlassButton>
+      <GlassCard style={styles.linhaSair} onPress={sair}>
+        <LogOut size={18} color={colors.textDim} />
+        <Text style={styles.sairTexto}>Sair da conta</Text>
+      </GlassCard>
 
       {/*
         Versão do app + id da atualização OTA.
@@ -231,32 +247,32 @@ export default function PerfilScreen() {
 }
 
 const styles = StyleSheet.create({
-  identidade: { flexDirection: 'row', alignItems: 'center', gap: 14, padding: 16 },
-  identidadeTexto: { flexShrink: 1 },
-  nome: { color: colors.text, fontSize: 17, fontWeight: '600' },
-  telefone: { color: colors.textDim, fontSize: 13, marginTop: 2 },
   secao: { marginTop: 28, marginBottom: 12 },
-  linha: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: 16 },
-  linhaEsquerda: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, flexShrink: 1 },
-  linhaTexto: { flexShrink: 1 },
-  linhaTitulo: { color: colors.text, fontSize: 14, fontWeight: '500' },
-  linhaHint: { color: colors.textFaint, fontSize: 11, marginTop: 2, lineHeight: 16 },
-  sair: { marginTop: 28, alignSelf: 'flex-start' },
-  memoriaVazia: { padding: 16 },
-  grupoMemoria: { marginBottom: 18 },
-  grupoRotulo: {
-    color: colors.textFaint,
-    fontSize: 10,
-    fontWeight: '700',
-    letterSpacing: 0.8,
-    textTransform: 'uppercase',
-    marginBottom: 8,
+  linha: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    padding: 16,
+    minHeight: 68,
+    marginBottom: 10,
   },
-  cardsMemoria: { gap: 8 },
-  cardMemoria: { padding: 14, gap: 8 },
-  memoriaTexto: { color: colors.text, fontSize: 13, lineHeight: 19 },
-  memoriaMeta: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  memoriaQuando: { color: colors.textFaint, fontSize: 10 },
-  avisoMemoria: { color: colors.textFaint, fontSize: 11, lineHeight: 17, marginTop: 6 },
-  versao: { color: 'rgba(255,255,255,0.22)', fontSize: 10, marginTop: 32, textAlign: 'center' },
+  linhaEsquerda: { flexDirection: 'row', alignItems: 'center', gap: 12, flexShrink: 1 },
+  linhaTexto: { flexShrink: 1, gap: 2 },
+  linhaTitulo: { color: colors.text, fontSize: 15, fontWeight: '500' },
+  /** 12 é o piso; este texto explica um controle, então não desce mais. */
+  linhaHint: { color: colors.textDim, fontSize: FONTE_MINIMA, lineHeight: 17 },
+  blocoFalha: { marginTop: 28 },
+  carregando: { color: colors.textDim, fontSize: FONTE_CLINICA, marginTop: 28 },
+  /** Sair é uma linha como as outras — 44pt garantidos, e não um `<Text>` no rodapé. */
+  linhaSair: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    padding: 16,
+    minHeight: 56,
+    marginTop: 28,
+  },
+  sairTexto: { color: colors.textDim, fontSize: 15, fontWeight: '500' },
+  versao: { color: colors.textDim, fontSize: FONTE_MINIMA, marginTop: 24, textAlign: 'center' },
 });

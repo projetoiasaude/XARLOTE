@@ -16,7 +16,13 @@
  * data não vira hoje, dia sem dose não vira zero. Num prontuário, o "não sei" precisa
  * chegar à tela como não-sei — é o paciente que lê isso, e às vezes o médico dele.
  */
-import { adherenceScore, adherenceSeries, type AdherenceDay, type DoseLogEntry } from '@iasaude/shared';
+import {
+  adherenceLabel,
+  adherenceScore,
+  adherenceSeries,
+  type AdherenceDay,
+  type DoseLogEntry,
+} from '@iasaude/shared';
 import { msDe } from '@/lib/br-format';
 
 // ─── Formas cruas da resposta ───────────────────────────────────────────────────
@@ -70,6 +76,33 @@ export interface Medication {
   controlled_class?: string | null;
   needs_prescription?: boolean | null;
   last_taken_at?: string | null;
+  /**
+   * Comprimidos por dia — `DECIMAL(5,2)`, então 0.5 (meio comprimido) é legítimo.
+   * É o divisor da conta de estoque; sem ele não há como dizer quantos dias sobram.
+   * Confirmado na migration 0003 (`ADD COLUMN daily_consumption DECIMAL(5,2)`).
+   */
+  daily_consumption?: number | null;
+  tablets_per_box?: number | null;
+}
+
+/**
+ * Uma caixa física que o paciente tem em casa (`medication_inventory`, migration 0003).
+ *
+ * ⚠️ Os nomes são `tablets_remaining` / `expected_depletion_at` / `purchased_at` —
+ * conferidos na migration, não supostos. O `select('*')` do overview traz tudo; o tipo
+ * declara só o que a tela lê, pela mesma razão do cabeçalho deste arquivo.
+ */
+export interface InventoryRow {
+  id: string;
+  medication_id: string;
+  /** O contador VIVO: desce a cada dose confirmada (`tool-executor-v2`). */
+  tablets_remaining?: number | null;
+  tablets_per_box?: number | null;
+  box_count?: number | null;
+  purchased_at?: string | null;
+  /** Coluna DATE — palpite congelado na compra. Ver `insights.ts` sobre não usá-la. */
+  expected_depletion_at?: string | null;
+  reorder_offered_at?: string | null;
 }
 
 export interface Treatment {
@@ -211,7 +244,7 @@ export interface Overview {
   conditions: Condition[];
   allergies: Allergy[];
   medications: Medication[];
-  inventory: unknown[];
+  inventory: InventoryRow[];
   treatments: Treatment[];
   prescribers: Prescriber[];
   reminders: ReminderRow[];
@@ -253,6 +286,28 @@ export function resumoAdesao(log: readonly DoseLogRow[], days: number, nowMs: nu
     serie,
     score: adherenceScore(doses, { days, nowMs }),
     diasComRegistro: serie.filter((d) => d.ratio !== null).length,
+  };
+}
+
+/**
+ * A adesão partida em NÚMERO e FRASE, pro herói da tela.
+ *
+ * A pergunta da tela de Saúde é "estou seguindo o tratamento?", e a resposta era um
+ * subtítulo de 12px ao lado de um gráfico. Aqui o número vira o herói e a frase vira o
+ * rótulo empático — mas a REDAÇÃO continua vindo de `adherenceLabel`, em shared, que é
+ * onde mora o cuidado de não repreender ninguém ("vamos ajustar juntos", nunca "ruim").
+ *
+ * O corte é no travessão porque `adherenceLabel` devolve "87% — quase sempre" e mostrar
+ * os dois juntos diria o mesmo número duas vezes a 40px de distância. Se um dia a
+ * redação perder o travessão, a frase inteira aparece no rótulo — feio, nunca vazio.
+ */
+export function adesaoEmPartes(score: number | null): { numero: string; frase: string } {
+  const rotulo = adherenceLabel(score);
+  if (score === null) return { numero: '—', frase: rotulo };
+  const corte = rotulo.indexOf('—');
+  return {
+    numero: `${Math.round(score * 100)}%`,
+    frase: corte >= 0 ? rotulo.slice(corte + 1).trim() : rotulo,
   };
 }
 

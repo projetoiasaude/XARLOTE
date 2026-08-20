@@ -7,7 +7,7 @@
  */
 import { type ReactNode } from 'react';
 import { StyleSheet, Text, View, type StyleProp, type ViewStyle } from 'react-native';
-import { colors, radii } from '@/theme';
+import { colors, radii, FONTE_CLINICA } from '@/theme';
 import { ehTextoCru } from './text-child';
 
 interface Props {
@@ -42,7 +42,10 @@ const styles = StyleSheet.create({
     borderColor: colors.glassBorder,
     marginBottom: 12,
   },
-  title: { color: 'rgba(255,255,255,0.80)', fontSize: 14, fontWeight: '600', textAlign: 'center' },
-  hint: { color: colors.textFaint, fontSize: 12, textAlign: 'center', marginTop: 4, lineHeight: 18 },
+  // Cor de token, nunca `rgba(255,255,255,…)` solto: o dia em que a hierarquia de texto
+  // do app subir de contraste, este título tem que subir junto sem ninguém procurar por ele.
+  title: { color: colors.text, fontSize: 15, fontWeight: '600', textAlign: 'center' },
+  // O hint é a ÚNICA instrução que a pessoa tem no estado vazio — 13px, não 12.
+  hint: { color: colors.textDim, fontSize: FONTE_CLINICA, textAlign: 'center', marginTop: 6, lineHeight: 19 },
   action: { marginTop: 16 },
 });

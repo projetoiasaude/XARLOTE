@@ -84,7 +84,7 @@ async function main(): Promise<void> {
     db.from('user_allergies').select('substance, reaction, severity').eq('user_id', uid),
     db.from('user_medications').select('medication_name, dosage, frequency').eq('user_id', uid),
     db.from('user_health_conditions').select('name, onset_date').eq('user_id', uid),
-    db.from('user_exam_results').select('exam_type, title, exam_date, summary').eq('user_id', uid),
+    db.from('user_exam_results').select('exam_type, title, exam_date, summary, findings').eq('user_id', uid),
   ]);
 
   const agora = Date.now();

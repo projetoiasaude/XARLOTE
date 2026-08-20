@@ -58,6 +58,50 @@ describe('blocoDoLembrete', () => {
     expect(blocoDoLembrete(lembrete({ status: 'failed' }), T)).toBe('encerrado');
   });
 
+  it('confirmado PELO WHATSAPP não fica preso em "Passou da hora"', () => {
+    // Os dois caminhos de confirmação por WhatsApp gravam SÓ `last_confirmed_at` — o
+    // status continua 'sent', que é ativo, e o `next_run_at` de um lembrete de uma vez
+    // só nunca avança. Sem esta regra a linha voltava como atrasada em toda abertura,
+    // alimentava o cartão "Tem N lembretes que passaram da hora" e nunca saía da lista:
+    // a tela cobrando uma dose que o próprio sistema já registrou.
+    const r = lembrete({
+      status: 'sent',
+      rrule: null,
+      next_run_at: '2026-08-05T11:00:00.000Z',
+      last_confirmed_at: '2026-08-05T11:04:00.000Z',
+    });
+    expect(blocoDoLembrete(r, T)).toBe('encerrado');
+  });
+
+  it('RECORRENTE com carimbo antigo continua acionável — o carimbo é da dose anterior', () => {
+    // A guarda que mais importa: num recorrente o `last_confirmed_at` é da ocorrência
+    // ANTERIOR. Comparar os dois sem olhar o `rrule` esconderia um remédio de todo dia.
+    const r = lembrete({
+      status: 'sent',
+      rrule: 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0',
+      next_run_at: '2026-08-05T11:00:00.000Z',
+      last_confirmed_at: '2026-08-05T11:04:00.000Z',
+    });
+    expect(blocoDoLembrete(r, T)).toBe('atrasado');
+  });
+
+  it('confirmar e DEPOIS adiar reabre a linha', () => {
+    // `+30 min` empurra o `next_run_at` pra frente do carimbo. Quem pediu pra ser
+    // chamado de novo tem que ser chamado de novo.
+    const r = lembrete({
+      status: 'pending',
+      next_run_at: '2026-08-05T14:00:00.000Z',
+      last_confirmed_at: '2026-08-05T11:04:00.000Z',
+    });
+    expect(blocoDoLembrete(r, T)).toBe('atrasado');
+  });
+
+  it('sem carimbo de confirmação, atraso continua sendo atraso', () => {
+    expect(
+      blocoDoLembrete(lembrete({ status: 'sent', next_run_at: '2026-08-05T11:00:00.000Z' }), T),
+    ).toBe('atrasado');
+  });
+
   it('pendente sem horário nenhum NÃO desaparece', () => {
     // Dado que existe no banco e não aparece em lugar algum é dado perdido.
     expect(blocoDoLembrete(lembrete({ next_run_at: null, scheduled_at: null }), T)).toBe('depois');

@@ -21,6 +21,7 @@ import { appRemindersRoutes } from './reminders.js';
 import { appAccountRoutes } from './account.js';
 import { appSharesRoutes } from './shares.js';
 import { appMediaRoutes } from './media.js';
+import { appMemoryRoutes } from './memory.js';
 
 export async function appPatientRoutes(app: FastifyInstance): Promise<void> {
   await appAuthRoutes(app);
@@ -34,4 +35,5 @@ export async function appPatientRoutes(app: FastifyInstance): Promise<void> {
   await appAccountRoutes(app);
   await appSharesRoutes(app);
   await appMediaRoutes(app);
+  await appMemoryRoutes(app);
 }

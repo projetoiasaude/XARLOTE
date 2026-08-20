@@ -33,7 +33,7 @@ export default function ExamesScreen() {
 
   if (isLoading && !data) {
     return (
-      <Screen title="Exames" subtitle="tudo que você me mandou">
+      <Screen voltar title="Exames" subtitle="tudo que você me mandou">
         <Skeleton variant="card" height={80} />
         <View style={styles.espaco} />
         <Skeleton variant="card" height={80} />
@@ -45,6 +45,9 @@ export default function ExamesScreen() {
 
   return (
     <Screen
+      // Subtela de Saúde, e não destino do orb: sem o voltar, a única saída é abrir o menu
+      // e escolher de novo — o que faz a pessoa achar que entrou num lugar sem retorno.
+      voltar
       title="Exames"
       subtitle={total > 0 ? `${total} guardado${total > 1 ? 's' : ''}` : 'tudo que você me mandou'}
       refreshControl={

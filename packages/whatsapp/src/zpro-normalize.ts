@@ -10,6 +10,7 @@
 import { parsePhoneNumber } from 'libphonenumber-js';
 import type { NormalizedInbound } from '@iasaude/shared';
 import { extractSharedContacts } from './contacts.js';
+import { mimePorExtensao, nomeArquivoDoPayload } from './documento.js';
 
 // ── helpers de extração tolerante ────────────────────────────────────────────
 
@@ -320,14 +321,25 @@ export function normalizeZproWebhook(
     };
   }
 
-  // 5) Documento
-  if (typeStr.includes('document') || typeStr.includes('file')) {
+  // 5) Documento — PDF de laudo do laboratório, receita digital, pedido médico. Também
+  //    a foto enviada como "arquivo" (sem compressão), que é o que clínica e laboratório
+  //    costumam fazer; quem decide o que fazer com o conteúdo são os BYTES, no handler.
+  //
+  //    Detecta TAMBÉM pela presença do objeto `document`: o zpro entrega mídia em
+  //    `msg.<tipo>.{url,mime_type}` (shape confirmado ao vivo pro áudio em 24/06), e um
+  //    payload cujo `type` não bate cairia no ramo de texto — sem texto, a mensagem era
+  //    descartada e o PDF do paciente virava silêncio absoluto.
+  const temObjetoDocumento = !!get(payload, 'msg.document') || !!get(payload, 'document');
+  if (typeStr.includes('document') || typeStr.includes('file') || temObjetoDocumento) {
+    const nome = nomeArquivoDoPayload(payload);
     return {
       ...base,
       contentType: 'document',
       text: pickStr(payload, P.text),
       mediaUrl: pickStr(payload, P.mediaUrl),
-      mediaMime: pickStr(payload, P.mime),
+      // Sem mime declarado, a extensão do nome. `media_mime` nulo faz a linha desaparecer
+      // do `resolveMediaMessageId` — e aí o exame não acha o próprio arquivo.
+      mediaMime: pickStr(payload, P.mime) ?? mimePorExtensao(nome) ?? undefined,
     };
   }
 

@@ -81,7 +81,7 @@ export async function appSharesRoutes(app: FastifyInstance): Promise<void> {
         db.from('user_allergies').select('substance, reaction, severity').eq('user_id', userId),
         db.from('user_medications').select('medication_name, dosage, frequency').eq('user_id', userId).eq('active', true),
         db.from('user_health_conditions').select('name, onset_date').eq('user_id', userId),
-        db.from('user_exam_results').select('exam_type, title, exam_date, summary').eq('user_id', userId).order('exam_date', { ascending: false, nullsFirst: false }).limit(10),
+        db.from('user_exam_results').select('exam_type, title, exam_date, summary, findings').eq('user_id', userId).order('exam_date', { ascending: false, nullsFirst: false }).limit(10),
       ]);
 
     if (!user) return reply.code(404).send({ error: 'user_gone' });

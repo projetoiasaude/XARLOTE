@@ -1,7 +1,7 @@
 /** GlassBadge — 7 tons do web, mesmos valores de fill/texto/borda. */
 import { type ReactNode } from 'react';
 import { StyleSheet, Text, View, type StyleProp, type TextStyle, type ViewStyle } from 'react-native';
-import { radii } from '@/theme';
+import { FONTE_MINIMA, radii } from '@/theme';
 import { StatusPing } from './status-ping';
 import { ehTextoCru } from './text-child';
 
@@ -11,6 +11,16 @@ interface Props {
   tone?: BadgeTone;
   size?: 'xs' | 'sm';
   dot?: boolean;
+  /**
+   * A bolinha pulsa? **Opt-in e explícito**, não derivado do tom.
+   *
+   * Antes era `pulse={tone === 'live'}`. Parecia elegante e escondia uma armadilha:
+   * "live" no `ActivityCard` quer dizer "pedido em andamento", que dura HORAS — não é
+   * estado transiente, é estado normal. Uma lista com quatro pedidos abertos ficava com
+   * quatro anéis pulsando pra sempre dentro de linha de lista. Quem quiser pulso agora
+   * pede pulso, e só onde ele existe por segundos (gravando áudio, por exemplo).
+   */
+  pulse?: boolean;
   style?: StyleProp<ViewStyle>;
   children?: ReactNode;
 }
@@ -25,7 +35,7 @@ const TONE: Record<BadgeTone, { bg: string; border: string; fg: string }> = {
   live: { bg: 'rgba(74,222,128,0.20)', border: 'rgba(74,222,128,0.30)', fg: '#bbf7d0' },
 };
 
-/** O ping do badge reusa o StatusPing — `live` é o único que pulsa (igual ao web). */
+/** O ping do badge reusa o StatusPing; o TOM é mapeado, o pulso é decisão do chamador. */
 const PING_TONE: Record<BadgeTone, 'success' | 'warn' | 'danger' | 'neutral' | 'accent'> = {
   success: 'success',
   warn: 'warn',
@@ -36,11 +46,21 @@ const PING_TONE: Record<BadgeTone, 'success' | 'warn' | 'danger' | 'neutral' | '
   live: 'success',
 };
 
-export function GlassBadge({ tone = 'neutral', size = 'sm', dot = false, style, children }: Props) {
+export function GlassBadge({
+  tone = 'neutral',
+  size = 'sm',
+  dot = false,
+  pulse = false,
+  style,
+  children,
+}: Props) {
   const t = TONE[tone];
   const textStyle: TextStyle = {
+    // `xs` era 10px. O piso do app é 12: uma badge que diz "cancelado" ou "todo dia"
+    // carrega estado, e estado ilegível é estado ausente. A pílula cresce 4px de altura
+    // e ninguém sente falta.
     color: t.fg,
-    fontSize: size === 'xs' ? 10 : 12,
+    fontSize: FONTE_MINIMA,
     fontWeight: '600',
   };
   return (
@@ -50,13 +70,13 @@ export function GlassBadge({ tone = 'neutral', size = 'sm', dot = false, style, 
         {
           backgroundColor: t.bg,
           borderColor: t.border,
-          height: size === 'xs' ? 20 : 24,
+          height: size === 'xs' ? 24 : 26,
           paddingHorizontal: size === 'xs' ? 8 : 10,
         },
         style,
       ]}
     >
-      {dot && <StatusPing tone={PING_TONE[tone]} pulse={tone === 'live'} />}
+      {dot && <StatusPing tone={PING_TONE[tone]} pulse={pulse} />}
       {ehTextoCru(children) ? <Text style={textStyle}>{children}</Text> : children}
     </View>
   );

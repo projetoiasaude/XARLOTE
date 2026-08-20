@@ -6,3 +6,4 @@ export * from './provider.js';
 export * from './zpro-client.js';
 export * from './zpro-normalize.js';
 export * from './contacts.js';
+export * from './documento.js';

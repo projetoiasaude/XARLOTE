@@ -20,7 +20,7 @@ import { useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import Svg, { Line, Rect } from 'react-native-svg';
 import type { AdherenceDay } from '@iasaude/shared';
-import { colors, radii } from '@/theme';
+import { colors, FONTE_CLINICA, radii } from '@/theme';
 
 interface Props {
   serie: readonly AdherenceDay[];
@@ -110,10 +110,29 @@ export function AdherenceChart({ serie, altura = 92 }: Props) {
 
 const styles = StyleSheet.create({
   area: { width: '100%' },
-  legenda: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 10 },
-  chaveGrupo: { flexDirection: 'row', gap: 14 },
+  // Com a legenda em 13px, três rótulos podem não caber numa linha de 320pt: em vez de
+  // truncar (ou de voltar a encolher a fonte), a linha quebra.
+  legenda: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    columnGap: 12,
+    rowGap: 4,
+    marginTop: 10,
+  },
+  chaveGrupo: { flexDirection: 'row', flexWrap: 'wrap', columnGap: 14, rowGap: 4 },
   chave: { flexDirection: 'row', alignItems: 'center', gap: 5 },
   amostra: { width: 8, height: 8, borderRadius: radii.md / 3 },
   amostraVazia: { height: 2, width: 10, backgroundColor: 'rgba(255,255,255,0.14)' },
-  legendaTexto: { color: colors.textFaint, fontSize: 10, letterSpacing: 0.2 },
+  /**
+   * 13px, não 10.
+   *
+   * "doses tomadas" é a UNIDADE do gráfico e "N sem registro" é a única coisa que
+   * explica os traços na base — as duas são dado clínico, e dado clínico tem piso de
+   * 13px. A 10px, na régua da casa, a legenda não existia: o herói da tela vinha com a
+   * própria legenda ilegível, e um gráfico sem unidade legível é um gráfico que o
+   * paciente (e o médico que abre o link) interpreta por conta própria.
+   */
+  legendaTexto: { color: colors.textDim, fontSize: FONTE_CLINICA, letterSpacing: 0.2 },
 });

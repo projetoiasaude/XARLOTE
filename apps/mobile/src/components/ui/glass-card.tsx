@@ -3,11 +3,34 @@
  * (`variant`/`radius`/`interactive`/`spec`), pra quem lê os dois lados não ter que
  * traduzir nada de cabeça.
  *
- * `interactive` só faz sentido com `onPress`: no web era hover (não existe aqui),
- * então virou o afundar do toque com o mesmo spring 320/26.
+ * ## Os três ornamentos são opt-in AGORA, e não por gosto
+ *
+ * `blur`, `spec` e `elevated` são as três camadas caras do vidro, e todas as três
+ * custam **por linha de lista**:
+ *
+ * · `blur` — `BlurView` real; já era opt-in (e só no iOS).
+ * · `spec` — `<LinearGradient>` de 3 paradas: um view NATIVO absoluto por card. Vinte
+ *   cards na Saúde 360 eram vinte views de degradê que ninguém pediu.
+ * · `elevated` — a sombra outset, que no Android é `BlurMaskFilter` por drawable
+ *   (ver o cabeçalho de theme/tokens.ts).
+ *
+ * O default dos três virou `false` no `GlassCard` e ficou `true` no `GlassPanel`. A
+ * regra em uma frase: **card é linha, painel é estrutura**. Linha é o que se repete
+ * dezenas de vezes; estrutura aparece uma vez por tela. Quem quiser furar a regra
+ * escreve a prop — e aí é escolha, não descuido.
+ *
+ * O fio de luz no topo continua lá em todos: ele vem do `boxShadow` inset com blur 0,
+ * que é de graça, então a perda visual do `spec` desligado é pequena.
+ *
+ * ## `interactive` e o háptico vêm juntos, por default
+ *
+ * Toda linha tocável tem que afundar e vibrar — é o único retorno que o dedo recebe num
+ * app sem hover. Deixar isso na mão do chamador significava que metade das linhas
+ * tocáveis do app não respondia ao toque. Agora `onPress` já implica os dois.
  */
 import { type ReactNode } from 'react';
 import { Pressable, StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
+import * as Haptics from 'expo-haptics';
 import { BlurView } from 'expo-blur';
 import { LinearGradient } from 'expo-linear-gradient';
 import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
@@ -26,10 +49,18 @@ import {
 interface GlassCardProps {
   variant?: GlassVariant;
   radius?: GlassRadius;
-  /** Afunda ao toque. Sem `onPress` não muda nada. */
+  /** Afunda ao toque + háptico leve. Ligado por default; sem `onPress` não faz nada. */
   interactive?: boolean;
-  /** Specular highlight no topo (padrão true, como no web). */
+  /**
+   * Specular highlight no topo — um `<LinearGradient>` nativo por card.
+   * Default FALSE: card é linha de lista. Use no painel estrutural.
+   */
   spec?: boolean;
+  /**
+   * Sombra projetada. Default FALSE porque no Android ela é um blur de máscara por
+   * drawable, cobrado a cada quadro mesmo com o dedo parado.
+   */
+  elevated?: boolean;
   /**
    * Blur REAL por baixo. Default false de propósito: card é o primitivo que aparece
    * dentro de lista, e blur em linha que rola é o caminho mais curto pra derrubar o
@@ -37,6 +68,7 @@ interface GlassCardProps {
    */
   blur?: boolean;
   onPress?: () => void;
+  accessibilityLabel?: string;
   style?: StyleProp<ViewStyle>;
   children?: ReactNode;
 }
@@ -55,10 +87,12 @@ function Spec({ radius }: { radius: GlassRadius }) {
 export function GlassCard({
   variant = 'default',
   radius = '2xl',
-  interactive = false,
-  spec = true,
+  interactive = true,
+  spec = false,
+  elevated = false,
   blur = false,
   onPress,
+  accessibilityLabel,
   style,
   children,
 }: GlassCardProps) {
@@ -76,7 +110,7 @@ export function GlassCard({
     </>
   );
 
-  const surface = [glassSurface(variant, radius, useBlur), styles.clip, style];
+  const surface = [glassSurface(variant, radius, useBlur, elevated), styles.clip, style];
 
   if (!onPress) {
     return <View style={surface}>{body}</View>;
@@ -85,7 +119,12 @@ export function GlassCard({
   return (
     <Animated.View style={animated}>
       <Pressable
-        onPress={onPress}
+        accessibilityRole="button"
+        {...(accessibilityLabel ? { accessibilityLabel } : {})}
+        onPress={() => {
+          void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+          onPress();
+        }}
         onPressIn={() => {
           if (interactive) scale.value = withSpring(0.985, springs.card);
         }}
@@ -104,19 +143,29 @@ interface GlassPanelProps {
   radius?: GlassRadius;
   /** Estrutural e parado → blur LIGADO por default (a regra do glass.ts). */
   blur?: boolean;
+  /** Specular e sombra também: painel aparece uma vez por tela, não uma vez por linha. */
+  spec?: boolean;
+  elevated?: boolean;
   style?: StyleProp<ViewStyle>;
   children?: ReactNode;
 }
 
 /** Variante estrutural — header, drawer, sheet. Sem animação e com blur no iOS. */
-export function GlassPanel({ radius = '3xl', blur = true, style, children }: GlassPanelProps) {
+export function GlassPanel({
+  radius = '3xl',
+  blur = true,
+  spec = true,
+  elevated = true,
+  style,
+  children,
+}: GlassPanelProps) {
   const useBlur = blur && CAN_BLUR;
   return (
-    <View style={[glassSurface('default', radius, useBlur), styles.clip, style]}>
+    <View style={[glassSurface('default', radius, useBlur, elevated), styles.clip, style]}>
       {useBlur && (
         <BlurView intensity={40} tint="dark" style={[styles.fill, { borderRadius: RADIUS[radius] }]} />
       )}
-      <Spec radius={radius} />
+      {spec && <Spec radius={radius} />}
       {children}
     </View>
   );

@@ -21,20 +21,19 @@
  * essas duas coisas sem avisar seria a mentira mais fácil de contar aqui.
  */
 import { useCallback, useState } from 'react';
-import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
-import { Stack, useRouter } from 'expo-router';
+import { Alert, StyleSheet, Text, View } from 'react-native';
+import { Stack } from 'expo-router';
 import * as WebBrowser from 'expo-web-browser';
-import { ArrowLeft, Download, FileJson, ShieldCheck, Trash2 } from 'lucide-react-native';
+import { Download, FileJson, ShieldCheck, Trash2 } from 'lucide-react-native';
 import { GlassBadge, GlassButton, GlassCard, GlassInput, SectionHeader } from '@/components/ui';
 import { Screen } from '@/components/xarlote/Screen';
 import { useApagarConta, useExportarDados } from '@/features/account/use-account';
-import { colors, radii } from '@/theme';
+import { colors, FONTE_CLINICA, FONTE_MINIMA, radii } from '@/theme';
 
 /** Tem que casar com `FRASE_CONFIRMACAO` em apps/api/src/routes/app/account.ts. */
 const FRASE = 'APAGAR MINHA CONTA';
 
 export default function PrivacidadeScreen() {
-  const router = useRouter();
   const exportar = useExportarDados();
   const apagarConta = useApagarConta();
   const [confirmacao, setConfirmacao] = useState('');
@@ -61,12 +60,9 @@ export default function PrivacidadeScreen() {
   return (
     <>
       <Stack.Screen options={{ headerShown: false }} />
-      <Screen title="Privacidade e dados">
-        <Pressable onPress={() => router.back()} hitSlop={12} style={styles.voltar} accessibilityRole="button">
-          <ArrowLeft size={14} color={colors.textDim} />
-          <Text style={styles.voltarTexto}>voltar</Text>
-        </Pressable>
-
+      {/* A volta mora no `Screen` (44pt, rotulada): esta tela não é destino do orb, e
+          entrar nela sem saída visível deixava o gesto do sistema como única porta. */}
+      <Screen title="Privacidade e dados" voltar>
         {/* ── Exportar ──────────────────────────────────────────────────────── */}
         <SectionHeader
           icon={<FileJson size={16} color={colors.info} />}
@@ -91,7 +87,7 @@ export default function PrivacidadeScreen() {
                 variant="primary"
                 size="md"
                 onPress={baixar}
-                icon={<Download size={16} color="#fff" />}
+                icon={<Download size={16} color={colors.textOnFill} />}
               >
                 Baixar o arquivo
               </GlassButton>
@@ -215,9 +211,11 @@ export default function PrivacidadeScreen() {
           {apagarConta.erro ? <Text style={styles.aviso}>{apagarConta.erro}</Text> : null}
         </GlassCard>
 
+        {/* A frase antiga terminava com "você também pode pedir as duas coisas por lá" —
+            convidando a sair de uma tela que já faz as duas. O WhatsApp fica como canal de
+            DÚVIDA, que é o que ele resolve melhor. */}
         <Text style={styles.rodape}>
-          Qualquer dúvida sobre seus dados, me chama no WhatsApp. Você também pode pedir as
-          duas coisas por lá.
+          Qualquer dúvida sobre os seus dados, me chama no WhatsApp.
         </Text>
       </Screen>
     </>
@@ -225,8 +223,6 @@ export default function PrivacidadeScreen() {
 }
 
 const styles = StyleSheet.create({
-  voltar: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8, alignSelf: 'flex-start' },
-  voltarTexto: { color: colors.textDim, fontSize: 13 },
   secao: { marginTop: 24, marginBottom: 12 },
   card: { padding: 16, gap: 14 },
   cardPerigo: { borderColor: 'rgba(248,113,113,0.22)', backgroundColor: 'rgba(248,113,113,0.04)' },
@@ -234,15 +230,16 @@ const styles = StyleSheet.create({
   enfase: { color: colors.text, fontWeight: '600' },
   badge: { alignSelf: 'flex-start' },
   linhaStatus: { flexDirection: 'row', alignItems: 'center', gap: 10, flexWrap: 'wrap' },
-  instrucao: { color: colors.textDim, fontSize: 12, lineHeight: 18 },
+  /** Instrução de ação irreversível: fica no piso clínico, nunca em metadado. */
+  instrucao: { color: colors.textDim, fontSize: FONTE_CLINICA, lineHeight: 19 },
   frase: { color: colors.danger, fontWeight: '700', letterSpacing: 0.3 },
   botaoPerigo: { backgroundColor: colors.danger, borderColor: 'rgba(248,113,113,0.5)' },
   textoPerigo: { color: colors.danger },
-  aviso: { color: colors.warn, fontSize: 12, lineHeight: 18 },
-  rodapeCard: { color: colors.textFaint, fontSize: 11, lineHeight: 16 },
+  aviso: { color: colors.warn, fontSize: FONTE_CLINICA, lineHeight: 19 },
+  rodapeCard: { color: colors.textDim, fontSize: FONTE_MINIMA, lineHeight: 17 },
   rodape: {
-    color: colors.textFaint,
-    fontSize: 11,
+    color: colors.textDim,
+    fontSize: FONTE_MINIMA,
     lineHeight: 17,
     marginTop: 28,
     textAlign: 'center',

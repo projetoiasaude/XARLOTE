@@ -19,7 +19,7 @@ import {
 } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
-import { colors, radii, shadows, springs } from '@/theme';
+import { colors, folgaDeToque, radii, shadows, springs } from '@/theme';
 import { ehTextoCru } from './text-child';
 
 type Variant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'success';
@@ -70,6 +70,21 @@ const SIZE_TEXT: Record<Size, TextStyle> = {
   lg: { fontSize: 15, fontWeight: '600' },
 };
 
+/**
+ * A folga de toque nasce DENTRO do primitivo, calculada da altura.
+ *
+ * Um `xs` tem 28pt de altura contra os 44pt mínimos: 16pt a menos, e o botão continua
+ * bonito enquanto o dedo de quem tem 60 anos passa ao lado. Deixar isso pro chamador
+ * significava um `hitSlop` esquecido por call-site — e esquecimento invisível, porque
+ * nada na tela denuncia um alvo pequeno. `xs`/`sm`/`md` (28/32/40) ganham 8/6/2.
+ */
+const HIT_SLOP: Record<Size, number> = {
+  xs: folgaDeToque(28),
+  sm: folgaDeToque(32),
+  md: folgaDeToque(40),
+  lg: folgaDeToque(52),
+};
+
 export function GlassButton({
   variant = 'secondary',
   size = 'md',
@@ -94,6 +109,7 @@ export function GlassButton({
         accessibilityLabel={accessibilityLabel}
         accessibilityState={{ disabled: inert, busy: loading }}
         disabled={inert}
+        hitSlop={HIT_SLOP[size]}
         onPressIn={() => {
           scale.value = withSpring(0.96, springs.button);
         }}

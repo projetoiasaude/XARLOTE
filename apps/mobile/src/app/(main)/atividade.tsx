@@ -7,31 +7,116 @@
  * verificáveis, com o preço e o nome da farmácia quando existem, e um "sua vez" quando
  * a bola está com ele.
  *
- * Todas as etapas saem de `timeline.ts` (puro): a tela não deduz progresso, só desenha
- * o que a função derivou dos dados.
+ * ## O que mudou nesta sessão
+ *
+ * 1. **A frase de estado vem ANTES da lista.** Ela ficava no rodapé: quem abria via
+ *    primeiro a pilha de encerrados e só descobria no fim que nada estava ativo — a
+ *    resposta da tela chegando depois do conteúdo que a contradiz.
+ * 2. **Encerrado é linha, dentro de uma seção recolhida com contador.** Eram até quinze
+ *    cartões completos de quatro etapas cada, em `opacity: 0.6`, empurrando pra baixo o
+ *    único item que pede ação. Continuam todos ali, a um toque — o que não pode é o
+ *    histórico morto disputar espaço com o presente.
+ * 3. **Os cartões vivos agora AGEM.** "Sua vez" leva às opções em um toque, e um pedido
+ *    que esfriou tem "Ainda preciso", que manda o pedido de retomada pronto. As duas
+ *    frases "me chama no chat" que estavam em `timeline.ts` sumiram junto: o app faz o
+ *    que ele pedia que o paciente fizesse.
+ * 4. **Nem a frase de estado nem o vazio mandam "pedir no chat".** Uma terceira cópia da
+ *    frase tinha voltado pela porta da tela, embaixo de "Nada em andamento agora". Nos
+ *    dois lugares agora tem o botão `BotaoFalar`, que abre a conversa.
+ *
+ * Todas as etapas e desfechos saem de `timeline.ts` (puro): a tela não deduz progresso,
+ * só desenha o que a função derivou dos dados.
  */
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo } from 'react';
 import { RefreshControl, StyleSheet, Text, View } from 'react-native';
-import { Zap } from 'lucide-react-native';
-import { EmptyState, GlassCard, LoadFailure, SectionHeader, Skeleton } from '@/components/ui';
+import { useRouter } from 'expo-router';
+import * as Haptics from 'expo-haptics';
+import { History, MessageCircle, Zap } from 'lucide-react-native';
+import { EmptyState, GlassButton, GlassCard, LoadFailure, Skeleton } from '@/components/ui';
+import { CollapsibleSection } from '@/components/ui/collapsible-section';
 import { Screen } from '@/components/xarlote/Screen';
 import { ActivityCard } from '@/features/activity/ActivityCard';
-import { montarAtividades } from '@/features/activity/timeline';
+import { ActivityLine } from '@/features/activity/ActivityLine';
+import { montarAtividades, resumoDaAtividade, type Atividade } from '@/features/activity/timeline';
+import { useAgora } from '@/features/health/use-agora';
+import { useFalarComXarlote } from '@/features/health/use-falar-com-xarlote';
 import { useOverview } from '@/features/health/use-overview';
-import { colors } from '@/theme';
+import { colors, FONTE_CLINICA } from '@/theme';
+
+/**
+ * O caminho pra conversa — um CONTROLE, não uma frase.
+ *
+ * Aqui morava "Nada travado do meu lado. É só me pedir no chat quando precisar de algo.":
+ * a tela mandando o paciente fazer o que ela mesma podia fazer, e sem dizer por onde. As
+ * duas irmãs dessa frase já tinham sido mortas em `timeline.ts` nesta mesma sessão — esta
+ * tinha voltado pela porta da tela. O estado vazio ganha o mesmo botão: dizer o que
+ * apareceria aqui "quando você me pedir algo" sem oferecer o caminho é um beco.
+ *
+ * `size="md"` são 40pt de altura + o `hitSlop` que o próprio `GlassButton` calcula = 44.
+ * O háptico também é dele (dispara no `onPress`), então o chamador não toca de novo.
+ */
+function BotaoFalar({ onPress }: { onPress: () => void }) {
+  return (
+    <GlassButton
+      size="md"
+      variant="secondary"
+      icon={<MessageCircle size={16} color={colors.text} />}
+      onPress={onPress}
+      accessibilityLabel="Abrir a conversa com a Xarlote"
+    >
+      Falar com a Xarlote
+    </GlassButton>
+  );
+}
 
 export default function AtividadeScreen() {
   const { data, isLoading, isRefetching, isError, error, refetch } = useOverview();
-  const [agora] = useState(() => Date.now());
+  const router = useRouter();
+  // Reacerta ao voltar do segundo plano: "atualizado há 2 min" congelado na montagem
+  // continua dizendo 2 min meia hora depois.
+  const agora = useAgora();
+  const { falar, emVoo } = useFalarComXarlote();
 
   const atividades = useMemo(
     () => (data ? montarAtividades(data.orders, data.consultations, agora) : []),
     [data, agora],
   );
+  const resumo = useMemo(() => resumoDaAtividade(atividades), [atividades]);
 
-  const vivas = atividades.filter((a) => a.viva);
-  const encerradas = atividades.filter((a) => !a.viva);
-  const aoAtualizar = useCallback(() => void refetch(), [refetch]);
+  const vivas = useMemo(() => atividades.filter((a) => a.viva), [atividades]);
+  const encerradas = useMemo(() => atividades.filter((a) => !a.viva), [atividades]);
+
+  const aoAtualizar = useCallback(() => {
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    void refetch();
+  }, [refetch]);
+
+  /**
+   * A ação do cartão. `responder` navega; `retomar` manda a mensagem pronta.
+   *
+   * Depende de `falar` e `router` — nunca do objeto de mutação inteiro. Dependência
+   * instável aqui faria o `memo` do `ActivityCard` não segurar nada, e cada re-render do
+   * pai reconstruiria a subárvore de todos os cartões (com o vidro e as etapas junto).
+   */
+  const aoAgir = useCallback(
+    (a: Atividade) => {
+      if (!a.acao) return;
+      if (a.acao.tipo === 'responder') {
+        void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        // `navigate` entre irmãos, nunca `push`: empilhar a conversa sobre a Atividade
+        // faria o botão de voltar do Android sair do chat pra cá, e não pra fora.
+        router.navigate('/');
+        return;
+      }
+      falar(a.acao.mensagem, `${a.tipo}:${a.id}`);
+    },
+    [falar, router],
+  );
+
+  /** Mesma regra do `aoAgir`: `navigate` entre irmãos, nunca `push`. */
+  const irParaConversa = useCallback(() => {
+    router.navigate('/');
+  }, [router]);
 
   if (isLoading && !data) {
     return (
@@ -64,40 +149,54 @@ export default function AtividadeScreen() {
             icon={<Zap size={22} color={colors.textFaint} />}
             title="Nada em andamento agora"
             hint="Quando você me pedir um remédio ou uma consulta, o passo a passo aparece aqui — quantas farmácias responderam, o melhor preço, e o que falta."
+            action={<BotaoFalar onPress={irParaConversa} />}
           />
         </GlassCard>
       ) : (
         <>
+          {/* A frase de estado é o herói e vem PRIMEIRO — inclusive quando o que existe
+              é só histórico, que é justamente o caso em que ela era invisível. */}
+          <Text style={styles.estado}>{resumo.frase}</Text>
+          {/* Sem nada vivo, a tela não fica só constatando: o caminho de sair desse
+              estado é um botão aqui mesmo, do tamanho do dedo. */}
+          {resumo.vivas === 0 ? (
+            <View style={styles.acaoEstado}>
+              <BotaoFalar onPress={irParaConversa} />
+            </View>
+          ) : null}
+
           {vivas.length > 0 && (
             <View style={styles.lista}>
               {vivas.map((a) => (
-                <ActivityCard key={`${a.tipo}-${a.id}`} atividade={a} agoraMs={agora} />
+                <ActivityCard
+                  key={`${a.tipo}-${a.id}`}
+                  atividade={a}
+                  agoraMs={agora}
+                  onAcao={aoAgir}
+                  ocupado={emVoo === `${a.tipo}:${a.id}`}
+                />
               ))}
             </View>
           )}
 
           {encerradas.length > 0 && (
-            <>
-              <SectionHeader
-                title="Já encerrados"
-                size="sm"
-                subtitle="fica registrado, mesmo o que não deu certo"
-                style={styles.secao}
-              />
-              <View style={styles.lista}>
+            <CollapsibleSection
+              title="Já encerrados"
+              count={encerradas.length}
+              icon={<History size={16} color={colors.textDim} />}
+              style={styles.secao}
+            >
+              <View style={styles.linhas}>
                 {encerradas.map((a) => (
-                  <View key={`${a.tipo}-${a.id}`} style={styles.apagado}>
-                    <ActivityCard atividade={a} agoraMs={agora} />
-                  </View>
+                  <ActivityLine key={`${a.tipo}-${a.id}`} atividade={a} agoraMs={agora} />
                 ))}
               </View>
-            </>
-          )}
-
-          {vivas.length === 0 && (
-            <Text style={styles.rodape}>
-              Nada em andamento no momento. É só me chamar no chat quando precisar.
-            </Text>
+              {/* O que não deu certo continua registrado, e a seção diz isso em vez de
+                  deixar o paciente descobrir sozinho por que há um "não seguiu" ali. */}
+              <Text style={styles.rodapeSecao}>
+                Fica registrado, mesmo o que não deu certo.
+              </Text>
+            </CollapsibleSection>
           )}
         </>
       )}
@@ -107,8 +206,10 @@ export default function AtividadeScreen() {
 
 const styles = StyleSheet.create({
   espaco: { height: 14 },
-  lista: { gap: 12 },
-  secao: { marginTop: 28, marginBottom: 12 },
-  apagado: { opacity: 0.6 },
-  rodape: { color: colors.textFaint, fontSize: 12, lineHeight: 18, marginTop: 24, textAlign: 'center' },
+  estado: { color: colors.text, fontSize: 20, fontWeight: '600', letterSpacing: -0.4 },
+  acaoEstado: { alignSelf: 'flex-start', marginTop: 12 },
+  lista: { gap: 12, marginTop: 18 },
+  secao: { marginTop: 26 },
+  linhas: { gap: 2 },
+  rodapeSecao: { color: colors.textFaint, fontSize: FONTE_CLINICA, lineHeight: 18, marginTop: 10 },
 });

@@ -8,8 +8,6 @@
  */
 import { useCallback, useState } from 'react';
 import {
-  KeyboardAvoidingView,
-  Platform,
   ScrollView,
   StyleSheet,
   Text,
@@ -25,10 +23,14 @@ import { requestOtp } from '@/lib/api/auth';
 import { ApiError } from '@/lib/api/errors';
 import { isSubmittablePhone, looksLikeLandline, maskPhoneBR, phoneDigitsBR } from '@/lib/phone-input';
 import { colors, spacing } from '@/theme';
+import Animated from 'react-native-reanimated';
+import { useRecuoDoTeclado } from '@/lib/teclado';
 
 export default function WelcomeScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  // O teclado tampava o campo já AQUI, na primeira tela de quem instala. Ver `lib/teclado.ts`.
+  const recuoDoTeclado = useRecuoDoTeclado(insets.bottom);
   const [raw, setRaw] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -55,10 +57,7 @@ export default function WelcomeScreen() {
   }, [raw, router]);
 
   return (
-    <KeyboardAvoidingView
-      style={styles.flex}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-    >
+    <Animated.View style={[styles.flex, recuoDoTeclado]}>
       <ScrollView
         contentContainerStyle={[
           styles.content,
@@ -131,7 +130,7 @@ export default function WelcomeScreen() {
           </GlassCard>
         </View>
       </ScrollView>
-    </KeyboardAvoidingView>
+    </Animated.View>
   );
 }
 

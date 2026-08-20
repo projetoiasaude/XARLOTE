@@ -8,8 +8,11 @@ import {
   expiraEm,
   hashPin,
   hashShareToken,
+  MAX_VALORES_POR_EXAME,
+  RESUMO_VERSAO,
   idadeEm,
   montarResumo,
+  normalizarValores,
   novoShareToken,
   pinConfere,
   pinValido,
@@ -218,8 +221,23 @@ describe('montarResumo — o que o médico vê', () => {
 
   it('NÃO leva telefone, CPF, endereço, conversas nem memória', () => {
     // Esta página pode ser encaminhada adiante. Menos dado exposto, menos dano.
+    //
+    // A guarda mira documento de IDENTIDADE, e por isso é `documento_`/`document_number`
+    // em vez da palavra inteira: se o acervo de anexos do paciente for ligado um dia, ele
+    // não deve derrubar este teste — o que não pode vazar é RG e CPF, não "laudo.pdf".
     const texto = JSON.stringify(montarResumo(dados, AGORA));
-    for (const proibido of ['phone', 'telefone', 'cpf', 'document', 'endereco', 'address', 'mensage', 'memor']) {
+    for (const proibido of [
+      'phone',
+      'telefone',
+      'whatsapp',
+      'cpf',
+      'documento_',
+      'document_number',
+      'endereco',
+      'address',
+      'mensage',
+      'memor',
+    ]) {
       expect(texto.toLowerCase(), proibido).not.toContain(proibido);
     }
   });
@@ -241,5 +259,132 @@ describe('montarResumo — o que o médico vê', () => {
     expect(vazio.paciente.idade).toBeNull();
     expect(vazio.alergias).toEqual([]);
     expect(vazio.adesao_30d).toBeNull();
+  });
+});
+
+// ─── v2: os marcadores do laudo ────────────────────────────────────────────────
+
+describe('normalizarValores — `findings` é JSONB livre escrito por um LLM', () => {
+  it('lê o contrato canônico da tool', () => {
+    const { valores, omitidos } = normalizarValores([
+      { marker: 'Hemoglobina', value: '13,5', unit: 'g/dL', reference: '12-16' },
+      { marker: 'Glicose', value: '98' },
+    ]);
+    expect(omitidos).toBe(0);
+    expect(valores).toEqual([
+      { marcador: 'Hemoglobina', valor: '13,5', unidade: 'g/dL', referencia: '12-16' },
+      { marcador: 'Glicose', valor: '98', unidade: null, referencia: null },
+    ]);
+  });
+
+  it('lê as variantes que já chegaram na prática (pt-BR e apelidos de chave)', () => {
+    const { valores } = normalizarValores([
+      { nome: 'Ureia', valor: '32', unidade: 'mg/dL', faixa: '10-45' },
+      { name: 'TGO', result: '28', unit: 'U/L', reference_range: '< 34' },
+      { label: 'TGP', valor: '30' },
+    ]);
+    expect(valores.map((v) => v.marcador)).toEqual(['Ureia', 'TGO', 'TGP']);
+    expect(valores[0]!.referencia).toBe('10-45');
+    expect(valores[1]!.referencia).toBe('< 34');
+  });
+
+  it('objeto solto (`{Hemoglobina: "13,5"}`) também é lido, inclusive aninhado', () => {
+    expect(normalizarValores({ hemoglobina: '13,5', Glicose: { value: '98', unit: 'mg/dL' } }).valores).toEqual([
+      { marcador: 'hemoglobina', valor: '13,5', unidade: null, referencia: null },
+      { marcador: 'Glicose', valor: '98', unidade: 'mg/dL', referencia: null },
+    ]);
+  });
+
+  it('marcador sem valor não vira linha — ruído numa página lida às pressas é pior que uma linha a menos', () => {
+    const { valores } = normalizarValores([
+      { marker: 'Hemoglobina' },
+      { value: '13,5' },
+      'texto solto',
+      null,
+      42,
+      { marker: 'Glicose', value: '98' },
+    ]);
+    expect(valores).toHaveLength(1);
+    expect(valores[0]!.marcador).toBe('Glicose');
+  });
+
+  it('nada, string e número não explodem', () => {
+    expect(normalizarValores(null).valores).toEqual([]);
+    expect(normalizarValores(undefined).valores).toEqual([]);
+    expect(normalizarValores('hemoglobina 13,5').valores).toEqual([]);
+    expect(normalizarValores(7).valores).toEqual([]);
+  });
+
+  it('o teto CONTA o que ficou fora, em vez de deixar a lacuna sumir', () => {
+    const muitos = Array.from({ length: MAX_VALORES_POR_EXAME + 7 }, (_, i) => ({ marker: `m${i}`, value: '1' }));
+    const { valores, omitidos } = normalizarValores(muitos);
+    expect(valores).toHaveLength(MAX_VALORES_POR_EXAME);
+    expect(omitidos).toBe(7);
+  });
+});
+
+describe('montarResumo v2 — o formato cresce sem quebrar o que já existe', () => {
+  const base = {
+    user: { preferred_name: 'Fulana', adherence_score_30d: 0.8 },
+    alergias: [],
+    medicamentos: [],
+    condicoes: [],
+  };
+
+  it('carimba a versão, para o leitor da página saber com o que está lidando', () => {
+    const r = montarResumo({ ...base, exames: [] }, AGORA);
+    expect(r.versao).toBe(RESUMO_VERSAO);
+    expect(r.versao).toBeGreaterThanOrEqual(2);
+  });
+
+  it('leva os marcadores de cada exame e a contagem do que sobrou', () => {
+    const r = montarResumo(
+      {
+        ...base,
+        exames: [
+          {
+            exam_type: 'sangue',
+            title: 'Hemograma',
+            exam_date: '2026-08-01',
+            findings: [{ marker: 'Hemoglobina', value: '13,5', unit: 'g/dL', reference: '12-16' }],
+          },
+        ],
+      },
+      AGORA,
+    );
+    expect(r.exames[0]!.valores).toHaveLength(1);
+    expect(r.exames[0]!.valores![0]!.marcador).toBe('Hemoglobina');
+    expect(r.exames[0]!.valores_omitidos).toBe(0);
+  });
+
+  it('exame cujo laudo não teve marcador lido degrada para lista vazia, nunca erro', () => {
+    // `findings` é NULL em exame que o modelo não conseguiu (ou não precisou) tabular: o
+    // paciente mandou a foto, virou um `summary` em texto e nenhum par marcador/valor.
+    //
+    // Isto NÃO é licença para a rota deixar a coluna fora do `select` — ver o teste
+    // abaixo. A degradação existe para o laudo sem números, não para o dado que existe no
+    // banco e não foi buscado: essa segunda forma some em silêncio, e some do lado do
+    // médico, que é onde ninguém percebe.
+    const r = montarResumo({ ...base, exames: [{ exam_type: 'sangue', title: 'Hemograma' }] }, AGORA);
+    expect(r.exames[0]!.valores).toEqual([]);
+    expect(r.exames[0]!.valores_omitidos).toBe(0);
+  });
+
+  it('o congelado NÃO anuncia campo que ninguém preenche', () => {
+    // Houve aqui um `documentos: []`, e ele nunca foi preenchido por rota nenhuma — a
+    // página do médico dizia "nenhum documento anexado a este resumo" para um paciente
+    // que tinha anexado. Formato que promete o que não entrega é pior que formato menor:
+    // o vazio deixa de ser "não há" e vira "não sei", sem avisar quem lê.
+    const r = montarResumo({ ...base, exames: [] }, AGORA) as Record<string, unknown>;
+    expect(Object.keys(r)).not.toContain('documentos');
+  });
+
+  it('`findings` corrompido não impede o resumo de existir', () => {
+    const r = montarResumo(
+      { ...base, exames: [{ exam_type: 'sangue', title: 'X', findings: 'lixo' }] },
+      AGORA,
+    );
+    expect(r.exames).toHaveLength(1);
+    expect(r.exames[0]!.valores).toEqual([]);
   });
 });

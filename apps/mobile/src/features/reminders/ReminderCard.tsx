@@ -1,5 +1,14 @@
 /**
- * Uma linha de lembrete com as três ações.
+ * Uma linha de lembrete VIVO, com as três ações.
+ *
+ * ## Cartão é só pra quem pede ação
+ *
+ * Este componente desenha atraso, hoje e os próximos — o que o paciente ainda pode
+ * resolver. Lembrete encerrado NÃO passa por aqui: ele é uma linha
+ * (`HistoricoLinha.tsx`), porque cartão completo com três botões desabilitados e
+ * `opacity: 0.6` não é hierarquia, é o mesmo objeto ilegível. A única exceção é o que
+ * ACABOU de ser resolvido nesta sessão, que continua em cartão de propósito: a
+ * confirmação tem que ficar onde o dedo estava.
  *
  * ## Cancelar pede confirmação; confirmar e adiar não
  *
@@ -9,17 +18,18 @@
  * quem depende dele pra lembrar. Foi o que motivou a auditoria do `cancel_reminders`
  * como "curinga sobre a agenda do paciente" (A3).
  *
- * ## Sem blur aqui
+ * ## Sem blur, sem specular, sem sombra
  *
- * `GlassCard` com `blur` fica de fora de propósito: esta é uma linha de lista que rola,
- * e blur em linha que rola é o caminho mais curto pra derrubar o frame rate no Android.
+ * `GlassCard` entra com os três ornamentos no default `false`: esta é uma linha de lista
+ * que rola, e cada camada de preenchimento é cobrada por linha, animando ou não.
  */
 import { memo, useCallback } from 'react';
 import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
+import * as Haptics from 'expo-haptics';
 import { AlarmClock, Ban, Check, Clock3, Pill, Stethoscope, TestTube } from 'lucide-react-native';
 import type { ReminderAppAction } from '@iasaude/shared';
 import { GlassBadge, GlassCard } from '@/components/ui';
-import { colors, radii } from '@/theme';
+import { colors, folgaDeToque, FONTE_CLINICA, radii } from '@/theme';
 import { brQuando } from '@/lib/br-format';
 import type { ReminderRow } from '@/features/health/overview';
 import { acoesDisponiveis, rotuloDoTipo, type BlocoLembrete } from './format';
@@ -29,6 +39,16 @@ interface Props {
   bloco: BlocoLembrete;
   agoraMs: number;
   ocupado?: boolean;
+  /**
+   * A frase que a Xarlote diz sobre o que ACABOU de acontecer com este lembrete —
+   * "Anotado, o de hoje está feito.", "Te chamo de novo em 30 minutos."
+   *
+   * Existe porque a confirmação tem que ficar ONDE O DEDO ESTAVA. Um remédio de todo dia
+   * confirmado volta `pending` com a data de amanhã: sem a frase, o único retorno do
+   * toque seria o háptico, e o cartão mudaria de bloco em silêncio. `fraseDaAcao` em
+   * `format.ts` é quem a escreve.
+   */
+  nota?: string;
   onAgir: (id: string, acao: ReminderAppAction, minutos?: number) => void;
 }
 
@@ -40,15 +60,14 @@ function IconeDoTipo({ tipo }: { tipo: string | null | undefined }) {
   return <AlarmClock size={15} color={cor} />;
 }
 
-export const ReminderCard = memo(function ReminderCard({ lembrete, bloco, agoraMs, ocupado, onAgir }: Props) {
+export const ReminderCard = memo(function ReminderCard({ lembrete, bloco, agoraMs, ocupado, nota, onAgir }: Props) {
   const acoes = acoesDisponiveis(lembrete);
   const quando = brQuando(lembrete.next_run_at ?? lembrete.scheduled_at, agoraMs);
-  const encerrado = bloco === 'encerrado';
 
   const cancelar = useCallback(() => {
     Alert.alert(
       'Cancelar este lembrete?',
-      'Eu paro de te avisar sobre ele. Isso não dá pra desfazer aqui — mas você pode me pedir um novo a qualquer momento.',
+      'Eu paro de te avisar sobre ele. Isso não dá pra desfazer aqui — mas você pode criar outro a qualquer momento.',
       [
         { text: 'Manter', style: 'cancel' },
         { text: 'Cancelar lembrete', style: 'destructive', onPress: () => onAgir(lembrete.id, 'cancel') },
@@ -57,7 +76,7 @@ export const ReminderCard = memo(function ReminderCard({ lembrete, bloco, agoraM
   }, [lembrete.id, onAgir]);
 
   return (
-    <GlassCard style={[styles.card, encerrado && styles.cardEncerrado]}>
+    <GlassCard style={styles.card}>
       <View style={styles.topo}>
         <View style={styles.icone}>
           <IconeDoTipo tipo={lembrete.type} />
@@ -66,13 +85,23 @@ export const ReminderCard = memo(function ReminderCard({ lembrete, bloco, agoraM
           <Text style={styles.titulo} numberOfLines={2}>
             {lembrete.title?.trim() || rotuloDoTipo(lembrete.type)}
           </Text>
+          {/* Logo abaixo do título, antes da posologia: é a resposta ao toque, e resposta
+              ao toque vem antes de qualquer outra leitura. */}
+          {nota ? <Text style={styles.nota}>{nota}</Text> : null}
           {lembrete.body?.trim() ? (
             <Text style={styles.corpo} numberOfLines={3}>
               {lembrete.body.trim()}
             </Text>
           ) : null}
           <View style={styles.metaLinha}>
-            {quando ? <Text style={styles.quando}>{quando}</Text> : null}
+            {quando ? (
+              // "era hoje às 08:00" no bloco de atraso: sem o verbo no passado, a mesma
+              // frase que anuncia o futuro anuncia o que já passou, e a pessoa lê como
+              // se ainda fosse acontecer.
+              <Text style={[styles.quando, bloco === 'atrasado' && styles.quandoAtrasado]}>
+                {bloco === 'atrasado' ? `era ${quando}` : quando}
+              </Text>
+            ) : null}
             {lembrete.rrule ? (
               <GlassBadge tone="neutral" size="xs">
                 todo dia
@@ -96,22 +125,22 @@ export const ReminderCard = memo(function ReminderCard({ lembrete, bloco, agoraM
         <View style={styles.acoes}>
           <Botao
             rotulo="Já tomei"
-            icone={<Check size={14} color={colors.success} />}
+            icone={<Check size={15} color={colors.success} />}
             cor={colors.success}
             desabilitado={ocupado}
             onPress={() => onAgir(lembrete.id, 'done')}
           />
           <Botao
             rotulo="+30 min"
-            icone={<Clock3 size={14} color={colors.textDim} />}
+            icone={<Clock3 size={15} color={colors.textDim} />}
             cor={colors.textDim}
             desabilitado={ocupado}
             onPress={() => onAgir(lembrete.id, 'snooze', 30)}
           />
           <Botao
             rotulo="Cancelar"
-            icone={<Ban size={14} color={colors.textFaint} />}
-            cor={colors.textFaint}
+            icone={<Ban size={15} color={colors.textDim} />}
+            cor={colors.textDim}
             desabilitado={ocupado}
             onPress={cancelar}
           />
@@ -121,12 +150,19 @@ export const ReminderCard = memo(function ReminderCard({ lembrete, bloco, agoraM
   );
 });
 
+/** Altura real do alvo antes da folga. `folgaDeToque` fecha a conta até os 44pt. */
+const ALTURA_BOTAO = 36;
+
 /**
  * Botão de ação inline.
  *
- * Não é o `GlassButton`: aqui são três alvos pequenos lado a lado dentro de uma linha
- * de lista, e o primitivo do design system tem padding e sombra pensados pra botão de
- * tela. Forçá-lo aqui daria três blocos gordos onde deveria haver três toques discretos.
+ * Não é o `GlassButton`: aqui são três alvos lado a lado dentro de uma linha de lista, e
+ * o primitivo do design system tem fundo e borda pensados pra botão de tela. Forçá-lo
+ * aqui daria três blocos gordos onde deveria haver três toques discretos.
+ *
+ * O que ele NÃO pode economizar é o alvo e o háptico: `folgaDeToque(36)` leva os 36pt de
+ * altura aos 44 mínimos, e a vibração leve é o único retorno que o dedo tem de que
+ * "Já tomei" foi registrado — a resposta da rede pode levar segundos.
  */
 function Botao({
   rotulo,
@@ -143,14 +179,16 @@ function Botao({
 }) {
   return (
     <Pressable
-      onPress={onPress}
+      onPress={() => {
+        void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        onPress();
+      }}
       disabled={desabilitado}
-      // O alvo de toque cresce além do texto: três ações lado a lado numa linha de
-      // lista, com dedo grande e celular na mão, erram fácil sem essa folga.
-      hitSlop={10}
+      hitSlop={folgaDeToque(ALTURA_BOTAO)}
       style={({ pressed }) => [styles.botao, (desabilitado || pressed) && styles.botaoApagado]}
       accessibilityRole="button"
       accessibilityLabel={rotulo}
+      accessibilityState={{ disabled: !!desabilitado }}
     >
       {icone}
       <Text style={[styles.botaoTexto, { color: cor }]}>{rotulo}</Text>
@@ -159,8 +197,7 @@ function Botao({
 }
 
 const styles = StyleSheet.create({
-  card: { padding: 14, gap: 12 },
-  cardEncerrado: { opacity: 0.55 },
+  card: { padding: 14, gap: 10 },
   topo: { flexDirection: 'row', gap: 12 },
   icone: {
     width: 30,
@@ -173,18 +210,33 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(124,135,255,0.22)',
   },
   textos: { flex: 1, gap: 3 },
-  titulo: { color: colors.text, fontSize: 14, fontWeight: '600', lineHeight: 19 },
-  corpo: { color: colors.textDim, fontSize: 12, lineHeight: 17 },
-  metaLinha: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 3, flexWrap: 'wrap' },
-  quando: { color: colors.accentHi, fontSize: 11, fontWeight: '600' },
+  titulo: { color: colors.text, fontSize: 15, fontWeight: '600', lineHeight: 20 },
+  /** Dose e instrução de uso: 13px é o piso, não uma preferência. Era 12. */
+  corpo: { color: colors.textDim, fontSize: FONTE_CLINICA, lineHeight: 19 },
+  /**
+   * A confirmação é a Xarlote FALANDO — contraste cheio, não metadado apagado. Quem
+   * acabou de tocar em "Já tomei" está lendo exatamente esta linha pra saber se
+   * registrou.
+   */
+  nota: { color: colors.text, fontSize: FONTE_CLINICA, lineHeight: 19, fontWeight: '500' },
+  metaLinha: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4, flexWrap: 'wrap' },
+  /** O HORÁRIO da dose. Era 11px — o dado mais consultado da tela, no menor tamanho. */
+  quando: { color: colors.accentHi, fontSize: FONTE_CLINICA, fontWeight: '600' },
+  quandoAtrasado: { color: colors.warn },
   acoes: {
     flexDirection: 'row',
-    gap: 18,
-    paddingTop: 10,
+    gap: 16,
+    paddingTop: 6,
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: colors.glassBorder,
   },
-  botao: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 4 },
-  botaoTexto: { fontSize: 12, fontWeight: '600' },
+  botao: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    minHeight: ALTURA_BOTAO,
+    paddingRight: 4,
+  },
+  botaoTexto: { fontSize: FONTE_CLINICA, fontWeight: '600' },
   botaoApagado: { opacity: 0.4 },
 });

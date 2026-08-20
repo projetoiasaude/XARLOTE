@@ -1,18 +1,32 @@
 /**
- * Skeleton com shimmer. O gradiente varre da esquerda pra direita em loop na UI
- * thread — que é justamente quando o JS está ocupado buscando o dado que falta.
+ * Skeleton — o retângulo que ocupa o lugar do dado que ainda não chegou.
+ *
+ * ## Trocamos a varredura por um pulso de opacidade, e o motivo é o momento
+ *
+ * A versão anterior varria um `<LinearGradient>` animado (view NATIVO + transform por
+ * quadro) em `withRepeat(-1)`. São 14 usos nas telas; o chat monta 3 juntos, a Saúde 3.
+ *
+ * A condição em que o skeleton aparece é exatamente a pior condição do público descrito:
+ * rede móvel ruim, aparelho intermediário. É a tela que a paciente ENCARA — e ela estava
+ * rodando três varreduras de degradê enquanto a thread de JS parseava a resposta que ela
+ * espera. Quanto pior a rede, mais tempo esse custo fica no ar.
+ *
+ * Um pulso de `opacity` num `View` sólido entrega a mesma informação ("isto está
+ * carregando") sem view nativo extra e sem transform: opacidade é a propriedade mais
+ * barata que existe pro compositor. E consulta `useReducedMotion` — quem desligou
+ * animação recebe o retângulo parado, que continua dizendo a mesma coisa.
  */
 import { useEffect } from 'react';
-import { StyleSheet, View, type DimensionValue, type StyleProp, type ViewStyle } from 'react-native';
-import { LinearGradient } from 'expo-linear-gradient';
+import { StyleSheet, type DimensionValue, type StyleProp, type ViewStyle } from 'react-native';
 import Animated, {
   Easing,
   useAnimatedStyle,
+  useReducedMotion,
   useSharedValue,
   withRepeat,
   withTiming,
 } from 'react-native-reanimated';
-import { FILL_PARENT, radii } from '@/theme';
+import { radii } from '@/theme';
 
 interface Props {
   variant?: 'card' | 'line' | 'circle';
@@ -21,18 +35,25 @@ interface Props {
   style?: StyleProp<ViewStyle>;
 }
 
-const AnimatedGradient = Animated.createAnimatedComponent(LinearGradient);
-
 export function Skeleton({ variant = 'line', width, height, style }: Props) {
-  const shift = useSharedValue(-1);
+  const brilho = useSharedValue(1);
+  const semMovimento = useReducedMotion();
 
   useEffect(() => {
-    shift.value = withRepeat(withTiming(1, { duration: 1400, easing: Easing.linear }), -1, false);
-  }, [shift]);
+    if (semMovimento) {
+      brilho.value = 1;
+      return;
+    }
+    brilho.value = withRepeat(
+      withTiming(0.5, { duration: 800, easing: Easing.inOut(Easing.ease) }),
+      -1,
+      true,
+    );
+  }, [brilho, semMovimento]);
 
-  const sweep = useAnimatedStyle(() => ({
-    transform: [{ translateX: shift.value * 260 }],
-  }));
+  // NUNCA parte de opacity 0: se o worklet não rodar, o retângulo aparece parado em vez
+  // de invisível. Animação que ESCONDE conteúdo quando falha é a pior forma de falhar.
+  const pulso = useAnimatedStyle(() => ({ opacity: brilho.value }));
 
   const shape: ViewStyle =
     variant === 'card'
@@ -42,23 +63,18 @@ export function Skeleton({ variant = 'line', width, height, style }: Props) {
         : { height: height ?? 16, borderRadius: radii.md };
 
   return (
-    <View style={[styles.base, shape, width !== undefined && { width }, style]}>
-      <AnimatedGradient
-        colors={['transparent', 'rgba(255,255,255,0.08)', 'transparent']}
-        start={{ x: 0, y: 0 }}
-        end={{ x: 1, y: 0 }}
-        style={[styles.sweep, sweep]}
-      />
-    </View>
+    <Animated.View
+      accessibilityRole="progressbar"
+      accessibilityLabel="Carregando"
+      style={[styles.base, shape, width !== undefined && { width }, style, pulso]}
+    />
   );
 }
 
 const styles = StyleSheet.create({
   base: {
-    backgroundColor: 'rgba(255,255,255,0.04)',
+    backgroundColor: 'rgba(255,255,255,0.06)',
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.05)',
-    overflow: 'hidden',
   },
-  sweep: { ...FILL_PARENT, width: 260 },
 });

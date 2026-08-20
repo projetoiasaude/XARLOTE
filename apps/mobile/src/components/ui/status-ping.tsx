@@ -1,13 +1,27 @@
 /**
- * StatusPing — a bolinha de status. O anel expansivo do web (`animate-pulse-ring`,
- * scale 1→2.4 com opacity 0.7→0) vira uma animação Reanimated em loop, que roda na
- * UI thread: continua pulsando mesmo com o JS ocupado montando uma lista.
+ * StatusPing — a bolinha de status.
+ *
+ * ## O default foi INVERTIDO, e é a correção principal deste arquivo
+ *
+ * Ele nascia com `pulse = true`. Como o `ActivityCard` o instancia duas vezes por cartão
+ * (um por etapa `agora` e um dentro do `GlassBadge tone="live"`) e nunca passava a prop,
+ * um paciente com 4 pedidos em andamento carregava 6-8 `withRepeat(-1)` simultâneos —
+ * movimento perpétuo dentro de linha de lista, exatamente o padrão que custou o dia
+ * 18/08 pra remover do fundo e do OrbNav. Sobreviveu porque estava escondido num default.
+ *
+ * Agora `pulse` é opt-in. A bolinha PARADA continua dizendo tudo o que precisa (cor +
+ * presença); o pulso é reforço, não informação — e reforço não se paga a cada quadro,
+ * pra sempre, no aparelho de quem tem mais coisa acontecendo.
+ *
+ * E quem pedir pulso agora respeita `useReducedMotion`: a regra existia no projeto
+ * (`LiquidCore` e `XarloteBackground` já consultavam) e estes primitivos não seguiam.
  */
 import { useEffect } from 'react';
 import { StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
 import Animated, {
   Easing,
   useAnimatedStyle,
+  useReducedMotion,
   useSharedValue,
   withRepeat,
   withTiming,
@@ -20,30 +34,39 @@ const TONE: Record<Tone, string> = {
   success: colors.success,
   warn: colors.warn,
   danger: colors.danger,
-  neutral: 'rgba(255,255,255,0.40)',
+  neutral: colors.textFaint,
   accent: colors.accent,
 };
 
 interface Props {
   tone?: Tone;
   size?: 'sm' | 'md';
+  /**
+   * Anel pulsante. **Opt-in**, e só para estado TRANSIENTE de verdade (gravando agora).
+   * Estado que dura horas — "pedido em andamento" — não é transiente: é cor parada.
+   */
   pulse?: boolean;
   style?: StyleProp<ViewStyle>;
 }
 
-export function StatusPing({ tone = 'success', size = 'sm', pulse = true, style }: Props) {
+export function StatusPing({ tone = 'success', size = 'sm', pulse = false, style }: Props) {
   const dot = size === 'md' ? 8 : 6;
   const progress = useSharedValue(0);
+  const semMovimento = useReducedMotion();
+  const animando = pulse && !semMovimento;
 
   useEffect(() => {
-    if (!pulse) return;
+    if (!animando) {
+      progress.value = 0;
+      return;
+    }
     progress.value = 0;
     progress.value = withRepeat(
       withTiming(1, { duration: 1800, easing: Easing.out(Easing.ease) }),
       -1,
       false,
     );
-  }, [pulse, progress]);
+  }, [animando, progress]);
 
   const ring = useAnimatedStyle(() => ({
     opacity: 0.7 * (1 - progress.value),
@@ -52,7 +75,7 @@ export function StatusPing({ tone = 'success', size = 'sm', pulse = true, style 
 
   return (
     <View style={[styles.wrap, { width: dot, height: dot }, style]}>
-      {pulse && (
+      {animando && (
         <Animated.View
           pointerEvents="none"
           style={[

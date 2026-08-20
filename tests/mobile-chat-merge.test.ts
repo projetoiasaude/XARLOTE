@@ -165,6 +165,60 @@ describe('casos de borda que não podem quebrar a tela', () => {
   });
 });
 
+describe('a foto que o paciente mandou continua sendo uma foto', () => {
+  /**
+   * O mapa `midias` (`clientId` → `mediaId`) é a única fonte de `mediaId` hoje: o
+   * `GET /app/messages` devolve `media_mime` e para aí. Sem ele, a bolha otimista
+   * mostrava a foto e a linha canônica do servidor a trocava por "Foto enviada" —
+   * a promessa central do produto piscando na cara da pessoa.
+   */
+  const MID = 'media-abc';
+
+  it('linha do servidor com clientId + mapa de mídias → o item sai COM mediaId', () => {
+    const r = mergeMessages(
+      [srv({ id: 'm1', createdAt: '2026-08-10T12:00:00.000Z', clientId: C1, contentType: 'image', text: null })],
+      [],
+      new Map([[C1, MID]]),
+    );
+    expect(r[0]!.mediaId).toBe(MID);
+  });
+
+  it('a MESMA linha sem clientId perde a foto — é por isso que o evento tem que carregá-lo', () => {
+    // Este é o defeito exato: o evento do SSE traz `clientId` (o servidor publica a
+    // mensagem do próprio paciente com ele), e quem inseria a linha no cache deixava o
+    // campo cair. Aqui fica registrado o que se perde quando isso acontece.
+    const r = mergeMessages(
+      [srv({ id: 'm1', createdAt: '2026-08-10T12:00:00.000Z', contentType: 'image', text: null })],
+      [],
+      new Map([[C1, MID]]),
+    );
+    expect(r[0]!.mediaId).toBeNull();
+  });
+
+  it('o `mediaId` do SERVIDOR vence o mapa local', () => {
+    const r = mergeMessages(
+      [srv({ id: 'm1', createdAt: '2026-08-10T12:00:00.000Z', clientId: C1, mediaId: 'do-servidor' })],
+      [],
+      new Map([[C1, MID]]),
+    );
+    expect(r[0]!.mediaId).toBe('do-servidor');
+  });
+
+  it('a troca da bolha otimista pela linha do servidor não muda o que está na tela', () => {
+    // Antes: item local com a foto. Depois: item do servidor, mesma foto. Se o
+    // `mediaId` sumisse nessa troca, a imagem apareceria e desapareceria em segundos.
+    const midias = new Map([[C1, MID]]);
+    const antes = mergeMessages([], [{ clientId: C1, text: '', createdAt: '2026-08-10T12:00:00.000Z', status: 'pending', mediaId: MID }], midias);
+    const depois = mergeMessages(
+      [srv({ id: 'm1', createdAt: '2026-08-10T12:00:00.000Z', clientId: C1, contentType: 'image', text: null })],
+      [],
+      midias,
+    );
+    expect(antes[0]!.mediaId).toBe(MID);
+    expect(depois[0]!.mediaId).toBe(MID);
+  });
+});
+
 describe('dropConfirmed', () => {
   it('remove só as confirmadas', () => {
     const r = dropConfirmed([pend(C1, '2026-08-10T12:00:00.000Z'), pend(C2, '2026-08-10T12:00:01.000Z')], [C1]);

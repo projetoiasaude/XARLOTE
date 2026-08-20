@@ -12,8 +12,6 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  KeyboardAvoidingView,
-  Platform,
   Pressable,
   StyleSheet,
   Text,
@@ -31,12 +29,16 @@ import { useSession } from '@/lib/auth/session';
 import { codeSecondsLeft, formatCountdown, resendState } from '@/lib/otp-timer';
 import { formatPhonePretty } from '@/lib/phone-input';
 import { colors, radii, FILL_PARENT } from '@/theme';
+import Animated from 'react-native-reanimated';
+import { useRecuoDoTeclado } from '@/lib/teclado';
 
 const LENGTH = 6;
 
 export default function OtpScreen() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  // O teclado tampava o campo já AQUI, na primeira tela de quem instala. Ver `lib/teclado.ts`.
+  const recuoDoTeclado = useRecuoDoTeclado(insets.bottom);
   const { signIn } = useSession();
   const params = useLocalSearchParams<{ phone: string; expiresInS: string; sentAt: string }>();
 
@@ -109,7 +111,7 @@ export default function OtpScreen() {
   }, [busy, phone, reenvio.canResend]);
 
   return (
-    <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+    <Animated.View style={[styles.flex, recuoDoTeclado]}>
       <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
         <Pressable
           accessibilityRole="button"
@@ -185,7 +187,7 @@ export default function OtpScreen() {
           </GlassCard>
         </View>
       </View>
-    </KeyboardAvoidingView>
+    </Animated.View>
   );
 }
 

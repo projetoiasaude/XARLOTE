@@ -25,6 +25,17 @@ export interface ServerMessage {
   contentType: string;
   text: string | null;
   mediaMime?: string | null;
+  /**
+   * Id da linha em `app_media` — o que abre a URL assinada (`GET /app/media/:id/url`).
+   *
+   * **Opcional porque o servidor AINDA não manda.** O `select` do `GET /app/messages`
+   * traz `media_mime` e para aí; `messages` guarda `media_storage_path`, que a rota de
+   * URL não aceita. O campo existe aqui porque é o contrato que falta, e porque o app
+   * PREENCHE ele sozinho pelo caminho local (ver `midiaPorClientId` abaixo) — então a
+   * exibição de mídia não é código morto esperando servidor: ela roda hoje, para o que
+   * o próprio aparelho acabou de mandar.
+   */
+  mediaId?: string | null;
   createdAt: string;
   /** Presente só quando a mensagem nasceu NESTE app. */
   clientId?: string | null;
@@ -36,6 +47,11 @@ export interface PendingMessage {
   text: string;
   createdAt: string;
   status: Extract<MessageStatus, 'pending' | 'failed'>;
+  /**
+   * `POST /app/media` já respondeu e o arquivo está no bucket; falta a mensagem. Com
+   * isto a bolha otimista de uma foto mostra **a foto**, não a palavra "imagem".
+   */
+  mediaId?: string;
 }
 
 /** O que a tela desenha. */
@@ -48,11 +64,17 @@ export interface ChatItem {
   contentType: string;
   text: string | null;
   mediaMime: string | null;
+  mediaId: string | null;
   createdAt: string;
   status: MessageStatus;
 }
 
-function fromServer(m: ServerMessage): ChatItem {
+/** `clientId` → `mediaId` das mídias que ESTE aparelho subiu nesta sessão. */
+export type MidiaPorClientId = ReadonlyMap<string, string>;
+
+const SEM_MIDIA: MidiaPorClientId = new Map();
+
+function fromServer(m: ServerMessage, midias: MidiaPorClientId): ChatItem {
   return {
     // A chave é o id do SERVIDOR mesmo quando há clientId. Usar `local-<clientId>`
     // aqui faria a lista trocar a chave do item quando a confirmação chega, e a
@@ -64,6 +86,10 @@ function fromServer(m: ServerMessage): ChatItem {
     contentType: m.contentType,
     text: m.text,
     mediaMime: m.mediaMime ?? null,
+    // O do servidor manda quando existir; senão, o que o app sabe do próprio envio.
+    // É isto que faz a foto CONTINUAR visível depois de a bolha otimista ser trocada
+    // pela linha canônica — sem isso a imagem apareceria e desapareceria em segundos.
+    mediaId: m.mediaId ?? (m.clientId ? midias.get(m.clientId) ?? null : null),
     createdAt: m.createdAt,
     status: 'sent',
   };
@@ -79,9 +105,13 @@ function fromPending(p: PendingMessage): ChatItem {
     // com a mesma direção que ela vai ter quando voltar do servidor — senão ela
     // aparece do lado da Xarlote e SALTA de lado ao confirmar.
     direction: 'in',
-    contentType: 'text',
+    // `media` e não `image`/`audio`: o aparelho ainda não sabe qual dos dois é. O tipo
+    // vem do mime que a URL assinada devolve — o veredicto sai dos BYTES no servidor,
+    // e repetir o palpite aqui seria uma segunda fonte de verdade pra mesma coisa.
+    contentType: p.mediaId ? 'media' : 'text',
     text: p.text,
     mediaMime: null,
+    mediaId: p.mediaId ?? null,
     createdAt: p.createdAt,
     status: p.status,
   };
@@ -108,10 +138,12 @@ function comparar(a: ChatItem, b: ChatItem): number {
 /**
  * @param server páginas do servidor já achatadas, em qualquer ordem
  * @param pending envios locais ainda não confirmados
+ * @param midias `clientId` → `mediaId` do que este aparelho subiu (ver ServerMessage.mediaId)
  */
 export function mergeMessages(
   server: readonly ServerMessage[],
   pending: readonly PendingMessage[],
+  midias: MidiaPorClientId = SEM_MIDIA,
 ): ChatItem[] {
   // Dedup do servidor por id: a mesma mensagem pode chegar pela página E pelo evento
   // do SSE. Sem isto, cada mensagem da Xarlote apareceria em dobro.
@@ -122,7 +154,7 @@ export function mergeMessages(
   const confirmados = new Set<string>();
   for (const m of porId.values()) if (m.clientId) confirmados.add(m.clientId);
 
-  const itens = [...porId.values()].map(fromServer);
+  const itens = [...porId.values()].map((m) => fromServer(m, midias));
 
   for (const p of pending) {
     // Já confirmada pelo servidor → a otimista morre aqui. Manter as duas é o bug
