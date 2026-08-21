@@ -98,7 +98,13 @@ function createGlView(canvas) {
     void main(){
       vec3 c=texture2D(tex,vec2(uv.x,mix(0.5+E,1.0-E,uv.y))).rgb;
       float a=texture2D(tex,vec2(uv.x,mix(E,0.5-E,uv.y))).r;
-      a=smoothstep(0.16,0.78,a);
+      /* A máscara vem PRONTA no arquivo v2 — nada de smoothstep aqui.
+         A curva antiga (0.16→0.78) existia pra disfarçar uma máscara ruim: ela apertava
+         o meio-tom pra esconder a franja escura das guelras. O preço era deformar a
+         cobertura real — meio coberto virava quase opaco carregando cor meio preta.
+         O v2 foi remasterizado quadro a quadro (cor desmisturada do preto, fundo dos
+         vãos recortado por conectividade + viés azul), então mexer nela agora só
+         estragaria o que já está certo. */
       gl_FragColor=vec4(c*a,a);
     }`;
   const sh = (type, src) => {
@@ -163,7 +169,7 @@ function initAlphaVideo() {
   video.setAttribute('muted', ''); video.setAttribute('playsinline', '');
   video.setAttribute('webkit-playsinline', '');
   video.preload = 'auto';
-  video.src = 'assets/xarlote-alpha.mp4';
+  video.src = 'assets/xarlote-alpha-v2.mp4';
   videoEl = video;
 
   let raf = 0, uploaded = false, dead = false, frames = 0;
