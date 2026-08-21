@@ -42,6 +42,7 @@
  * a função continua testável sem mock nenhum.
  */
 import { inflateSync } from 'node:zlib';
+import { decifradorDeSenhaVazia, type Decifrador } from './pdf-cripto.js';
 
 /**
  * `falha_ao_ler` não é produzido por esta função — ela não lança. Ele existe pro chamador
@@ -153,11 +154,24 @@ export function extrairTextoDePdf(
   // buffer. É o que permite achar `stream` por texto e cortar os bytes por subarray.
   const cru = buf.toString('latin1');
 
-  // Senha: o dicionário do trailer (ou do xref stream) fica em texto claro mesmo em PDF
-  // cifrado, então a chave aparece aqui. Exigir o caractere seguinte evita casar com a
-  // palavra "/Encrypt" escrita dentro do conteúdo de um PDF legível.
+  /**
+   * Senha: o dicionário do trailer fica em texto claro mesmo em PDF cifrado, então a
+   * chave aparece aqui. Exigir o caractere seguinte evita casar com a palavra "/Encrypt"
+   * escrita dentro do conteúdo de um PDF legível.
+   *
+   * Achar `/Encrypt` NÃO é motivo suficiente pra desistir, e isso custou um laudo real em
+   * 21/08. Laboratório costuma cifrar com senha de DONO — a que impede copiar e editar —
+   * deixando a senha de USUÁRIO vazia. O arquivo abre em qualquer leitor sem perguntar
+   * nada, mas o conteúdo está cifrado de verdade. Parar aqui mandava o paciente
+   * fotografar uma folha que a máquina já lia.
+   *
+   * `decifradorDeSenhaVazia` devolve `null` quando o arquivo pede senha DE VERDADE, e aí
+   * `protegido` volta a ser a resposta honesta.
+   */
+  let decifrador: Decifrador | null = null;
   if (/\/Encrypt[\s<[\d]/.test(cru)) {
-    return { ok: false, motivo: 'protegido', paginas: contarPaginas(cru) };
+    decifrador = decifradorDeSenhaVazia(cru);
+    if (!decifrador) return { ok: false, motivo: 'protegido', paginas: contarPaginas(cru) };
   }
 
   /**
@@ -200,7 +214,7 @@ export function extrairTextoDePdf(
     const orcamento = Math.min(LIMITE_INFLADO, MAX_TOTAL_INFLADO - inflado);
     if (orcamento <= 0) break;
 
-    const conteudo = decodificarStream(stream, orcamento);
+    const conteudo = decodificarStream(stream, orcamento, decifrador);
     if (conteudo === null) continue;
     inflado += conteudo.length;
 
@@ -280,6 +294,9 @@ interface StreamBruto {
   /** Janela de texto antes do `stream` — onde mora o `/Filter` e o `/Subtype`. */
   dicionario: string;
   dados: Buffer;
+  /** Número e geração do objeto: em PDF cifrado, cada objeto tem a SUA chave. */
+  numero: number;
+  geracao: number;
 }
 
 /**
@@ -332,9 +349,16 @@ function* streamsDe(cru: string, buf: Buffer): Generator<StreamBruto> {
       idx - 1200,
       0,
     );
+    // `N G obj` imediatamente antes do stream. Em arquivo cifrado é isto que dá a chave
+    // do objeto; num arquivo claro é só metadado ignorado.
+    const cabeca = cru.slice(Math.max(0, fronteira - 24), idx);
+    const ref = /(\d+)\s+(\d+)\s+obj\b(?![\s\S]*\bobj\b)/.exec(cabeca);
+
     yield {
       dicionario: cru.slice(fronteira, idx),
       dados: buf.subarray(inicio, fim),
+      numero: ref ? Number(ref[1]) : 0,
+      geracao: ref ? Number(ref[2]) : 0,
     };
 
     pos = fim + 9;
@@ -367,10 +391,19 @@ const FILTROS_OPACOS =
  */
 const DICT_SEM_TEXTO = /\/Subtype\s*\/Image|\/Type\s*\/(Font|Metadata|XRef|EmbeddedFile)|\/FontFile/;
 
-function decodificarStream(s: StreamBruto, orcamento: number): string | null {
+function decodificarStream(
+  s: StreamBruto,
+  orcamento: number,
+  decifrador: Decifrador | null,
+): string | null {
   if (DICT_SEM_TEXTO.test(s.dicionario)) return null;
   if (FILTROS_OPACOS.test(s.dicionario)) return null;
   if (s.dados.length === 0) return null;
+
+  // Decifrar vem ANTES de inflar: no arquivo cifrado é o texto comprimido que está
+  // embaralhado, então inflar primeiro só produz erro de zlib.
+  const dados = decifrador ? decifrador.streamDe(s.dados, s.numero, s.geracao) : s.dados;
+  if (!dados || dados.length === 0) return null;
 
   if (/\/FlateDecode/.test(s.dicionario)) {
     try {
@@ -378,7 +411,7 @@ function decodificarStream(s: StreamBruto, orcamento: number): string | null {
       // pedir gigabytes de RAM e derrubar o processo da API inteira. O orçamento vem do
       // chamador porque o teto que importa é o da SOMA — 400 streams dentro do limite
       // individual ainda somam gigabytes.
-      return inflateSync(s.dados, { maxOutputLength: orcamento }).toString('latin1');
+      return inflateSync(dados, { maxOutputLength: orcamento }).toString('latin1');
     } catch {
       // Stream corrompido ou cifrado. Seguir pro próximo é melhor que abortar o PDF:
       // laudo com um stream ruim ainda pode ter o hemograma no stream seguinte.
@@ -388,7 +421,7 @@ function decodificarStream(s: StreamBruto, orcamento: number): string | null {
 
   // Sem `/Filter`: o conteúdo já está em texto claro (gerador simples faz isso).
   if (/\/Filter/.test(s.dicionario)) return null;
-  return s.dados.toString('latin1');
+  return dados.toString('latin1');
 }
 
 /** Um stream de página tem bloco de texto (`BT`) e ao menos um operador que escreve. */
