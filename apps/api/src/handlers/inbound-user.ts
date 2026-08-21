@@ -91,16 +91,25 @@ export function looksLikeImage(buf: Buffer | null | undefined): boolean {
 // o mesmo registro de exame que a foto viraria.
 
 /**
- * Teto do texto do PDF neste caminho — MAIOR que o `MAX_CARACTERES_PDF` (3000) do extrator,
- * e a divergência é deliberada:
+ * Teto do texto do PDF que vai pro prompt.
  *
- * o teto de 3000 existe porque no caminho do APP o texto extraído entra no campo `text` de
- * `POST /app/messages`, validado em 4000 caracteres. Aqui o texto vai pro PROMPT, onde o
- * limite é a janela de contexto — e um laudo laboratorial com hemograma + bioquímica passa
- * de 3000 caracteres com facilidade. Perder marcadores do exame do paciente custa mais que
- * alguns milhares de tokens; o corte, quando acontece, é ANUNCIADO no bloco.
+ * MEDIDO num laudo real de 21/08: 7 páginas, **7.842 caracteres**. Com o teto anterior de
+ * 6000, a Xarlote lia 77% do exame e perdia o resto em silêncio — e o pedaço perdido é
+ * justamente o fim, onde costumam ficar bioquímica e observações do responsável técnico.
+ *
+ * 24000 não é chute: cobre um painel grande (hemograma + bioquímica + hormônios + urina)
+ * com folga, e custa ~6 mil tokens no pior caso. Perder um marcador do exame de alguém
+ * custa mais que isso, e custa de um jeito que ninguém percebe.
+ *
+ * Aqui o limite é a janela de contexto, não o campo de uma mensagem: este texto vai pro
+ * PROMPT. O caminho do app parou de embutir o laudo no `text` de `POST /app/messages`
+ * justamente pra não herdar o teto de 4000 daquele campo — os dois caminhos agora leem
+ * pelo servidor, com este teto.
+ *
+ * O corte, quando acontece, continua ANUNCIADO no bloco: laudo que encolhe em silêncio
+ * ensina o paciente que o app perde exame.
  */
-export const MAX_CHARS_TEXTO_PDF = 6000;
+export const MAX_CHARS_TEXTO_PDF = 24_000;
 
 /** Marcas que delimitam o conteúdo do documento dentro do prompt. */
 const MARCA_INICIO = '--- TEXTO DO DOCUMENTO ---';
