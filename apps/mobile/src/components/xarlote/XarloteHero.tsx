@@ -70,17 +70,35 @@ export function XarloteHero({ size = 172, wordmark = true, style }: Props) {
   }, [float, semMovimento]);
 
   const drift = useAnimatedStyle(() => ({ transform: [{ translateY: -6 * float.value }] }));
-  const halo = size * 1.9;
+  /**
+   * O halo é um SVG QUADRADO, e o degradê tem que morrer antes da borda dele.
+   *
+   * A versão anterior usava `cx="46%" cy="38%" r="52%"` — o brilho descentralizado dentro
+   * do quadrado. A conta: do centro do brilho até a borda de cima são 38% e até a
+   * esquerda 46%, mas o degradê só zera aos 52%. Ou seja, nessas duas bordas ele ainda
+   * tinha opacidade (~0,16 no topo, ~0,05 na esquerda) e o quadrado APARECIA: uma linha
+   * reta no topo e outra à esquerda. Como só aquele canto vazava, o brilho parecia
+   * deslocado pra direita. Visto no aparelho em 20/08.
+   *
+   * Agora o brilho é concêntrico ao SVG e zera aos 48% — antes de qualquer borda, com
+   * folga. A direção da luz (vindo de cima, de trás da cabeça) passa a ser dada movendo o
+   * SVG INTEIRO, que é seguro, em vez de descentralizar o degradê dentro dele.
+   */
+  const halo = size * 2.2;
+  const haloSobe = size * 0.12;
 
   return (
     <View style={[styles.wrap, style]}>
       {/* halo aurora — integra o orb à cena em vez de deixá-lo colado por cima */}
-      <Svg width={halo} height={halo} style={[styles.halo, { width: halo, height: halo, marginLeft: -halo / 2, marginTop: -halo / 2 }]}>
+      <Svg width={halo} height={halo} style={[styles.halo, { width: halo, height: halo, marginLeft: -halo / 2, marginTop: -halo / 2 - haloSobe }]}>
         <Defs>
-          <RadialGradient id="hero-halo" cx="46%" cy="38%" r="52%">
+          <RadialGradient id="hero-halo" cx="50%" cy="50%" r="48%">
             <Stop offset="0%" stopColor="#637cfa" stopOpacity={0.5} />
-            <Stop offset="55%" stopColor="#9b5cf6" stopOpacity={0.28} />
-            <Stop offset="80%" stopColor="#d946ef" stopOpacity={0.12} />
+            <Stop offset="45%" stopColor="#9b5cf6" stopOpacity={0.24} />
+            <Stop offset="72%" stopColor="#d946ef" stopOpacity={0.10} />
+            {/* Zera ANTES do fim: o último trecho é a margem que garante que nenhuma
+                borda do quadrado tenha cor pra mostrar. */}
+            <Stop offset="92%" stopColor="#d946ef" stopOpacity={0} />
             <Stop offset="100%" stopColor="#d946ef" stopOpacity={0} />
           </RadialGradient>
         </Defs>
