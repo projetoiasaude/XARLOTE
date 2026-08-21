@@ -152,9 +152,26 @@ function Destino({
    * UM transform comanda os dois estados. O raio interpola de 33 (ponto encostado) a 152
    * (bolha aberta), então o ponto não "some e a bolha aparece" — ele VIAJA e vira bolha.
    */
-  const trilho = useAnimatedStyle(() => {
+  /**
+   * O VOO — e por que ele move o desenho, não o botão.
+   *
+   * Antes a âncora inteira animava, e o `Pressable` viajava dentro dela. Enquanto a bolha
+   * estava a caminho, a área tocável também estava: quem tocasse onde a bolha VAI ficar
+   * não acertava nada, o toque atravessava e caía no VÉU — cuja função é fechar o menu.
+   * Daí o sintoma exato relatado no aparelho: abrir e tocar rápido fazia o menu RETRAIR,
+   * em vez de não responder. O dedo estava acertando o botão de fechar.
+   *
+   * Agora a âncora nasce no destino final e não se move nunca; o que voa é só o desenho,
+   * e ele é `pointerEvents="none"`. O recuo é negativo enquanto a bolha não chegou: em
+   * repouso puxa o desenho de volta pro raio 33 (o ponto encostado no orb), e em 1 zera.
+   *
+   * Resultado: a animação elástica continua idêntica, e o botão está no lugar desde o
+   * primeiro quadro. Não é "mais rápido" — é que deixou de haver espera.
+   */
+  const voo = useAnimatedStyle(() => {
     const raio = RAIO_REPOUSO + (RAIO_ABERTO - RAIO_REPOUSO) * t.value;
-    return { transform: [{ translateX: cos * raio }, { translateY: sen * raio }] };
+    const recuo = raio - RAIO_ABERTO;
+    return { transform: [{ translateX: cos * recuo }, { translateY: sen * recuo }] };
   });
 
   // O ponto sai cedo (× 2.6): ele some no primeiro terço da viagem, quando a bolha já
@@ -176,56 +193,78 @@ function Destino({
   const tamanhoPonto = active ? PONTO_ATIVO : PONTO;
 
   return (
-    <Animated.View pointerEvents={open ? 'auto' : 'none'} style={[styles.ancora, trilho]}>
-      {/* O ponto em repouso — o mapa do menu, e o "você está aqui". */}
-      <Animated.View
-        pointerEvents="none"
-        style={[
-          styles.ponto,
-          {
-            width: tamanhoPonto,
-            height: tamanhoPonto,
-            borderRadius: tamanhoPonto / 2,
-            marginLeft: -tamanhoPonto / 2,
-            marginTop: -tamanhoPonto / 2,
-            backgroundColor: item.cor,
-            opacity: active ? 1 : 0.7,
-          },
-          active && styles.pontoAtivo,
-          estiloPonto,
-        ]}
-      />
+    /*
+      ÂNCORA — parada, no destino final, desde sempre. É ela que define ONDE o toque vale.
+      `pointerEvents` acompanha `open`, então o alvo nasce vivo no mesmo quadro em que o
+      menu abre. Fechado ela continua aqui, mas surda.
+    */
+    <View
+      pointerEvents={open ? 'auto' : 'none'}
+      style={[
+        styles.ancora,
+        { transform: [{ translateX: cos * RAIO_ABERTO }, { translateY: sen * RAIO_ABERTO }] },
+      ]}
+    >
+      {/* VISUAL — voa do orb até aqui. Não recebe toque, e é por isso que o toque funciona. */}
+      <Animated.View pointerEvents="none" style={[styles.visual, voo]}>
+        {/* O ponto em repouso — o mapa do menu, e o "você está aqui". */}
+        <Animated.View
+          style={[
+            styles.ponto,
+            {
+              width: tamanhoPonto,
+              height: tamanhoPonto,
+              borderRadius: tamanhoPonto / 2,
+              marginLeft: -tamanhoPonto / 2,
+              marginTop: -tamanhoPonto / 2,
+              backgroundColor: item.cor,
+              opacity: active ? 1 : 0.7,
+            },
+            active && styles.pontoAtivo,
+            estiloPonto,
+          ]}
+        />
 
-      <Animated.View style={estiloBolha}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel={item.label}
-          accessibilityState={{ selected: active }}
-          onPress={onPress}
-          style={[styles.bubble, active ? styles.bubbleActive : styles.bubbleIdle]}
+        <Animated.View style={estiloBolha}>
+          <View style={[styles.bubble, active ? styles.bubbleActive : styles.bubbleIdle]}>
+            <Icon size={20} color={active ? '#ffffff' : 'rgba(255,255,255,0.85)'} />
+          </View>
+        </Animated.View>
+
+        {/*
+          DOIS Views de propósito: o de fora só POSICIONA (transparente, mais largo que a
+          bolha), o de dentro é a pílula com fundo, que encolhe pro tamanho do texto.
+          Com um View só, o Yoga limitava a largura disponível à da bolha (48px) e o
+          `numberOfLines={1}` cortava tudo: no aparelho os rótulos apareciam como "Co…",
+          "Sa…", "Le…", "Ati…" — e só "Perfil" cabia inteiro.
+        */}
+        <Animated.View
+          style={[styles.labelSlot, labelAbove ? styles.labelSlotAbove : styles.labelSlotLeft, estiloRotulo]}
         >
-          <Icon size={20} color={active ? '#ffffff' : 'rgba(255,255,255,0.85)'} />
-        </Pressable>
+          <View style={styles.label}>
+            <Text style={[styles.labelText, active && { color: colors.accentHi }]} numberOfLines={1}>
+              {item.label}
+            </Text>
+          </View>
+        </Animated.View>
       </Animated.View>
 
       {/*
-        DOIS Views de propósito: o de fora só POSICIONA (transparente, mais largo que a
-        bolha), o de dentro é a pílula com fundo, que encolhe pro tamanho do texto.
-        Com um View só, o Yoga limitava a largura disponível à da bolha (48px) e o
-        `numberOfLines={1}` cortava tudo: no aparelho os rótulos apareciam como "Co…",
-        "Sa…", "Le…", "Ati…" — e só "Perfil" cabia inteiro.
+        ÁREA DE TOQUE — estática, do tamanho da bolha, viva desde o primeiro quadro.
+        O `hitSlop` é 8 por uma conta, não por gosto: as bolhas vizinhas ficam a 69px de
+        centro a centro (raio 152, arco de 26° entre elas), então o alvo pode crescer até
+        68px sem que dois vizinhos se sobreponham. Com 10, um toque na fresta entre duas
+        abriria a errada — pior que errar, porque leva a pessoa pra outra tela.
       */}
-      <Animated.View
-        pointerEvents="none"
-        style={[styles.labelSlot, labelAbove ? styles.labelSlotAbove : styles.labelSlotLeft, estiloRotulo]}
-      >
-        <View style={styles.label}>
-          <Text style={[styles.labelText, active && { color: colors.accentHi }]} numberOfLines={1}>
-            {item.label}
-          </Text>
-        </View>
-      </Animated.View>
-    </Animated.View>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={item.label}
+        accessibilityState={{ selected: active }}
+        onPress={onPress}
+        hitSlop={8}
+        style={StyleSheet.absoluteFill}
+      />
+    </View>
   );
 }
 
@@ -375,6 +414,15 @@ const styles = StyleSheet.create({
     top: (ORB - BUBBLE) / 2,
     width: BUBBLE,
     height: BUBBLE,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  visual: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
     alignItems: 'center',
     justifyContent: 'center',
   },
