@@ -39,7 +39,13 @@ Node 20 · TS 5 · Fastify 4 · BullMQ 5 · Redis 7 · **OpenRouter** (modelo pa
 - **Sara**: usa cards recuperados (top-K) no system prompt, agrupados por kind. Quando memória influencia ação, fala em voz alta (*"Lembrei que você é alérgico a dipirona…"*). Se confidence baixa, pergunta antes de assumir.
 - **Forget-me**: cascata via FK `on delete cascade` no `memory_cards_index` + `deleteUserMemory()` chamada no fluxo CONFIRMO APAGAR.
 
-## WhatsApp — DUAL-PROVIDER (sara=zpro/oficial, agent=uazapi)
+## WhatsApp — DUAL-PROVIDER (a fachada suporta os dois; **em prod hoje as DUAS pernas são zpro**)
+> ⚠️ **Confira antes de assumir** (24/08/2026): o `/health` de produção responde
+> `wa_provider_sara: "zpro"` **e** `wa_provider_agent: "zpro"`, e as mensagens das duas
+> pernas têm `provider_ticket_id` do zpro. Este título dizia "agent=uazapi" e por pouco
+> não me fez responder a uma clínica pelo canal errado. O código continua dual-provider
+> de verdade (`providerFor(instance)`); o que mudou foi a CONFIGURAÇÃO. Leia o `/health`,
+> não este arquivo, pra saber quem serve cada perna hoje.
 - **Fachada única**: `packages/whatsapp/src/client.ts` exporta `sendText/sendMenu/sendImage/sendAudio/fetchInboundMedia/...` e despacha por **provider** (`provider.ts` → `providerFor(instance)`). Decisão por env `WHATSAPP_PROVIDER_<INSTANCE>` (`zpro`|`uazapi`); auto-detecta quando vazio. **Nunca** chame um provider direto fora do client — use a fachada (mantém os call-sites agnósticos).
 - **zpro (API Business oficial)** — leg `sara` (Xarlote). Contrato de SAÍDA confirmado (OpenAPI oficial): base `POST {ZPRO_BASE_URL}/v2/api/external/{ZPRO_<I>_API_ID}` + suffixes `/url`, `/base64`, `/voice`, `/sendButtonWABA`; auth `Authorization: Bearer`; número só-dígitos com DDI. **Botões WABA exigem `ticketId`** (vem do webhook de entrada → flui via `NormalizedInbound.providerTicketId` → `sendMenu`). Voz só por URL (`/voice`); Buffer cai pra `/base64`.
 - **zpro ENTRADA é NÃO-DOCUMENTADA**: `zpro-normalize.ts` é tolerante/provisório (tenta N chaves candidatas). A rota `webhook.zpro.ts` captura o payload redatado em `webhook_events`/system_logs — **finalize o parser contra o payload real capturado**, não invente o shape.
