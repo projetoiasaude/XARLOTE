@@ -1,3 +1,4 @@
+import { foldPt } from './br-datetime.js';
 /**
  * Helpers puros do fluxo de farmácia (sem I/O — testáveis isolados).
  *
@@ -922,4 +923,44 @@ export function humanizePaymentLabel(method: string | null | undefined): string 
   }
   if (t.includes('dinheiro') || t.includes('especie')) return 'dinheiro';
   return String(method);
+}
+
+/**
+ * `true` quando a mensagem é MENU DE AUTOATENDIMENTO do estabelecimento — aquele
+ * bloco automático que chega antes de qualquer humano ler a conversa.
+ *
+ * ─── POR QUE (caso Duda, 24/08/2026) ──────────────────────────────────────────
+ * O backstop de repasse existe pra nunca deixar o paciente sem saber o que a clínica
+ * disse (caso Glauber, 30/07). Mas ele repassa VERBATIM, e o primeiro retorno de um
+ * consultório costuma ser o menu da recepção. A Duda recebeu, no meio da conversa
+ * sobre a dor de estômago dela:
+ *
+ *   "Sobre a *Dra Mayra Freitas Storti*: Olá, tudo bem? Seja bem vindo (a)! Meu nome é
+ *    Ludmylla… *1-* Agendamento de consultas: *1.1*- Nutrologia *1.2*- Gastro …
+ *    (_)disponibilidade, agendamentos e valores apenas após o envio de uma foto legível
+ *    do pedido inteiro médico(_)"
+ *
+ * Ela não tinha o que fazer com isso: o menu é para QUEM ESTÁ NEGOCIANDO — e quem
+ * negocia é a Xarlote. Repassar transfere ao paciente um trabalho que é nosso, e
+ * ainda o assusta com exigências que talvez nem se apliquem ao caso dele.
+ *
+ * O que o menu EXIGE (foto do pedido médico) continua sendo lido — por
+ * `readBookingPreconditions`, que o transforma em uma frase que ele entende. Filtrar o
+ * repasse cru não perde informação; troca ruído por sinal.
+ */
+export function ehMenuDeAutoatendimento(texto: string): boolean {
+  const t = (texto ?? '').trim();
+  if (t.length < 40) return false;
+  const low = foldPt(t);
+
+  // Duas ou mais opções numeradas ("1-", "*1.2*-", "2)") em linhas/posições diferentes.
+  const opcoes = (low.match(/(?:^|\n|\s)\*?\d{1,2}(?:\.\d{1,2})?\*?\s*[-–—)]/g) ?? []).length;
+
+  // Frases que só existem em menu/resposta automática.
+  const convite = /\bem\s+que\s+(?:eu\s+)?posso\s+(?:te\s+)?ajudar\b|\bdigite\s+o\s+n?umero\b|\bescolha\s+(?:uma\s+)?op[cç]?[aã]?o\b|\bselecione\s+(?:uma\s+)?op|\bmenu\s+de\s+atendimento\b|\bresposta\s+autom[aá]tica\b|\bseja\s+bem\s+vindo\b/.test(low);
+
+  // Menu = lista de opções E convite a escolher. Só um dos dois não basta: "1- levar o
+  // pedido 2- chegar 15min antes" é orientação real, e "seja bem vindo, temos quarta às
+  // 18h" é atendimento humano — nenhum dos dois pode ser engolido.
+  return opcoes >= 2 && convite;
 }

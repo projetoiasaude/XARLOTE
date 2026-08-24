@@ -11,7 +11,13 @@
  *   - Apresentação inclui: data+hora, médico, modalidade, plano, preço, distância
  */
 import { db, writeLog, writeAudit, writeEvent } from '@iasaude/db';
-import { pickValidOffers, isOfferStillValid } from '@iasaude/shared';
+import {
+  pickValidOffers,
+  isOfferStillValid,
+  readBookingPreconditions,
+  describePreconditionsForPatient,
+  limparPlaceholder,
+} from '@iasaude/shared';
 import { NOT_TERMINAL_FILTER, PHANTOM_CONSULTATION_STATUSES } from './entity-resolve.js';
 import { sendOutbound } from './outbound.js';
 import { hasPendingClinicClarification } from './clarification.js';
@@ -315,11 +321,35 @@ export async function notifyUserConsultationQuoteArrived(
   const offered = (quotes ?? []).filter((q) => q.status === 'offered').length;
   const total = (quotes ?? []).length;
 
+  // 🔁 IDEMPOTÊNCIA POR CONTAGEM (caso Duda, 24/08).
+  // A Duda recebeu "Recebi a primeira proposta aqui (Dra Mayra Freitas Storti) 💙" DUAS
+  // vezes, às 15:47:17 e às 15:48:01. A clínica mandou duas mensagens seguidas com o
+  // mesmo horário; as duas passaram por aqui e as duas viram `offered === 1`, porque a
+  // contagem de cotações não mudou entre elas. O texto era função do ESTADO, não do
+  // EVENTO — e estado que não mudou gera a mesma frase de novo.
+  //
+  // Guardar quantas já foram anunciadas transforma a pergunta em "chegou alguma NOVA?",
+  // que é a única que justifica falar com o paciente outra vez.
+  const jaAnunciadas = Number((prefs['_offers_announced'] as number | undefined) ?? 0);
+  if (offered <= jaAnunciadas) {
+    await writeLog('info', 'consultation', `nova mensagem de ${clinicName} não trouxe cotação inédita (${offered} ofertadas, ${jaAnunciadas} já anunciadas) — não repito o aviso`, {
+      traceId, consultationId,
+    });
+    return;
+  }
+
   const msg = offered === 1
     ? `Recebi a primeira proposta aqui (${clinicName}) 💙 vou aguardar mais umas pra te trazer as melhores opções de horário.`
     : `Mais uma proposta de consulta chegando (${clinicName}) — ${offered} de ${total} ✨`;
 
-  await sendOutbound(userConvId, userPhoneE164, msg, traceId);
+  const saiu = await sendOutbound(userConvId, userPhoneE164, msg, traceId);
+  // Só marca o que REALMENTE saiu: carimbar antes do envio faria uma falha de rede
+  // calar o aviso pra sempre (falha nunca vira sucesso).
+  if (saiu) {
+    const { data: fresh } = await db.from('consultations').select('preferences').eq('id', consultationId).maybeSingle();
+    const p = (fresh?.preferences as Record<string, unknown> | null) ?? prefs;
+    await db.from('consultations').update({ preferences: { ...p, _offers_announced: offered } as never }).eq('id', consultationId);
+  }
 }
 
 /**
@@ -677,10 +707,18 @@ export async function consolidateConsultationQuotes(
     const pricePart = q.price_brl != null ? (q.price_brl > 0 ? ` · R$${q.price_brl.toFixed(2)}` : ` · pelo plano`) : '';
     const planPart = q.plan_accepted && q.plan_accepted.toLowerCase() !== 'particular' ? ` · plano ${q.plan_accepted}` : '';
     // Local = endereço da clínica (é pra lá que o paciente vai); cai pra cidade se não tiver.
-    const localText = clinic?.address || clinic?.city;
+    // `limparPlaceholder`: "Não informado" estava GRAVADO em `clinics.address` e passava
+    // no teste de verdade porque string não-vazia é truthy — a Duda viu `📍 Não informado`.
+    const localText = limparPlaceholder(clinic?.address) ?? limparPlaceholder(clinic?.city);
     const addressPart = localText ? `\n   📍 ${localText}` : '';
+    // 💰 O QUE TRAVA A VAGA aparece JUNTO da opção, antes da escolha.
+    // Escolher sem saber do sinal de R$ 180 não reembolsável não é escolher — e essa
+    // informação existia desde o primeiro minuto, enterrada em `notes`.
+    const exigencias = describePreconditionsForPatient(readBookingPreconditions(q.notes ?? ''), q.price_brl ?? null)
+      .map((linha) => `\n   ${linha}`)
+      .join('');
 
-    lines.push(`${NUMBERS[i] ?? `${i + 1}.`} *${clinic?.name ?? 'Clínica'}*\n   📅 ${dt}${doctorPart}${modePart}${pricePart}${planPart}${addressPart}`);
+    lines.push(`${NUMBERS[i] ?? `${i + 1}.`} *${clinic?.name ?? 'Clínica'}*\n   📅 ${dt}${doctorPart}${modePart}${pricePart}${planPart}${addressPart}${exigencias}`);
   }
 
   const unavail = (quotes ?? []).filter((q) => ['unavailable', 'timeout'].includes(q.status)).length;
@@ -712,9 +750,14 @@ export async function consolidateConsultationQuotes(
         modality: q.modality,
         price_brl: q.price_brl,
         plan: q.plan_accepted,
+        // O modelo precisa DISSO na mão: sem estas linhas ele responde "está tudo certo"
+        // sobre uma vaga que a clínica ainda não segurou.
+        preconditions: describePreconditionsForPatient(readBookingPreconditions(q.notes ?? ''), q.price_brl ?? null),
       };
     }),
-    instructions: 'Quando o paciente escolher uma opção (ex: "quero a 1", "prefiro o Dr. X", "pode ser a do dia 02"), identifique e chame confirm_consultation_selection com consultation_id + quote_id.',
+    instructions: 'Quando o paciente escolher uma opção (ex: "quero a 1", "prefiro o Dr. X", "pode ser a do dia 02"), identifique e chame confirm_consultation_selection com consultation_id + quote_id. '
+      + 'Se a opção escolhida tiver `preconditions`, DIGA-AS ao paciente antes de confirmar (sinal, valor não reembolsável, documento exigido) — ele precisa saber o que trava a vaga antes de decidir. '
+      + 'NUNCA afirme que a consulta está marcada enquanto a clínica não confirmar: até lá é proposta.',
   };
 
   // consultations não tem column summary — salvamos em preferences
@@ -737,7 +780,7 @@ export async function consolidateConsultationQuotes(
   });
 }
 
-function formatDateTimeBR(iso: string): string {
+export function formatDateTimeBR(iso: string): string {
   try {
     const d = new Date(iso);
     const day = d.toLocaleDateString('pt-BR', { weekday: 'long', day: '2-digit', month: '2-digit', timeZone: 'America/Sao_Paulo' });

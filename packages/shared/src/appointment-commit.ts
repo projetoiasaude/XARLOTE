@@ -35,6 +35,15 @@ export interface ClinicSlotReading {
   needsAnchor: boolean;
   /** Marcador que decidiu a classificação — vai pro log, pra auditoria ser legível. */
   matched: string | null;
+  /**
+   * Quando havia verbo de fechamento no texto e ele foi DERRUBADO, o que o derrubou.
+   * `null` quando não havia verbo de fechamento nenhum (não há o que derrubar).
+   *
+   * Existe pro log dizer *por que* não fechou. Sem isto, "a clínica falou de horário e
+   * nada aconteceu" é indistinguível de "o detector não viu nada" — e foi justamente
+   * um fechamento indevido que custou a confiança da Duda em 24/08.
+   */
+  blockedBy: string | null;
 }
 
 /**
@@ -70,6 +79,59 @@ const OFFER_MARKERS: Array<[RegExp, string]> = [
   [/\bou\s+ent[ao]{1,2}\b/, 'ou então'],
 ];
 
+/**
+ * CONDIÇÃO SOBRE A RESERVA — prova do CONTRÁRIO, não mera ausência de prova.
+ *
+ * ─── CASO DUDA, 24/08/2026 ───────────────────────────────────────────────────
+ * A recepção da Dra Mayra escreveu, na mesma mensagem que trazia o horário:
+ *
+ *   "Ressaltamos que a reserva do horário SÓ SERÁ CONFIRMADA após a realização do
+ *    pagamento inicial."
+ *
+ * A palavra `confirmada` casou com o verbo de fechamento `confirmad[ao]s?`. Não havia
+ * `?` na mensagem e nenhum marcador de oferta bateu, então o texto virou `commitment`,
+ * o horário foi fechado e a paciente — que nunca escolheu nada — recebeu
+ * "Confirmado, Duda! 🎉". A clínica, três segundos depois, ainda perguntava
+ * "Vamos agendar?".
+ *
+ * A frase que dizia que a reserva NÃO estava confirmada foi exatamente a que fez o
+ * sistema declará-la confirmada.
+ *
+ * ─── A REGRA ─────────────────────────────────────────────────────────────────
+ * Quem escreve "só será confirmada após X" está afirmando, na MESMA oração, que ela
+ * ainda não está. Análise léxica de verbo não enxerga polaridade nem modalidade: o
+ * verbo aparece igual em "está confirmada" e em "será confirmada mediante depósito".
+ * Estes marcadores capturam a modalidade — condicional, futuro condicionado e
+ * cláusula de finalidade — e VETAM o fechamento.
+ *
+ * Falso positivo aqui custa uma pergunta a mais ao paciente. Falso negativo custa uma
+ * consulta que ele acha que tem e não tem. A assimetria decide o desenho.
+ */
+const CONDITIONAL_MARKERS: Array<[RegExp, string]> = [
+  // "só será confirmada", "somente após", "apenas mediante"
+  [/\b(?:so|somente|apenas)\b[^.!?]{0,40}\b(?:apos|depois|mediante|quando|assim\s+que)\b/, 'só … após'],
+  [/\b(?:so|somente|apenas)\s+(?:sera|serao|estara|estarao|fica|ficara)\b/, 'só será'],
+  // Futuro sobre o ato de reservar: "será confirmada", "ficará reservado"
+  [/\b(?:sera|serao|estara|estarao|ficara|ficarao)\b[^.!?]{0,30}\b(?:confirmad|reservad|garantid|agendad|marcad|efetivad)/, 'será confirmada'],
+  // A reserva pendurada num pagamento/documento
+  [/\b(?:apos|mediante|depois\s+d[aeo]|assim\s+que|somente\s+com|mmediante)\b[^.!?]{0,45}\b(?:pagament|deposit|transferenc|pix|comprovant|sinal|entrada|adiantament|agendament)\w*/, 'após o pagamento'],
+  // Cláusula de finalidade: "para garantir seu agendamento, solicitamos…"
+  [/\bpara\s+(?:garantir|confirmar|reservar|efetivar|assegurar)\b/, 'para garantir'],
+  // Exigência explícita antes de reservar
+  [/\b(?:precis\w+|necessario|solicitamos|pedimos|exigimos)\b[^.!?]{0,45}\b(?:pagament|deposit|pix|comprovant|sinal|entrada|foto|pedido|encaminhament|document|carteirinha|guia)\w*/, 'exige pagamento/documento'],
+];
+
+/**
+ * NEGAÇÃO sobre o fechamento. "Ainda não está confirmado" tem o verbo de fechamento
+ * dentro e significa o oposto dele.
+ */
+const NEGATION_MARKERS: Array<[RegExp, string]> = [
+  [/\bnao\b[^.!?]{0,25}\b(?:confirmad|reservad|agendad|marcad|garantid|fechad)/, 'não confirmado'],
+  [/\b(?:confirmad|reservad|agendad|marcad)\w*\b[^.!?]{0,15}\bnao\b/, 'confirmado … não'],
+  [/\bainda\s+nao\b/, 'ainda não'],
+  [/\b(?:sem|falta|faltando|pendente\s+de)\b[^.!?]{0,25}\b(?:confirmacao|reserva|pagament|deposit|comprovant)\w*/, 'sem confirmação'],
+];
+
 /** Afirmações secas — só valem como confirmação SOMADAS a estado (ver doc do módulo). */
 const BARE_AFFIRMATIONS = new Set([
   'ok', 'okay', 'ok!', 'isso', 'isso mesmo', 'sim', 'certo', 'perfeito', 'combinado',
@@ -94,8 +156,9 @@ function firstMatch(folded: string, table: Array<[RegExp, string]>): string | nu
 /**
  * Lê a mensagem da recepção e classifica.
  *
- * `commitment` exige verbo de fechamento E ausência de vocabulário de oferta E que
- * a frase não seja pergunta. Qualquer dúvida cai em `offer` — que é reversível.
+ * `commitment` exige verbo de fechamento E ausência de vocabulário de oferta E que a
+ * frase não seja pergunta E que não haja condição nem negação sobre a reserva.
+ * Qualquer dúvida cai em `offer` — que é reversível, porque volta ao paciente.
  */
 export function readClinicSlotMessage(text: string, nowMs: number): ClinicSlotReading {
   const raw = (text ?? '').trim();
@@ -104,16 +167,31 @@ export function readClinicSlotMessage(text: string, nowMs: number): ClinicSlotRe
 
   const offer = firstMatch(folded, OFFER_MARKERS);
   const closing = firstMatch(folded, CLOSING_MARKERS);
+  const conditional = firstMatch(folded, CONDITIONAL_MARKERS);
+  const negated = firstMatch(folded, NEGATION_MARKERS);
   // Pergunta ("marcamos pra quarta?") NUNCA é fechamento — quem pergunta não fechou.
-  const isQuestion = /\?\s*$/.test(raw) || /\?/.test(raw);
+  const isQuestion = /\?/.test(raw);
 
-  if (closing && !offer && !isQuestion) {
-    return { kind: 'commitment', datetimes, needsAnchor: datetimes.length === 0, matched: closing };
+  // Só faz sentido falar em "derrubado" se havia um verbo de fechamento pra derrubar.
+  // A ordem é a da força da evidência contrária: negação explícita > condição > pergunta
+  // > vocabulário de oferta na mesma frase.
+  const blockedBy = closing
+    ? (negated ?? conditional ?? (isQuestion ? 'pergunta' : null) ?? (offer ? `oferta (${offer})` : null))
+    : null;
+
+  if (closing && !blockedBy) {
+    return { kind: 'commitment', datetimes, needsAnchor: datetimes.length === 0, matched: closing, blockedBy: null };
   }
   if (datetimes.length > 0) {
-    return { kind: 'offer', datetimes, needsAnchor: false, matched: offer ?? (closing ? `${closing} (ambíguo → tratado como oferta)` : null) };
+    return {
+      kind: 'offer',
+      datetimes,
+      needsAnchor: false,
+      matched: offer ?? (closing ? `${closing} (derrubado por: ${blockedBy}) → oferta` : null),
+      blockedBy,
+    };
   }
-  return { kind: 'neither', datetimes: [], needsAnchor: false, matched: offer ?? closing };
+  return { kind: 'neither', datetimes: [], needsAnchor: false, matched: offer ?? closing, blockedBy };
 }
 
 /** Tolerância pra casar duas datas "iguais" vindas de caminhos diferentes. */

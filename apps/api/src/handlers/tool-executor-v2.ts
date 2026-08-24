@@ -16,7 +16,7 @@
  *   - Side-effects em transação quando possível
  */
 import { db, writeAudit, writeLog, writeEvent } from '@iasaude/db';
-import { nextOccurrence, isOfferStillValid, pickFutureBrDateTimes, sameSlot, isAmbiguousNegation } from '@iasaude/shared';
+import { nextOccurrence, isOfferStillValid, pickFutureBrDateTimes, sameSlot, isAmbiguousNegation, gravarEscolhaDoPaciente } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { discoverClinics } from './clinic-discovery.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
@@ -644,6 +644,30 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
     }
   }
 
+  // ─── 📍 PRÉ-REQUISITO: SEM ONDE, NÃO HÁ BUSCA (caso Duda, 24/08) ───────────
+  // A Duda pediu um gastro às 15:41. O onboarding só havia perguntado o nome dela, e
+  // nenhum endereço existia — então a busca rodou com `city = null`, o Places não tinha
+  // o que pesquisar e devolveu zero em 2,3 segundos. A paciente leu:
+  //
+  //   "não consegui encontrar gastroenterologia agora 😔 Pode ser que eu não tenha
+  //    achado clínicas com contato disponível na região"
+  //
+  // Uma frase que atribui o fracasso à REGIÃO, quando a região nunca foi informada.
+  // Ela mesma percebeu: "não sei em que região que ela tava procurando, porque no
+  // início ela me perguntou só meu nome". Quando disse "Goiânia", apareceram 5 clínicas
+  // em segundos — a busca sempre funcionou; faltava o dado.
+  //
+  // Falta de INSUMO não é falta de RESULTADO. Perguntar custa um turno; mentir custa a
+  // confiança de quem estava com dor de estômago havia semanas.
+  if (!city && (lat == null || lng == null)) {
+    await writeLog('info', 'consultation', 'start_consultation_search sem cidade nem geo — perguntando ao paciente em vez de buscar no vazio', { traceId: ctx.traceId });
+    throw new ToolFailure(
+      'NÃO iniciei busca nenhuma: não sei em que cidade o paciente está (sem cidade no pedido, sem cidade no perfil e sem endereço salvo). '
+      + 'NÃO diga que procurou, nem que não encontrou — nenhuma busca rodou. '
+      + 'Pergunte em que cidade ele quer ser atendido e chame `start_consultation_search` de novo com `city` preenchida.',
+    );
+  }
+
   // Se o paciente informou uma cidade nova nesse pedido, salva no perfil pra
   // próxima vez a Xarlote só confirmar em vez de perguntar de novo.
   if (args.city && args.city.trim() && args.city.trim().toLowerCase() !== (profile?.home_city ?? '').toLowerCase()) {
@@ -713,8 +737,13 @@ export async function handleStartConsultationSearch(args: StartConsultationArgs,
       });
 
       if (candidates.length === 0) {
+        // Aqui a busca RODOU DE VERDADE — o pré-requisito de cidade/geo garante isso
+        // (ver o gate acima). Então dizer "não achei" é honesto, e nomear o lugar onde
+        // se procurou é o que permite ao paciente corrigir: a Duda só destravou o caso
+        // porque perguntou "não tem nenhum gastro na região de Goiânia?".
+        const onde = city ? ` em ${city}` : ' perto do seu endereço';
         await sendOutbound(ctx.conversationId, ctx.phoneE164,
-          `Puxa, não consegui encontrar ${args.specialty}${city ? ` em ${city}` : ''} agora 😔 Pode ser que eu não tenha achado clínicas com contato disponível na região. Quer que eu tente em outra cidade próxima, ou prefere telemedicina?`,
+          `Procurei ${args.specialty}${onde} e não achei nenhuma clínica com contato disponível 😔 Quer que eu tente em outra cidade, ou prefere telemedicina?`,
           ctx.traceId);
         await db.from('consultations').update({ status: 'failed' }).eq('id', c.id);
         return;
@@ -824,13 +853,28 @@ export async function handleConfirmConsultation(args: { consultation_id: string;
     throw new ToolFailure('NADA FOI CONFIRMADO: esse horário JÁ PASSOU. Não confirme data no passado — peça horários novos à clínica com `nudge_consultation` passando `message` (message_supplier é de FARMÁCIA) e explique ao paciente que a vaga anterior venceu.');
   }
 
-  // 1. Atualiza consultation
+  // 1. Atualiza consultation — e GRAVA O CONSENTIMENTO.
+  //
+  // 🔑 `_patient_choice` é a chave que abre a porta pra `scheduled` (ver
+  // `appointment-consent.ts`). É AQUI, e só aqui, que o consentimento nasce: este
+  // handler só roda depois de o paciente ter dito "sim" explicitamente neste turno.
+  //
+  // Sem este registro, a fala da clínica não fecha nada — foi o que faltou no caso
+  // Duda, em que a consulta pulou de `searching` direto pra `scheduled` porque
+  // ninguém jamais precisou provar que ela havia escolhido.
+  const { data: prefsAtuais } = await db.from('consultations').select('preferences').eq('id', consultationId).maybeSingle();
   await db.from('consultations').update({
     status: 'confirming',
     selected_quote_id: quoteId,
     scheduled_at: q.proposed_datetime,
     scheduled_clinic_id: q.clinic_id,
     scheduled_prescriber_id: q.prescriber_id,
+    preferences: gravarEscolhaDoPaciente(prefsAtuais?.preferences ?? {}, {
+      quoteId,
+      iso: q.proposed_datetime ?? null,
+      at: new Date().toISOString(),
+      via: 'tool',
+    }) as never,
   }).eq('id', consultationId);
 
   // 2. Marca outras quotes como 'rejected'

@@ -17,3 +17,6 @@ export * from './reminder-actions.js';
 export * from './phone.js';
 export * from './adherence.js';
 export * from './pharmacy.js';
+export * from './booking-preconditions.js';
+export * from './appointment-consent.js';
+export * from './placeholder.js';

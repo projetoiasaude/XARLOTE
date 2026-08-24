@@ -33,6 +33,27 @@ export interface AgentClinicContext {
   } | null;
   /** Perguntas que o paciente JÁ respondeu nesta consulta (aplica sozinha, não re-pergunta). */
   clientAnswers?: string[];
+  /**
+   * O que ESTA clínica já respondeu nesta negociação.
+   *
+   * ─── CASO DUDA, 24/08 ───────────────────────────────────────────────────────
+   * 15:47:08 — a recepção: "Quarta 26/Agosto 18h Vamos agendar?"
+   * 15:47:15 — a Xarlote: "Obrigada! E qual o primeiro horário disponível e o valor?"
+   *
+   * Sete segundos depois de RECEBER o horário e o valor, ela pediu horário e valor.
+   * O turno do modelo é montado só com o histórico de mensagens; o que os backstops
+   * determinísticos gravaram na cotação — horário, preço, plano, exigências — nunca
+   * voltava pro prompt. O agente tinha amnésia de tudo que o CÓDIGO tinha aprendido.
+   */
+  negotiationState?: {
+    /** Horários já ofertados, já formatados em PT-BR. */
+    slots?: string[];
+    priceBrl?: number | null;
+    planAccepted?: string | null;
+    address?: string | null;
+    /** Exigências já ditas (sinal, documento) — em PT-BR, prontas pra ler. */
+    preconditions?: string[];
+  } | null;
 }
 
 const URGENCY_MAP: Record<string, string> = {
@@ -122,6 +143,23 @@ ${kdLines.join('\n')}
 Se a recepção pedir qualquer um desses, **responda DIRETO com o valor acima** e continue — não chame \`request_clarification\` pra re-perguntar (o paciente já passou; ele autorizou).${convenioFix}`
     : '';
 
+  // O QUE ESTA CLÍNICA JÁ ME RESPONDEU — o antídoto da repergunta (caso Duda 24/08).
+  const ns = ctx.negotiationState ?? null;
+  const nsLinhas = ns
+    ? [
+        ns.slots?.length ? `- Horário(s) que ELES já ofereceram: **${ns.slots.join('**, **')}**` : '',
+        ns.priceBrl != null ? `- Valor da consulta: **R$ ${ns.priceBrl.toFixed(2).replace('.', ',')}**` : '',
+        ns.planAccepted ? `- Atendimento: **${ns.planAccepted}**` : '',
+        ns.address ? `- Endereço: **${ns.address}**` : '',
+        ...(ns.preconditions ?? []).map((p) => `- Exigência já informada: ${p}`),
+      ].filter(Boolean)
+    : [];
+  const negotiationBlock = nsLinhas.length
+    ? `\n\n## O QUE ESTA CLÍNICA JÁ ME DISSE (NÃO pergunte de novo)
+${nsLinhas.join('\n')}
+Perguntar de novo o que já está aqui faz a recepção repetir tudo e nos trata como robô — foi o que aconteceu em 24/08: eles mandaram horário e valor, e eu pedi horário e valor sete segundos depois. Se falta só UMA coisa (o endereço, por exemplo), pergunte **só ela**, nomeando o que já sei (*"Perfeito, anotei quarta 18h e os R$ 600. Só me falta o endereço, por favor 🙂"*).`
+    : '';
+
   // O QUE O PACIENTE JÁ RESPONDEU (espelha answersLine da farmácia).
   const answersBlock = ctx.clientAnswers && ctx.clientAnswers.length
     ? `\n\n## O QUE O PACIENTE JÁ RESPONDEU NESTA CONSULTA (aplique SOZINHA, NÃO re-pergunte)
@@ -206,7 +244,7 @@ ${dateAnchor}
 - ${planLine}
 - ${modalityLine}
 - ${timeLine}
-- ${patientLine}${singleTargetBlock}${knownDataBlock}${answersBlock}
+- ${patientLine}${singleTargetBlock}${knownDataBlock}${negotiationBlock}${answersBlock}
 
 ---
 
@@ -262,7 +300,11 @@ ${caseCBlock}
 
 2. Quando a clínica oferecer horário + plano/preço (Caso A), chame \`record_consultation_quote\` IMEDIATAMENTE — não segure esperando todos os dados. Atualize depois com nova chamada se faltar info.
 
-3. NÃO marque a consulta — só cota e registra. Quem confirma é o paciente via Xarlote.
+3. **NÃO marque a consulta — só cote e registre. Quem confirma é o PACIENTE.** E isso vale também pro que você ESCREVE: nada de frase que a recepção possa ler como fechamento antes de ele ter escolhido.
+   - ❌ **PROIBIDO** antes do "sim" dele: *"tá tudo certo então"*, *"pode marcar"*, *"fechado"*, *"confirmado"*, *"pode agendar"*, *"combinado"*.
+   - ✅ Diga que vai confirmar: *"Perfeito, anotei! Vou confirmar com ele e já te falo 🙂"*.
+   - Quando a recepção perguntar **"vamos agendar?"**, a resposta honesta é *"Deixa eu confirmar com ele rapidinho e já volto 🙂"* — e você leva a oferta ao paciente. Nunca responda algo ambíguo e vá embora.
+   - **Caso Duda, 24/08:** você respondeu *"Perfeito, muito obrigada! Tá tudo certo então"* a uma recepção que ainda não tinha agendado nada. Ela perguntou **"Vamos agendar?"** de novo, 15 segundos depois, e ficou sem resposta — enquanto a paciente já tinha recebido "Confirmado! 🎉". Os dois lados acreditaram em coisas diferentes, e nenhuma delas era verdade.
 
 4. **SOE HUMANA, NÃO ROBÔ.** Pra clínica é UMA conversa contínua com VOCÊ — nada de "voltando aqui" nem de falar "o paciente" em 3ª pessoa toda hora (cara de call-center). Fale em **1ª pessoa** ("quero marcar", "vou confirmar aqui", "fechei"). Varie ("Perfeito!", "Boa!", "Fechou!", "Ótimo!") — não repita "Show, anotei" toda vez. Emoji com moderação (no máx. 1, tipo 🙂/🙏). Sem "agente", "IA", "sistema", "atendimento virtual".
 

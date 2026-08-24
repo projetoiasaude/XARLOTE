@@ -29,6 +29,15 @@
  * que ficou pela metade e CONSERTAR sozinho, sem intervenção humana.
  */
 import { db, writeLog, writeAudit, writeEvent } from '@iasaude/db';
+import {
+  mayDeclareScheduled,
+  lerEscolhaDoPaciente,
+  readBookingPreconditions,
+  describePreconditionsForPatient,
+  blocksReservation,
+  limparPlaceholder,
+  type ConsentDenial,
+} from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 
 /** De onde veio o fechamento — vai pro log/auditoria e distingue o determinístico do LLM. */
@@ -63,6 +72,15 @@ export interface CommitAppointmentResult {
   remindersCreated: number;
   patientNotified: boolean;
   reason?: string;
+  /**
+   * Motivo TIPADO quando o GATE DE CONSENTIMENTO barrou o fechamento.
+   *
+   * Existe pro chamador reagir em vez de só logar: `sem_escolha_do_paciente` significa
+   * que a fala da clínica é uma OFERTA e precisa chegar ao paciente. Um `ok: false`
+   * sem esta etiqueta seria indistinguível de erro técnico, e a oferta se perderia —
+   * que é exatamente o buraco que a Duda caiu do outro lado.
+   */
+  denial?: ConsentDenial;
 }
 
 /** Lembretes que toda consulta futura precisa ter. */
@@ -259,12 +277,50 @@ export async function commitAppointment(input: CommitAppointmentInput): Promise<
     await writeLog('error', 'consultation', `commitAppointment: consulta não encontrada (${cErr?.message ?? 'sem linha'})`, { traceId, consultationId });
     return { ok: false, alreadyCommitted: false, remindersCreated: 0, patientNotified: false, reason: 'consulta não encontrada' };
   }
-  if (c.status === 'cancelled') {
-    await writeLog('warn', 'consultation', 'commitAppointment recusado: consulta CANCELADA — não se fecha o que o paciente desmarcou', { traceId, consultationId });
-    return { ok: false, alreadyCommitted: false, remindersCreated: 0, patientNotified: false, reason: 'consulta cancelada' };
+  const prefs = (c.preferences as Record<string, unknown> | null) ?? {};
+
+  // ─── 🚪 GATE DE CONSENTIMENTO (caso Duda, 24/08) ───────────────────────────
+  // A ÚNICA porta pra `scheduled` agora exige o consentimento do paciente PARA AQUELE
+  // HORÁRIO. Antes daqui bastava a consulta não estar cancelada — e foi por essa fresta
+  // que a fala de uma recepção virou "Confirmado, Duda! 🎉" pra alguém que nunca tinha
+  // escolhido nada, e que 30 segundos antes lera "vou aguardar mais umas opções".
+  //
+  // O gate é PURO (`@iasaude/shared`) e vale pros QUATRO caminhos de origem — inclusive
+  // a tool do LLM. Uma porta que qualquer origem contorna não é porta.
+  //
+  // Negar aqui NÃO descarta informação: `denial` volta tipado e o chamador é obrigado a
+  // registrar a fala da clínica como OFERTA e levá-la ao paciente.
+  const veredito = mayDeclareScheduled(
+    {
+      status: c.status as string,
+      selectedQuoteId: (c.selected_quote_id as string | null) ?? null,
+      scheduledAt: (c.scheduled_at as string | null) ?? null,
+      patientChoice: lerEscolhaDoPaciente(prefs),
+    },
+    new Date(alvo).toISOString(),
+    source,
+  );
+  if (!veredito.allow) {
+    const nivel = veredito.reason === 'consulta_terminal' ? 'warn' : 'error';
+    await writeLog(nivel, 'consultation', `🚪 commitAppointment RECUSADO (${veredito.reason}) — ${veredito.explain}`, {
+      traceId, consultationId, source, evidence: input.evidence?.slice(0, 160) ?? null,
+    });
+    await writeAudit({
+      actorType: source === 'patient_selection' ? 'xarlote' : 'agent_clinic',
+      action: 'consultation.commit_blocked',
+      userId: c.user_id as string,
+      targetTable: 'consultations',
+      targetId: consultationId,
+      conversationId: (c.conversation_id as string | null) ?? undefined,
+      traceId,
+      metadata: { reason: veredito.reason, source, slot: new Date(alvo).toISOString(), evidence: input.evidence?.slice(0, 160) ?? null },
+    }).catch(() => {});
+    return {
+      ok: false, alreadyCommitted: false, remindersCreated: 0, patientNotified: false,
+      reason: veredito.explain, denial: veredito.reason,
+    };
   }
 
-  const prefs = (c.preferences as Record<string, unknown> | null) ?? {};
   const commitAnterior = (prefs['_commit'] ?? null) as { at?: string; iso?: string; notified_at?: string } | null;
   const mesmoHorario = c.scheduled_at ? Math.abs(Date.parse(c.scheduled_at) - alvo) <= 60_000 : false;
   const jaFechada = c.status === 'scheduled' && mesmoHorario;
@@ -347,11 +403,24 @@ export async function commitAppointment(input: CommitAppointmentInput): Promise<
     }
     if (quoteId) {
       await db.from('consultation_quotes').update({ status: 'selected', proposed_datetime: new Date(alvo).toISOString() }).eq('id', quoteId);
+      // ─── VOCABULÁRIO DE STATUS: recusa ≠ silêncio (caso Duda, 24/08) ────────
+      // As 5 clínicas da Duda viraram: 1 `selected` e 4 `rejected`. Só que NENHUMA das
+      // quatro chegou a responder — três receberam uma única mensagem e ficaram mudas.
+      // `rejected` significa "o paciente viu esta oferta e preferiu outra"; carimbá-lo
+      // em quem nunca abriu a boca inventa uma recusa que não houve e envenena a métrica
+      // de conversão por clínica, que é justamente como se decide quem vale contatar.
       await db.from('consultation_quotes')
         .update({ status: 'rejected' })
         .eq('consultation_id', consultationId)
         .neq('id', quoteId)
-        .in('status', ['pending', 'offered']);
+        .eq('status', 'offered');
+      // Nunca respondeu: a consulta acabou por outro caminho. Mesma convenção de
+      // `closeConsultationQuotes` — encerra sem fingir que houve negociação.
+      await db.from('consultation_quotes')
+        .update({ status: 'unavailable', notes: '[encerrada] paciente fechou com outra clínica' })
+        .eq('consultation_id', consultationId)
+        .neq('id', quoteId)
+        .in('status', ['pending', 'contacting']);
     }
   }
 
@@ -452,17 +521,28 @@ async function notifyPatientCommitted(args: {
   let medico: string | null = null;
   let preco: number | null = null;
   let pagamentos: string[] | null = null;
+  let condicoes: string[] = [];
+  let bloqueiaReserva = false;
   if (args.quoteId) {
     const { data: q } = await db
       .from('consultation_quotes')
-      .select('price_brl, payment_methods, clinics(name, address), prescribers(name)')
+      .select('price_brl, payment_methods, notes, clinics(name, address), prescribers(name)')
       .eq('id', args.quoteId)
       .maybeSingle();
-    clinica = ((q?.clinics as { name?: string } | null)?.name) ?? null;
-    endereco = ((q?.clinics as { address?: string } | null)?.address) ?? null;
-    medico = ((q?.prescribers as { name?: string } | null)?.name) ?? null;
+    clinica = limparPlaceholder((q?.clinics as { name?: string } | null)?.name);
+    // 🧹 "Não informado" é rótulo de ausência, não endereço. Ele estava GRAVADO em
+    // `clinics.address` e passou no teste `endereco ? …` porque string não-vazia passa —
+    // a Duda recebeu `📍 Não informado · Dra Mayra Freitas Storti` como se fosse local.
+    endereco = limparPlaceholder((q?.clinics as { address?: string } | null)?.address);
+    medico = limparPlaceholder((q?.prescribers as { name?: string } | null)?.name);
     preco = (q?.price_brl as number | null) ?? null;
     pagamentos = (q?.payment_methods as string[] | null) ?? null;
+    // 💰 CONDIÇÕES DA CLÍNICA. Ficavam só em `notes` — texto livre que ninguém lia — e
+    // o card saía com `💰 R$ 600,00` limpo, sem dizer que faltava um sinal de R$ 180
+    // não reembolsável. Quem vai ao consultório precisa saber o que levar.
+    const pcs = readBookingPreconditions((q?.notes as string | null) ?? '');
+    condicoes = describePreconditionsForPatient(pcs, preco);
+    bloqueiaReserva = blocksReservation(pcs);
   }
 
   const especialidade = (args.consultation['specialty'] as string | null) ?? 'consulta';
@@ -476,6 +556,13 @@ async function notifyPatientCommitted(args: {
   if (preco != null) {
     const formas = pagamentos && pagamentos.length > 0 ? ` (${pagamentos.join(', ')})` : '';
     linhas.push(`💰 R$ ${preco.toFixed(2).replace('.', ',')}${formas}`);
+  }
+  if (condicoes.length > 0) {
+    linhas.push('', ...condicoes);
+    // Pré-condição que TRAVA a vaga e da qual não sabemos o desfecho: perguntar é a
+    // única resposta honesta. O silêncio aqui é o que faz alguém viajar até o
+    // consultório achando que tem reserva.
+    if (bloqueiaReserva) linhas.push('', 'Me avisa quando tiver acertado isso com eles, pra eu confirmar que a vaga está guardada? 💙');
   }
   if (args.remindersCreated > 0) {
     linhas.push('', `Já deixei ${args.remindersCreated === 1 ? 'o lembrete pronto' : 'os lembretes prontos'} pra você não esquecer 💙`);

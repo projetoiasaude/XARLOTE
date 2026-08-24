@@ -26,6 +26,11 @@ import {
   resolveCommittedSlot,
   isBareAffirmation,
   isOfferStillValid,
+  readBookingPreconditions,
+  blocksReservation,
+  describePreconditionsForPatient,
+  limparPlaceholder,
+  ehMenuDeAutoatendimento,
 } from '@iasaude/shared';
 import type { NormalizedInbound, Message } from '@iasaude/shared';
 import { commitAppointment } from './appointment-commit.js';
@@ -36,6 +41,7 @@ import {
   consolidateConsultationQuotes,
   notifyUserConsultationQuoteArrived,
   notifyUserSingleTargetDeadEnd,
+  formatDateTimeBR,
 } from './consultation-consolidation.js';
 import { relayClinicQuestionToUser } from './clarification.js';
 
@@ -349,6 +355,24 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     },
     clientAnswers,
     isAppointmentConfirmation,
+    // 🧠 O QUE O CÓDIGO JÁ APRENDEU volta pro modelo (caso Duda, 24/08).
+    // Os backstops determinísticos gravam horário/preço/plano/exigências na cotação, mas
+    // o turno seguinte era montado só com o histórico de mensagens — então o agente
+    // repetia pergunta já respondida sete segundos antes. Memória do processo tem que
+    // chegar a quem escreve a próxima frase.
+    negotiationState: {
+      slots: [
+        quote.proposed_datetime as string | null,
+        ...(((quote.alternative_datetimes ?? []) as string[]) ?? []),
+      ].filter((s): s is string => !!s).map((iso) => formatDateTimeBR(iso)),
+      priceBrl: (quote.price_brl as number | null) ?? null,
+      planAccepted: (quote.plan_accepted as string | null) ?? null,
+      address: limparPlaceholder((quote.clinics as { address?: string } | null)?.address),
+      preconditions: describePreconditionsForPatient(
+        readBookingPreconditions((quote.notes as string | null) ?? ''),
+        (quote.price_brl as number | null) ?? null,
+      ),
+    },
   };
 
   const cfg = loadPrompts();
@@ -462,6 +486,9 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   let quoteRecorded = false;         // record_consultation_quote
   let appointmentConfirmed = false;  // record_appointment_confirmation
   let clarificationRequested = false; // request_clarification (levou pergunta ao paciente)
+  // O LLM chamou `record_appointment_confirmation` e o GATE DE CONSENTIMENTO barrou:
+  // o horário é bom, o fechamento não. Vira oferta no backstop (iii), como no detector.
+  let confirmacaoSemConsentimento = false;
   let singleTargetDeadEnd = false;   // alvo único deu beco sem saída → paciente avisado, clínica recebe cortesia
   let repliedToClinic = false;       // já mandamos algo à clínica dentro do loop de tools (não duplicar no passo 9)
 
@@ -713,6 +740,11 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
         // continua ligado (falha nunca vira sucesso).
         appointmentConfirmed = commit.ok;
         if (!commit.ok) {
+          // O gate vale igual pro LLM: uma porta que a tool contorna não é porta.
+          // Aqui o rebaixamento é sinalizado pelo mesmo caminho do detector.
+          if (commit.denial === 'sem_escolha_do_paciente' || commit.denial === 'escolha_de_outro_horario') {
+            confirmacaoSemConsentimento = true;
+          }
           await writeLog('warn', 'consultation', `clínica confirmou mas o fechamento NÃO foi aceito (${commit.reason}) — repasse ao paciente segue ligado`, {
             traceId, consultationId: quote.consultation_id,
           });
@@ -738,6 +770,38 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   // importavam: os três horários da Rita (nada registrado) e a confirmação da consulta
   // (nada registrado). Um turno vazio de um modelo nunca mais pode custar uma consulta.
   const leitura = readClinicSlotMessage(text, Date.now());
+
+  // ─── 💰 PRÉ-CONDIÇÕES DA RESERVA (caso Duda, 24/08) ────────────────────────
+  // Registra SEMPRE que a recepção mencionar exigência — não só no turno em que ela
+  // oferta horário. A cláusula do depósito de R$ 180 não reembolsável veio grudada na
+  // mesma mensagem do horário, e as duas coisas seguem caminhos de código diferentes:
+  // sem capturar aqui, a exigência ficaria dependendo de qual branch disparasse.
+  //
+  // O destino é `notes` da cotação, que é o que a consolidação e o card do paciente
+  // leem. Dedupe por trecho: a recepção repete o bloco de condições a cada mensagem.
+  const precondicoes = readBookingPreconditions(text);
+  if (precondicoes.length > 0) {
+    const notasAtuais = ((quote.notes as string | null) ?? '').trim();
+    const ineditas = precondicoes
+      .map((p) => p.evidence)
+      .filter((e) => e.length >= 12 && !notasAtuais.includes(e.slice(0, 40)));
+    if (ineditas.length > 0) {
+      await db.from('consultation_quotes')
+        .update({ notes: [notasAtuais, ...ineditas].filter(Boolean).join(' · ').slice(0, 1500) })
+        .eq('id', quote.id);
+      await writeLog(blocksReservation(precondicoes) ? 'warn' : 'info', 'agent-clinic',
+        `💰 pré-condição da clínica registrada (${precondicoes.map((p) => p.kind).join(', ')})${blocksReservation(precondicoes) ? ' — TRAVA a reserva; o paciente precisa saber antes de escolher' : ''}`,
+        { traceId, conversationId, quoteId: quote.id });
+    }
+  }
+
+  // 🚪 REBAIXAMENTO PARA OFERTA (caso Duda, 24/08).
+  // O gate de consentimento (`appointment-consent.ts`) recusa fechar consulta que o
+  // paciente nunca escolheu. Recusar, sozinho, seria PERDER o horário que a clínica
+  // acabou de oferecer — trocaria um erro por outro. Quando o gate barra por falta de
+  // consentimento, a fala da clínica é rebaixada a OFERTA e segue o caminho normal:
+  // vira cotação, a consolidação apresenta ao paciente, e ELE decide.
+  let rebaixadoParaOferta = confirmacaoSemConsentimento;
 
   // (i) FECHAMENTO. A recepção afirmou um agendamento como FATO.
   if (!appointmentConfirmed && leitura.kind === 'commitment') {
@@ -771,6 +835,12 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
         evidence: leitura.datetimes[0]?.evidence ?? leitura.matched,
       });
       appointmentConfirmed = commit.ok;
+      if (!commit.ok && (commit.denial === 'sem_escolha_do_paciente' || commit.denial === 'escolha_de_outro_horario')) {
+        rebaixadoParaOferta = true;
+        await writeLog('warn', 'agent-clinic', `🚪 a clínica afirmou fechamento mas o paciente não consentiu (${commit.denial}) — REBAIXANDO a oferta e levando ao paciente`, {
+          traceId, conversationId, consultationId: quote.consultation_id, slot: slot.iso,
+        });
+      }
     } else {
       await writeLog('warn', 'agent-clinic', `clínica parece ter CONFIRMADO ("${leitura.matched}") mas não há horário nem no texto nem na cotação — não invento data; o repasse ao paciente cobre`, {
         traceId, conversationId, consultationId: quote.consultation_id,
@@ -804,7 +874,10 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   // (iii) OFERTA. A recepção pôs horários na mesa e nenhuma tool os registrou. Grava o
   // primeiro como proposto e os demais em `alternative_datetimes` — a coluna existe
   // desde o schema inicial e ficou `[]` justamente no dia em que a Rita ofereceu TRÊS.
-  if (!quoteRecorded && !appointmentConfirmed && leitura.kind === 'offer') {
+  // `rebaixadoParaOferta`: a leitura foi `commitment`, mas o gate barrou por falta de
+  // consentimento. O horário está no texto e é bom — só não é um fechamento. Entra aqui
+  // pra virar cotação e chegar ao paciente, em vez de evaporar num log.
+  if (!quoteRecorded && !appointmentConfirmed && (leitura.kind === 'offer' || rebaixadoParaOferta)) {
     const futuros = leitura.datetimes.filter((h) => isOfferStillValid(h.iso, Date.now()));
     const primeiro = futuros[0];
     if (primeiro) {
@@ -909,7 +982,17 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   // turno, repassa. Verbatim (é a mensagem REAL da clínica, não paráfrase do LLM).
   const nadaFoiAoPaciente = !quoteRecorded && !appointmentConfirmed && !clarificationRequested && !singleTargetDeadEnd;
   const clinicaDisseAlgo = (text ?? '').trim().length >= 15;
-  if (nadaFoiAoPaciente && clinicaDisseAlgo && !isAppointmentConfirmation) {
+  // 🧹 Menu de autoatendimento NÃO é resposta ao paciente (caso Duda, 24/08): o primeiro
+  // retorno do consultório foi "1.1- Nutrologia / 1.2- Gastro / Em que posso ajudar?",
+  // repassado cru pra quem estava com dor de estômago. O menu é pra quem NEGOCIA — e
+  // quem negocia sou eu. O que ele EXIGE já é lido por `readBookingPreconditions`.
+  const ehMenu = ehMenuDeAutoatendimento(text ?? '');
+  if (ehMenu && nadaFoiAoPaciente) {
+    await writeLog('info', 'agent-clinic', 'resposta da clínica é menu de autoatendimento — NÃO repasso ao paciente (a exigência dele, se houver, já foi capturada)', {
+      traceId, conversationId, quoteId: quote.id,
+    });
+  }
+  if (nadaFoiAoPaciente && clinicaDisseAlgo && !isAppointmentConfirmation && !ehMenu) {
     await writeLog('warn', 'agent-clinic', 'Backstop: clínica respondeu e NADA foi repassado ao paciente — repassando', { traceId, conversationId, quoteId: quote.id });
     await relayClinicQuestionToUser(quote, text, traceId)
       .catch((e) => writeLog('error', 'agent-clinic', `Backstop de repasse falhou: ${String(e).slice(0, 140)}`, { traceId }));
