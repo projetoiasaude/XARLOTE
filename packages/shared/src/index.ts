@@ -22,3 +22,6 @@ export * from './appointment-consent.js';
 export * from './placeholder.js';
 export * from './claim-guard.js';
 export * from './reminder-fadiga.js';
+export * from './repasse-clinica.js';
+export * from './latencia.js';
+export * from './outreach-hold.js';

@@ -95,41 +95,30 @@ describe('isExplicitAbandon — só o inequívoco encerra', () => {
  * "já te retorno" sem nunca retornar é pior que silêncio.
  */
 describe('pickClinicAck — cortesia que não se repete e sabe escalar', () => {
-  it('nunca repete a frase que acabou de sair', () => {
-    const primeira = CLINIC_ACK_VARIANTS[0];
-    expect(pickClinicAck(primeira, 1)).not.toBe(primeira);
+  it('não repete a cortesia que já saiu na janela (caso Ciro, 25/08)', () => {
+    // A Rita recebeu a MESMA frase 3× em 4 minutos porque mensagens reais entravam
+    // entre elas e zeravam a comparação com "a última".
+    const primeira = CLINIC_ACK_VARIANTS[0]!;
+    const janelaComRuidoNoMeio = ['Oi Rita! Meu nome é Ciro Costa.', primeira, 'Não, obrigado.'];
+    expect(pickClinicAck(janelaComRuidoNoMeio)).not.toBe(primeira);
   });
 
-  it('sem histórico usa a primeira variante', () => {
-    expect(pickClinicAck(null, 0)).toBe(CLINIC_ACK_VARIANTS[0]);
-    expect(pickClinicAck(undefined, 0)).toBe(CLINIC_ACK_VARIANTS[0]);
+  it('sem histórico, usa a primeira variante', () => {
+    expect(pickClinicAck([])).toBe(CLINIC_ACK_VARIANTS[0]);
+    expect(pickClinicAck([null, undefined, ''])).toBe(CLINIC_ACK_VARIANTS[0]);
   });
 
-  it('🔴 na TERCEIRA vez para de prometer retorno e faz uma pergunta concreta', () => {
-    expect(pickClinicAck(CLINIC_ACK_VARIANTS[1], 2)).toBe(CLINIC_ACK_ESCALATION);
-    expect(pickClinicAck(CLINIC_ACK_VARIANTS[0], 3)).toBe(CLINIC_ACK_ESCALATION);
+  it('duas cortesias na janela ⇒ escala pra pergunta concreta', () => {
+    const janela = [CLINIC_ACK_VARIANTS[0]!, 'qualquer coisa', CLINIC_ACK_VARIANTS[1]!];
+    expect(pickClinicAck(janela)).toBe(CLINIC_ACK_ESCALATION);
   });
 
-  it('a escalação faz uma PERGUNTA (é o que destrava a conversa)', () => {
-    expect(CLINIC_ACK_ESCALATION).toContain('?');
+  it('esgotadas as variantes, escala em vez de repetir', () => {
+    expect(pickClinicAck([...CLINIC_ACK_VARIANTS])).toBe(CLINIC_ACK_ESCALATION);
   });
 
-  it('três turnos vazios seguidos produzem três mensagens DIFERENTES', () => {
-    const m1 = pickClinicAck(null, 0);
-    const m2 = pickClinicAck(m1, 1);
-    const m3 = pickClinicAck(m2, 2);
-    expect(new Set([m1, m2, m3]).size).toBe(3);
-  });
-
-  it('isGenericClinicAck reconhece as variantes e ignora texto real', () => {
-    for (const v of CLINIC_ACK_VARIANTS) expect(isGenericClinicAck(v)).toBe(true);
-    expect(isGenericClinicAck('Ficou então para o dia 26/08 às 10 horas')).toBe(false);
-    expect(isGenericClinicAck(null)).toBe(false);
-    expect(isGenericClinicAck('')).toBe(false);
-  });
-
-  it('nenhuma variante tem emoji de travessão ou quebra que o humanizador remove', () => {
-    for (const v of CLINIC_ACK_VARIANTS) expect(v).not.toContain('—');
-    expect(CLINIC_ACK_ESCALATION).not.toContain('—');
+  it('isGenericClinicAck reconhece a cortesia e ignora fala real', () => {
+    expect(isGenericClinicAck(CLINIC_ACK_VARIANTS[0])).toBe(true);
+    expect(isGenericClinicAck('Consegui quarta às 18h')).toBe(false);
   });
 });

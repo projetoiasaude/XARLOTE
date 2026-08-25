@@ -208,6 +208,39 @@ export async function reconcileAppointmentReminders(args: {
     }
 
     const iso = new Date(quando).toISOString();
+
+    // ♻️ REVIVE A LINHA EXISTENTE EM VEZ DE CRIAR OUTRA (auditoria 25/08).
+    //
+    // O reparo funcionava, mas deixava rastro: em 03/08 o par 1d/2h do Ciro foi criado;
+    // um `cancel_reminders` curinga o cancelou; em 04/08 este reconciliador o RESTAUROU —
+    // inserindo DUAS LINHAS NOVAS ao lado das canceladas. A consulta passou a ter dois
+    // "Consulta em 2 horas" pras mesmas 08:00 de 26/08.
+    //
+    // O estrago aparece no cancelamento: em 25/08 o Ciro desmarcou, o `cancel_reminders`
+    // pegou UM gêmeo e deixou o outro `pending` — ele receberia "Consulta em 2 horas" pra
+    // uma consulta que não existia mais. Um par (consulta, âncora) tem que ser UMA linha;
+    // enquanto forem várias, todo cancelamento vira sorteio.
+    if (irmao) {
+      const { error: upErr } = await db.from('reminders').update({
+        status: 'pending',
+        scheduled_at: iso,
+        next_run_at: iso,
+        payload: { ...((irmao.payload ?? {}) as Record<string, unknown>), consultation_id: args.consultationId, kind, restored: true, cancel_reason: null },
+      }).eq('id', irmao.id);
+      if (upErr) {
+        await writeLog('error', 'consultation', `lembrete ${kind} NÃO restaurado: ${upErr.message.slice(0, 120)}`, {
+          traceId: args.traceId, consultationId: args.consultationId, reminderId: irmao.id,
+        });
+        skipped.push(`${kind}: update falhou`);
+        continue;
+      }
+      created += 1;
+      await writeLog('warn', 'consultation', `lembrete ${kind} de consulta RESTAURADO na MESMA linha (existia cancelado sem pedido do paciente)`, {
+        traceId: args.traceId, consultationId: args.consultationId, reminderId: irmao.id,
+      });
+      continue;
+    }
+
     const { error: insErr } = await db.from('reminders').insert({
       user_id: args.userId,
       type: 'appointment',
@@ -218,7 +251,7 @@ export async function reconcileAppointmentReminders(args: {
       scheduled_at: iso,
       next_run_at: iso,
       status: 'pending',
-      payload: { consultation_id: args.consultationId, kind, restored: Boolean(irmao) },
+      payload: { consultation_id: args.consultationId, kind },
     });
     if (insErr) {
       await writeLog('error', 'consultation', `lembrete ${kind} de consulta NÃO criado: ${insErr.message.slice(0, 120)}`, {
@@ -228,11 +261,6 @@ export async function reconcileAppointmentReminders(args: {
       continue;
     }
     created += 1;
-    if (irmao) {
-      await writeLog('warn', 'consultation', `lembrete ${kind} de consulta RESTAURADO — existia cancelado sem pedido do paciente (cancelamento colateral)`, {
-        traceId: args.traceId, consultationId: args.consultationId, reminderId: irmao.id,
-      });
-    }
   }
 
   // Consulta futura que não conseguiu NENHUMA âncora precisa ser visível: é uma

@@ -30,7 +30,7 @@ import {
   blocksReservation,
   describePreconditionsForPatient,
   limparPlaceholder,
-  ehMenuDeAutoatendimento,
+  decidirRepasseAoPaciente,
 } from '@iasaude/shared';
 import type { NormalizedInbound, Message } from '@iasaude/shared';
 import { commitAppointment } from './appointment-commit.js';
@@ -88,11 +88,29 @@ export const CLINIC_ACK_VARIANTS = [
 export const CLINIC_ACK_ESCALATION =
   'Obrigada! Só pra eu não te deixar esperando: precisa de mais alguma informação do paciente pra fechar o horário, ou já está tudo certo do seu lado?';
 
-export function pickClinicAck(lastSent: string | null | undefined, genericAcksInARow: number): string {
-  if (genericAcksInARow >= 2) return CLINIC_ACK_ESCALATION;
-  const last = (lastSent ?? '').trim();
-  const first = CLINIC_ACK_VARIANTS.find((v) => v !== last);
-  return first ?? CLINIC_ACK_ESCALATION;
+/**
+ * Escolhe a cortesia olhando uma JANELA de mensagens recentes, não só a última.
+ *
+ * ─── POR QUE MUDOU (caso Ciro, 25/08) ─────────────────────────────────────────
+ * A Rita recebeu "Perfeito, obrigada! Deixa eu confirmar aqui rapidinho e já te retorno"
+ * TRÊS vezes em quatro minutos — 09:32, 09:35 e 09:36.
+ *
+ * A versão anterior comparava só com a mensagem IMEDIATAMENTE anterior e contava acks
+ * ESTRITAMENTE consecutivos. Entre uma cortesia e a seguinte entraram mensagens reais
+ * ("Oi Rita! Meu nome é Ciro Costa…"), então `last` nunca era a cortesia, o contador de
+ * consecutivos zerava, e a busca devolvia sempre a MESMA primeira variante. A defesa
+ * existia e era anulada por qualquer coisa dita no meio.
+ *
+ * A pergunta certa não é "acabei de dizer isso?", é "eu já disse isso ultimamente?".
+ * Uma janela responde às duas.
+ */
+export function pickClinicAck(recentesOut: ReadonlyArray<string | null | undefined>): string {
+  const janela = recentesOut.map((t) => (t ?? '').trim()).filter((t) => t.length > 0);
+  // Duas cortesias na janela já bastam: prometer retorno pela terceira vez não ajuda
+  // ninguém — a essa altura a recepção precisa de uma pergunta concreta.
+  if (janela.filter((t) => isGenericClinicAck(t)).length >= 2) return CLINIC_ACK_ESCALATION;
+  const inedita = CLINIC_ACK_VARIANTS.find((v) => !janela.includes(v));
+  return inedita ?? CLINIC_ACK_ESCALATION;
 }
 
 /** `true` se o texto é uma das cortesias genéricas (pra contar repetição). */
@@ -956,18 +974,11 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
       .eq('conversation_id', conversationId)
       .eq('direction', 'out')
       .order('created_at', { ascending: false })
-      .limit(3);
-    const ultimoTexto = (ultimas?.[0]?.content as string | null) ?? null;
-    const seguidas = (() => {
-      let n = 0;
-      for (const m of ultimas ?? []) {
-        if (!isGenericClinicAck(m.content as string | null)) break;
-        n += 1;
-      }
-      return n;
-    })();
-    const ack = pickClinicAck(ultimoTexto, seguidas);
-    await writeLog('warn', 'agent-clinic', `Agente clínica retornou resposta vazia — cortesia determinística (genéricas seguidas: ${seguidas}${seguidas >= 2 ? ' → escalando pra pergunta concreta' : ''})`, { traceId, conversationId });
+      .limit(6);
+    // Janela inteira, não só a última: mensagem real no meio não pode zerar a defesa.
+    const janela = (ultimas ?? []).map((m) => m.content as string | null);
+    const ack = pickClinicAck(janela);
+    await writeLog('warn', 'agent-clinic', `Agente clínica retornou resposta vazia — cortesia determinística (${ack === CLINIC_ACK_ESCALATION ? 'escalando pra pergunta concreta' : 'variante inédita na janela'})`, { traceId, conversationId });
     await sendOutboundToClinic(conversationId, clinicPhone, ack, traceId);
   }
 
@@ -982,17 +993,20 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   // turno, repassa. Verbatim (é a mensagem REAL da clínica, não paráfrase do LLM).
   const nadaFoiAoPaciente = !quoteRecorded && !appointmentConfirmed && !clarificationRequested && !singleTargetDeadEnd;
   const clinicaDisseAlgo = (text ?? '').trim().length >= 15;
-  // 🧹 Menu de autoatendimento NÃO é resposta ao paciente (caso Duda, 24/08): o primeiro
-  // retorno do consultório foi "1.1- Nutrologia / 1.2- Gastro / Em que posso ajudar?",
-  // repassado cru pra quem estava com dor de estômago. O menu é pra quem NEGOCIA — e
-  // quem negocia sou eu. O que ele EXIGE já é lido por `readBookingPreconditions`.
-  const ehMenu = ehMenuDeAutoatendimento(text ?? '');
-  if (ehMenu && nadaFoiAoPaciente) {
-    await writeLog('info', 'agent-clinic', 'resposta da clínica é menu de autoatendimento — NÃO repasso ao paciente (a exigência dele, se houver, já foi capturada)', {
-      traceId, conversationId, quoteId: quote.id,
+  // 🧹 NEM TUDO QUE A CLÍNICA DIZ É PRA O PACIENTE (Duda 24/08, Ciro 25/08).
+  // O backstop nasceu do caso Glauber (30/07), em que uma exigência real nunca chegou a
+  // ele — então ele repassa VERBATIM. Só que "verbatim" incluiu o menu da recepção, a
+  // apresentação da secretária ("qual o seu nome?") e a conversa de processo ("Vou
+  // desmarcar aqui, obrigada"). Isso é pra quem NEGOCIA, e quem negocia sou eu.
+  // `decidirRepasseAoPaciente` mantém a assimetria: só barra o que é confiadamente
+  // inútil, e qualquer conteúdo acionável — inclusive dentro de um menu — passa.
+  const repasse = decidirRepasseAoPaciente(text ?? '');
+  if (!repasse.repassar && nadaFoiAoPaciente && clinicaDisseAlgo) {
+    await writeLog('info', 'agent-clinic', `fala da clínica não repassada ao paciente (${repasse.motivo}) — é conversa de negociação, não informação pra ele`, {
+      traceId, conversationId, quoteId: quote.id, preview: (text ?? '').slice(0, 80),
     });
   }
-  if (nadaFoiAoPaciente && clinicaDisseAlgo && !isAppointmentConfirmation && !ehMenu) {
+  if (nadaFoiAoPaciente && clinicaDisseAlgo && !isAppointmentConfirmation && repasse.repassar) {
     await writeLog('warn', 'agent-clinic', 'Backstop: clínica respondeu e NADA foi repassado ao paciente — repassando', { traceId, conversationId, quoteId: quote.id });
     await relayClinicQuestionToUser(quote, text, traceId)
       .catch((e) => writeLog('error', 'agent-clinic', `Backstop de repasse falhou: ${String(e).slice(0, 140)}`, { traceId }));

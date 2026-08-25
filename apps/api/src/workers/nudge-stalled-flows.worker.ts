@@ -18,7 +18,7 @@
  *   - kill-switch: NUDGE_ENABLED=false desliga tudo
  */
 import { db, writeLog, writeEvent } from '@iasaude/db';
-import { pickValidOffers } from '@iasaude/shared';
+import { pickValidOffers, emPausaDeOutreach, motivoDaPausa } from '@iasaude/shared';
 import { sendOutbound } from '../handlers/outbound.js';
 import { withCronLock } from '../middleware/cron-lock.js';
 import { loadPrompts } from '../config/prompts.js';
@@ -204,6 +204,24 @@ export async function nudgeStalledFlows(): Promise<void> {
       if (lastIn > new Date(t.entityTs).getTime()) continue;
 
       if (await alreadyNudged(t.conversationId, t.kind, t.entityTs)) continue;
+
+      // ⏸️ UM HUMANO ESTÁ CUIDANDO DESTE CASO (auditoria 24/08 — caso Duda).
+      // Às 18:53 este worker mandou "as opções de consulta que te mandei ainda estão de
+      // pé" a uma paciente que, três horas antes, tinha recebido a confirmação de uma
+      // consulta inexistente. O erro já estava sendo corrigido por gente; o robô entrou
+      // no meio, sem saber, e falou como se nada tivesse acontecido.
+      // A pausa é ligada sozinha quando alguém manda mensagem manual (`/admin/message`)
+      // e expira em horas — silêncio permanente seria a falha oposta.
+      const { data: dono } = await db.from('conversations').select('user_id').eq('id', t.conversationId).maybeSingle();
+      if (dono?.user_id) {
+        const { data: u } = await db.from('users').select('metadata').eq('id', dono.user_id).maybeSingle();
+        if (emPausaDeOutreach(u?.metadata, Date.now())) {
+          await writeLog('info', 'nudge', `nudge de ${t.kind} adiado — um humano está cuidando deste paciente (${motivoDaPausa(u?.metadata) ?? 'pausa ativa'})`, {
+            conversationId: t.conversationId,
+          });
+          continue;
+        }
+      }
 
       const phone = await phoneForConversation(t.conversationId);
       if (!phone) continue;

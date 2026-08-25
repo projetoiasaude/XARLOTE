@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import type { FastifyInstance } from 'fastify';
 import { db, writeAudit, findOrCreateConversation } from '@iasaude/db';
-import { SARA_INSTANCE, AGENT_INSTANCE } from '@iasaude/shared';
+import { SARA_INSTANCE, AGENT_INSTANCE, isWabaWindowOpen, comPausaDeOutreach, CHAVE_PAUSA } from '@iasaude/shared';
 import type { OrderItem } from '@iasaude/shared';
 import { loadPrompts, savePrompts } from '../config/prompts.js';
 import { buildXarloteSystemPrompt, buildAgentPharmacySystemPrompt } from '@iasaude/llm';
@@ -33,6 +33,99 @@ export async function adminRoute(app: FastifyInstance) {
   // Campanha 21/07 (churn por erro já corrigido). {{2}} = `reason` (frase personalizada,
   // sem quebra de linha — o buildReengageTemplate sanitiza). Espelha em `messages` e o
   // WORKER da fila carimba delivered/failed via messageId (verdade de entrega, 0022).
+  /**
+   * ✉️ ENVIO MANUAL DE TEXTO — a rota que faltava (auditoria 24-25/08).
+   *
+   * Em 24/08 a Duda recebeu uma confirmação de consulta que não existia, e a única forma
+   * de corrigi-la de dentro do sistema era `/reengage/send`, que só dispara TEMPLATE com
+   * 300 caracteres e sem quebra de linha. Para a clínica não havia forma nenhuma: aquela
+   * rota é fixada em `SARA_INSTANCE` e resolve a pessoa pela tabela `users` — uma
+   * secretária não é paciente. A recepção ficou 24h sem resposta a um "Vamos agendar?".
+   *
+   * Quando um humano precisa consertar algo, ele não pode depender de painel externo:
+   * mensagem enviada por fora não passa pela fila (CLAUDE.md §5), não vira linha em
+   * `messages` e some do histórico que a Xarlote lê no turno seguinte.
+   *
+   * Esta rota vale pras DUAS pernas, passa pela fila, espelha e audita. E, ao enviar,
+   * PAUSA o re-engajamento automático daquele paciente: em 24/08 o nudge disparou às
+   * 18:53 no meio de um caso que um humano estava resolvendo.
+   */
+  app.post<{ Body: { conversationId?: string; phone?: string; instance?: string; text?: string; holdHours?: number } }>('/message', async (req, reply) => {
+    const { conversationId, phone, instance, text, holdHours } = req.body ?? {};
+    const corpo = (text ?? '').trim();
+    if (!corpo) return reply.code(400).send({ error: 'text é obrigatório' });
+    if (corpo.length > 4000) return reply.code(400).send({ error: 'text acima de 4000 caracteres' });
+
+    // Alvo: por id da conversa (preciso) ou por telefone + perna.
+    let conv: { id: string; whatsapp_jid: string | null; whatsapp_instance: string | null; user_id: string | null } | null = null;
+    if (conversationId) {
+      const { data } = await db.from('conversations').select('id, whatsapp_jid, whatsapp_instance, user_id').eq('id', conversationId).maybeSingle();
+      conv = data ?? null;
+    } else if (phone) {
+      const jid = `${phone.replace(/\D/g, '')}@s.whatsapp.net`;
+      const perna = instance === 'agent' ? AGENT_INSTANCE : SARA_INSTANCE;
+      const { data } = await db.from('conversations').select('id, whatsapp_jid, whatsapp_instance, user_id')
+        .eq('whatsapp_jid', jid).eq('whatsapp_instance', perna).limit(1).maybeSingle();
+      conv = data ?? null;
+    } else {
+      return reply.code(400).send({ error: 'informe conversationId ou phone' });
+    }
+    if (!conv) return reply.code(404).send({ error: 'conversa não encontrada' });
+
+    const destino = conv.whatsapp_jid?.replace('@s.whatsapp.net', '');
+    if (!destino) return reply.code(409).send({ error: 'conversa sem telefone' });
+
+    // 🚪 JANELA DE 24h. Texto livre só sai com a janela aberta — fora dela o WhatsApp
+    // recusa e o envio falharia em silêncio. Recusar aqui, dizendo o porquê, é melhor que
+    // devolver 200 sobre uma mensagem que nunca chegou.
+    const { data: ultimaIn } = await db.from('messages').select('created_at')
+      .eq('conversation_id', conv.id).eq('direction', 'in')
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
+    const ultimaInMs = ultimaIn?.created_at ? Date.parse(ultimaIn.created_at as string) : null;
+    if (!isWabaWindowOpen(Number.isFinite(ultimaInMs as number) ? (ultimaInMs as number) : null, Date.now())) {
+      return reply.code(409).send({
+        error: 'janela de 24h fechada — texto livre não chega. Use /admin/reengage/send (template) para paciente.',
+        lastInboundAt: ultimaIn?.created_at ?? null,
+      });
+    }
+
+    const { data: mirror } = await db.from('messages').insert({
+      conversation_id: conv.id, direction: 'out', sender_role: 'assistant',
+      content_type: 'text', content: corpo, delivery_status: 'queued',
+    }).select('id').single();
+
+    await dispatchOutbound({
+      kind: 'text',
+      instance: conv.whatsapp_instance ?? SARA_INSTANCE,
+      phoneE164: `+${destino}`,
+      text: corpo,
+      messageId: mirror?.id,
+    });
+
+    // ⏸️ Humano falou ⇒ automação recua. Sem depender de ninguém lembrar de ligar nada.
+    let pausaAte: string | null = null;
+    if (conv.user_id) {
+      const { data: u } = await db.from('users').select('metadata').eq('id', conv.user_id).maybeSingle();
+      const meta = comPausaDeOutreach(
+        u?.metadata ?? {}, Date.now(),
+        (holdHours ?? 12) * 3_600_000,
+        'mensagem manual enviada por um humano',
+      );
+      await db.from('users').update({ metadata: meta as never }).eq('id', conv.user_id);
+      pausaAte = (meta[CHAVE_PAUSA] as string | undefined) ?? null;
+    }
+
+    await writeAudit({
+      actorType: 'system', actorId: 'admin-message', action: 'message.manual_sent',
+      targetTable: 'messages', targetId: mirror?.id ?? '',
+      userId: conv.user_id ?? undefined, conversationId: conv.id,
+      traceId: `admin-msg-${conv.id.slice(0, 8)}`,
+      metadata: { instance: conv.whatsapp_instance, chars: corpo.length, hold_until: pausaAte },
+    });
+
+    return reply.send({ ok: true, messageId: mirror?.id, conversationId: conv.id, instance: conv.whatsapp_instance, outreachHoldUntil: pausaAte });
+  });
+
   app.post<{ Body: { phone?: string; firstName?: string; reason?: string } }>('/reengage/send', async (req, reply) => {
     const { phone, firstName, reason } = req.body ?? {};
     if (!phone || !reason) return reply.code(400).send({ error: 'phone e reason são obrigatórios' });

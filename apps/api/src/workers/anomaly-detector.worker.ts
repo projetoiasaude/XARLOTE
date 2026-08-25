@@ -13,6 +13,7 @@
  *
  * Cada detecção dispara Telegram alert (com throttle). Roda a cada 10min.
  */
+import { avaliarLatencia, descreverLatencia } from '@iasaude/shared';
 import { db, writeLog, writeEvent } from '@iasaude/db';
 import { sendTelegramAlert } from '../handlers/telegram-alerter.js';
 import { sendFounderAlert, type FounderAlertOpts } from '../handlers/founder-alerter.js';
@@ -118,20 +119,26 @@ async function detectLLMLatencyDegradation(): Promise<void> {
       .not('duration_ms', 'is', null)
       .limit(500);
 
-    const durations = (data ?? []).map((r) => r.duration_ms as number).filter((n) => n > 0).sort((a, b) => a - b);
-    if (durations.length < 10) return;
+    const durations = (data ?? []).map((r) => r.duration_ms as number);
 
-    const p95Idx = Math.floor(durations.length * 0.95);
-    const p95 = durations[p95Idx]!;
+    // 📊 A ESTATÍSTICA PRECISA SER VÁLIDA PRA VIRAR ALERTA (auditoria 25/08).
+    // O cálculo antigo exigia 10 amostras e usava `floor(n × 0,95)`, que em n=10 aponta
+    // pro MÁXIMO — "p95" era, na prática, a chamada mais lenta da janela. Às 09:45 de
+    // 25/08 isso mandou um alerta de severidade alta ao fundador por causa de UMA chamada
+    // de 57s entre nove, com mediana de 5,8s. Num produto com 26 pacientes, esse regime de
+    // volume é o normal, não a exceção.
+    // `avaliarLatencia` separa as duas perguntas: degradação de distribuição (exige
+    // amostra) e chamadas absurdas (contagem, válida em qualquer volume).
+    const veredito = avaliarLatencia(durations);
+    if (!veredito.alertar) return;
 
-    if (p95 > 30_000) {
-      await alertFounder({
-        title: 'LLM p95 alto',
-        body: `Últimos 30min: p95=${(p95 / 1000).toFixed(1)}s sobre ${durations.length} chamadas. (Esperado <10s)`,
-        severity: 'high',
-        throttleKey: 'llm_latency_spike',
-      });
-    }
+    await alertFounder({
+      title: veredito.tipo === 'p95' ? 'LLM p95 alto' : 'LLM com chamadas muito lentas',
+      body: descreverLatencia(veredito) ?? '',
+      // Chamada lenta isolada é sinal mais fraco que degradação de distribuição.
+      severity: veredito.tipo === 'p95' ? 'high' : 'warn',
+      throttleKey: 'llm_latency_spike',
+    });
   } catch {}
 }
 
