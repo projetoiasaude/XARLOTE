@@ -15,7 +15,7 @@
  */
 import { db, writeEvent, writeLog, listDeviceTokens, deleteDeviceTokens } from '@iasaude/db';
 import { isSimulatorMode, providerFor } from '@iasaude/whatsapp';
-import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBody, isWabaWindowOpen } from '@iasaude/shared';
+import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBody, isWabaWindowOpen, avaliarFadiga, perguntaDeContinuidade } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
@@ -329,6 +329,73 @@ export async function dispatchReminders(): Promise<void> {
     // água às 22h é ESCOLHA do usuário (não dá pra suprimir por horário sem quebrar a intenção). O
     // anti-flood noturno vem do CAP DE PUSH abaixo (que corta só o push do app, não o remédio), e o
     // quiet-hours de verdade fica nos NUDGES/rescue de consulta (que re-tentam de dia, sem descartar).
+
+    // 🔇 FADIGA — parar de falar com quem parou de ouvir (auditoria 25/08).
+    //
+    // A mesma paciente do cap de 09/07 seguia recebendo SETE lembretes de água por dia
+    // (8:00 … 23:00), criados em 02/07, e não respondeu a NENHUM em quase dois meses —
+    // por volta de 380 mensagens. Outro paciente recebe dois de exercício às 5:00 e 5:05,
+    // o segundo cobrando o primeiro, desde 17/07, também sem uma palavra.
+    //
+    // O cap de 09/07 limitou o VOLUME por dia; ninguém tinha olhado a RESPOSTA. Um
+    // lembrete que ninguém lê há dois meses não é cuidado: é o treino de ignorar a
+    // Xarlote, inclusive no dia em que a mensagem for sobre remédio.
+    //
+    // Escopo estreito de propósito: `medication` e `appointment` NUNCA entram aqui
+    // (`avaliarFadiga` recusa por tipo). O silêncio noturno da mesma função NÃO é honrado
+    // aqui — a NOTA acima explica por que pular à noite descartaria a ocorrência pra
+    // sempre, e essa decisão anterior continua de pé. Este bloco só trata desengajamento,
+    // que é o problema real e não depende da hora.
+    if (!isCriticalReminderType(reminder.type)) {
+      const { data: ultimaEntrada } = await db.from('messages')
+        .select('created_at')
+        .eq('direction', 'in')
+        .eq('conversation_id', (await db.from('conversations').select('id').eq('user_id', reminder.user_id).eq('whatsapp_instance', SARA_INSTANCE).limit(1).maybeSingle()).data?.id ?? '')
+        .order('created_at', { ascending: false }).limit(1).maybeSingle();
+      // Sem nenhuma entrada, o marco é a criação do lembrete: quem nunca falou nunca
+      // "reiniciou" a contagem, e é exatamente o caso que precisa ser pego.
+      const desde = (ultimaEntrada?.created_at as string | undefined) ?? (reminder.created_at as string);
+      const { count: disparosMudos } = await db
+        .from('event_log')
+        .select('id', { count: 'exact', head: true })
+        .eq('event_name', 'reminder.dispatched')
+        .eq('user_id', reminder.user_id)
+        .gt('occurred_at', desde);
+      const prefsLembrete = (reminder.payload as Record<string, unknown> | null) ?? {};
+      const horaBrt = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'America/Sao_Paulo', hour: '2-digit', hour12: false }).format(now));
+      const fadiga = avaliarFadiga({
+        tipo: reminder.type,
+        horaBrt,
+        disparosSemResposta: disparosMudos ?? 0,
+        jaPerguntou: Boolean(prefsLembrete['_fadiga_sinalizada']),
+      });
+      if (!fadiga.enviar && fadiga.motivo === 'sem_engajamento') {
+        releaseTemplateSlot(reminder.user_id, reminder.id);
+        if (!prefsLembrete['_fadiga_sinalizada']) {
+          await db.from('reminders')
+            .update({ payload: { ...prefsLembrete, _fadiga_sinalizada: new Date().toISOString() } })
+            .eq('id', reminder.id);
+          // Evento (não mensagem): estes pacientes estão MUDOS há semanas, logo fora da
+          // janela de 24h — uma pergunta em texto livre não chegaria neles. Quem precisa
+          // ver isto é o dashboard, com a frase já pronta pra quando houver como falar.
+          await writeEvent({
+            eventName: 'reminder.fadiga_detectada',
+            userId: reminder.user_id,
+            payload: {
+              reminder_id: reminder.id,
+              title: reminder.title,
+              type: reminder.type,
+              disparos_sem_resposta: disparosMudos ?? 0,
+              pergunta_sugerida: perguntaDeContinuidade(reminder.title, user.preferred_name ?? null),
+            },
+          }).catch(() => {});
+          await writeLog('warn', 'reminder', `🔇 fadiga: "${reminder.title}" disparou ${disparosMudos ?? 0}× sem UMA resposta — pausando este lembrete (tipo ${reminder.type}, não-clínico)`, {
+            reminderId: reminder.id, userId: reminder.user_id,
+          });
+        }
+        continue; // claim JÁ avançou next_run_at → recorrência intacta, sem loop
+      }
+    }
 
     // 🧯 CAP DIÁRIO (incidente Antônia Flávia 09/07): a coluna users.reminder_max_per_day
     // existia SÓ no banco — o código nunca a leu, e ela recebia 10 lembretes/dia há 6 dias

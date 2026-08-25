@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, verificarAnuncios, falaHonestaPara, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -2166,6 +2166,41 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
         : orderState && orderState.suppliers.length
           ? 'Deixa eu acertar direitinho: com qual farmácia do seu pedido você quer que eu fale? Me diz o nome que eu mando a mensagem na hora 💙'
           : 'Pra eu falar com uma farmácia eu preciso de um pedido ativo — me fala o remédio e o endereço que eu começo a busca 💙';
+    }
+  }
+
+  // 🚫 ANTI-MENTIRA GENÉRICA — o anúncio que a FERRAMENTA DESMENTE (caso Ciro, 25/08).
+  //
+  // As duas guardas acima nasceram de incidentes específicos: contato com farmácia (07/07)
+  // e lembrete (Waldir). Cada nova família de mentira exigia uma guarda nova, e a que
+  // faltava sempre aparecia depois do estrago. Em 25/08 foi o CANCELAMENTO: a tool
+  // `cancel_consultation` recusou ("NADA FOI CANCELADO: há mais de uma consulta possível"),
+  // a recusa voltou ao modelo com `ok:false` e a instrução de não anunciar — e ele escreveu
+  // "Cancelamento confirmado com a clínica e já cancelei o lembrete" no mesmo minuto. O
+  // paciente ficou com uma consulta viva no banco e um lembrete armado pro dia seguinte.
+  //
+  // Esta guarda é a regra por CONSTRUÇÃO, não mais por família: se uma ferramenta que
+  // sustentaria o anúncio FALHOU neste turno e nenhuma outra da mesma família teve êxito,
+  // o texto não sai. Vale pra toda tool que existir daqui pra frente sem ninguém precisar
+  // lembrar de escrever mais uma rede.
+  if (replyText && executedToolCalls.some((t) => !t.ok)) {
+    const falharam = executedToolCalls.filter((t) => !t.ok).map((t) => t.name);
+    const funcionaram = executedToolCalls.filter((t) => t.ok).map((t) => t.name);
+    const veredito = verificarAnuncios(replyText, falharam, funcionaram);
+    if (veredito.blocked.length > 0) {
+      const pior = veredito.blocked[0]!;
+      await writeLog('error', 'agent', `🚫 Anti-mentira: o texto anunciou "${pior.kind}" e a tool ${pior.tool} RECUSOU neste turno → troco por resposta honesta`, {
+        traceId, evidence: pior.evidence, blocked: veredito.blocked.map((b) => b.kind),
+      });
+      replyText = falaHonestaPara(pior.kind);
+    }
+    // Anúncio sem ferramenta nenhuma pode ser fala legítima sobre o passado ("aquele pedido
+    // que a gente cancelou"). Não bloqueia — mas fica no log, que é como a próxima família
+    // de mentira aparece antes de custar um paciente.
+    for (const s of veredito.suspect) {
+      await writeLog('warn', 'agent', `anúncio de "${s.kind}" sem nenhuma ferramenta da família neste turno — pode ser referência ao passado`, {
+        traceId, evidence: s.evidence,
+      });
     }
   }
 

@@ -64,12 +64,47 @@ interface ConsultationRow {
   specialty: string | null;
   preferences: Record<string, unknown> | null;
   scheduled_at: string | null;
+  /** Usado só pra DISTINGUIR duas consultas do mesmo médico sem horário marcado. */
+  created_at?: string | null;
 }
 
+/**
+ * Como a consulta aparece pro modelo escolher.
+ *
+ * ⚠️ PRECISA DISTINGUIR (caso Ciro, 25/08). Antes só saía médico + especialidade, e o
+ * modelo recebeu literalmente:
+ *
+ *   "há mais de uma consulta possível (com Dr. Rafael Navarrete (reumatologia) |
+ *    com Dr. Rafael Navarrete (reumatologia)) e não dá pra saber qual é"
+ *
+ * Duas etiquetas idênticas. A instrução "PERGUNTE ao paciente qual delas" é impossível
+ * de cumprir: nem o modelo nem o Ciro teriam como escolher entre duas coisas com o mesmo
+ * nome. Uma desambiguação que não desambigua empurra pro chute — e o chute aqui foi
+ * anunciar o cancelamento sem ter cancelado.
+ *
+ * Estado e data são o que separa: uma estava marcada pra 26/08, a outra era uma busca
+ * recém-aberta.
+ */
 function describeConsultation(c: ConsultationRow): string {
   const doctor = (c.preferences as Record<string, unknown> | null)?.['requested_doctor'] as string | undefined;
   const esp = c.specialty && c.specialty !== 'consulta' ? c.specialty : null;
-  return `${doctor ? `com ${doctor}` : ''}${doctor && esp ? ' ' : ''}${esp ? `(${esp})` : ''}`.trim() || 'sem médico/especialidade definidos';
+  const quem = `${doctor ? `com ${doctor}` : ''}${doctor && esp ? ' ' : ''}${esp ? `(${esp})` : ''}`.trim();
+  const fmt = (iso: string) => {
+    const t = Date.parse(iso);
+    return Number.isFinite(t)
+      ? new Date(t).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' })
+      : null;
+  };
+  const quando = c.scheduled_at ? fmt(c.scheduled_at as string) : null;
+  const marcas = [
+    quando ? `marcada pra ${quando}` : null,
+    // Sem horário, o que resta pra separar duas buscas do mesmo médico é quando cada uma
+    // começou. É pouco, mas é diferente — e diferente é o requisito.
+    !quando && c.created_at ? `aberta em ${fmt(c.created_at as string) ?? '?'}` : null,
+    c.status ? `status ${c.status}` : null,
+  ].filter(Boolean);
+  const base = quem || 'sem médico/especialidade definidos';
+  return marcas.length ? `${base} — ${marcas.join(', ')}` : base;
 }
 
 /**

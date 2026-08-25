@@ -20,3 +20,5 @@ export * from './pharmacy.js';
 export * from './booking-preconditions.js';
 export * from './appointment-consent.js';
 export * from './placeholder.js';
+export * from './claim-guard.js';
+export * from './reminder-fadiga.js';

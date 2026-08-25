@@ -302,10 +302,20 @@ export async function handleNudgeConsultation(ctx: ReachCtx, args?: { message?: 
   const { data: c } = await db.from('consultations')
     .select('id, status, specialty, preferences, created_at')
     .eq('user_id', ctx.userId)
-    .in('status', ['searching', 'quoting', 'quoted', 'confirming', 'failed'])
+    // 🔴 `scheduled` ENTRA NA LISTA (caso Ciro, 25/08). Ele estava fora, e uma consulta
+    // JÁ MARCADA é exatamente quando o paciente mais precisa falar com o consultório —
+    // pra cancelar, remarcar ou tirar dúvida. Sem `scheduled` aqui, a tool não achava
+    // consulta nenhuma e devolvia ao modelo "NÃO existe consulta em andamento… ofereça
+    // começar uma". Foi o que aconteceu às 09:28 quando ele escreveu "Teremos que
+    // cancelar, avisa por favor": o modelo obedeceu a instrução, abriu uma consulta NOVA,
+    // ficaram duas idênticas, `cancel_consultation` recusou por ambiguidade — e ele
+    // anunciou o cancelamento assim mesmo. A cascata inteira nasceu deste array.
+    .in('status', ['searching', 'quoting', 'quoted', 'confirming', 'scheduled', 'failed'])
     .order('created_at', { ascending: false }).limit(1).maybeSingle();
   if (!c || (c.status === 'failed' && Date.now() - new Date(c.created_at as string).getTime() > 24 * 60 * 60_000)) {
-    if (ctx.observation) ctx.observation.note = 'NÃO existe consulta em andamento pra retomar. Diga isso ao paciente com suas palavras e ofereça começar uma (peça o médico ou a especialidade).';
+    // "ofereça começar uma" saiu daqui: virava ordem mesmo quando o paciente falava de uma
+    // consulta EXISTENTE. Agora só entrega o fato; quem lê a mensagem dele é o modelo.
+    if (ctx.observation) ctx.observation.note = 'NÃO encontrei consulta em andamento pra retomar. Diga isso ao paciente com suas palavras. Só comece uma busca nova se ELE estiver pedindo marcar — se ele falou de cancelar, remarcar ou de uma consulta que já tem, pergunte de qual consulta se trata em vez de abrir outra.';
     return;
   }
   const prefs = (c.preferences as Record<string, unknown> | null) ?? {};
@@ -351,6 +361,37 @@ export async function handleNudgeConsultation(ctx: ReachCtx, args?: { message?: 
   if (c.status === 'confirming') {
     if (ctx.observation) ctx.observation.note = `A reserva ${alvo || ''} já está em confirmação com a clínica — aguardando o retorno deles. Tranquilize o paciente com suas palavras, sem prometer horário que ainda não foi confirmado.`;
     return;
+  }
+
+  // ✅ CONSULTA JÁ MARCADA (caso Ciro, 25/08).
+  //
+  // Sem `message`, não há o que mandar ao consultório: o paciente só mencionou a consulta,
+  // e o que ele precisa é que o modelo saiba QUAL é ela e o que fazer a seguir. COM
+  // `message`, o pedido dele (cancelar, remarcar, perguntar) segue pro consultório pelo
+  // caminho normal lá embaixo — que já trata pergunta específica como informação nova e
+  // pula o cooldown.
+  //
+  // O que este bloco NUNCA faz é sugerir abrir busca nova. Abrir uma segunda consulta pro
+  // mesmo médico foi o que produziu duas candidatas indistinguíveis e travou o
+  // cancelamento do Ciro.
+  if (c.status === 'scheduled') {
+    const semMensagem = !(args?.message ?? '').trim();
+    if (semMensagem && ctx.observation) {
+      const { data: agenda } = await db.from('consultations')
+        .select('scheduled_at, clinics:scheduled_clinic_id(name)').eq('id', c.id).maybeSingle();
+      const quando = agenda?.scheduled_at
+        ? new Date(agenda.scheduled_at as string).toLocaleString('pt-BR', { weekday: 'long', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' })
+        : null;
+      const onde = (agenda?.clinics as { name?: string } | null)?.name ?? null;
+      ctx.observation.note =
+        `O paciente JÁ TEM uma consulta MARCADA${alvo ? ` ${alvo}` : ''}`
+        + `${quando ? ` pra ${quando}` : ''}${onde ? ` (${onde})` : ''}. `
+        + `NÃO abra busca nova e NÃO ofereça procurar outra clínica — a consulta dele é esta. `
+        + `Se ele quer CANCELAR, chame \`cancel_consultation\`. Se quer remarcar ou perguntar algo ao consultório, `
+        + `chame \`nudge_consultation\` com o campo \`message\` (é o que faz a mensagem chegar lá de verdade).`;
+      return;
+    }
+    // Com mensagem: cai no envio ao consultório logo abaixo.
   }
 
   // Daqui pra baixo o handler PODE executar uma ação (cutucar a clínica / reviver a consulta)
