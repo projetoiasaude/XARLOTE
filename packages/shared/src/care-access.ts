@@ -24,10 +24,20 @@
  */
 import { resolveEntityRef, type EntityCandidate } from './entity-ref.js';
 
-/** Relação do CUIDADOR em relação ao SUJEITO — "sou filho dela". */
+/**
+ * QUEM O SUJEITO É PARA O CUIDADOR — "ela é minha mãe".
+ *
+ * ⚠️ A direção não é arbitrária, e a inversa não funciona. Se `relation` guardasse a
+ * relação do CUIDADOR ("sou filho dela"), o valor seria 'filho' e teria de ser invertido
+ * pra casar com o que ele escreve — "minha mãe". A inversão é impossível sem saber o
+ * gênero do sujeito: de 'filho' não se deduz se o outro é mãe ou pai.
+ *
+ * Guardando quem o SUJEITO é, `relation` já é a palavra que ele usa. E a pergunta na tela
+ * fica a natural: "quem é essa pessoa pra você?".
+ */
 export type CareRelation =
-  | 'filho' | 'filha' | 'pai' | 'mae' | 'neto' | 'neta'
-  | 'conjuge' | 'irmao' | 'irma' | 'responsavel' | 'cuidador' | 'outro';
+  | 'mae' | 'pai' | 'avo' | 'filho' | 'filha'
+  | 'conjuge' | 'irmao' | 'irma' | 'neto' | 'neta' | 'outro';
 
 /**
  * `vinculo`    — as duas pessoas têm conta própria; o sujeito consentiu e pode revogar.
@@ -112,11 +122,13 @@ export function vinculosAtivos(vinculos: readonly CareLinkView[]): CareLinkView[
 export function descreverParentesco(relation: string): string {
   const r = (relation ?? '').trim().toLowerCase();
   const mapa: Record<string, string> = {
-    filho: 'pai/mãe dele', filha: 'pai/mãe dela',
-    pai: 'filho dele', mae: 'filho dela',
-    neto: 'avô/avó dele', neta: 'avô/avó dela',
+    mae: 'mãe dele', pai: 'pai dele',
+    // 'avo' cobre avó e avô: os dois só diferem por acento, e é o NOME da pessoa que
+    // desambigua na prática. Um valor por gênero no banco daria dado sujo por nada.
+    avo: 'avó/avô dele',
+    filho: 'filho dele', filha: 'filha dele',
     conjuge: 'cônjuge dele', irmao: 'irmão dele', irma: 'irmã dele',
-    responsavel: 'sob responsabilidade dele', cuidador: 'sob cuidado dele',
+    neto: 'neto dele', neta: 'neta dele',
   };
   return mapa[r] ?? 'sob cuidado dele';
 }
@@ -162,9 +174,13 @@ export function resolverSujeito(
     // Só auto-referências INEQUÍVOCAS. Possessivos ('meu', 'minha') ficam de fora: o
     // token de "minha mãe" casaria com o próprio ator e a ação voltaria calada pra ele.
     { id: ator.userId, labels: [ator.nome, 'eu', 'mim', 'pra mim', 'comigo'] },
+    // `relation` sozinha é o rótulo — ela JÁ é a palavra que ele escreve ("mãe").
+    // `descreverParentesco` fica FORA: "mãe dele" traz o token 'dele', e `labelMatches`
+    // exige que um lado contenha TODOS os tokens do outro, então 'dele' quebraria o
+    // casamento com "minha mãe".
     ...ativos.map((v) => ({
       id: v.subjectUserId,
-      labels: [v.subjectName, v.relation, descreverParentesco(v.relation)],
+      labels: [v.subjectName, v.relation],
     })),
   ];
 

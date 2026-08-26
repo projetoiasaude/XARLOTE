@@ -37,7 +37,10 @@ create table if not exists care_links (
   user_id uuid not null references users(id) on delete cascade,
   caregiver_user_id uuid not null references users(id) on delete cascade,
 
-  -- Relação do CUIDADOR em relação ao SUJEITO: 'filho' = "sou filho dela".
+  -- QUEM O SUJEITO É PARA O CUIDADOR: 'mae' = "ela é minha mãe".
+  -- A direção não é arbitrária. Guardar a relação do CUIDADOR ('filho') exigiria inverter
+  -- pra casar com o que ele escreve ("minha mãe") — e a inversão é impossível sem saber o
+  -- gênero do sujeito: de 'filho' não se deduz se o outro é mãe ou pai.
   relation text not null,
 
   -- vinculo    = os dois têm conta; o sujeito consentiu e pode revogar sozinho.

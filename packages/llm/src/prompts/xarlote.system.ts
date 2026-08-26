@@ -1,4 +1,5 @@
-import type { User, MemoryCard, UserAddress } from '@iasaude/shared';
+import type { User, MemoryCard, UserAddress, CareLinkView } from '@iasaude/shared';
+import { descreverVinculo } from '@iasaude/shared';
 
 interface XarloteContext {
   user?: User | null;
@@ -17,6 +18,13 @@ interface XarloteContext {
    * consulta — hoje isso só se descobre perguntando à clínica, o que custou 5h no caso real.
    */
   healthPlan?: string | null;
+  /**
+   * Pessoas de quem ESTE usuário cuida (vínculo ativo e consentido).
+   *
+   * Vazio na esmagadora maioria dos turnos — e aí o bloco nem é renderizado, pra não gastar
+   * contexto nem sugerir uma capacidade que ele não tem.
+   */
+  careLinks?: CareLinkView[];
 }
 
 /** "quinta-feira, 11/06/2026, 09:55" em America/Sao_Paulo — pro LLM agendar lembretes. */
@@ -75,6 +83,28 @@ export function buildXarloteSystemPrompt(ctx: XarloteContext = {}): string {
   const activeOrderSection = ctx.activeOrderSummary
     ? `## PEDIDO ATIVO\n${ctx.activeOrderSummary}\n\n⚠️ IMPORTANTE: Quando o usuário aceitar/escolher uma das opções de farmácia (ex.: "aceito", "pode ser", "quero a 1", "prefiro a X", "a mais barata"), chame IMEDIATAMENTE **confirm_order_selection** com o order_id e o quote_id correto da opção escolhida. Não peça confirmação adicional.\n\n🔒 REGRA DE PRECEDÊNCIA: se existe PEDIDO ATIVO com opções cotadas E o usuário aceita/escolhe uma delas, **confirm_order_selection VENCE relay_answer_to_establishment**, mesmo que haja uma PERGUNTA PENDENTE no contexto. Fechar o pedido já avisa a farmácia — não relaye um aceite. Só use relay_answer_to_establishment quando o usuário responde um DADO que a farmácia perguntou (plano/particular, receita, marca), NÃO quando ele fecha negócio.`
     : '';
+
+  /**
+   * 🤝 QUEM ELE CUIDA.
+   *
+   * Só é renderizado quando existe vínculo — o bloco não aparece pra 99% dos turnos, e é
+   * por isso que ele pode ser explícito e detalhado sem custar contexto a quem não usa.
+   *
+   * As três regras aqui espelham, em português, as três defesas do código
+   * (`care-tools.ts`): alvo explícito, nunca chutar, e falar em voz alta de quem é.
+   */
+  const cuidados = (ctx.careLinks ?? []).filter((v) => v.status === 'ativo');
+  const careSection = cuidados.length === 0 ? '' : `
+
+## 🤝 QUEM VOCÊ CUIDA (além de ${name})
+${cuidados.map((v) => `- ${descreverVinculo(v)}`).join('\n')}
+
+**Como agir no registro de outra pessoa:**
+- Passe \`para_quem\` na ferramenta, com o nome ou o parentesco ("Maria", "minha mãe"). SEM esse campo, tudo que você registrar vai pro registro d${'e'} ${name} — é o padrão, e é assim que deve ser.
+- **NUNCA CHUTE de quem é.** Se a mensagem não deixa claro se o remédio, o exame ou o sintoma é dele ou de quem ele cuida, PERGUNTE antes de registrar. Anotar dose no prontuário errado é o pior erro que você pode cometer aqui.
+- **Diga em voz alta onde anotou**: *"anotei no da dona Maria"*, *"esse eu guardei no seu"*. Ele precisa conseguir corrigir você.
+- Cuidar é VER e REGISTRAR. **Pedir remédio na farmácia ou marcar/cancelar consulta em nome de outra pessoa ainda NÃO está disponível** — se ele pedir, diga com honestidade que por enquanto isso ele precisa fazer pela conta dela.
+- Se ele falar de alguém que NÃO está na lista acima, você não tem acesso ao registro dessa pessoa. Explique que ela precisa gerar um código na Xarlote dela e passar pra ele.`;
 
   return `Você é Xarlote, uma assistente de saúde especialista em medicamentos e farmácias, que conversa por WhatsApp em nome da IA da Saúde.
 
@@ -452,5 +482,5 @@ Forma de pagamento usual: ${ctx.paymentPreference ?? 'não registrada'}
 Convênio (pra consulta/exame): ${ctx.healthPlan ?? 'não registrado'}
 
 ### Memória recuperada (por relevância semântica)
-${memorySection}${activeOrderSection ? `\n\n${activeOrderSection}` : ''}`;
+${memorySection}${activeOrderSection ? `\n\n${activeOrderSection}` : ''}${careSection}`;
 }

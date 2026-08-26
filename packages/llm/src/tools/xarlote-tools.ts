@@ -9,6 +9,11 @@ export const xarloteTools: ToolDefinition[] = [
       parameters: {
         type: 'object',
         properties: {
+          para_quem: {
+            type: 'string',
+            description:
+              'SÓ quando a ação for de OUTRA pessoa de quem ele cuida (as pessoas aparecem no seu contexto em QUEM VOCÊ CUIDA). Use o nome ou o parentesco: "Maria", "minha mãe". OMITA quando for dele mesmo — omitir é o padrão e é o correto na esmagadora maioria das vezes. ⚠️ Na dúvida sobre de quem é, PERGUNTE em vez de preencher: registrar no prontuário errado é o pior erro possível.',
+          },
           category: {
             type: 'string',
             enum: ['condition', 'allergy', 'medication', 'address', 'preference', 'identity', 'other'],
@@ -66,6 +71,11 @@ export const xarloteTools: ToolDefinition[] = [
       parameters: {
         type: 'object',
         properties: {
+          para_quem: {
+            type: 'string',
+            description:
+              'SÓ quando a ação for de OUTRA pessoa de quem ele cuida (as pessoas aparecem no seu contexto em QUEM VOCÊ CUIDA). Use o nome ou o parentesco: "Maria", "minha mãe". OMITA quando for dele mesmo — omitir é o padrão e é o correto na esmagadora maioria das vezes. ⚠️ Na dúvida sobre de quem é, PERGUNTE em vez de preencher: registrar no prontuário errado é o pior erro possível.',
+          },
           exam_type: {
             type: 'string',
             description: 'Tipo do exame: "sangue", "urina", "imagem" (raio-x/ultrassom/tomografia), "cardiologico" (ecg/ecocardio), "covid", "outro".',
@@ -305,6 +315,11 @@ export const xarloteTools: ToolDefinition[] = [
       parameters: {
         type: 'object',
         properties: {
+          para_quem: {
+            type: 'string',
+            description:
+              'SÓ quando a ação for de OUTRA pessoa de quem ele cuida (as pessoas aparecem no seu contexto em QUEM VOCÊ CUIDA). Use o nome ou o parentesco: "Maria", "minha mãe". OMITA quando for dele mesmo — omitir é o padrão e é o correto na esmagadora maioria das vezes. ⚠️ Na dúvida sobre de quem é, PERGUNTE em vez de preencher: registrar no prontuário errado é o pior erro possível.',
+          },
           type: {
             type: 'string',
             enum: ['medication', 'appointment', 'exercise', 'hydration', 'sleep', 'custom'],
@@ -348,6 +363,11 @@ export const xarloteTools: ToolDefinition[] = [
       parameters: {
         type: 'object',
         properties: {
+          para_quem: {
+            type: 'string',
+            description:
+              'SÓ quando a ação for de OUTRA pessoa de quem ele cuida (as pessoas aparecem no seu contexto em QUEM VOCÊ CUIDA). Use o nome ou o parentesco: "Maria", "minha mãe". OMITA quando for dele mesmo — omitir é o padrão e é o correto na esmagadora maioria das vezes. ⚠️ Na dúvida sobre de quem é, PERGUNTE em vez de preencher: registrar no prontuário errado é o pior erro possível.',
+          },
           title_query: {
             type: 'string',
             description: 'Parte do título dos lembretes a cancelar (case-insensitive). Ex: "água", "sobrancelha", "Losartana".',
@@ -367,7 +387,12 @@ export const xarloteTools: ToolDefinition[] = [
       name: 'list_reminders',
       description:
         'Envia ao usuário a lista dos lembretes ativos dele (título + horário). Use quando ele perguntar "quais lembretes eu tenho?", "o que você me lembra?". NÃO repita a lista no seu texto — a ferramenta já envia formatado.',
-      parameters: { type: 'object', properties: {}, required: [] },
+      parameters: { type: 'object', properties: {
+          para_quem: {
+            type: 'string',
+            description:
+              'SÓ quando a ação for de OUTRA pessoa de quem ele cuida (as pessoas aparecem no seu contexto em QUEM VOCÊ CUIDA). Use o nome ou o parentesco: "Maria", "minha mãe". OMITA quando for dele mesmo — omitir é o padrão e é o correto na esmagadora maioria das vezes. ⚠️ Na dúvida sobre de quem é, PERGUNTE em vez de preencher: registrar no prontuário errado é o pior erro possível.',
+          },}, required: [] },
     },
   },
   // NOTA: send_emergency_orientation foi REMOVIDA. Use red_flag_check no lugar
@@ -401,6 +426,11 @@ export const xarloteTools: ToolDefinition[] = [
       parameters: {
         type: 'object',
         properties: {
+          para_quem: {
+            type: 'string',
+            description:
+              'SÓ quando a ação for de OUTRA pessoa de quem ele cuida (as pessoas aparecem no seu contexto em QUEM VOCÊ CUIDA). Use o nome ou o parentesco: "Maria", "minha mãe". OMITA quando for dele mesmo — omitir é o padrão e é o correto na esmagadora maioria das vezes. ⚠️ Na dúvida sobre de quem é, PERGUNTE em vez de preencher: registrar no prontuário errado é o pior erro possível.',
+          },
           medication_name: { type: 'string', description: 'Nome do medicamento' },
           status: { type: 'string', enum: ['taken', 'skipped', 'snoozed'], description: 'taken=tomou, skipped=pulou, snoozed=vai tomar mais tarde' },
           notes: { type: 'string', description: 'Notas opcionais (ex: "tomou junto com o almoço")' },
@@ -433,6 +463,11 @@ export const xarloteTools: ToolDefinition[] = [
       parameters: {
         type: 'object',
         properties: {
+          para_quem: {
+            type: 'string',
+            description:
+              'SÓ quando a ação for de OUTRA pessoa de quem ele cuida (as pessoas aparecem no seu contexto em QUEM VOCÊ CUIDA). Use o nome ou o parentesco: "Maria", "minha mãe". OMITA quando for dele mesmo — omitir é o padrão e é o correto na esmagadora maioria das vezes. ⚠️ Na dúvida sobre de quem é, PERGUNTE em vez de preencher: registrar no prontuário errado é o pior erro possível.',
+          },
           name: { type: 'string', description: 'Nome do sintoma em PT-BR (ex: "dor de cabeça")' },
           intensity: { type: 'integer', minimum: 1, maximum: 10, description: 'Intensidade 1-10 se o paciente disser' },
           duration_hours: { type: 'number', description: 'Há quanto tempo tem o sintoma' },
@@ -596,6 +631,11 @@ export const xarloteTools: ToolDefinition[] = [
       parameters: {
         type: 'object',
         properties: {
+          para_quem: {
+            type: 'string',
+            description:
+              'SÓ quando a ação for de OUTRA pessoa de quem ele cuida (as pessoas aparecem no seu contexto em QUEM VOCÊ CUIDA). Use o nome ou o parentesco: "Maria", "minha mãe". OMITA quando for dele mesmo — omitir é o padrão e é o correto na esmagadora maioria das vezes. ⚠️ Na dúvida sobre de quem é, PERGUNTE em vez de preencher: registrar no prontuário errado é o pior erro possível.',
+          },
           category: {
             type: 'string',
             enum: [

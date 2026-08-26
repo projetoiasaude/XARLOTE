@@ -282,7 +282,16 @@ export async function writeEvent(input: EventInput): Promise<void> {
  */
 export async function auditToolCall(params: {
   toolName: string;
+  /** De quem é o REGISTRO afetado. Numa ação de cuidador, é o sujeito — não quem agiu. */
   userId: string;
+  /**
+   * Quem AGIU, quando não é o dono do registro: o `users.id` do cuidador.
+   *
+   * Sem isto, a ação do filho no prontuário da mãe seria gravada como `actor_type:'xarlote'`
+   * e ficaria indistinguível de uma ação dela própria — inclusive no export que ela lê como
+   * "quem acessou meu prontuário". Presente ⇒ o ator vira `caregiver`.
+   */
+  caregiverUserId?: string | null;
   conversationId?: string | null;
   traceId: string;
   args: Record<string, unknown>;
@@ -290,9 +299,11 @@ export async function auditToolCall(params: {
   error?: string;
   durationMs?: number;
 }): Promise<void> {
+  const porCuidador = Boolean(params.caregiverUserId);
   await Promise.all([
     writeAudit({
-      actorType: 'xarlote',
+      actorType: porCuidador ? 'caregiver' : 'xarlote',
+      ...(porCuidador ? { actorId: params.caregiverUserId! } : {}),
       action: params.result === 'success' ? 'tool.invoked' : 'tool.failed',
       userId: params.userId,
       conversationId: params.conversationId,
@@ -300,6 +311,7 @@ export async function auditToolCall(params: {
       metadata: {
         tool_name: params.toolName,
         args: params.args,
+        ...(porCuidador ? { por_cuidador: params.caregiverUserId } : {}),
         ...(params.error ? { error: params.error } : {}),
       },
     }),

@@ -9,7 +9,10 @@
  */
 import { randomUUID } from 'crypto';
 import { db } from '@iasaude/db';
-import { podeAtuarSobre, resolverSujeito, type CareLinkView } from '@iasaude/shared';
+import {
+  podeAtuarSobre, resolverSujeito, resolverAlvoDaTool, emergenciaSobreQuemCuido,
+  type CareLinkView,
+} from '@iasaude/shared';
 import {
   criarConvite, resgatarConvite, criarDependente, revogarVinculo,
   carregarVinculosDoCuidador, carregarQuemCuidaDeMim,
@@ -63,14 +66,14 @@ async function main(): Promise<void> {
   ok('a mãe gerou um código de 6 dígitos', conv.ok && /^\d{6}$/.test(conv.code));
   if (!conv.ok) { await limpar(); process.exit(1); }
 
-  const errado = await resgatarConvite({ caregiverUserId: filho, codigoBruto: '000000', relation: 'filho', traceId: TRACE });
+  const errado = await resgatarConvite({ caregiverUserId: filho, codigoBruto: '000000', relation: 'mae', traceId: TRACE });
   ok('código errado NÃO cria vínculo', errado.ok === false);
 
-  const proprio = await resgatarConvite({ caregiverUserId: mae, codigoBruto: conv.code, relation: 'filho', traceId: TRACE });
+  const proprio = await resgatarConvite({ caregiverUserId: mae, codigoBruto: conv.code, relation: 'mae', traceId: TRACE });
   ok('a própria mãe resgatando o próprio código é recusada com motivo claro',
     proprio.ok === false && proprio.verdict === 'proprio');
 
-  const bom = await resgatarConvite({ caregiverUserId: filho, codigoBruto: conv.code, relation: 'filho', traceId: TRACE });
+  const bom = await resgatarConvite({ caregiverUserId: filho, codigoBruto: conv.code, relation: 'mae', traceId: TRACE });
   ok('o filho resgatou e o vínculo nasceu', bom.ok === true);
   if (bom.ok) criados.links.push(bom.linkId);
 
@@ -107,13 +110,13 @@ async function main(): Promise<void> {
   console.log('\n6. índice único parcial');
   const conv2 = await criarConvite(mae, TRACE);
   const dup = conv2.ok
-    ? await resgatarConvite({ caregiverUserId: filho, codigoBruto: conv2.code, relation: 'filho', traceId: TRACE })
+    ? await resgatarConvite({ caregiverUserId: filho, codigoBruto: conv2.code, relation: 'mae', traceId: TRACE })
     : { ok: false as const, verdict: 'falha' as const };
   ok('não dá pra criar um segundo vínculo vivo entre os mesmos dois', dup.ok === false);
 
   // ── 7. Dependente ───────────────────────────────────────────────────────────
   console.log('\n7. perfil dependente');
-  const dep = await criarDependente({ caregiverUserId: filho, nome: 'Pedro', relation: 'pai', traceId: TRACE });
+  const dep = await criarDependente({ caregiverUserId: filho, nome: 'Pedro', relation: 'filho', traceId: TRACE });
   ok('o filho criou o perfil do filho pequeno', dep.ok === true);
   if (dep.ok) {
     criados.users.push(dep.subjectUserId);
@@ -140,7 +143,7 @@ async function main(): Promise<void> {
   console.log('\n9. reconectar depois de revogar');
   const conv3 = await criarConvite(mae, TRACE);
   const re = conv3.ok
-    ? await resgatarConvite({ caregiverUserId: filho, codigoBruto: conv3.code, relation: 'filho', traceId: TRACE })
+    ? await resgatarConvite({ caregiverUserId: filho, codigoBruto: conv3.code, relation: 'mae', traceId: TRACE })
     : { ok: false as const };
   ok('dá pra reconectar (o unique é PARCIAL de propósito)', re.ok === true);
 
@@ -150,6 +153,31 @@ async function main(): Promise<void> {
     .select('actor_type, actor_id, action').eq('user_id', mae).eq('action', 'care.link.created').limit(1).maybeSingle();
   ok('a criação do vínculo foi auditada como `caregiver`', aud?.actor_type === 'caregiver');
   ok('e o actor_id é o cuidador, não a titular', aud?.actor_id === filho);
+
+  // ── 11. O roteamento de tool (F3) ───────────────────────────────────────────
+  console.log('\n11. de quem é a ação');
+  const vivos = await carregarVinculosDoCuidador(filho);
+  const atorFilho = { userId: filho, nome: 'Hiago', vinculos: vivos };
+
+  const semAlvo = resolverAlvoDaTool('create_reminder', {}, atorFilho);
+  ok('sem `para_quem`, o lembrete é do PRÓPRIO cuidador',
+    semAlvo.ok === true && semAlvo.subjectUserId === filho);
+
+  const comAlvo = resolverAlvoDaTool('create_reminder', { para_quem: 'minha mãe' }, atorFilho);
+  ok('com "minha mãe", a ação vai pro registro DELA',
+    comAlvo.ok === true && comAlvo.subjectUserId === mae);
+
+  const farmacia = resolverAlvoDaTool('start_pharmacy_order', { para_quem: 'minha mãe' }, atorFilho);
+  ok('pedir remédio em nome dela é RECUSADO (capacidade não concedida)', farmacia.ok === false);
+
+  const inexistente = resolverAlvoDaTool('create_reminder', { para_quem: 'Joaquina' }, atorFilho);
+  ok('alvo desconhecido não cai em ninguém', inexistente.ok === false);
+
+  const emergencia = emergenciaSobreQuemCuido('minha mãe está com dor no peito', { userId: filho, nome: 'Hiago' }, vivos);
+  ok('"minha mãe está com dor no peito" agora identifica a emergência DELA', emergencia?.subjectUserId === mae);
+
+  const passado = emergenciaSobreQuemCuido('semana passada minha mãe teve dor no peito', { userId: filho, nome: 'Hiago' }, vivos);
+  ok('mas o PASSADO continua não acionando nada', passado === null);
 
   await limpar();
   console.log(falhas === 0 ? '\n✅ tudo certo — nada ficou no banco\n' : `\n❌ ${falhas} falha(s)\n`);

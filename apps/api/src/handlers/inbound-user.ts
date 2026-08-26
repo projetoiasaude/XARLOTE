@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, verificarAnuncios, falaHonestaPara, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -48,6 +48,7 @@ import { publishMessageEvent } from '../lib/app-publish.js';
 import { extractAppClientId } from '../lib/app-inbound.js';
 import { sendOutbound, sendOutboundAudio } from './outbound.js';
 import { handleToolCall, type ToolResult, type MidiaDoTurno } from './tool-executor.js';
+import { carregarVinculosDoCuidador } from '../lib/care-links.js';
 import { uploadInboundMedia } from './media-host.js';
 import { saveContactsToMemory } from './reach-out.js';
 import { findPendingClarificationForUser } from './clarification.js';
@@ -715,7 +716,7 @@ async function processInboundUserInner(
     }
   };
 
-  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif, activeRemindersRes, recentTasksRes, orderState, consultStateBlock] = await Promise.all([
+  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif, activeRemindersRes, recentTasksRes, orderState, consultStateBlock, careLinks] = await Promise.all([
     getConversationMessages(conversation.id, 30),
     queryUser360(user.id),
     db.from('orders')
@@ -763,6 +764,10 @@ async function processInboundUserInner(
     // ESTADO DA CONSULTA ativa — sem isto a Xarlote fica CEGA à consulta em andamento e "insiste
     // em marcar" cai no fluxo de farmácia (incidente Vadivino 22/07).
     buildConsultationStateBlock(user.id).catch(() => null),
+    // 🤝 De quem esta pessoa cuida. Vazio na esmagadora maioria dos turnos, e a leitura é
+    // por índice parcial — o custo é desprezível e entra no mesmo Promise.all pra não
+    // acrescentar um round-trip serial ao caminho quente.
+    carregarVinculosDoCuidador(user.id).catch(() => []),
   ]);
 
   const geminiHistory = trimHistory(messagesToHistory(history.slice(0, -1)), 20);
@@ -817,6 +822,7 @@ async function processInboundUserInner(
   })();
 
   let systemPrompt = buildXarloteSystemPrompt({
+    careLinks,
     user,
     preferredName: user.preferred_name,
     addresses: addresses ?? [],
@@ -1396,6 +1402,10 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
     conversationId: conversation.id,
     phoneE164,
     traceId,
+    // 🤝 Quem fala, e de quem ele cuida. `handleToolCall` usa os dois pra decidir em qual
+    // registro a ação cai — e, sem `para_quem`, a resposta é sempre "no dele mesmo".
+    atorNome: (user.preferred_name || user.full_name) ?? null,
+    careLinks,
     inboundMsg,
     inbound,
     ordersCreatedThisTurn: new Set<string>(),
@@ -1418,13 +1428,50 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
   // faz um pedido de exame com "Indicação clínica: dor no peito" disparar os botões do SAMU.
   const distressText = textoDoPaciente;
   const EMERGENCY_RE = /(dor no peito|aperto no peito|falta de ar|n[aã]o consigo respirar|desmai|convuls|derrame\b|\bavc\b|rosto torto|fala arrastada|sangrando muito|dor de cabe[çc]a (muito|t[aã]o|super|bem) forte)/i;
-  const PAST_OR_OTHER_RE = /\b(semana passada|m[êe]s passado|ano passado|ontem|anteontem|passad[oa]|minha m[ãa]e|meu pai|minha av[óo]|meu av[ôo]|minha filha|meu filho|minha esposa|meu marido|um amigo|uma amiga|j[áa] tive|tinha tido|ele teve|ela teve|costumo ter|as vezes tenho|[àa]s vezes tenho)\b/i;
+
+  // 🤝 OS DOIS MOTIVOS DE NÃO ESCALAR ERAM UM REGEX SÓ — e precisavam deixar de ser.
+  //
+  // `PAST_OR_OTHER_RE` misturava PASSADO ("semana passada", "já tive") com TERCEIRA PESSOA
+  // ("minha mãe", "meu pai"). Os dois suprimiam a preempção, e estava certo num mundo em
+  // que um telefone é uma pessoa: a Xarlote não tinha como saber de quem se falava nem o
+  // que fazer a respeito.
+  //
+  // Com vínculo de cuidado, a metade da terceira pessoa vira o oposto. "Minha mãe está com
+  // dor no peito" escrito por quem cuida dela é uma emergência REAL, e quem escreveu está
+  // do lado dela precisando ouvir 192 agora. Já o passado continua sendo passado —
+  // "semana passada minha mãe teve dor no peito, cota AAS" não aciona SAMU nem com vínculo,
+  // e é por isso que os dois regexes tiveram que ser separados antes desta correção.
+  const ehPassado = PASSADO_RE.test(distressText);
+  const ehTerceiro = TERCEIRO_RE.test(distressText);
+  const sujeitoDaEmergencia = emergenciaSobreQuemCuido(
+    distressText,
+    { userId: user.id, nome: (user.preferred_name || user.full_name) ?? null },
+    careLinks,
+  );
+  const suprimePreempcao = ehPassado || (ehTerceiro && !sujeitoDaEmergencia);
+
   const alreadyRedFlag = llmResponse.toolCalls.some((t) => t.name === 'red_flag_check');
   let distressPreempted = false;
-  if (!alreadyRedFlag && EMERGENCY_RE.test(distressText) && !PAST_OR_OTHER_RE.test(distressText)) {
-    await writeLog('warn', 'red_flag', `🚑 Emergência determinística ("${distressText.slice(0, 40)}") → forçando red_flag_check`, { traceId });
+  if (!alreadyRedFlag && EMERGENCY_RE.test(distressText) && !suprimePreempcao) {
+    const sobreQuem = sujeitoDaEmergencia
+      ? ` sobre ${sujeitoDaEmergencia.subjectName ?? 'quem ele cuida'}`
+      : '';
+    await writeLog('warn', 'red_flag', `🚑 Emergência determinística${sobreQuem} ("${distressText.slice(0, 40)}") → forçando red_flag_check`, { traceId });
     await handleToolCall(
-      { id: randomUUID(), name: 'red_flag_check', args: { category: 'other_critical', severity: 'high', evidence: distressText.slice(0, 200) } } as unknown as Parameters<typeof handleToolCall>[0],
+      {
+        id: randomUUID(),
+        name: 'red_flag_check',
+        args: {
+          category: 'other_critical',
+          severity: 'high',
+          evidence: distressText.slice(0, 200),
+          // Registra no prontuário de quem está passando mal. A ORIENTAÇÃO do SAMU vai
+          // pra conversa de quem escreveu de qualquer forma — `conversationId` e
+          // `phoneE164` não são redirecionados —, que é o comportamento certo: quem
+          // precisa ligar 192 é quem está lá.
+          ...(sujeitoDaEmergencia ? { para_quem: sujeitoDaEmergencia.subjectName ?? sujeitoDaEmergencia.relation } : {}),
+        },
+      } as unknown as Parameters<typeof handleToolCall>[0],
       turnToolCtx,
     );
     turnToolCtx.turnFlags.suppressLlmText = true;

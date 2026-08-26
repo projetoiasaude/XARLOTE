@@ -15,10 +15,16 @@ import {
 } from '../../lib/care-links.js';
 import { explicarVerdict } from '../../lib/care-invite.js';
 
-/** Parentescos aceitos. Lista fechada: texto livre aqui viraria dado sujo e imprestável. */
+/**
+ * Parentescos aceitos — QUEM O SUJEITO É pra quem cuida ("ela é minha mãe").
+ *
+ * Lista fechada: texto livre aqui viraria dado sujo e imprestável, e este valor é usado
+ * pra CASAR com o que a pessoa escreve ("cria um lembrete pra minha mãe"). 'avo' cobre
+ * avó e avô — os dois só diferem por acento e o nome desambigua.
+ */
 const RELACOES = new Set([
-  'filho', 'filha', 'pai', 'mae', 'neto', 'neta',
-  'conjuge', 'irmao', 'irma', 'responsavel', 'cuidador', 'outro',
+  'mae', 'pai', 'avo', 'filho', 'filha',
+  'conjuge', 'irmao', 'irma', 'neto', 'neta', 'outro',
 ]);
 
 export async function appCareRoutes(app: FastifyInstance): Promise<void> {
@@ -56,7 +62,7 @@ export async function appCareRoutes(app: FastifyInstance): Promise<void> {
     const userId = req.patient!.userId;
     const { codigo, relation } = req.body ?? {};
     if (!relation || !RELACOES.has(relation)) {
-      return reply.code(400).send({ error: 'relacao_invalida', message: 'Diga o que você é dessa pessoa (filho, filha, neto, cônjuge…).' });
+      return reply.code(400).send({ error: 'relacao_invalida', message: 'Diga quem essa pessoa é pra você (mãe, pai, avó, filho, cônjuge…).' });
     }
 
     const rl = await checkKeyedRateLimit(`care:resg:${userId}`, { max: 10, windowS: 3600 });

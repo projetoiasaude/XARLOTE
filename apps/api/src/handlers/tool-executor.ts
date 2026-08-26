@@ -2,8 +2,8 @@ import { db, writeLog, auditToolCall, writeAudit, saveMemoryCard } from '@iasaud
 import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
-import type { NormalizedInbound, Message, OrderItem } from '@iasaude/shared';
-import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal } from '@iasaude/shared';
+import type { NormalizedInbound, Message, OrderItem, CareLinkView } from '@iasaude/shared';
+import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -85,10 +85,29 @@ export interface MidiaDoTurno {
 }
 
 interface ToolContext {
+  /**
+   * De quem é a ação.
+   *
+   * ⚠️ Este campo é REESCRITO por chamada quando a tool traz `para_quem` e o ator cuida
+   * daquela pessoa (ver `handleToolCall`). Os handlers continuam usando `ctx.userId` e
+   * passam a escrever no registro certo sem saber que existe cuidador — foi o que evitou
+   * mexer em 30 handlers.
+   *
+   * `conversationId` e `phoneE164` NÃO são reescritos: a resposta volta pra quem falou.
+   */
   userId: string;
   conversationId: string;
   phoneE164: string;
   traceId: string;
+  /**
+   * Quem está falando, quando é diferente do dono do registro. Só preenchido em ação de
+   * cuidador — é o que a auditoria usa pra distinguir "o filho anotou" de "ela anotou".
+   */
+  atorUserId?: string | null;
+  /** Nome do ator, pra desambiguar "pra mim" de "pra minha mãe". */
+  atorNome?: string | null;
+  /** Pessoas de quem o ATOR cuida. Vazio no fluxo de sempre. */
+  careLinks?: CareLinkView[];
   inboundMsg: Message;
   inbound: NormalizedInbound;
   /**
@@ -143,13 +162,31 @@ export interface ToolResult {
 }
 
 export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<ToolResult> {
+  // ── 🤝 DE QUEM É ESTA AÇÃO ──────────────────────────────────────────────────
+  //
+  // Uma resolução, no funil, antes de qualquer efeito. Os 30 handlers continuam escrevendo
+  // `.eq('user_id', ctx.userId)` sem saber que cuidador existe — é o que permitiu abrir o
+  // produto pra multi-paciente sem tocar em nenhum deles.
+  //
+  // `resolverAlvoDaTool` NUNCA lança: devolve a frase que o modelo vai ler. Sem `para_quem`
+  // (o caminho de praticamente todo turno) é o próprio ator, e o objeto de contexto sequer
+  // é clonado.
+  const alvo = resolverAlvoDaTool(tc.name, tc.args as Record<string, unknown> | undefined, {
+    userId: ctx.userId,
+    nome: ctx.atorNome ?? null,
+    vinculos: ctx.careLinks ?? [],
+  });
+  const ctxAlvo: ToolContext = alvo.ok && alvo.subjectUserId !== ctx.userId
+    ? { ...ctx, userId: alvo.subjectUserId, atorUserId: ctx.userId }
+    : ctx;
+
   // recordTaskStart DENTRO de um guard: ele estava fora do try, então uma falha do Supabase
   // ao inserir em `assistant_tasks` (contabilidade, não a ação) lançava pra fora do handler,
   // escapava do loop de tools e derrubava o turno INTEIRO — o paciente não recebia nada.
   // A contabilidade nunca pode matar o atendimento.
   let taskId = '';
   try {
-    taskId = await recordTaskStart(tc, ctx);
+    taskId = await recordTaskStart(tc, ctxAlvo);
   } catch (err) {
     await writeLog('warn', 'tool', `recordTaskStart falhou (seguindo mesmo assim): ${String(err).slice(0, 120)}`, { traceId: ctx.traceId });
   }
@@ -157,33 +194,41 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
   // Buffer de observação desta chamada (handlers escrevem via ctx.observation.note).
   const obs: { note: string | null } = { note: null };
   ctx.observation = obs;
+  // O clone foi feito ANTES desta linha — sem isto, um handler chamado com `ctxAlvo`
+  // escreveria a observação num objeto que ninguém lê, e o modelo ficaria sem o retorno.
+  ctxAlvo.observation = obs;
   const spokeBefore = ctx.turnFlags?.suppressLlmText === true;
 
   try {
+    // Alvo irresolúvel (ambíguo, desconhecido, ou tool que não pode agir por terceiro):
+    // NADA é executado e o modelo recebe a frase explicando. Mesma escola do ToolFailure —
+    // ele lê "NADA FOI FEITO" e não anuncia o que não aconteceu.
+    if (!alvo.ok) throw new ToolFailure(alvo.mensagem);
+
     switch (tc.name) {
       case 'save_user_profile_fact':
-        await handleSaveProfileFact(tc.args as { category: string; payload: Record<string, unknown> }, ctx);
+        await handleSaveProfileFact(tc.args as { category: string; payload: Record<string, unknown> }, ctxAlvo);
         break;
       case 'request_user_location':
         // Xarlote will say it in text; nothing else needed
         break;
       case 'parse_prescription_image':
-        await handleParsePrescription({}, ctx);
+        await handleParsePrescription({}, ctxAlvo);
         break;
       case 'save_exam_result':
-        await handleSaveExamResult(tc.args as unknown as SaveExamArgs, ctx);
+        await handleSaveExamResult(tc.args as unknown as SaveExamArgs, ctxAlvo);
         break;
       case 'start_pharmacy_order':
-        await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string; preferred_pharmacy_names?: string[] }, ctx);
+        await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string; preferred_pharmacy_names?: string[] }, ctxAlvo);
         break;
       case 'create_reminder':
-        await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string; event_at?: string }, ctx);
+        await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string; event_at?: string }, ctxAlvo);
         break;
       case 'cancel_reminders':
-        await handleCancelReminders(tc.args as { title_query?: string; all?: boolean }, ctx);
+        await handleCancelReminders(tc.args as { title_query?: string; all?: boolean }, ctxAlvo);
         break;
       case 'list_reminders':
-        await handleListReminders(ctx);
+        await handleListReminders(ctxAlvo);
         break;
       case 'send_emergency_orientation':
         // DEPRECATED — redireciona pra red_flag_check (que envia botões).
@@ -193,31 +238,31 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
           category: 'other_critical',
           severity: 'high',
           evidence: (tc.args as { symptoms_summary?: string }).symptoms_summary ?? 'situação reportada como emergência',
-        }, ctx);
+        }, ctxAlvo);
         break;
       case 'get_order_status':
-        await handleGetOrderStatus(ctx);
+        await handleGetOrderStatus(ctxAlvo);
         break;
       case 'expand_pharmacy_search':
-        await handleExpandPharmacySearch(ctx);
+        await handleExpandPharmacySearch(ctxAlvo);
         break;
       case 'message_supplier':
-        await handleMessageSupplier(tc.args as { supplier_hint?: string; message?: string }, ctx);
+        await handleMessageSupplier(tc.args as { supplier_hint?: string; message?: string }, ctxAlvo);
         break;
       case 'confirm_order_selection':
-        await handleConfirmOrder(tc.args as { order_id: string; quote_id: string }, ctx);
+        await handleConfirmOrder(tc.args as { order_id: string; quote_id: string }, ctxAlvo);
         break;
       case 'cancel_order':
-        await handleCancelOrder(tc.args as { order_id?: string; reason?: string }, ctx);
+        await handleCancelOrder(tc.args as { order_id?: string; reason?: string }, ctxAlvo);
         break;
       case 'forward_media_to_establishment':
-        await handleForwardMediaToEstablishment(tc.args as { what?: string; caption?: string }, ctx);
+        await handleForwardMediaToEstablishment(tc.args as { what?: string; caption?: string }, ctxAlvo);
         break;
       case 'find_clinic_by_name':
-        await handleFindByName(tc.args as { name: string; city?: string; specialty?: string }, ctx);
+        await handleFindByName(tc.args as { name: string; city?: string; specialty?: string }, ctxAlvo);
         break;
       case 'contact_establishment':
-        await handleContactEstablishment(tc.args as { phone?: string; name?: string; kind?: 'clinic' | 'pharmacy'; specialty?: string; professional?: string; items?: OrderItem[] }, ctx);
+        await handleContactEstablishment(tc.args as { phone?: string; name?: string; kind?: 'clinic' | 'pharmacy'; specialty?: string; professional?: string; items?: OrderItem[] }, ctxAlvo);
         break;
       case 'relay_answer_to_establishment':
         // Loop agêntico: o cliente respondeu a uma pergunta de farmácia/clínica.
@@ -227,47 +272,51 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
         break;
       // ─── Xarlote 2.0 ──────────────────────────────────────────────────────
       case 'start_treatment_from_order':
-        await handleStartTreatmentFromOrder(tc.args as unknown as StartTreatmentArgs, ctx);
+        await handleStartTreatmentFromOrder(tc.args as unknown as StartTreatmentArgs, ctxAlvo);
         break;
       case 'log_medication_taken':
-        await handleLogMedicationTaken(tc.args as unknown as LogMedicationTakenArgs, ctx);
+        await handleLogMedicationTaken(tc.args as unknown as LogMedicationTakenArgs, ctxAlvo);
         break;
       case 'update_treatment_status':
-        await handleUpdateTreatmentStatus(tc.args as unknown as UpdateTreatmentStatusArgs, ctx);
+        await handleUpdateTreatmentStatus(tc.args as unknown as UpdateTreatmentStatusArgs, ctxAlvo);
         break;
       case 'log_symptom':
-        await handleLogSymptom(tc.args as unknown as LogSymptomArgs, ctx);
+        await handleLogSymptom(tc.args as unknown as LogSymptomArgs, ctxAlvo);
         break;
       case 'query_my_addresses':
         // Não faz nada server-side — a Xarlote já tem os endereços no user_360 context.
         // Tool é "marker" pra a LLM saber que o user perguntou.
         break;
       case 'set_default_address':
-        await handleSetDefaultAddress(tc.args as unknown as { address_label: string }, ctx);
+        await handleSetDefaultAddress(tc.args as unknown as { address_label: string }, ctxAlvo);
         break;
       case 'save_address':
-        await handleSaveAddress(tc.args as unknown as { label: string; full_address?: string; complement?: string; notes?: string; set_default?: boolean; confirmed_residential?: boolean }, ctx);
+        await handleSaveAddress(tc.args as unknown as { label: string; full_address?: string; complement?: string; notes?: string; set_default?: boolean; confirmed_residential?: boolean }, ctxAlvo);
         break;
       case 'start_consultation_search':
-        await handleStartConsultationSearch(tc.args as unknown as StartConsultationArgs, ctx);
+        await handleStartConsultationSearch(tc.args as unknown as StartConsultationArgs, ctxAlvo);
         break;
       case 'confirm_consultation_selection':
-        await handleConfirmConsultation(tc.args as unknown as { consultation_id: string; quote_id?: string; requested_datetime?: string }, ctx);
+        await handleConfirmConsultation(tc.args as unknown as { consultation_id: string; quote_id?: string; requested_datetime?: string }, ctxAlvo);
         break;
       case 'cancel_consultation':
-        await handleCancelConsultation(tc.args as unknown as { consultation_id: string; reason: string }, ctx);
+        await handleCancelConsultation(tc.args as unknown as { consultation_id: string; reason: string }, ctxAlvo);
         break;
       case 'nudge_consultation':
-        await handleNudgeConsultation(ctx, tc.args as { message?: string });
+        // `ctxAlvo`, não `ctx`: hoje são o mesmo objeto (nudge_consultation não aceita
+        // `para_quem`), mas este handler recebe o contexto como PRIMEIRO argumento e não
+        // foi alcançado pela troca dos demais. Se um dia a tool entrar em
+        // `TOOLS_COM_SUJEITO`, aqui já está certo em vez de escrever calado no ator.
+        await handleNudgeConsultation(ctxAlvo, tc.args as { message?: string });
         break;
       case 'red_flag_check': {
         // Handler envia BOTÕES diretos pra uazapi + agenda escalation 60s.
         // Não devolve texto pra Xarlote — paciente vai responder via botão.
-        await handleRedFlagCheck(tc.args as unknown as RedFlagArgs, ctx);
+        await handleRedFlagCheck(tc.args as unknown as RedFlagArgs, ctxAlvo);
         break;
       }
       case 'set_emergency_contact':
-        await handleSetEmergencyContact(tc.args as unknown as SetEmergencyContactArgs, ctx);
+        await handleSetEmergencyContact(tc.args as unknown as SetEmergencyContactArgs, ctxAlvo);
         break;
       default:
         break;
@@ -275,7 +324,9 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
     if (taskId) await db.from('assistant_tasks').update({ status: 'success', tool_output: tc.args, completed_at: new Date().toISOString() }).eq('id', taskId);
     await auditToolCall({
       toolName: tc.name,
-      userId: ctx.userId,
+      // O REGISTRO afetado — que numa ação de cuidador é o do sujeito, não o de quem falou.
+      userId: ctxAlvo.userId,
+      caregiverUserId: ctxAlvo.atorUserId ?? null,
       conversationId: ctx.conversationId,
       traceId: ctx.traceId,
       args: (tc.args as Record<string, unknown>) ?? {},
@@ -300,7 +351,8 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
     }
     await auditToolCall({
       toolName: tc.name,
-      userId: ctx.userId,
+      userId: ctxAlvo.userId,
+      caregiverUserId: ctxAlvo.atorUserId ?? null,
       conversationId: ctx.conversationId,
       traceId: ctx.traceId,
       args: (tc.args as Record<string, unknown>) ?? {},

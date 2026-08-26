@@ -20,7 +20,7 @@ const vinculoMae: CareLinkView = {
   subjectUserId: MAE, subjectName: 'Maria', relation: 'mae', kind: 'vinculo', status: 'ativo',
 };
 const vinculoFilhoPequeno: CareLinkView = {
-  subjectUserId: NETO, subjectName: 'Pedro', relation: 'pai', kind: 'dependente', status: 'ativo',
+  subjectUserId: NETO, subjectName: 'Pedro', relation: 'filho', kind: 'dependente', status: 'ativo',
 };
 
 describe('o padrão é sempre o próprio', () => {
@@ -120,7 +120,7 @@ describe('como isso é dito em voz alta', () => {
   it('a linha do prompt nomeia a pessoa e o parentesco', () => {
     const linha = descreverVinculo(vinculoMae);
     expect(linha).toContain('Maria');
-    expect(linha).toContain('filho dela');
+    expect(linha).toContain('mãe dele');
   });
 
   it('dependente é apresentado como perfil sem WhatsApp', () => {
