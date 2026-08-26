@@ -126,6 +126,7 @@ export async function buildExport(userId: string, agoraIso: string): Promise<Res
     condicoes, alergias, medicamentos, inventario, tratamentos, prescritores,
     exames, lembretes, pedidos, consultas, sintomas, logDoses, memoria,
     consentimentos, auditoria, dispositivos, midias, compartilhamentos, tarefas,
+    quemCuidaDeMim, deQuemEuCuido,
   ] = await Promise.all([
     safe(db.from('user_health_conditions').select('*').eq('user_id', userId)),
     safe(db.from('user_allergies').select('*').eq('user_id', userId)),
@@ -148,6 +149,15 @@ export async function buildExport(userId: string, agoraIso: string): Promise<Res
     safe(db.from('app_media').select('id, mime, bytes, kind, created_at').eq('user_id', userId)),
     safe(db.from('share_grants').select('id, expires_at, revoked_at, access_count, last_accessed_at, created_at').eq('user_id', userId)),
     safe(db.from('assistant_tasks').select('id, tool_name, status, created_at').eq('user_id', userId)),
+    // 🤝 AS DUAS DIREÇÕES DO CUIDADO. Quem enxerga o prontuário desta pessoa é dado dela
+    // (art. 9º: ela tem direito de saber com quem ele é compartilhado). E de quem ela
+    // cuida também é: são vínculos que ela criou e pode revogar.
+    safe(db.from('care_links')
+      .select('id, caregiver_user_id, relation, kind, status, activated_at, revoked_at')
+      .eq('user_id', userId)),
+    safe(db.from('care_links')
+      .select('id, user_id, relation, kind, status, activated_at, revoked_at')
+      .eq('caregiver_user_id', userId)),
   ]);
 
   const arquivo = {
@@ -212,6 +222,13 @@ export async function buildExport(userId: string, agoraIso: string): Promise<Res
       links_compartilhados: compartilhamentos ?? [],
       registro_de_acessos: auditoria ?? [],
       acoes_automaticas: tarefas ?? [],
+    },
+    cuidado_compartilhado: {
+      _o_que_e:
+        'Pessoas que acompanham a sua saúde e pessoas que você acompanha. Um vínculo ' +
+        'revogado continua listado de propósito: ele existiu, e o histórico é seu.',
+      quem_me_acompanha: quemCuidaDeMim ?? [],
+      quem_eu_acompanho: deQuemEuCuido ?? [],
     },
   };
 

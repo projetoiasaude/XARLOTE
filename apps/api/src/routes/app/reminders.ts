@@ -86,6 +86,7 @@ import { z } from 'zod';
 import { db, findUserByPhone, writeEvent } from '@iasaude/db';
 import { brPhoneVariants, nextOccurrence, reminderActionPatch } from '@iasaude/shared';
 import { requirePatient, tryPatient } from '../../middleware/patient-auth.js';
+import { resolverSujeitoDaRequisicao } from '../../lib/care-subject.js';
 import { requireAppToken } from '../../middleware/auth.js';
 import { checkUserRateLimit } from '../../middleware/rate-limit.js';
 import { decodeCursor, encodeCursor } from '../../lib/messages-cursor.js';
@@ -618,7 +619,10 @@ export async function appRemindersRoutes(app: FastifyInstance): Promise<void> {
     const parsed = ListaQuery.safeParse(req.query);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_query' });
 
-    const userId = req.patient!.userId;
+    // 🤝 Lembretes de quem ele cuida, quando `?subject=` vem preenchido.
+    const sujeito = await resolverSujeitoDaRequisicao(req, reply, 'ver');
+    if (!sujeito) return;
+    const userId = sujeito.userId;
     const { scope } = parsed.data;
 
     if (scope === 'history') {
@@ -690,9 +694,16 @@ export async function appRemindersRoutes(app: FastifyInstance): Promise<void> {
     const parsed = CriarSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'invalid_body' });
 
-    const userId = req.patient!.userId;
+    // Criar lembrete no registro do outro exige `agir`, não só `ver`.
+    const sujeito = await resolverSujeitoDaRequisicao(req, reply, 'agir');
+    if (!sujeito) return;
+    const userId = sujeito.userId;
 
-    const rl = await checkUserRateLimit(`app:new-reminder:${userId}`);
+    // ⚠️ O teto de requisições é do ATOR (quem aperta o botão), e não do dono do registro:
+    // um cuidador com três pessoas não pode ganhar três vezes mais cota, e um paciente não
+    // pode ser travado pelo ritmo de quem cuida dele. O CAP de lembretes ativos, logo
+    // abaixo, continua sendo do SUJEITO — é a lista dele que satura.
+    const rl = await checkUserRateLimit(`app:new-reminder:${req.patient!.userId}`);
     if (!rl.allowed) {
       return reply
         .code(429)
@@ -756,7 +767,11 @@ export async function appRemindersRoutes(app: FastifyInstance): Promise<void> {
         // `origem` existe pra uma pergunta futura: quantos lembretes o paciente cria
         // sozinho depois que a tela passou a permitir? Sem o carimbo, a resposta seria
         // um chute.
-        payload: { origem: 'app' },
+        // Carimba quem criou quando não foi o dono: é o que permite ao paciente ver, na
+        // tela dele, que aquele lembrete veio de quem cuida dele — e cobrar explicação.
+        payload: sujeito.caregiverUserId
+          ? { origem: 'app', criado_por_cuidador: sujeito.caregiverUserId }
+          : { origem: 'app' },
       })
       .select(REMINDER_COLUMNS)
       .single();

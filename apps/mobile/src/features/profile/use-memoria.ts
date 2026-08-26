@@ -24,6 +24,7 @@ import { useCallback, useMemo } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiFetch } from '@/lib/api/client';
 import { useSession } from '@/lib/auth/session';
+import { useChaveDoSujeito } from '@/lib/care/sujeito';
 import { OVERVIEW_KEY, useOverview } from '@/features/health/use-overview';
 import type { MemoryCard } from '@/features/health/overview';
 import {
@@ -85,6 +86,7 @@ export interface EstadoEsquecer {
 export function useEsquecerCard(): EstadoEsquecer {
   const qc = useQueryClient();
   const { user } = useSession();
+  const chaveDoSujeito = useChaveDoSujeito();
 
   const m = useMutation<void, Error, string>({
     mutationFn: (id) => apiFetch<void>(`/app/memory/${id}`, { method: 'DELETE' }),
@@ -93,7 +95,7 @@ export function useEsquecerCard(): EstadoEsquecer {
     // foi construída pra evitar — num app de saúde, sumir com um dado que continua lá é
     // pior do que demorar meio segundo pra sumir com ele de verdade.
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: [OVERVIEW_KEY, user?.id ?? 'anon'] });
+      void qc.invalidateQueries({ queryKey: [OVERVIEW_KEY, chaveDoSujeito] });
     },
   });
 

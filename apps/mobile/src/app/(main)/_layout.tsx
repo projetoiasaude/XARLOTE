@@ -1,6 +1,7 @@
 import { Stack } from 'expo-router';
 import { View, StyleSheet } from 'react-native';
 import { OrbNav } from '@/components/xarlote/OrbNav';
+import { SujeitoProvider } from '@/lib/care/sujeito';
 
 /**
  * A casca das telas logadas. O OrbNav fica FORA do Stack de propósito: ele é o mesmo
@@ -9,16 +10,20 @@ import { OrbNav } from '@/components/xarlote/OrbNav';
  */
 export default function MainLayout() {
   return (
-    <View style={styles.root}>
-      <Stack
-        screenOptions={{
-          headerShown: false,
-          animation: 'fade',
-          contentStyle: { backgroundColor: 'transparent' },
-        }}
-      />
-      <OrbNav />
-    </View>
+    // O provedor envolve TODAS as telas logadas, e não só as de dados: o chip de quem
+    // está sendo cuidado vive na moldura (`Screen.tsx`), que é usada por todas elas.
+    <SujeitoProvider>
+      <View style={styles.root}>
+        <Stack
+          screenOptions={{
+            headerShown: false,
+            animation: 'fade',
+            contentStyle: { backgroundColor: 'transparent' },
+          }}
+        />
+        <OrbNav />
+      </View>
+    </SujeitoProvider>
   );
 }
 

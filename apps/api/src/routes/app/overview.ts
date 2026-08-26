@@ -15,10 +15,16 @@ import type { FastifyInstance } from 'fastify';
 import { db, writeEvent } from '@iasaude/db';
 import { requirePatient } from '../../middleware/patient-auth.js';
 import { buildOverview, type OverviewUser } from '../../lib/app-overview.js';
+import { resolverSujeitoDaRequisicao } from '../../lib/care-subject.js';
 
 export async function appOverviewRoutes(app: FastifyInstance): Promise<void> {
   app.get('/overview', { preHandler: requirePatient }, async (req, reply) => {
-    const userId = req.patient!.userId;
+    // 🤝 `?subject=<userId>` abre a bolsa de quem ele cuida. Sem o parâmetro é a dele —
+    // e nem toca no banco de vínculos. A autorização é conferida AQUI, a cada request:
+    // um sujeito escolhido pelo cliente sem validação tornaria o vínculo decorativo.
+    const sujeito = await resolverSujeitoDaRequisicao(req, reply, 'ver');
+    if (!sujeito) return;
+    const userId = sujeito.userId;
 
     const { data: user } = await db
       .from('users')
@@ -41,6 +47,10 @@ export async function appOverviewRoutes(app: FastifyInstance): Promise<void> {
       // entender uso e detectar leitura anômala.
       payload: {
         channel: 'xarlote_app',
+        // Quem LEU, quando não é o dono. É o que dá sentido à pergunta "quem acessou meu
+        // prontuário" no export — sem isto, a leitura do cuidador seria indistinguível
+        // da leitura do próprio paciente.
+        ...(sujeito.caregiverUserId ? { por_cuidador: sujeito.caregiverUserId } : {}),
         exames: (overview['examResults'] as unknown[]).length,
         lembretes: (overview['reminders'] as unknown[]).length,
         memoria: (overview['memoryCards'] as unknown[]).length,

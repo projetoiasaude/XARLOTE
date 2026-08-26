@@ -38,7 +38,7 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import * as LocalAuthentication from 'expo-local-authentication';
 import { useQueryClient } from '@tanstack/react-query';
-import { ChevronRight, Fingerprint, LogOut, ShieldCheck, Stethoscope } from 'lucide-react-native';
+import { ChevronRight, Fingerprint, LogOut, ShieldCheck, Stethoscope, HeartHandshake} from 'lucide-react-native';
 import { GlassCard, LoadFailure, SectionHeader } from '@/components/ui';
 import { Screen } from '@/components/xarlote/Screen';
 import { useMe } from '@/lib/api/use-me';
@@ -199,6 +199,22 @@ export default function PerfilScreen() {
           <View style={styles.linhaTexto}>
             <Text style={styles.linhaTitulo}>Mostrar ao meu médico</Text>
             <Text style={styles.linhaHint}>Um link com seu resumo, que expira sozinho.</Text>
+          </View>
+        </View>
+        <ChevronRight size={18} color={colors.textDim} />
+      </GlassCard>
+
+      {/*
+        Cuidar de alguém fica JUNTO das outras duas: levar embora, mostrar ao médico e
+        dividir com quem cuida são a mesma família de decisão — quem mais, além de mim,
+        toca no meu prontuário.
+      */}
+      <GlassCard style={styles.linha} onPress={() => router.push('/perfil/cuidar')}>
+        <View style={styles.linhaEsquerda}>
+          <HeartHandshake size={18} color={colors.accentHi} />
+          <View style={styles.linhaTexto}>
+            <Text style={styles.linhaTitulo}>Cuidar de alguém</Text>
+            <Text style={styles.linhaHint}>Acompanhe a saúde de quem você cuida — e veja quem acompanha a sua.</Text>
           </View>
         </View>
         <ChevronRight size={18} color={colors.textDim} />

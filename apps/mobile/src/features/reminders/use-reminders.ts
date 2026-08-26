@@ -37,6 +37,7 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import type { ReminderAppAction } from '@iasaude/shared';
 import { apiFetch } from '@/lib/api/client';
 import { useSession } from '@/lib/auth/session';
+import { useChaveDoSujeito, useSubjectQuery } from '@/lib/care/sujeito';
 import { OVERVIEW_KEY } from '@/features/health/use-overview';
 import type { ReminderRow } from '@/features/health/overview';
 import { lembreteOtimista, type CorpoNovoLembrete } from './format';
@@ -82,9 +83,12 @@ interface CriarResposta {
 
 export function useReminders() {
   const { user } = useSession();
+  const chaveDoSujeito = useChaveDoSujeito();
+  const subject = useSubjectQuery();
+  const subjectExtra = subject ? subject.replace('?', '&') : '';
   return useQuery<ListaAtivos>({
-    queryKey: [REMINDERS_KEY, user?.id ?? 'anon'],
-    queryFn: () => apiFetch<ListaAtivos>('/app/reminders?scope=active'),
+    queryKey: [REMINDERS_KEY, chaveDoSujeito],
+    queryFn: () => apiFetch<ListaAtivos>(`/app/reminders?scope=active${subjectExtra}`),
     enabled: user !== null,
     staleTime: 60_000,
   });
@@ -98,13 +102,16 @@ export function useReminders() {
  */
 export function useHistoricoLembretes(aberta: boolean) {
   const { user } = useSession();
+  const chaveDoSujeito = useChaveDoSujeito();
+  const subject = useSubjectQuery();
+  const subjectExtra = subject ? subject.replace('?', '&') : '';
   return useInfiniteQuery({
-    queryKey: [REMINDERS_HISTORY_KEY, user?.id ?? 'anon'],
+    queryKey: [REMINDERS_HISTORY_KEY, chaveDoSujeito],
     enabled: user !== null && aberta,
     initialPageParam: null as string | null,
     queryFn: ({ pageParam }) =>
       apiFetch<PaginaHistorico>(
-        `/app/reminders?scope=history&limit=${HISTORICO_PAGINA}` +
+        `/app/reminders?scope=history&limit=${HISTORICO_PAGINA}${subjectExtra}` +
           (pageParam ? `&cursor=${encodeURIComponent(pageParam)}` : ''),
       ),
     getNextPageParam: (ultima) => ultima.nextCursor,
@@ -123,9 +130,12 @@ export interface AcaoLembrete {
 
 export function useReminderAction() {
   const { user } = useSession();
+  const chaveDoSujeito = useChaveDoSujeito();
+  const subject = useSubjectQuery();
+  const subjectExtra = subject ? subject.replace('?', '&') : '';
   const qc = useQueryClient();
-  const chave = [REMINDERS_KEY, user?.id ?? 'anon'];
-  const chaveHistorico = [REMINDERS_HISTORY_KEY, user?.id ?? 'anon'];
+  const chave = [REMINDERS_KEY, chaveDoSujeito];
+  const chaveHistorico = [REMINDERS_HISTORY_KEY, chaveDoSujeito];
 
   const mutation = useMutation<AcaoResposta, Error, AcaoLembrete, { anterior: ListaAtivos | undefined }>({
     mutationFn: ({ id, acao, minutos }) =>
@@ -173,7 +183,7 @@ export function useReminderAction() {
     onSettled: () => {
       // O prontuário mostra os mesmos lembretes e a adesão muda com um "feito":
       // invalidar aqui é o que evita a Saúde 360 discordar da tela de Lembretes.
-      void qc.invalidateQueries({ queryKey: [OVERVIEW_KEY, user?.id ?? 'anon'] });
+      void qc.invalidateQueries({ queryKey: [OVERVIEW_KEY, chaveDoSujeito] });
       /**
        * O histórico é RESETADO, não invalidado.
        *
@@ -223,13 +233,16 @@ export function useReminderAction() {
  */
 export function useCriarLembrete() {
   const { user } = useSession();
+  const chaveDoSujeito = useChaveDoSujeito();
+  const subject = useSubjectQuery();
+  const subjectExtra = subject ? subject.replace('?', '&') : '';
   const qc = useQueryClient();
 
   return useMutation<CriarResposta, Error, CorpoNovoLembrete>({
-    mutationFn: (corpo) => apiFetch<CriarResposta>('/app/reminders', { method: 'POST', body: corpo }),
+    mutationFn: (corpo) => apiFetch<CriarResposta>(`/app/reminders${subject}`, { method: 'POST', body: corpo }),
     onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: [REMINDERS_KEY, user?.id ?? 'anon'] });
-      void qc.invalidateQueries({ queryKey: [OVERVIEW_KEY, user?.id ?? 'anon'] });
+      void qc.invalidateQueries({ queryKey: [REMINDERS_KEY, chaveDoSujeito] });
+      void qc.invalidateQueries({ queryKey: [OVERVIEW_KEY, chaveDoSujeito] });
     },
   });
 }

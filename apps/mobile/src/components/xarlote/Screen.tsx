@@ -28,10 +28,11 @@ import {
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { ChevronLeft } from 'lucide-react-native';
+import { ChevronLeft, X } from 'lucide-react-native';
 import { colors, FONTE_CLINICA } from '@/theme';
 import Animated from 'react-native-reanimated';
 import { useRecuoDoTeclado } from '@/lib/teclado';
+import { useSujeito } from '@/lib/care/sujeito';
 
 /** Altura do orb (68) + folga. Toda tela rolável termina acima dele. */
 export const ORB_INSET = 104;
@@ -69,6 +70,37 @@ function Voltar() {
   );
 }
 
+/**
+ * 🤝 DE QUEM É ESTA TELA.
+ *
+ * Fica na MOLDURA, não na tela que trocou, e por isso aparece em todas — Saúde, Lembretes,
+ * Exames, Atividade. O erro que esta faixa existe pra impedir não é técnico: é alguém ler
+ * o exame da mãe achando que é o dele, ou registrar uma dose no prontuário errado por não
+ * ter percebido a troca.
+ *
+ * Some por completo quando é o próprio registro: 99% do tempo não há nada a avisar, e uma
+ * faixa permanente vira ruído que ninguém mais enxerga — inclusive quando importa.
+ */
+function ChipDoSujeito() {
+  const { pessoa, cuidandoDeOutro, voltarParaMim } = useSujeito();
+  if (!cuidandoDeOutro || !pessoa) return null;
+  const nome = (pessoa.nome ?? '').trim() || 'outra pessoa';
+  return (
+    <Pressable
+      onPress={voltarParaMim}
+      accessibilityRole="button"
+      accessibilityLabel={`Você está vendo o registro de ${nome}. Toque para voltar ao seu.`}
+      style={styles.chip}
+      hitSlop={8}
+    >
+      <Text style={styles.chipTexto} numberOfLines={1}>
+        Você está no registro de <Text style={styles.chipNome}>{nome}</Text>
+      </Text>
+      <X size={15} color={colors.text} strokeWidth={2.4} />
+    </Pressable>
+  );
+}
+
 export function Screen({
   title,
   subtitle,
@@ -83,14 +115,16 @@ export function Screen({
   // link, nome no perfil). A moldura resolve uma vez pelas oito. Ver `lib/teclado.ts`.
   const recuoDoTeclado = useRecuoDoTeclado(insets.bottom);
 
-  const header =
-    title || voltar ? (
-      <View style={styles.header}>
-        {voltar && <Voltar />}
-        {title ? <Text style={styles.title}>{title}</Text> : null}
-        {subtitle ? <Text style={styles.subtitle}>{subtitle}</Text> : null}
-      </View>
-    ) : null;
+  // O chip entra no header MESMO quando não há título nem seta: uma tela sem cabeçalho
+  // (o chat) é justamente onde a troca de pessoa passaria mais despercebida.
+  const header = (
+    <View style={title || voltar || subtitle ? styles.header : styles.headerSoChip}>
+      <ChipDoSujeito />
+      {voltar && <Voltar />}
+      {title ? <Text style={styles.title}>{title}</Text> : null}
+      {subtitle ? <Text style={styles.subtitle}>{subtitle}</Text> : null}
+    </View>
+  );
 
   if (!scroll) {
     return (
@@ -136,6 +170,27 @@ const styles = StyleSheet.create({
   flex: { flex: 1 },
   content: { paddingHorizontal: 20 },
   header: { marginBottom: 20 },
+  /** Sem título, a moldura só reserva o espaço do chip — e nada quando ele não existe. */
+  headerSoChip: {},
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    alignSelf: 'flex-start',
+    maxWidth: '100%',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginBottom: 12,
+    borderRadius: 999,
+    // Âmbar em vez do accent do produto: isto é um AVISO de contexto, não um destaque.
+    // Precisa destoar do resto pra ser lido antes do conteúdo, e não junto com ele.
+    backgroundColor: 'rgba(245, 158, 11, 0.16)',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(245, 158, 11, 0.45)',
+  },
+  chipTexto: { color: colors.text, fontSize: 13, flexShrink: 1 },
+  chipNome: { fontWeight: '700' },
   title: { color: colors.text, fontSize: 28, fontWeight: '700', letterSpacing: -0.6 },
   subtitle: { color: colors.textDim, fontSize: FONTE_CLINICA, marginTop: 4, lineHeight: 19 },
   /** 44 de altura mesmo com o texto em 15: o alvo é o piso, não o tamanho da letra. */

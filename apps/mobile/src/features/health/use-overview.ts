@@ -12,15 +12,22 @@
 import { useQuery } from '@tanstack/react-query';
 import { apiFetch } from '@/lib/api/client';
 import { useSession } from '@/lib/auth/session';
+import { useChaveDoSujeito, useSubjectQuery } from '@/lib/care/sujeito';
 import type { Overview } from './overview';
 
 export const OVERVIEW_KEY = 'overview';
 
+// 🤝 A chave de cache e a URL carregam DE QUEM é a bolsa. `useChaveDoSujeito()` devolve
+// `<meu id>:eu` quando é o próprio registro — então o comportamento de quem não cuida de
+// ninguém fica idêntico — e `<meu id>:<id dela>` quando é de outra pessoa. Cache separado
+// por pessoa é o que impede a tela de mostrar o exame de uma sob o nome da outra.
 export function useOverview() {
   const { user } = useSession();
+  const chave = useChaveDoSujeito();
+  const subject = useSubjectQuery();
   return useQuery<Overview>({
-    queryKey: [OVERVIEW_KEY, user?.id ?? 'anon'],
-    queryFn: () => apiFetch<Overview>('/app/overview'),
+    queryKey: [OVERVIEW_KEY, chave],
+    queryFn: () => apiFetch<Overview>(`/app/overview${subject}`),
     enabled: user !== null,
     // Prontuário não muda de segundo em segundo, e a resposta é grande (até 180 linhas
     // de log de dose). 2 minutos evita refetch a cada troca de aba sem deixar a tela

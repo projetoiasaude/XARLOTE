@@ -14,6 +14,7 @@ import { initiatePharmacyNegotiation } from './inbound-supplier.js';
 import { scheduleQuoteTimeout, sendCurrentOrderStatus } from './quote-consolidation.js';
 import { relayUserAnswerToEstablishment } from './clarification.js';
 import { handleFindByName, handleContactEstablishment, handleNudgeConsultation , handleForwardMediaToEstablishment } from './reach-out.js';
+import { avisarSujeitoDeAcaoDoCuidador, acaoPesa } from './care-notify.js';
 import { loadLatestOrderState, resolveTargetSupplier } from './order-state.js';
 import {
   handleStartTreatmentFromOrder, handleLogMedicationTaken, handleUpdateTreatmentStatus,
@@ -333,6 +334,19 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
       result: 'success',
       durationMs: Date.now() - startedAt,
     });
+
+    // 🤝 O DONO DO REGISTRO PRECISA SABER. Um ponto só, depois do sucesso, cobrindo toda
+    // tool de cuidador — presente e futura. Consentimento dado uma vez não é vigilância
+    // permanente: se aparecer um aviso que ela não esperava, ela descobre AGORA que
+    // precisa revogar. `void`: transparência não atrasa nem derruba o que já aconteceu.
+    if (ctxAlvo.atorUserId && acaoPesa(tc.name)) {
+      void avisarSujeitoDeAcaoDoCuidador({
+        subjectUserId: ctxAlvo.userId,
+        caregiverUserId: ctxAlvo.atorUserId,
+        toolName: tc.name,
+        traceId: ctx.traceId,
+      });
+    }
     return {
       ok: true,
       ...(obs.note ? { note: obs.note } : {}),
