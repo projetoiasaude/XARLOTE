@@ -173,6 +173,36 @@ export async function executeForgetMe(
     if (n > 0) tabelas[t] = n;
   }
 
+  // 🤝 O OUTRO LADO DO VÍNCULO DE CUIDADO.
+  //
+  // A varredura acima apaga por `user_id`, e em `care_links` `user_id` é o SUJEITO — ou
+  // seja, ela cobre "apagaram a pessoa cuidada". O caso inverso não é alcançável por ali:
+  // quando quem pede o apagamento é o CUIDADOR, a linha aponta pra ele em
+  // `caregiver_user_id`.
+  //
+  // E o `on delete cascade` da FK NÃO salva: este fluxo ANONIMIZA a linha de `users` (o
+  // `id` é preservado de propósito, pras FKs da prova), nunca a deleta. O cascade jamais
+  // dispara. Sem este bloco, uma pessoa que pediu pra ser esquecida continuaria com acesso
+  // ativo ao prontuário de quem ficou.
+  {
+    const { data: comoCuidador } = await db
+      .from('care_links')
+      .delete()
+      .eq('caregiver_user_id', userId)
+      .select('id');
+    if ((comoCuidador ?? []).length > 0) tabelas['care_links_como_cuidador'] = comoCuidador!.length;
+  }
+  {
+    // Convite que ELE resgataria depois de sumir — porta entreaberta com o nome de um
+    // fantasma. `consumed_by_user_id` é o vestígio dele em convite de outra pessoa.
+    const { data: convites } = await db
+      .from('care_invites')
+      .update({ consumed_by_user_id: null })
+      .eq('consumed_by_user_id', userId)
+      .select('id');
+    if ((convites ?? []).length > 0) tabelas['care_invites_resgatados_por_ele'] = convites!.length;
+  }
+
   // ── 3. Mensagens das conversas DELE ────────────────────────────────────────
   let mensagensApagadas = 0;
   if (idsConvPaciente.length) {

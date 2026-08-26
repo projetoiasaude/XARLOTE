@@ -22,6 +22,7 @@ import { appAccountRoutes } from './account.js';
 import { appSharesRoutes } from './shares.js';
 import { appMediaRoutes } from './media.js';
 import { appMemoryRoutes } from './memory.js';
+import { appCareRoutes } from './care.js';
 
 export async function appPatientRoutes(app: FastifyInstance): Promise<void> {
   await appAuthRoutes(app);
@@ -36,4 +37,5 @@ export async function appPatientRoutes(app: FastifyInstance): Promise<void> {
   await appSharesRoutes(app);
   await appMediaRoutes(app);
   await appMemoryRoutes(app);
+  await appCareRoutes(app);
 }
