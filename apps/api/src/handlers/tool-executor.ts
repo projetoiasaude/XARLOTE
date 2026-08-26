@@ -2007,6 +2007,35 @@ function escapeLike(s: string): string {
   return s.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
+/**
+ * O remédio do perfil que este título nomeia — ou `null`.
+ *
+ * Só devolve em casamento inequívoco: um candidato, achado por token de ≥4 letras do nome
+ * do medicamento dentro do título do lembrete. Dois candidatos devolvem `null`, porque
+ * escolher errado carimbaria adesão no remédio errado — pior que não carimbar nenhuma.
+ */
+async function acharRemedioDoTitulo(titulo: string, userId: string): Promise<string | null> {
+  const t = (titulo ?? '').trim();
+  if (t.length < 3) return null;
+  const { data: meds } = await db
+    .from('user_medications')
+    .select('id, medication_name')
+    .eq('user_id', userId)
+    .eq('active', true)
+    .limit(40);
+  if (!meds?.length) return null;
+
+  const fold = (s: string) => s.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+  const alvo = fold(t);
+  const hits = meds.filter((m) => {
+    const nome = fold(String(m.medication_name ?? ''));
+    // Tokens de 4+ letras: "ac" e "de" casariam com qualquer coisa.
+    const tokens = nome.split(/\W+/).filter((w) => w.length >= 4);
+    return tokens.length > 0 && tokens.some((w) => alvo.includes(w));
+  });
+  return hits.length === 1 ? (hits[0]!.id as string) : null;
+}
+
 async function handleCreateReminder(
   args: { type: string; title?: string; body?: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string; event_at?: string },
   ctx: ToolContext
@@ -2133,10 +2162,24 @@ async function handleCreateReminder(
     }
   }
 
+  // 💊 LIGA O LEMBRETE AO REMÉDIO DO PERFIL, quando dá pra ter certeza.
+  //
+  // `medication_log` — a fonte da adesão do app e do `calc_adherence_score` — tem
+  // `medication_id` NOT NULL. Um lembrete sem esse vínculo nunca vira linha de adesão:
+  // o paciente responde "tomei" no WhatsApp e o número na tela dele não se mexe.
+  // Em 26/08 eram 2 de 30 lembretes de remédio ligados; os outros 28 confirmavam no vazio.
+  //
+  // A resolução é contra os remédios QUE JÁ EXISTEM no perfil dele, e só em casamento
+  // INEQUÍVOCO. Zero ou vários candidatos ⇒ não liga. Foi tentar adivinhar pelo título que
+  // criou `user_medications` fantasma antes ("Hora do Dipirona 500mg" virou remédio) —
+  // aqui nada é criado, só reconhecido.
+  const medicationId = args.type === 'medication' ? await acharRemedioDoTitulo(title, ctx.userId) : null;
+
   const { error: insErr } = await db.from('reminders').insert({
     user_id: ctx.userId,
     type: args.type,
     title,
+    ...(medicationId ? { medication_id: medicationId } : {}),
     // body:"" (string vazia da LLM) → null, senão o dispatcher mandaria msg vazia.
     body,
     scheduled_at: scheduledAt,

@@ -68,7 +68,14 @@ const ANUNCIOS: Record<ClaimKind, RegExp> = {
   lembrete_cancelado: /\bcancelei\b[^.!?]{0,20}\blembrete/,
   agendamento: /\b(?:marquei|agendei|reservei)\b|\b(?:consulta|horario)\b[^.!?]{0,25}\b(?:confirmad[oa]|agendad[oa]|marcad[oa]|reservad[oa])\b/,
   pedido_fechado: /\bfechei\b[^.!?]{0,20}\bpedido\b|\bpedido\b[^.!?]{0,20}\b(?:fechad[oa]|confirmad[oa])\b/,
-  mensagem_a_terceiro: /\bja\s+(?:falei|avisei|mandei|pedi)\b|\b(?:falei|avisei|mandei)\s+(?:com|pra|para|a|o)\s+(?:a\s+)?(?:farmacia|clinica|consultorio|eles|secretaria)\b|\bentrei\s+em\s+contato\b/,
+  // ⚠️ ENCAMINHAR conta como falar com terceiro (pendência de revisor, fechada em 26/08).
+  // A primeira versão só conhecia `falei|avisei|mandei|pedi`, e deixava passar justamente
+  // os verbos de DOCUMENTO — "encaminhei seu exame pra farmácia", "repassei o pedido
+  // médico". Era a frase exata que o revisor apontou: a Xarlote dizendo que encaminhou o
+  // exame pra uma farmácia que não recebeu nada.
+  // Duas formas: verbo + estabelecimento, ou verbo + documento (encaminhar documento já é,
+  // por definição, uma ação sobre terceiro).
+  mensagem_a_terceiro: /\bja\s+(?:falei|avisei|mandei|pedi|encaminhei|repassei|enviei)\b|\b(?:falei|avisei|mandei|encaminhei|repassei|enviei)\b[^.!?]{0,45}\b(?:farmacia|clinica|consultorio|eles|secretaria|drogaria)\b|\b(?:encaminhei|repassei|enviei)\b[^.!?]{0,35}\b(?:exame|receita|pedido|carteirinha|documento|foto|laudo|guia)\b|\bentrei\s+em\s+contato\b|\b(?:dei|mandei)\s+(?:um\s+)?(?:alo|al[ôo]|toque)\b|\b(?:cutuquei|insisti|reforcei|refor[çc]ei)\b/,
   registro_salvo: /\b(?:guardei|salvei|registrei|anotei)\b[^.!?]{0,30}\b(?:exame|receita|perfil|historico|prontuario)\b/,
 };
 

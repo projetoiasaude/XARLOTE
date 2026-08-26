@@ -80,8 +80,11 @@ describe('blocoDeDocumentoParaModelo — o conteúdo é DADO, não instrução',
       limiteDeCaracteres: 200,
     });
 
-    expect(bloco).toContain('o documento tem 900 caracteres');
-    expect(bloco).toContain('você está vendo os primeiros 200');
+    // O corte passou a ser por valor clínico, não por posição — mas continua anunciado,
+    // e continua dizendo o TAMANHO REAL do arquivo, que é o que impede a Xarlote de
+    // afirmar que leu o laudo inteiro.
+    expect(bloco).toContain('900 caracteres');
+    expect(bloco).toContain('ficou de fora');
     expect(bloco).toContain('peça ao paciente a página específica');
   });
 
@@ -95,13 +98,13 @@ describe('blocoDeDocumentoParaModelo — o conteúdo é DADO, não instrução',
       limiteDeCaracteres: MAX_CHARS_TEXTO_PDF,
     });
 
-    expect(bloco).toContain('o documento tem 12000 caracteres');
-    expect(bloco).toContain('você está vendo os primeiros 3000');
+    expect(bloco).toContain('12000 caracteres');
+    expect(bloco).toContain('ficou de fora');
   });
 
   it('texto que cabe inteiro NÃO ganha aviso de corte', () => {
     const bloco = blocoDeDocumentoParaModelo({ ...BASE, texto: 'Hemoglobina 13,2 g/dL' });
-    expect(bloco).not.toContain('texto cortado aqui');
+    expect(bloco).not.toContain('ficou de fora');
   });
 
   it('arquivo que não foi guardado não pode ser prometido a ninguém', () => {

@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -194,14 +194,32 @@ export function blocoDeDocumentoParaModelo(d: {
   // um laudo pela metade parecer um laudo inteiro.
   const totalNoArquivo = Math.max(d.caracteres ?? 0, texto.length);
   const meuCorte = texto.length > limite;
-  const corpo = (meuCorte ? texto.slice(0, limite) : texto)
+  // ✂️ CORTE POR VALOR, NÃO POR POSIÇÃO (pendência de revisor, fechada em 26/08).
+  //
+  // `texto.slice(0, limite)` é o pior corte possível num laudo: a ordem de um laudo é
+  // laboratório → paciente → hemograma → bioquímica → hormônios → observação técnica, e
+  // cortar os primeiros N caracteres joga fora exatamente a metade clínica, preservando
+  // endereço e CNPJ do laboratório.
+  const recorte = meuCorte ? recortarLaudo(texto, limite) : null;
+  const corpo = (recorte ? recorte.texto : texto)
     // Neutraliza as marcas dentro do conteúdo pra o documento não poder "fechar" o bloco e
     // passar a falar como se fosse eu.
     .split(MARCA_FIM).join('- - -')
     .split(MARCA_INICIO).join('- - -');
-  const mostrados = meuCorte ? limite : texto.length;
-  const aviso = totalNoArquivo > mostrados
-    ? `\n[…texto cortado aqui: o documento tem ${totalNoArquivo} caracteres e você está vendo os primeiros ${mostrados}. Se precisar do resto, peça ao paciente a página específica.]`
+  // ⚠️ DOIS CORTES PODEM TER ACONTECIDO, e os dois precisam ser anunciados:
+  //   • o do EXTRATOR, antes daqui (`caracteres` do arquivo > o texto que chegou);
+  //   • o MEU, quando o texto recebido não cabe no limite de contexto.
+  // A primeira versão desta linha só olhava o meu, e um PDF já cortado pelo extrator
+  // chegava ao modelo como se fosse o laudo inteiro — pego por `inbound-documento.test.ts`.
+  const cortouAqui = recorte?.cortado ?? false;
+  const cortouAntes = totalNoArquivo > texto.length;
+  const comoCortei = recorte && recorte.linhasMantidas > 0
+    ? ` Do que chegou, você está vendo o cabeçalho e as ${recorte.linhasMantidas} linhas que trazem resultado, do começo ao fim do laudo — texto corrido intermediário ficou de fora.`
+    : cortouAqui
+      ? ' O texto foi cortado no limite de tamanho, e o final ficou de fora.'
+      : ' O restante ficou de fora antes de chegar até mim.';
+  const aviso = (cortouAqui || cortouAntes)
+    ? `\n[…documento longo: o arquivo tem ${totalNoArquivo} caracteres.${comoCortei} Se precisar de algo que não está aqui, peça ao paciente a página específica.]`
     : '';
 
   return [
@@ -2019,7 +2037,7 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
     if (!calledLog && (strongConfirm || weakAck) && !distressPreempted) {
       const windowMs = strongConfirm ? 3 * 60 * 60_000 : 20 * 60_000;
       const { data: recentRem } = await db.from('reminders')
-        .select('id, title, type, last_run_at')
+        .select('id, title, type, last_run_at, medication_id')
         .eq('user_id', user.id)
         .in('status', ['pending', 'sent'])
         .gte('last_run_at', new Date(Date.now() - windowMs).toISOString())
@@ -2056,6 +2074,33 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
         // pro log_medication_taken criava user_medications FANTASMA ("Hora do Dipirona
         // 500mg" virava remédio no perfil — review #23). Adesão/analytics via event_log.
         await db.from('reminders').update({ last_confirmed_at: new Date().toISOString() }).eq('id', recentRem.id);
+
+        // 💊 E VIRA LINHA DE ADESÃO — quando o lembrete aponta pra um remédio de verdade.
+        //
+        // Carimbar `last_confirmed_at` fazia o lembrete parar de insistir, mas parava aí:
+        // `medication_log` é a fonte da adesão que o paciente vê no app e do
+        // `calc_adherence_score`. O resultado era o pior tipo de silêncio — ele responde
+        // "tomei" todos os dias no WhatsApp e o número na tela dele não se mexe.
+        //
+        // `medication_id` é NOT NULL, e é por isso que a versão anterior não escrevia nada:
+        // passar o TÍTULO pro `log_medication_taken` criava `user_medications` fantasma.
+        // Aqui não se inventa remédio — só se registra quando o vínculo JÁ existe.
+        if (recentRem.medication_id) {
+          const { error: errAdesao } = await db.from('medication_log').insert({
+            user_id: user.id,
+            medication_id: recentRem.medication_id,
+            reminder_id: recentRem.id,
+            status: 'taken',
+            scheduled_at: recentRem.last_run_at ?? new Date().toISOString(),
+            responded_at: new Date().toISOString(),
+            response_text: userText.slice(0, 200),
+          });
+          if (errAdesao) {
+            await writeLog('warn', 'agent', `adesão NÃO registrada no medication_log: ${errAdesao.message.slice(0, 110)}`, {
+              traceId, userId: user.id, reminderId: recentRem.id,
+            });
+          }
+        }
         await writeLog('warn', 'agent', `🛟 Backstop de confirmação: adesão registrada sem log_medication_taken (reminder ${recentRem.id})`, {
           traceId, userId: user.id, reminderId: recentRem.id,
         });

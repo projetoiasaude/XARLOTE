@@ -62,6 +62,43 @@ describe('o anúncio que a ferramenta desmente', () => {
     expect(r.blocked.map((b) => b.kind)).toContain(kind);
   });
 
+  it.each([
+    'Encaminhei seu exame para a farmácia 💙',
+    'Repassei o pedido médico pro consultório',
+    'Enviei sua carteirinha pra clínica',
+  ])('🔴 verbo de ENCAMINHAR também é falar com terceiro: "%s"', (texto) => {
+    // Pendência de revisor, fechada em 26/08: a guarda só conhecia falei|avisei|mandei|pedi
+    // e deixava passar justamente os verbos de DOCUMENTO. Era a frase exata do apontamento —
+    // a Xarlote dizendo que encaminhou o exame pra uma farmácia que não recebeu nada.
+    const r = verificarAnuncios(texto, ['forward_media_to_establishment'], []);
+    expect(r.blocked.map((b) => b.kind)).toContain('mensagem_a_terceiro');
+  });
+
+  it('mas "te enviei uma cópia" (ao próprio paciente) não é anúncio de terceiro', () => {
+    const r = verificarAnuncios('Criei o lembrete e te enviei uma cópia', ['forward_media_to_establishment'], []);
+    expect(r.blocked).toHaveLength(0);
+  });
+
+  it.each([
+    'Já dei um alô nas outras clínicas que estavam em silêncio 💙',
+    'Dei um toque no consultório',
+    'Cutuquei a clínica de novo',
+  ])('🔴 "dar um alô" também é falar com terceiro: "%s"', (texto) => {
+    // Caso Duda, 25/08: `nudge_consultation` com a consulta em `quoted` é INFORMATIVO —
+    // não manda nada. A tool voltou `success`, o modelo leu a observação como ação e
+    // escreveu esta frase sobre quatro consultórios que não recebiam mensagem desde o dia
+    // anterior. A paciente esperou 24h por um alô que nunca saiu.
+    const r = verificarAnuncios(texto, ['nudge_consultation'], []);
+    expect(r.blocked.map((b) => b.kind)).toContain('mensagem_a_terceiro');
+  });
+
+  it('mas a PROMESSA no futuro não é bloqueada aqui', () => {
+    // "vou dar um alô" é promessa, e quem cuida disso é o `detectContactClaim`, que
+    // distingue passado de futuro. Bloquear os dois no mesmo lugar duplicaria a rede.
+    const r = verificarAnuncios('Vou dar um alô nelas agora', ['nudge_consultation'], []);
+    expect(r.blocked).toHaveLength(0);
+  });
+
   it('conversa comum não vira alarme', () => {
     const r = verificarAnuncios('Oi! Como você tá se sentindo hoje? 💙', ['cancel_consultation'], []);
     expect(r.blocked).toHaveLength(0);

@@ -196,8 +196,14 @@ describe('blocoDeDocumentoParaModelo — o conteúdo do arquivo é DADO, não in
     const b = blocoDeDocumentoParaModelo({
       nomeArquivo: 'grande.pdf', texto: gigante, guardado: true, mime: 'application/pdf',
     });
-    expect(b).toContain('texto cortado aqui');
-    expect(b).toContain(String(MAX_CHARS_TEXTO_PDF));
+    // O aviso mudou de forma em 26/08: o corte deixou de ser por POSIÇÃO e passou a ser
+    // por VALOR CLÍNICO (ver `laudo-recorte.ts`). O que este teste garante continua o
+    // mesmo — o corte é ANUNCIADO, e o laudo não encolhe em silêncio.
+    expect(b).toContain('documento longo');
+    expect(b).toContain('ficou de fora');
+    // O tamanho REAL do arquivo — é o número que impede a Xarlote de tratar o pedaço
+    // como se fosse o laudo inteiro. (Antes se afirmava o limite; o total é mais honesto.)
+    expect(b).toContain(String(gigante.length));
   });
 
   it('sem texto: diz o motivo e PROÍBE deduzir conteúdo', () => {

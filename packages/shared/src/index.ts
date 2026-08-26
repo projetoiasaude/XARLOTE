@@ -27,3 +27,4 @@ export * from './latencia.js';
 export * from './outreach-hold.js';
 export * from './care-access.js';
 export * from './care-tools.js';
+export * from './laudo-recorte.js';

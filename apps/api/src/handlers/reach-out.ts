@@ -344,7 +344,14 @@ export async function handleNudgeConsultation(ctx: ReachCtx, args?: { message?: 
     const preco = (opts ?? [])[0]?.price_brl;
     if (ctx.observation) {
       ctx.observation.note = linhas.length
-        ? `Consulta ${alvo || ''} está AGUARDANDO A ESCOLHA do paciente.`
+        // ⚠️ ABRE DIZENDO QUE NADA SAIU (caso Duda, 25/08). Este ramo é INFORMATIVO: ele
+        // entrega os horários ao modelo e não manda mensagem nenhuma. Sem esta frase, o
+        // modelo leu a nota como confirmação de ação e escreveu à paciente "já dei um alô
+        // nas outras clínicas que estavam em silêncio" — quatro consultórios que não
+        // recebiam mensagem desde o dia anterior. O ramo de cooldown, logo abaixo, já
+        // avisava assim; este não avisava.
+        ? `NENHUMA mensagem foi enviada a consultório nenhum agora — este é um resumo do estado, não uma ação.`
+          + ` Consulta ${alvo || ''} está AGUARDANDO A ESCOLHA do paciente.`
           + ` Horários que a clínica ofereceu e que ainda valem: ${linhas.join(' | ')}.`
           + (preco ? ` Valor: R$${preco}.` : '')
           + ` ⚠️ LEIA a mensagem dele: se ele ESCOLHEU um horário ou disse que quer confirmar,`
