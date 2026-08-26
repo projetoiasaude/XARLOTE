@@ -18,14 +18,34 @@ import { redactPII } from './redact.js';
 // TYPES
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type AuditActorType =
-  | 'xarlote'
-  | 'agent_pharmacy'
-  | 'agent_clinic'
-  | 'system'
-  | 'admin'
-  | 'user'
-  | 'webhook';
+/**
+ * Quem agiu. Ortogonal a `user_id`, que é de quem é o dado.
+ *
+ * ⚠️ ESTA LISTA VIVE EM DOIS LUGARES: aqui e no CHECK de `audit_log.actor_type` (migration
+ * 0002, alterada na 0030). Divergir significa `writeAudit` aceitar em TypeScript um valor
+ * que o banco recusa — e, como `writeAudit` nunca lança, a auditoria sumiria em silêncio
+ * exatamente no evento que mais precisava de prova.
+ * `tests/audit-actor-type.test.ts` compara as duas e quebra quando desencontram.
+ */
+export const AUDIT_ACTOR_TYPES = [
+  'xarlote',
+  'agent_pharmacy',
+  'agent_clinic',
+  'system',
+  'admin',
+  'user',
+  'webhook',
+  /**
+   * Pessoa física que NÃO é o titular: o filho agindo no registro da mãe.
+   *
+   * Sem este valor, a ação de um cuidador seria gravada como `'user'` e ficaria
+   * indistinguível do próprio paciente no export que ele lê como "quem acessou meu
+   * prontuário". `actor_id` carrega o `users.id` de quem agiu.
+   */
+  'caregiver',
+] as const;
+
+export type AuditActorType = (typeof AUDIT_ACTOR_TYPES)[number];
 
 export type EventSeverity = 'debug' | 'info' | 'warn' | 'error' | 'critical';
 

@@ -67,6 +67,8 @@ export const TABELAS_COM_USER_ID = [
   'red_flag_pending',
   'reminders',
   'share_grants',
+  'care_links',
+  'care_invites',
   'symptoms_log',
   'system_logs',
   'treatments',
@@ -128,6 +130,16 @@ export const PLANO_LGPD: readonly TratamentoLgpd[] = [
   // ── Acesso: apaga PRIMEIRO, e é o mais urgente de tudo ──────────────────────
   // Sessão viva depois do apagamento = JWT válido lendo prontuário que não existe mais.
   { tabela: 'app_sessions', acao: 'apagar' },
+  // 🤝 CUIDADO DE TERCEIRO — vínculo órfão é acesso vivo a um prontuário.
+  //
+  // Em `care_links`, `user_id` é o SUJEITO (o titular de quem o dado é) — por isso a tabela
+  // entra aqui e o apagamento genérico por `user_id` já cobre "apagaram a pessoa cuidada".
+  // O outro lado — "apagaram o CUIDADOR" — não é alcançável por `user_id` e tem tratamento
+  // explícito em `executeForgetMe` (`caregiver_user_id`). As duas pontas importam: uma
+  // deixa acesso a quem não existe mais, a outra deixa um fantasma com acesso a quem ficou.
+  { tabela: 'care_links', acao: 'apagar' },
+  // Convite pendente é porta entreaberta: código ainda resgatável por quem o tiver em mãos.
+  { tabela: 'care_invites', acao: 'apagar' },
   { tabela: 'device_tokens', acao: 'apagar' },
   // Link de médico vivo depois do apagamento = terceiro abrindo o prontuário de alguém
   // que pediu pra desaparecer.
