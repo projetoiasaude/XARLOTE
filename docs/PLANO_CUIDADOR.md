@@ -1,6 +1,9 @@
 # Conta Cuidador — uma Xarlote que cuida de mais de uma pessoa
 
-> Desenho técnico. Escrito em 25/08/2026, a partir de uma varredura completa do código.
+> Desenho técnico. Escrito em 25/08/2026 a partir de uma varredura completa do código.
+> **Status em 26/08: F1 a F5 ENTREGUES. Migration 0030 APLICADA. `verify-care-link.ts` 38/38
+> verde contra o banco real.** Commits `8cb7533` · `3bc9980` · `abacf9a` · `0e4a419`.
+> O que mudou em relação ao desenho original está anotado em ✅/⚠️ nas seções abaixo.
 
 ## 1. O problema, em uma frase
 
@@ -189,13 +192,41 @@ reescrever nada.
 
 | Fase | Escopo | Fecha quando |
 |---|---|---|
-| **F1 — Fundação** | migration 0029, `care-access.ts` puro, `care-subject.ts`, plano LGPD, `actor_type='caregiver'` + teste que compara CHECK e união | testes verdes; nenhuma superfície mudou ainda |
-| **F2 — Conexão** | gerar/resgatar código, os dois tipos de vínculo, revogação, consentimento gravado | dois usuários reais se conectam e se desconectam em staging |
-| **F3 — A IA sabe** | bloco do prompt, `para_quem` nas tools, resolução de sujeito, correção da emergência | "cria um lembrete de losartana pra minha mãe" grava no registro DELA, e a resposta diz isso |
-| **F4 — App** | seletor no `Screen.tsx`, `?subject`, tela `cuidar` | trocar de pessoa troca a bolsa inteira |
-| **F5 — Transparência** | avisos ao sujeito, export, forget-me, painel de acessos | apagar conta não deixa vínculo órfão; o sujeito vê quem agiu por ele |
+| ✅ **F1 — Fundação** | migration 0029, `care-access.ts` puro, `care-subject.ts`, plano LGPD, `actor_type='caregiver'` + teste que compara CHECK e união | testes verdes; nenhuma superfície mudou ainda |
+| ✅ **F2 — Conexão** | gerar/resgatar código, os dois tipos de vínculo, revogação, consentimento gravado | dois usuários reais se conectam e se desconectam em staging |
+| ✅ **F3 — A IA sabe** | bloco do prompt, `para_quem` nas tools, resolução de sujeito, correção da emergência | "cria um lembrete de losartana pra minha mãe" grava no registro DELA, e a resposta diz isso |
+| ✅ **F4 — App** | seletor no `Screen.tsx`, `?subject`, tela `cuidar` | trocar de pessoa troca a bolsa inteira |
+| ✅ **F5 — Transparência** | avisos ao sujeito, export, forget-me, painel de acessos | apagar conta não deixa vínculo órfão; o sujeito vê quem agiu por ele |
 
-## 12. Verificação
+## 12. O que mudou durante a execução
+
+**`relation` inverteu de direção.** O desenho original guardava a relação do CUIDADOR
+("sou filho dela" → `'filho'`). Não fecha: `labelMatches` exige conter todos os tokens,
+`'filho'` não casa com "minha mãe", e a inversão é impossível sem saber o gênero do sujeito.
+Passou a guardar **quem o SUJEITO é** ("ela é minha mãe" → `'mae'`) — que é também a pergunta
+natural de fazer na tela.
+
+**Duas defesas a mais em `resolverSujeito`.** `resolveEntityRef` tem um resgate `only-one`:
+com UM candidato, devolve esse candidato mesmo sem casar o texto. Numa lista só das pessoas
+cuidadas, um cuidador com UMA pessoa veria qualquer alvo irreconhecível cair calado no
+prontuário dela. O ATOR entra na lista (nunca há alvo único) **e** `only-one` é recusado.
+
+**Um furo de LGPD antecipado da F5 pra F2.** `executeForgetMe` ANONIMIZA a linha de `users`
+e nunca a deleta, então o `on delete cascade` de `care_links` jamais dispara. Quem pedisse
+pra ser esquecido continuaria com acesso ATIVO ao prontuário de quem ficou.
+
+**A emergência revelou um defeito de anos.** Ao separar PASSADO de TERCEIRA PESSOA, um teste
+escrito pra provar que nada mudara falhou em três termos: `\b` do JavaScript só conhece
+`[A-Za-z0-9_]`, então `minha av[óo]\b` NUNCA casou com "minha avó". Três das 23 alternativas
+estavam mortas em produção. Trocado por `(?<!\p{L})…(?!\p{L})` com flag `u`.
+⚠️ Isso MUDOU comportamento: "minha avó com dor no peito" **sem vínculo** deixou de disparar
+a orientação determinística do SAMU.
+
+**O que NÃO foi feito, e por quê:** não há tela de "quem mexeu no meu registro" (o evento e o
+export existem, o painel não); `falar` segue sem ser concedido (decisão de produto); e a
+Conta Cuidador **nunca foi usada por gente de verdade** — só por usuários sintéticos.
+
+## 13. Verificação
 
 - Vitest sobre os módulos puros: vínculo revogado não autoriza; ausência de `para_quem` é
   sempre self; ambiguidade lança; código expirado/consumido/errado colapsa num só desfecho.
