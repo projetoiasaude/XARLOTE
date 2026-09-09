@@ -90,6 +90,22 @@ export function resolverAlvoDaTool(
     };
   }
 
+  // ⚠️ INCIDENTE GLAUBER (31/08/2026) — a ordem destas duas checagens importa.
+  //
+  // Antes, `vinculos.length === 0` recusava ANTES de `resolverSujeito` rodar. Só que
+  // `resolverSujeito` é justamente quem sabe dizer "esse nome é o do próprio ator" — ele
+  // já carrega `ator.nome` entre os candidatos. Resultado: numa conversa de quem não cuida
+  // de ninguém, um `para_quem` com o PRÓPRIO nome levava a *"você não cuida de ninguém
+  // chamado Glauber Andrade"* — dito ao Glauber, na conversa do Glauber. O
+  // `save_exam_result` do exame de oncologia dele falhou e ninguém tentou de novo.
+  //
+  // Resolver PRIMEIRO e recusar DEPOIS: quem pede pra si mesmo passa, tenha vínculo ou não.
+  // A causa raiz foi tratada em `ferramentasParaAtor` (sem vínculo o campo nem existe no
+  // schema); isto aqui é a segunda camada, pro dia em que o campo chegar por outro caminho.
+  const r = resolverSujeito(pedido, { userId: ator.userId, nome: ator.nome }, ator.vinculos);
+
+  if (r.kind === 'proprio') return { ok: true, subjectUserId: ator.userId, via: 'proprio' };
+
   if (ator.vinculos.length === 0) {
     return {
       ok: false,
@@ -98,10 +114,6 @@ export function resolverAlvoDaTool(
         + `Explique isso — NÃO registre nada no lugar.`,
     };
   }
-
-  const r = resolverSujeito(pedido, { userId: ator.userId, nome: ator.nome }, ator.vinculos);
-
-  if (r.kind === 'proprio') return { ok: true, subjectUserId: ator.userId, via: 'proprio' };
   if (r.kind === 'vinculo') {
     return { ok: true, subjectUserId: r.userId, via: 'vinculo', nome: r.link.subjectName, relation: r.link.relation };
   }

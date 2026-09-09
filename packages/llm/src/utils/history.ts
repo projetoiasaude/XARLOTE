@@ -32,7 +32,3 @@ export function messagesToHistory(messages: Message[]): ChatMessage[] {
     .filter((m) => m.content.length > 0);
 }
 
-export function trimHistory(history: ChatMessage[], maxTurns = 20): ChatMessage[] {
-  if (history.length <= maxTurns * 2) return history;
-  return history.slice(-maxTurns * 2);
-}

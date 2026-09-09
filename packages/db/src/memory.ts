@@ -23,6 +23,59 @@ export interface SaveMemoryCardInput {
   embedding?: number[] | null;
 }
 
+/** O que gravar quando um card novo casa semanticamente com um que já existe. */
+export interface PatchSupersede {
+  last_seen_at: string;
+  confidence: number;
+  text?: string;
+  embedding?: string;
+  tags?: string[];
+  source?: 'self_reported' | 'inferred';
+}
+
+/**
+ * ⚠️ SUPERSEDE — o card NOVO corrige o antigo (31/08/2026).
+ *
+ * Antes, o dedupe semântico atualizava só `last_seen_at` e `confidence` e devolvia
+ * `hit.text`: o TEXTO NOVO era descartado. A memória nunca se corrigia, só se
+ * reforçava. "agora prefiro cartão" casa ~0,87 com "prefere pagar no Pix" — e o
+ * resultado era o card ERRADO ganhando +0,05 de confiança e sobrevivendo.
+ *
+ * Enquanto existia decay, um card assim ao menos desbotava em 180 dias. Com a
+ * migration 0031 (preferência e episódio passam a valer para sempre) ele seria
+ * ETERNO e cada vez mais confiante — este conserto é PRÉ-REQUISITO daquela, não
+ * melhoria solta.
+ *
+ * Regra: o texto MAIS RECENTE vence. O enricher escreve o que a pessoa acabou de
+ * dizer, e num card de saúde estar desatualizado é pior do que estar menos
+ * detalhado. O `id` é preservado (não duplica no índice) e o embedding é regravado
+ * junto — sem isso o card seguiria sendo ENCONTRADO pela redação antiga enquanto
+ * MOSTRA a nova, que é a pior das combinações.
+ *
+ * Função pura de propósito: é a decisão inteira, e é a parte que erra em silêncio.
+ */
+export function patchDoSupersede(
+  hit: Pick<MemoryCardIndexed, 'text' | 'confidence'>,
+  input: Pick<SaveMemoryCardInput, 'text' | 'tags' | 'source' | 'embedding'>,
+  now: string,
+): PatchSupersede {
+  const patch: PatchSupersede = {
+    last_seen_at: now,
+    confidence: Math.min(1, (hit.confidence ?? 0.8) + 0.05),
+  };
+  // Texto igual = só reencontro do mesmo fato: refresca e não reescreve nada.
+  if (hit.text === input.text) return patch;
+
+  patch.text = input.text;
+  if (input.embedding?.length === 1536) patch.embedding = `[${input.embedding.join(',')}]`;
+  if (input.tags?.length) patch.tags = input.tags;
+  // `source` acompanha o texto: se agora foi a própria pessoa que disse, o card
+  // deixa de ser "inferido". O caminho inverso não vale — uma inferência não
+  // rebaixa algo que a pessoa afirmou.
+  if (input.source === 'self_reported') patch.source = 'self_reported';
+  return patch;
+}
+
 /**
  * Insere um card novo (ou faz refresh do `last_seen_at` se já existir um
  * card MUITO parecido — dedup textual simples por enquanto).
@@ -84,12 +137,9 @@ export async function saveMemoryCard(input: SaveMemoryCardInput): Promise<Memory
       });
       const hit = Array.isArray(similar) ? (similar[0] as MemoryCardIndexed | undefined) : undefined;
       if (hit?.id && hit.kind === input.kind) {
-        const newConf = Math.min(1, (hit.confidence ?? 0.8) + 0.05);
-        await db
-          .from('memory_cards_index')
-          .update({ last_seen_at: now, confidence: newConf })
-          .eq('id', hit.id);
-        return { ...card, id: hit.id, text: hit.text, confidence: newConf };
+        const patch = patchDoSupersede(hit, input, now);
+        await db.from('memory_cards_index').update(patch).eq('id', hit.id);
+        return { ...card, id: hit.id, text: input.text, confidence: patch.confidence };
       }
     } catch {
       // RPC pode não existir — segue pro insert normal
