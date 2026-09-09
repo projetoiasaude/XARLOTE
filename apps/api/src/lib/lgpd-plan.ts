@@ -75,6 +75,7 @@ export const TABELAS_COM_USER_ID = [
   'user_addresses',
   'user_allergies',
   'user_exam_results',
+  'lab_fetches',
   'user_health_conditions',
   'user_medications',
   'users',
@@ -114,6 +115,10 @@ export const PLANO_LGPD: readonly TratamentoLgpd[] = [
   { tabela: 'user_medications', acao: 'apagar' },
   { tabela: 'user_addresses', acao: 'apagar' },
   { tabela: 'user_exam_results', acao: 'apagar' },
+  // Registro de cada busca no portal do laboratório. Nunca contém credencial (a senha vive
+  // cifrada no job da fila pelos segundos que ele dura) — mas contém o nome do laboratório
+  // e o desfecho, que é dado de saúde por inferência. Apaga.
+  { tabela: 'lab_fetches', acao: 'apagar' },
   // Nome e CRM do médico DO PACIENTE são dado pessoal dele. Estava faltando.
   { tabela: 'prescribers', acao: 'apagar' },
 

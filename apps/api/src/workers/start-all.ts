@@ -35,6 +35,7 @@ import { startOrderFollowupWorker, stopOrderFollowupWorker } from './order-follo
 import { startOutboundWorkers } from '../queues/outbound.queue.js';
 import { startAppInboundWorker, stopAppInboundWorker } from './app-inbound.worker.js';
 import { startAccountForgetWorker, startDataExportWorker, stopLgpdWorkers } from './lgpd.worker.js';
+import { startLabFetchWorker, stopLabFetchWorker } from './lab-fetch.worker.js';
 import { onShutdown } from '../lifecycle.js';
 import { withCronLock } from '../middleware/cron-lock.js';
 
@@ -101,6 +102,8 @@ export function startAllWorkers(log: WorkerLogger): void {
   // num request — e, no caso do apagamento, com retry porque "quase apagado" não vale.
   startAccountForgetWorker();
   startDataExportWorker();
+  // Só escuta a fila com LAB_FETCH_ENABLED=true + LAB_VAULT_KEY (ver lib/lab-vault.ts).
+  void startLabFetchWorker();
 
   // ── Disposers específicos dos workers (na ordem de registro) ──
   onShutdown('cron intervals', () => {
@@ -111,6 +114,7 @@ export function startAllWorkers(log: WorkerLogger): void {
   });
   onShutdown('app-inbound worker', () => stopAppInboundWorker());
   onShutdown('lgpd workers', () => stopLgpdWorkers());
+  onShutdown('lab-fetch worker', () => stopLabFetchWorker());
   onShutdown('profile-enricher worker', () => enricherWorker.close());
 
   log.info(

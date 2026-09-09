@@ -1,10 +1,11 @@
 import type { FastifyInstance } from 'fastify';
 import { isPushConfigured } from '@iasaude/integrations';
 import { db } from '@iasaude/db';
-import { providerFor } from '@iasaude/whatsapp';
+import { providerFor, isSimulatorMode } from '@iasaude/whatsapp';
 import { SARA_INSTANCE, AGENT_INSTANCE } from '@iasaude/shared';
 import { getRedisClient } from '../queue-config.js';
 import { loadPrompts } from '../config/prompts.js';
+import { labFetchDisponivel, labFetchPronto } from '../lib/lab-vault.js';
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 
@@ -80,14 +81,27 @@ export async function healthRoute(app: FastifyInstance) {
   // Railway (railway.toml healthcheckPath=/health): só reinicia se o processo
   // morrer, não em blip transitório de dependência.
   app.get('/health', async (_req, reply) => {
+    // 🧪 Busca de exames no laboratório — DUAS verdades distintas, de propósito:
+    //   enabled = a config diz que existe (flag + chave);
+    //   ready   = um worker PROVOU há <2 min que abre um Chromium (chave viva no Redis).
+    // "enabled sem ready" é o estado que ninguém deve confundir com "funcionando": a tool
+    // NÃO é oferecida ao modelo nesse caso. Nunca derruba o liveness: falha → false.
+    const lab_fetch_enabled = labFetchDisponivel();
+    const lab_fetch_ready = lab_fetch_enabled
+      ? await withTimeout(labFetchPronto(getRedisClient()), 1500, 'lab-ready').catch(() => false)
+      : false;
     return reply.send({
       ok: true,
-      whatsapp_mode: process.env['WHATSAPP_MODE'] ?? 'live',
+      // O que o SISTEMA faz, não o que a env diz: em produção a env valia "uazapi" (rótulo
+      // antigo) enquanto as duas pernas eram zpro — e o /health repetia o rótulo.
+      whatsapp_mode: isSimulatorMode() ? 'simulator' : 'live',
       wa_provider_sara: providerFor(SARA_INSTANCE),
       wa_provider_agent: providerFor(AGENT_INSTANCE),
       // Push silenciosamente morto era INVISÍVEL (auditoria 05/08: isPushConfigured
       // existia e ninguém chamava) — agora o /health conta a verdade.
       push_configured: isPushConfigured(),
+      lab_fetch_enabled,
+      lab_fetch_ready,
       uptime_s: Math.round(process.uptime()),
       ts: new Date().toISOString(),
     });
