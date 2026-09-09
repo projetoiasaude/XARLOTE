@@ -117,10 +117,48 @@ export interface ChatOptions {
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 const DEFAULT_MODEL = 'openai/gpt-4.1-mini';
 
-// Modelos de fallback usados pelo OpenRouter quando o primário fica indisponível
-// (rate-limit upstream, provider down, etc). OpenRouter tenta na ordem.
-// Doc: https://openrouter.ai/docs/features/model-routing
-const FALLBACK_MODELS = ['openai/gpt-4.1-mini', 'openai/gpt-4o-mini'];
+/**
+ * Cadeia de FALLBACK do OpenRouter — o degrau abaixo não pode ser um abismo.
+ *
+ * Quando o primário fica indisponível (429 upstream, provider fora), o OpenRouter tenta
+ * os modelos de `models` na ordem. Doc: https://openrouter.ai/docs/features/model-routing
+ *
+ * ─── AUDITORIA 08/09/2026 ────────────────────────────────────────────────────────────
+ * A cadeia era `[gpt-4.1-mini, gpt-4o-mini]` para QUALQUER primário. No τ²-Bench Airline
+ * que o próprio OpenRouter rodou em 03/09 — agente multi-turno chamando ferramentas sob
+ * regras de política, que é literalmente o trabalho da Xarlote — o `gpt-4.1-mini` faz
+ * **44,0%** e o modelo de produção faz **75,2%**. No dia em que o primário caísse, a
+ * Xarlote continuaria respondendo **31 pontos pior**, e ninguém saberia: o fallback do
+ * OpenRouter é silencioso por construção. Degradar é aceitável; degradar pela metade em
+ * silêncio, num app de saúde, não é.
+ *
+ * Agora é uma ESCADA: o degrau seguinte é o modelo mais forte que já rodou em produção
+ * aqui, e o ÚLTIMO é de OUTRO fornecedor — senão uma queda da Z.ai inteira derrubaria a
+ * cadeia junto com o primário.
+ *
+ * ⚠️ MODALIDADE — a razão de existirem DUAS cadeias. GLM 5.2 e 5.3 são texto puro
+ * (`input_modalities: ['text']` no catálogo do OpenRouter). Num turno com foto (exame,
+ * receita, caixa de remédio), um fallback texto-only recebe a mensagem multimodal e, no
+ * melhor caso, erra; no pior, ignora a imagem e responde sobre nada. Foi imagem que sumiu
+ * em silêncio que produziu o incidente do exame da Ludmila em 04/09 — não vamos
+ * reintroduzir a mesma falha pela porta dos fundos. Todo modelo em `FALLBACK_VISAO`
+ * ACEITA imagem; todo modelo em `FALLBACK_TEXTO` só precisa ser bom de ferramenta.
+ */
+const FALLBACK_TEXTO = ['z-ai/glm-5.2', 'openai/gpt-4.1-mini'];
+const FALLBACK_VISAO = ['openai/gpt-4.1-mini', 'openai/gpt-4o-mini'];
+
+/** O turno carrega imagem? (content multimodal com `image_url`) */
+export function turnoTemImagem(messages: readonly ChatMessage[]): boolean {
+  return messages.some((m) => Array.isArray(m.content) && m.content.some((c) => c.type === 'image_url'));
+}
+
+/**
+ * A cadeia certa para este turno, sem o primário duplicado.
+ * PURA e exportada de propósito: é regra de segurança, e regra de segurança se testa.
+ */
+export function cadeiaDeFallback(modelName: string, temImagem: boolean): string[] {
+  return (temImagem ? FALLBACK_VISAO : FALLBACK_TEXTO).filter((m) => m !== modelName);
+}
 
 // Schema da resposta do OpenRouter (CLAUDE.md/F1.C6: validar resposta da LLM
 // com Zod). Lenient (.passthrough + campos opcionais) pra não rejeitar
@@ -145,6 +183,9 @@ const OpenRouterResponseSchema = z
         }),
       )
       .min(1),
+    // Qual modelo REALMENTE serviu. Num fallback o OpenRouter devolve outro nome aqui —
+    // é o único sinal de que o primário caiu (ver o `model` do ChatResponse abaixo).
+    model: z.string().nullish(),
     usage: z
       .object({
         prompt_tokens: z.number().nullish(),
@@ -222,10 +263,9 @@ async function callOpenRouter(
 ): Promise<ChatResponse> {
   const start = Date.now();
 
-  // Fallback chain: se o modelo primário ficar indisponível (429 upstream, etc),
-  // OpenRouter automaticamente tenta os modelos listados em `models` na ordem.
-  // Filtramos pra não duplicar o primário caso ele já seja um dos fallbacks.
-  const fallbacks = FALLBACK_MODELS.filter((m) => m !== modelName);
+  // Fallback chain, ciente de MODALIDADE (ver FALLBACK_TEXTO/FALLBACK_VISAO):
+  // turno com foto só cai em modelo que enxerga.
+  const fallbacks = cadeiaDeFallback(modelName, turnoTemImagem(messages));
 
   const body: Record<string, unknown> = {
     model: modelName,
@@ -282,6 +322,24 @@ async function callOpenRouter(
   const choice = data.choices[0];
   if (!choice) throw new Error('No choices in OpenRouter response');
 
+  /**
+   * 🔎 QUEM REALMENTE ATENDEU (auditoria 08/09/2026).
+   *
+   * `model` do ChatResponse devolvia `modelName` — o modelo PEDIDO. Então um fallback era
+   * invisível em toda a cadeia: o log dizia o primário, `messages.llm_model` gravava o
+   * primário, e o dashboard de custo calculava o preço do primário. A Xarlote podia estar
+   * rodando meio dia num modelo 31 pontos pior sem uma linha em lugar nenhum.
+   *
+   * Agora vale o que o provedor respondeu, e a divergência vai pro stdout em WARN — é o
+   * que a plataforma mostra (`writeLog` grava só no banco, e este arquivo não tem acesso a
+   * ele). O nome do modelo não é dado de paciente: pode ir a log em qualquer nível.
+   */
+  const servedModel = (data.model ?? '').trim() || modelName;
+  // O OpenRouter às vezes sufixa a variante (`:floor`, `:nitro`) — compara a raiz.
+  if (servedModel.split(':')[0] !== modelName.split(':')[0]) {
+    console.warn(`[llm] ⚠️ FALLBACK ATIVO: pedi "${modelName}" e quem respondeu foi "${servedModel}" — o primário está indisponível`);
+  }
+
   const validToolNames = (tools ?? []).map((t) => t.function.name);
   const rawToolCalls: RawToolCall[] = [];
   const toolCalls: ToolCall[] = (choice.message.tool_calls ?? []).map((tc, i) => {
@@ -314,7 +372,7 @@ async function callOpenRouter(
     tokensOut: data.usage?.completion_tokens ?? 0,
     cachedTokens: data.usage?.prompt_tokens_details?.cached_tokens ?? 0,
     latencyMs: Date.now() - start,
-    model: modelName,
+    model: servedModel,
   };
 }
 

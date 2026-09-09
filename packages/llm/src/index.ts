@@ -9,4 +9,4 @@ export * from './prompts/agent-pharmacy.system.js';
 export * from './prompts/agent-clinic.system.js';
 export * from './prompts/prescription-ocr.js';
 export * from './prompts/profile-enricher.system.js';
-export * from './utils/trim-history.js';
+export * from './utils/history.js';
