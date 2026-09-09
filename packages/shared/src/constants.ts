@@ -1,5 +1,25 @@
 export const LGPD_POLICY_VERSION = process.env['PRIVACY_POLICY_VERSION'] ?? '1.0';
-export const LGPD_POLICY_URL = process.env['PRIVACY_POLICY_URL'] ?? 'https://iadasaude.com/privacidade';
+/**
+ * ⚠️ AUDITORIA 08/09/2026 — o padrão antigo era `https://iadasaude.com/privacidade`, e em
+ * 08/09 esse domínio servia a política de privacidade de OUTRA empresa ("Radar Materno",
+ * portal sobre gravidez, com AdSense). 32 pacientes receberam esse link como base do
+ * consentimento LGPD; a Cleonice ficou travada no aceite em 06–07/09. A página nossa,
+ * com os dados da CRIATE, está em `xarlote.com.br/privacidade` desde 03/09.
+ *
+ * O padrão passa a ser a página certa, e o anomaly-detector PROVA a cada 10 min que a URL
+ * serve a nossa política (`politicaDePrivacidadeEhNossa`) — link de consentimento que
+ * aponta pra fora tem que acordar o fundador, não esperar um paciente reclamar.
+ */
+export const LGPD_POLICY_URL = process.env['PRIVACY_POLICY_URL'] ?? 'https://xarlote.com.br/privacidade';
+
+/** O que a NOSSA política tem e a de qualquer outro site não tem: o produto e o CNPJ. */
+export const PRIVACY_POLICY_SENTINELS = ['Xarlote', '54.236.008/0001-80'] as const;
+
+/** `true` quando o HTML é a política da Xarlote/CRIATE (todas as sentinelas presentes). */
+export function politicaDePrivacidadeEhNossa(html: string | null | undefined): boolean {
+  const h = html ?? '';
+  return PRIVACY_POLICY_SENTINELS.every((s) => h.includes(s));
+}
 
 export const ONBOARDING_CONSENT_MESSAGE = `Oi! Eu sou a *Xarlote*, sua assistente de saúde 💙
 
@@ -77,6 +97,12 @@ export const QUEUE_NAMES = {
   ACCOUNT_FORGET: 'account-forget',
   /** Exportação de dados (art. 18 II/V). Gera o JSON completo e avisa quando fica pronto. */
   DATA_EXPORT: 'data-export',
+  /**
+   * Buscar exames no portal do laboratório com o acesso que a pessoa mandou. Fila porque
+   * abre um Chromium (segundos) e porque o payload carrega credencial CIFRADA — o job é
+   * removido ao terminar, ganhe ou perca. Desenho: docs/PLANO_EXAMES_LAB.md.
+   */
+  LAB_FETCH: 'lab-fetch',
 } as const;
 
 export const SARA_INSTANCE = 'sara';

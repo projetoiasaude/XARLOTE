@@ -13,7 +13,7 @@
  *
  * Cada detecção dispara Telegram alert (com throttle). Roda a cada 10min.
  */
-import { avaliarLatencia, descreverLatencia } from '@iasaude/shared';
+import { avaliarLatencia, descreverLatencia, LGPD_POLICY_URL, politicaDePrivacidadeEhNossa } from '@iasaude/shared';
 import { db, writeLog, writeEvent } from '@iasaude/db';
 import { sendTelegramAlert } from '../handlers/telegram-alerter.js';
 import { sendFounderAlert, type FounderAlertOpts } from '../handlers/founder-alerter.js';
@@ -421,9 +421,53 @@ async function detectAbandonedOneShots(): Promise<void> {
   } catch {}
 }
 
+/**
+ * 🔗 O LINK DE CONSENTIMENTO APONTA PRA GENTE? (auditoria 08/09/2026)
+ *
+ * Todo paciente novo recebe `LGPD_POLICY_URL` e é convidado a "Aceitar" com base nela. Em
+ * 08/09 a URL padrão antiga (`iadasaude.com/privacidade`) servia a política de OUTRA
+ * empresa — e nada no sistema tinha como notar: o link é texto numa mensagem, não uma
+ * dependência que falha. 32 pacientes receberam o link errado ao longo de 3 meses.
+ *
+ * Esta sonda faz o que um paciente faria: abre a página. Se não responder 200 ou não
+ * carregar a NOSSA política (nome do produto + CNPJ da CRIATE), o fundador é acordado.
+ * Cooldown de 6h — a página não conserta sozinha, e o alerta não pode virar ruído.
+ */
+let lastPrivacyAlertMs = 0;
+const PRIVACY_ALERT_COOLDOWN_MS = 6 * 60 * 60_000;
+
+async function detectPrivacyPolicyDrift(): Promise<void> {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10_000);
+    let problema: string | null = null;
+    try {
+      const res = await fetch(LGPD_POLICY_URL, { signal: ctrl.signal, redirect: 'follow', headers: { 'User-Agent': 'Xarlote-Probe/1.0 (+https://xarlote.com.br)' } });
+      if (!res.ok) problema = `HTTP ${res.status}`;
+      else if (!politicaDePrivacidadeEhNossa(await res.text())) problema = 'a página não é a política da Xarlote/CRIATE';
+    } catch (err) {
+      problema = String(err).slice(0, 100);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!problema) return;
+    await writeLog('error', 'anomaly', `🔗 política de privacidade em ${LGPD_POLICY_URL} NÃO é a nossa: ${problema}`, { url: LGPD_POLICY_URL });
+    if (Date.now() - lastPrivacyAlertMs < PRIVACY_ALERT_COOLDOWN_MS) return;
+    lastPrivacyAlertMs = Date.now();
+    await alertFounder({
+      title: '🔗 Link da política de privacidade quebrado',
+      body: `A URL de consentimento LGPD (${LGPD_POLICY_URL}) não está servindo a política da Xarlote: ${problema}. Todo paciente novo recebe esse link — consentimento colhido assim não vale. Corrija a página ou a env PRIVACY_POLICY_URL.`,
+      severity: 'critical',
+      throttleKey: 'privacy_policy_drift',
+    });
+    await writeEvent({ eventName: 'anomaly.privacy_policy_drift', severity: 'critical', payload: { url: LGPD_POLICY_URL, problema } });
+  } catch {}
+}
+
 async function runOnce(): Promise<void> {
   try {
     await Promise.all([
+      detectPrivacyPolicyDrift(),
       detectUntreatedRedFlags(),
       detectToolFailureSpike(),
       detectUndeliveredCriticalReminders(),

@@ -50,12 +50,21 @@ export function middleware(req: NextRequest) {
 
 export const config = {
   // Tudo, EXCETO: /app (cliente público), /s/ (link do médico), /login, /api
-  // (rotas Next), assets do Next, manifest e arquivos estáticos comuns.
+  // (rotas Next), /privacidade e /suporte (páginas legais), assets do Next,
+  // manifest e arquivos estáticos comuns.
   //
   // `s/` leva a barra de propósito: `s` sozinho no lookahead casaria por PREFIXO e
   // abriria também `/saude`, `/sessoes`, `/simulator` — o gate do dashboard cairia em
   // silêncio nessas telas. Com a barra, só `/s/<token>` escapa.
+  //
+  // `privacidade` e `suporte` são HTML estático em `public/`, servido em URL limpa por
+  // um rewrite do next.config. Precisam ser públicos por obrigação externa: a Apple abre
+  // as duas na revisão da App Store, e o art. 41 da LGPD exige um canal do Encarregado
+  // acessível a qualquer titular — nenhum dos dois tem, nem pode ter, conta no dashboard.
+  // Vão sem barra porque são segmentos inteiros e nenhuma outra rota começa por eles.
+  // ⚠️ O middleware roda ANTES do rewrite: o caminho aqui é `/privacidade`, não
+  // `/privacidade.html` — pôr só `html` na lista de extensões não resolveria.
   matcher: [
-    '/((?!app|s/|login|api|_next/static|_next/image|favicon.ico|manifest.webmanifest|icon|.*\\.(?:png|jpg|jpeg|gif|svg|ico|webp|mp4|webmanifest|txt)).*)',
+    '/((?!app|s/|login|api|privacidade|suporte|_next/static|_next/image|favicon.ico|manifest.webmanifest|icon|.*\\.(?:png|jpg|jpeg|gif|svg|ico|webp|mp4|webmanifest|txt|html)).*)',
   ],
 };
