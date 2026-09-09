@@ -76,8 +76,38 @@ const ANUNCIOS: Record<ClaimKind, RegExp> = {
   // Duas formas: verbo + estabelecimento, ou verbo + documento (encaminhar documento já é,
   // por definição, uma ação sobre terceiro).
   mensagem_a_terceiro: /\bja\s+(?:falei|avisei|mandei|pedi|encaminhei|repassei|enviei)\b|\b(?:falei|avisei|mandei|encaminhei|repassei|enviei)\b[^.!?]{0,45}\b(?:farmacia|clinica|consultorio|eles|secretaria|drogaria)\b|\b(?:encaminhei|repassei|enviei)\b[^.!?]{0,35}\b(?:exame|receita|pedido|carteirinha|documento|foto|laudo|guia)\b|\bentrei\s+em\s+contato\b|\b(?:dei|mandei)\s+(?:um\s+)?(?:alo|al[ôo]|toque)\b|\b(?:cutuquei|insisti|reforcei|refor[çc]ei)\b/,
-  registro_salvo: /\b(?:guardei|salvei|registrei|anotei)\b[^.!?]{0,30}\b(?:exame|receita|perfil|historico|prontuario)\b/,
+  // ⚠️ AMPLIADO em 08/09/2026 (caso Ludmila/Hiago, 04/09): "Já guardei tudo aqui no perfil"
+  // — sem NENHUMA ferramenta no turno — passava, porque só a forma verbo+objeto era
+  // conhecida. Entram: verbo + "tudo"; objeto + particípio ("exame guardado"); e o estado
+  // ("já está salvo", "ficou registrado"). "Anotado, Glauber ✅" sozinho NÃO entra: é a
+  // fórmula de confirmação de dose, coberta pelo backstop determinístico de adesão.
+  registro_salvo: /\b(?:guardei|salvei|registrei|anotei)\b[^.!?]{0,30}\b(?:exame|resultado|laudo|receita|perfil|historico|prontuario|tudo)\b|\b(?:exame|resultado|laudo|receita)\b[^.!?]{0,30}\b(?:guardad[oa]|salv[oa]|registrad[oa]|anotad[oa])\b|\b(?:ja\s+)?(?:esta|estao|ta|tao|ficou|ficaram|foi|foram)\s+(?:tudo\s+)?(?:guardad[oa]s?|salv[oa]s?|registrad[oa]s?)\b/,
 };
+
+/**
+ * Famílias cujo anúncio no passado, SEM ferramenta no turno, não pode sair como "suspeita
+ * só pra auditoria" quando o turno gira em torno de um ARQUIVO do paciente. "Já guardei
+ * tudo" sobre o exame que acabou de chegar não é referência ao passado — é o fato que o
+ * paciente vai levar pra casa. O call-site dá ao modelo UMA rodada pra se corrigir (chamar
+ * a ferramenta ou reescrever) e, se ele insistir, derruba a oração (`semAnuncios`).
+ */
+export const FAMILIAS_COM_PROVA_NO_TURNO: readonly ClaimKind[] = ['registro_salvo'];
+
+/**
+ * Devolve o texto SEM as orações que anunciam qualquer das famílias em `kinds`.
+ * Orações negadas ("não consegui guardar") ficam — elas são a verdade.
+ */
+export function semAnuncios(texto: string, kinds: readonly ClaimKind[]): { texto: string; removidas: string[] } {
+  const removidas: string[] = [];
+  const mantidas: string[] = [];
+  for (const frase of oracoes(texto ?? '')) {
+    const f = foldPt(frase);
+    const anuncia = !NEGADO.test(f) && kinds.some((k) => ANUNCIOS[k].test(f));
+    if (anuncia) removidas.push(frase);
+    else mantidas.push(frase);
+  }
+  return { texto: mantidas.join(' ').replace(/\s{2,}/g, ' ').trim(), removidas };
+}
 
 /** Nega o anúncio na MESMA oração: "não consegui cancelar" não é anúncio de cancelamento. */
 const NEGADO = /\bnao\b[^.!?]{0,30}$|^[^.!?]{0,30}\bnao\b/;

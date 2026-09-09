@@ -105,3 +105,25 @@ export async function signedUrlForStoredMedia(
     return null;
   }
 }
+
+/**
+ * Os BYTES de uma mídia já hospedada — pra devolver ao modelo a foto de há pouco quando a
+ * pergunta do paciente é sobre ela (ver foto-recente.ts). Teto de tamanho: uma foto de
+ * WhatsApp tem ~100–300 KB; acima de `maxBytes` não é o caso de uso e não vai pro prompt.
+ * Null em qualquer falha — quem chama segue sem a foto, nunca com um buffer suspeito.
+ */
+export async function downloadStoredMedia(storagePath: string, maxBytes = 6 * 1024 * 1024): Promise<Buffer | null> {
+  try {
+    const { data, error } = await db.storage.from(BUCKET).download(storagePath);
+    if (error || !data) {
+      await writeLog('warn', 'media', `download da mídia hospedada falhou: ${error?.message ?? 'sem corpo'}`);
+      return null;
+    }
+    const buf = Buffer.from(await data.arrayBuffer());
+    if (!buf.length || buf.length > maxBytes) return null;
+    return buf;
+  } catch (err) {
+    await writeLog('warn', 'media', `download da mídia hospedada (exceção): ${String(err).slice(0, 160)}`);
+    return null;
+  }
+}

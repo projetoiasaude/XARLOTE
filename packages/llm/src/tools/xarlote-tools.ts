@@ -21,8 +21,32 @@ export const xarloteTools: ToolDefinition[] = [
           },
           payload: {
             type: 'object',
-            description: 'Dados do fato (nome, dosagem, endereço, etc.)',
-            properties: {},
+            /**
+             * ⚠️ ESTE CAMPO JÁ CUSTOU DOIS INCIDENTES (09/09/2026).
+             *
+             * Ele era `{type:'object', description:'Dados do fato (nome, dosagem, endereço,
+             * etc.)', properties:{}}`. Um objeto que declara `properties: {}` está dizendo ao
+             * modelo, em JSON Schema, que **não tem campo nenhum** — e o modelo obedece: manda
+             * `{}`. Foi o que aconteceu com o Rodrigo (24/08), que respondeu o próprio nome e
+             * gerou quatro `save_user_profile_fact {category:'identity', payload:{}}` seguidos,
+             * nada salvo, turno sem texto, e "Prontinho, já cuidei disso aqui!" saindo como o
+             * ÁUDIO de boas-vindas dele. E de novo em 09/09, no teste da pergunta de alergia:
+             * "tenho alergia a dipirona" virou `payload:{}` em 2 de 3 rodadas.
+             *
+             * A descrição agora traz a FORMA EXATA por categoria. `properties` sai (o payload é
+             * livre por construção — muda de forma conforme a categoria) e `additionalProperties`
+             * declara isso explicitamente, em vez de declarar o oposto por acidente.
+             */
+            additionalProperties: true,
+            description:
+              'Os dados do fato, na forma da categoria escolhida. NUNCA mande vazio: sem conteúdo aqui nada é gravado e a ferramenta recusa. '
+              + 'condition → {"name":"hipertensão"} · '
+              + 'allergy → {"substance":"dipirona"} · '
+              + 'medication → {"medication_name":"Losartana","dosage":"50mg"} · '
+              + 'identity → {"preferred_name":"Rodrigo"} · '
+              + 'address → {"label":"casa","street":"...","city":"..."} · '
+              + 'preference/other → o par que você quer guardar, ex. {"health_plan":"Unimed"}. '
+              + 'Se o paciente disse que NÃO tem (sem alergia, sem remédio), não chame a ferramenta: não há fato a guardar.',
           },
           confidence: {
             type: 'number',
@@ -67,7 +91,7 @@ export const xarloteTools: ToolDefinition[] = [
     function: {
       name: 'save_exam_result',
       description:
-        'Guarda no perfil do paciente um resultado de EXAME/LAUDO que ele compartilhou por foto (hemograma, raio-x, ultrassom, teste de covid, etc.). SÓ chame DEPOIS de o paciente CONFIRMAR que quer guardar. Você já viu a imagem pelo seu canal multimodal — preencha com o que LEU, sem interpretar clinicamente (não diga se está normal/alterado). NÃO use pra receita (use parse_prescription_image) nem pra foto comum.',
+        'Guarda no perfil do paciente um resultado de EXAME/LAUDO que ele compartilhou por foto ou PDF (hemograma, raio-x, ultrassom, doppler, teste de covid, etc.). SÓ chame DEPOIS de o paciente CONFIRMAR que quer guardar — e NUNCA diga que guardou sem esta ferramenta ter voltado ok:true neste turno. Preencha com o que está ESCRITO no exame (valores, referências, conclusão do laudo); a sua interpretação fica na conversa. NÃO use pra receita (use parse_prescription_image) nem pra foto comum.',
       parameters: {
         type: 'object',
         properties: {
@@ -81,10 +105,7 @@ export const xarloteTools: ToolDefinition[] = [
             description: 'Tipo do exame: "sangue", "urina", "imagem" (raio-x/ultrassom/tomografia), "cardiologico" (ecg/ecocardio), "covid", "outro".',
           },
           title: { type: 'string', description: 'Nome do exame como aparece no laudo. Ex: "Hemograma completo", "Raio-X de tórax".' },
-          summary: {
-            type: 'string',
-            description: 'Resumo curto e NEUTRO do que está no laudo, sem interpretar (ex: "Hemograma com hemoglobina 13,5; leucócitos 7.200"). NUNCA escreva se está normal ou alterado.',
-          },
+          summary: { type: 'string', description: 'Resumo curto e NEUTRO do que está ESCRITO no laudo — valores e a conclusão do próprio documento (ex: "Hemograma com hemoglobina 13,5; leucócitos 7.200"). É o REGISTRO; a sua interpretação e opinião vão na conversa, não aqui.' },
           findings: {
             type: 'array',
             description: 'Marcadores/valores legíveis no exame. Liste o que conseguir ler.',
@@ -328,7 +349,7 @@ export const xarloteTools: ToolDefinition[] = [
           body: {
             type: 'string',
             description:
-              'A mensagem que a Xarlote vai enviar quando o lembrete disparar, no tom dela (ex: "Oi Pedro! Hora da Losartana 💊 Já tomou?"). ⏰ O body é lido NO MOMENTO DO DISPARO, não agora: escreva da perspectiva desse momento futuro. Se o evento acontece no dia do disparo, é "hoje" — NUNCA copie o "amanhã" da fala do usuário (ex.: pediu "me lembra da quimio amanhã às 7h" → body "Hoje é dia da quimioterapia, 7h!" — o lembrete toca no próprio dia).',
+              'A mensagem que a Xarlote vai enviar quando o lembrete disparar, no tom dela (ex: "Oi Pedro! Hora da Losartana 💊 Já tomou?"). ⏰ O body é lido NO MOMENTO DO DISPARO, não agora: escreva da perspectiva desse momento futuro. Se o evento acontece no dia do disparo, é "hoje" — NUNCA copie o "amanhã" da fala do usuário (ex.: pediu "me lembra da quimio amanhã às 7h" → body "Hoje é dia da quimioterapia, 7h!" — o lembrete toca no próprio dia). 🚫 O body é TEXTO FINAL: nunca escreva placeholder ("faltam X dias", "{nome}", "[remédio]") — ninguém preenche, e a frase inteira é removida. Se quiser falar de duração, use duration_days/COUNT e deixe o texto sem contagem ("é até acabar a caixa").',
           },
           event_at: {
             type: 'string',
@@ -339,10 +360,15 @@ export const xarloteTools: ToolDefinition[] = [
             type: 'string',
             description: 'Lembrete ÚNICO: ISO datetime com offset de Brasília -03:00 (copie a hora local, sem converter). Ex: "2026-07-04T15:00:00-03:00".',
           },
+          dia_do_mes: {
+            type: 'integer',
+            description:
+              '⚠️ USE SEMPRE que a pessoa disser só o DIA, sem o mês ("dia 2", "no dia 15", "todo dia 10"). Passe apenas o número (2, 15, 10) e mande a HORA no scheduled_at — o SERVIDOR calcula a data da próxima ocorrência desse dia. NÃO calcule o mês nem o ano você mesmo: em 31/08, "dia 2" é 02/09, e errar isso já atrasou o resultado de exame de um paciente em um mês.',
+          },
           rrule: {
             type: 'string',
             description:
-              'Lembrete RECORRENTE: RRULE com BYHOUR/BYMINUTE em HORÁRIO DE BRASÍLIA (não converta pra UTC). Ex: "FREQ=DAILY;BYHOUR=8;BYMINUTE=0" ou "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=7;BYMINUTE=30"',
+              'Lembrete RECORRENTE: RRULE com BYHOUR/BYMINUTE em HORÁRIO DE BRASÍLIA (não converta pra UTC). Ex: "FREQ=DAILY;BYHOUR=8;BYMINUTE=0" ou "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=7;BYMINUTE=30". Vários horários no mesmo dia: "BYHOUR=8,20". Tratamento com FIM (antibiótico de 7 dias, corticoide de 5, "até acabar a caixa de 10"): acrescente ";COUNT=N" (N doses) ou passe duration_days — o servidor encerra a série sozinho e te confirma o último dia.',
           },
           depends_on_title: {
             type: 'string',
@@ -412,7 +438,7 @@ export const xarloteTools: ToolDefinition[] = [
           condition: { type: 'string', description: 'Condição que o tratamento trata (ex: "hipertensão")' },
           daily_consumption: { type: 'number', description: 'Comprimidos por dia (ex: 1, 0.5)' },
           reminder_time: { type: 'string', description: 'Horário do lembrete diário em HH:MM 24h (ex: "08:00"). Pergunte ao paciente.' },
-          duration_days: { type: 'integer', description: 'Duração esperada em dias. Omita pra tratamentos indefinidos.' },
+          duration_days: { type: 'integer', description: 'Duração em dias, INCLUINDO o dia do primeiro disparo ("por 10 dias" = 10). O servidor encerra o lembrete depois disso e te diz o último dia. Use SEMPRE em antibiótico, corticoide, colírio pós-cirúrgico e qualquer tratamento com prazo. Omita só pra uso contínuo (pressão, tireoide, antidepressivo).' },
         },
         required: ['order_id', 'treatment_name', 'daily_consumption', 'reminder_time'],
       },
@@ -422,7 +448,7 @@ export const xarloteTools: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'log_medication_taken',
-      description: 'Registra que o paciente tomou (ou pulou) uma dose. Use quando o paciente responder a um lembrete confirmando ("tomei", "ok", "👍") ou negando ("esqueci", "pulei").',
+      description: 'Registra que o paciente tomou (ou pulou) uma dose. Use quando o paciente responder a um lembrete confirmando ("tomei", "ok", "👍") ou negando ("esqueci", "pulei"). ⚠️ UMA confirmação = UMA dose: "tomei" confirma o lembrete que ACABOU de tocar, e só ele — nunca a dose de outro horário (a do jantar às 7h da manhã) nem "todas as pendentes". Se ele mandar "tomei" duas vezes, é a mesma dose: não registre de novo. O servidor recusa atribuições fora de hora e ignora duplicatas; leia o resultado.',
       parameters: {
         type: 'object',
         properties: {
@@ -670,4 +696,63 @@ export const xarloteTools: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'fetch_lab_results',
+      description:
+        'Entra no site do LABORATÓRIO com o login e a senha que a pessoa mandou (normalmente na foto do protocolo do exame), baixa os PDFs dos resultados e guarda no prontuário dela. '
+        + '⚠️ SÓ chame DEPOIS que a pessoa autorizou EXPLICITAMENTE, na mensagem dela, NESTE turno (ex.: "sim", "pode", "autorizo"). Antes disso, PERGUNTE: '
+        + '"Quer que eu entre no site do [laboratório] com esse acesso e busque seus resultados? Uso o login uma vez e não guardo a senha. Responde sim pra autorizar." '
+        + 'Se ela não autorizou, NÃO chame — o servidor recusa e você terá anunciado algo que não aconteceu. A busca é assíncrona: diga que está entrando e que avisa quando terminar. Nunca prometa que vai dar certo.',
+      parameters: {
+        type: 'object',
+        properties: {
+          laboratorio: { type: 'string', description: 'Nome do laboratório como está impresso no protocolo.' },
+          portal_url: { type: 'string', description: 'URL do site de resultados, se estiver impressa no protocolo. Omita se não estiver — NÃO invente.' },
+          login: { type: 'string', description: 'Usuário/login/protocolo de acesso, exatamente como impresso.' },
+          senha: { type: 'string', description: 'Senha, exatamente como impressa.' },
+          protocolo: { type: 'string', description: 'Número de protocolo/atendimento, se for um campo separado do login.' },
+        },
+        required: ['laboratorio', 'login', 'senha'],
+      },
+    },
+  },
 ];
+
+/**
+ * ⚠️ INCIDENTE GLAUBER (31/08/2026) — por que `para_quem` não pode existir pra todo mundo.
+ *
+ * Glauber mandou os dados de acesso aos resultados dele no Instituto Goiano de Oncologia.
+ * A Xarlote chamou `save_exam_result` com `para_quem: "Glauber Andrade"` — na conversa DO
+ * PRÓPRIO Glauber — e o guard do cuidador recusou: *"você não cuida de ninguém chamado
+ * Glauber Andrade"*. O exame de um paciente oncológico não foi salvo, e ninguém tentou de novo.
+ *
+ * O modelo não errou por burrice. Ele errou porque a gente pediu:
+ *   • o SCHEMA expunha `para_quem` em 8 ferramentas, pra 100% dos usuários, sempre;
+ *   • a descrição do campo mandava consultar a seção "QUEM VOCÊ CUIDA" do prompt;
+ *   • essa seção só existe pra quem TEM vínculo — `careSection` é '' pros outros.
+ * Ou seja: um campo opcional chamado "para quem?", sem nenhuma instrução, numa conversa em
+ * que a resposta óbvia é o nome do usuário. Preencher foi a leitura razoável.
+ *
+ * Hoje isso valia pros 32 usuários — não existe um único vínculo de cuidador no banco.
+ *
+ * A correção verdadeira é não oferecer a pergunta a quem não pode respondê-la: sem vínculo,
+ * o campo não existe no schema, e o modelo não tem como preenchê-lo. `resolverAlvoDaTool`
+ * ganhou o reconhecimento do próprio nome no mesmo commit — mas como DEFESA EM PROFUNDIDADE,
+ * não como o conserto: a superfície some primeiro.
+ */
+export function ferramentasParaAtor(opts: { temVinculos: boolean }): ToolDefinition[] {
+  if (opts.temVinculos) return xarloteTools;
+  return xarloteTools.map((t) => {
+    const params = t.function.parameters as { properties?: Record<string, unknown> };
+    if (!params?.properties || !('para_quem' in params.properties)) return t;
+    // Cópia rasa em cada nível que muda — o array exportado é compartilhado entre turnos
+    // e mutá-lo vazaria a remoção pra quem TEM vínculo.
+    const { para_quem: _removido, ...resto } = params.properties;
+    return {
+      ...t,
+      function: { ...t.function, parameters: { ...params, properties: resto } },
+    };
+  });
+}

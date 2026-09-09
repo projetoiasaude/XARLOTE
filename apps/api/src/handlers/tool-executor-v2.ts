@@ -16,7 +16,7 @@
  *   - Side-effects em transação quando possível
  */
 import { db, writeAudit, writeLog, writeEvent } from '@iasaude/db';
-import { nextOccurrence, isOfferStillValid, pickFutureBrDateTimes, sameSlot, isAmbiguousNegation, gravarEscolhaDoPaciente } from '@iasaude/shared';
+import { nextOccurrence, isOfferStillValid, pickFutureBrDateTimes, sameSlot, isAmbiguousNegation, gravarEscolhaDoPaciente, decidirRegistroDeDose, JANELA_DUPLICATA_MS, type LembreteParaDose } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { discoverClinics } from './clinic-discovery.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
@@ -34,6 +34,10 @@ export interface BaseToolCtx {
   conversationId: string;
   phoneE164: string;
   traceId: string;
+  /** O que o paciente disse neste turno (ver ToolContext.textoDoPaciente). */
+  textoDoPaciente?: string | null;
+  /** Nota pro modelo (ver ToolContext.observation). */
+  observation?: { note: string | null };
 }
 
 export interface StartTreatmentArgs {
@@ -279,6 +283,35 @@ export async function handleStartTreatmentFromOrder(args: StartTreatmentArgs, ct
 
 export async function handleLogMedicationTaken(args: LogMedicationTakenArgs, ctx: BaseToolCtx): Promise<void> {
   const likeSafe = (s: string) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+  const confirmName = args.medication_name?.trim() ?? '';
+
+  // 🛡️ A DOSE CONFIRMA O LEMBRETE QUE TOCOU (auditoria 08/09/2026 — caso Glauber 07:40).
+  // Decisão PURA em `decidirRegistroDeDose` (packages/shared/adherence-guard.ts): resposta
+  // nua ("tomei") só confirma o que disparou há pouco; nome dito pelo paciente vence; e a
+  // mesma dose não entra duas vezes. Roda ANTES de qualquer escrita — inclusive do
+  // `last_confirmed_at`, que abaixo suprimiria o backup condicional do lembrete errado.
+  const { data: lembretesRaw } = await db.from('reminders')
+    .select('id, title, type, last_run_at, next_run_at, last_confirmed_at, medication_id')
+    .eq('user_id', ctx.userId)
+    .in('status', ['pending', 'sent'])
+    .order('last_run_at', { ascending: false, nullsFirst: false })
+    .limit(40);
+  const lembretes = (lembretesRaw ?? []) as LembreteParaDose[];
+  const decisaoPrevia = decidirRegistroDeDose({
+    nomeInformado: confirmName,
+    status: args.status,
+    textoDoPaciente: ctx.textoDoPaciente,
+    lembretes,
+    registroRecente: null, // a duplicata é checada abaixo, depois de resolver o remédio
+  });
+  if (decisaoPrevia.acao === 'recusar') {
+    await writeLog('warn', 'tool', `log_medication_taken RECUSADO — confirmação nua atribuída a lembrete que não tocou ("${confirmName}")`, {
+      traceId: ctx.traceId, userId: ctx.userId,
+    });
+    throw new ToolFailure(decisaoPrevia.motivo);
+  }
+  const lembreteAlvo = decisaoPrevia.acao === 'registrar' ? decisaoPrevia.lembrete : null;
+  const ocorrenciaIso = decisaoPrevia.acao === 'registrar' ? decisaoPrevia.ocorrenciaIso : null;
 
   // CONFIRMAÇÃO DE LEMBRETE (0020 — backup condicional): carimba last_confirmed_at no
   // lembrete cujo TÍTULO bate com o nome confirmado. Cobre medicamento E hábito (creatina,
@@ -289,7 +322,6 @@ export async function handleLogMedicationTaken(args: LogMedicationTakenArgs, ctx
   //     suprimia o backup errado = lembrete de remédio silenciado (review 08/07).
   //   • Guarda de nome vazio/curto: sem ela, likeSafe('') virava '%%' e carimbava TODOS os
   //     lembretes do usuário (blast — suprimia todos os backups dele).
-  const confirmName = args.medication_name?.trim() ?? '';
   if (args.status === 'taken' && confirmName.length >= 2) {
     await db.from('reminders')
       .update({ last_confirmed_at: new Date().toISOString() })
@@ -354,13 +386,38 @@ export async function handleLogMedicationTaken(args: LogMedicationTakenArgs, ctx
     med = created;
   }
 
+  // 🔁 A MESMA DOSE NÃO ENTRA DUAS VEZES: "Tomei" repetido 19 s depois virava dois registros.
+  const { data: ultimoLog } = await db.from('medication_log')
+    .select('status, created_at')
+    .eq('medication_id', med.id)
+    .gte('created_at', new Date(Date.now() - JANELA_DUPLICATA_MS).toISOString())
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const decisao = decidirRegistroDeDose({
+    nomeInformado: confirmName,
+    status: args.status,
+    textoDoPaciente: ctx.textoDoPaciente,
+    lembretes,
+    registroRecente: (ultimoLog as { status: string; created_at: string } | null) ?? null,
+  });
+  if (decisao.acao === 'ja_registrado') {
+    await writeLog('info', 'tool', `log_medication_taken: dose de "${confirmName}" já registrada há <${Math.round(JANELA_DUPLICATA_MS / 60_000)}min — não duplicada`, { traceId: ctx.traceId, userId: ctx.userId });
+    if (ctx.observation) ctx.observation.note = decisao.nota;
+    return;
+  }
+
   const { error: logErr } = await db.from('medication_log').insert({
     user_id: ctx.userId,
     medication_id: med.id,
     treatment_id: med.treatment_id,
+    // O lembrete e a OCORRÊNCIA que esta dose confirma — antes era sempre "agora", e a adesão
+    // do app não conseguia dizer de qual disparo era cada "tomei".
+    reminder_id: lembreteAlvo?.id ?? null,
     status: args.status,
-    scheduled_at: new Date().toISOString(),
+    scheduled_at: ocorrenciaIso ?? new Date().toISOString(),
     responded_at: new Date().toISOString(),
+    response_text: (ctx.textoDoPaciente ?? '').trim().slice(0, 200) || null,
     notes: args.notes,
   });
   if (logErr) {

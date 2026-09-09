@@ -15,7 +15,7 @@
  */
 import { db, writeEvent, writeLog, listDeviceTokens, deleteDeviceTokens } from '@iasaude/db';
 import { isSimulatorMode, providerFor } from '@iasaude/whatsapp';
-import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBody, isWabaWindowOpen, avaliarFadiga, perguntaDeContinuidade } from '@iasaude/shared';
+import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBody, isWabaWindowOpen, avaliarFadiga, perguntaDeContinuidade, sanitizarCorpoDeLembrete } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
@@ -246,7 +246,13 @@ export async function dispatchReminders(): Promise<void> {
     // Recorrência calculada no FUSO DO USUÁRIO (default Brasília) — "8h30" tem
     // que ser 8h30 onde a pessoa mora, não onde o servidor roda.
     const userTz = (user as { timezone?: string | null }).timezone || undefined;
-    const next = reminder.rrule ? nextOccurrence(reminder.rrule, now, userTz) : null;
+    // ⏳ A série pode ter FIM (UNTIL/COUNT — honrados desde 08/09/2026). `null` depois do
+    // último disparo = acabou: o claim abaixo marca `sent`, e o lembrete para de existir
+    // exatamente quando o tratamento acaba. COUNT precisa de âncora: o início da série é a
+    // criação do lembrete (o 1º disparo é a 1ª ocorrência depois dela).
+    const next = reminder.rrule
+      ? nextOccurrence(reminder.rrule, now, userTz, { anchor: new Date(reminder.created_at) })
+      : null;
     const claim = next
       ? { next_run_at: next.toISOString(), last_run_at: now.toISOString() }
       : { status: 'sent', last_run_at: now.toISOString() };
@@ -424,6 +430,13 @@ export async function dispatchReminders(): Promise<void> {
     // caso da água afogando o anti-hipertensivo.
     const criticality = reminderCriticality(reminder.title, reminder.type);
     const isCritical = criticality === 'clinical';
+    // 🔕 REFORÇO BLOQUEADO NÃO É "REMÉDIO NÃO ENTREGUE" (auditoria 08/09/2026, noites de
+    // 04 e 05/09): o primário da Venlafaxina saiu (texto ou template), os reforços de
+    // 30 em 30 min bateram na janela fechada, e o fundador foi acordado com "1 lembrete
+    // CRÍTICO não chegou — paciente sem lembrete de medicação". Falso: o paciente tinha o
+    // lembrete na tela. O reforço só existe porque o primário JÁ tocou; se o primário
+    // falhar, é o evento DELE que alerta. Um backup nunca é crítico pro alerta.
+    const alertaCritico = isCritical && !isConditionalBackup;
     // O cap segue isento pra TODO `medication`/`appointment`: suplemento que o paciente pediu
     // não deve ser cortado por flood. O que muda é só quem ganha o template e quem alerta.
     const capExempt = isCriticalReminderType(reminder.type);
@@ -491,7 +504,13 @@ export async function dispatchReminders(): Promise<void> {
     const name = user.preferred_name ?? 'você';
     // body:"" (string vazia que a LLM às vezes manda) NÃO é null → `?? fallback`
     // não pega e o WhatsApp recebia mensagem VAZIA (rejeitada). Trata vazio.
-    const rawMsg = reminder.body?.trim() ? reminder.body : `Ei ${name}, lembrete: ${reminder.title} 💊`;
+    // 🧹 Placeholder nunca sai pro paciente (auditoria 08/09/2026): linhas antigas do banco
+    // ainda podem carregar "faltam X dias". A criação já sanea; aqui é a segunda trava.
+    const saneado = sanitizarCorpoDeLembrete(reminder.body);
+    if (saneado.removidas.length) {
+      await writeLog('warn', 'reminder', `body com placeholder — ${saneado.removidas.length} oração(ões) removida(s) no disparo (reminder ${reminder.id})`, { reminderId: reminder.id });
+    }
+    const rawMsg = saneado.body ?? `Ei ${name}, lembrete: ${reminder.title} 💊`;
 
     // 🕐 RE-ANCORAGEM DE DÊITICO NO DISPARO (incidente Elizabeth 09/07): rows ONE-SHOT
     // criadas antes do fix (ou por um LLM desobediente) podem ter "amanhã" congelado da
@@ -801,9 +820,11 @@ export async function dispatchReminders(): Promise<void> {
             type: reminder.type,
             recurring: Boolean(reminder.rrule),
             // Sinais pro anomaly-detector priorizar: one-shot em retry ainda tem chance;
-            // medicação bloqueada é o que exige ação humana.
+            // medicação bloqueada é o que exige ação humana. Backup condicional NUNCA
+            // (ver `alertaCritico`).
             retrying: oneShotRetrying,
-            critical: isCritical,
+            critical: alertaCritico,
+            conditional_backup: isConditionalBackup,
             silent_days: Number.isFinite(windowSilentMs) ? Math.round(windowSilentMs / 86_400_000) : null,
             // Dias SEGUIDOS sem conseguir entregar ESTE lembrete. Depois de muitos dias, o
             // que resolve não é outra tentativa automática — é alguém ligar pro paciente.

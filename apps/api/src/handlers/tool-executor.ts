@@ -3,11 +3,13 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem, CareLinkView } from '@iasaude/shared';
-import { resolveReminderFirstRun, isPlaceholderPhone, toE164BR, parseRrule, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool } from '@iasaude/shared';
+import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { markSupplierVerifiedById } from './supplier-directory.js';
+import { chaveDoCofre, cifrar, labFetchDisponivel, redigirCredenciais } from '../lib/lab-vault.js';
+import { enqueueLabFetch } from '../queues/lab-fetch.queue.js';
 import { presentPlatformQuotes, extractCep } from './platform-quotes.js';
 import { loadPrompts } from '../config/prompts.js';
 import { initiatePharmacyNegotiation } from './inbound-supplier.js';
@@ -111,6 +113,13 @@ interface ToolContext {
   careLinks?: CareLinkView[];
   inboundMsg: Message;
   inbound: NormalizedInbound;
+  /**
+   * O que o paciente DISSE neste turno, já resolvido (texto, legenda da foto ou
+   * transcrição do áudio). É o que uma ferramenta lê quando precisa saber se ele NOMEOU
+   * algo ou só respondeu "tomei"/"sim" — ver adherence-guard. `inboundMsg.content` não
+   * serve: pra áudio a transcrição chega depois do insert.
+   */
+  textoDoPaciente?: string | null;
   /**
    * Mídia do turno (foto/PDF/áudio) já baixada e verificada. Opcional: turno de texto puro
    * não tem nenhuma, e o backstop determinístico também chama tools sem mídia.
@@ -223,7 +232,10 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
         await handleStartPharmacyOrder(tc.args as { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string; preferred_pharmacy_names?: string[] }, ctxAlvo);
         break;
       case 'create_reminder':
-        await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string; event_at?: string }, ctxAlvo);
+        await handleCreateReminder(tc.args as { type: string; title: string; scheduled_at?: string; rrule?: string; dia_do_mes?: number; payload?: Record<string, unknown>; depends_on_title?: string; event_at?: string }, ctxAlvo);
+        break;
+      case 'fetch_lab_results':
+        await handleFetchLabResults(tc.args as FetchLabArgs, ctxAlvo);
         break;
       case 'cancel_reminders':
         await handleCancelReminders(tc.args as { title_query?: string; all?: boolean }, ctxAlvo);
@@ -394,7 +406,9 @@ async function recordTaskStart(tc: ToolCall, ctx: ToolContext): Promise<string> 
     conversation_id: ctx.conversationId,
     user_id: ctx.userId,
     tool_name: tc.name,
-    tool_input: tc.args,
+    // `redigirCredenciais` ANTES de gravar: `fetch_lab_results` chega com a senha do portal
+    // do laboratório nos args, e esta tabela é para sempre. Para as outras tools é no-op.
+    tool_input: redigirCredenciais(tc.args),
     status: 'running',
     trace_id: ctx.traceId,
   }).select('id').single();
@@ -414,11 +428,38 @@ async function handleSaveProfileFact(
     return out;
   };
 
+  /**
+   * 🔴 PAYLOAD VAZIO NÃO É SUCESSO (auditoria 09/09/2026 — caso Rodrigo, 24/08).
+   *
+   * O modelo chamou esta tool com `{category:'identity', payload:{}}` QUATRO vezes seguidas.
+   * O `identity` monta um patch, acha o patch vazio, não escreve nada — e RETORNA NORMAL.
+   * `assistant_tasks` gravou quatro `success`, o turno terminou sem texto, e o narrador de
+   * turno só-tool ("Prontinho, já cuidei disso aqui!") virou o **ÁUDIO DE BOAS-VINDAS** do
+   * paciente, que tinha acabado de dizer o nome.
+   *
+   * As categorias de lista eram piores: `condition`/`allergy`/`medication` com payload vazio
+   * INSERIAM uma linha com nome `''` no prontuário. Dado-lixo que depois aparece como
+   * "condição registrada" no contexto dela.
+   *
+   * Regra 26 do projeto: falha nunca vira sucesso. Se não há o que gravar, o modelo tem que
+   * ouvir isso e chamar de novo com o valor — nunca anunciar que guardou.
+   */
+  const exigir = (valor: string, oQue: string): string => {
+    const v = valor.trim();
+    if (!v) {
+      void writeLog('warn', 'tool', `save_user_profile_fact (${args.category}) sem ${oQue} — recusado`, {
+        traceId: ctx.traceId, userId: ctx.userId,
+      });
+      throw new ToolFailure(`NÃO guardei nada: faltou ${oQue} em save_user_profile_fact (category "${args.category}"). Chame de novo com o valor preenchido, e NÃO diga que guardou.`);
+    }
+    return v;
+  };
+
   switch (args.category) {
     case 'condition':
       await db.from('user_health_conditions').insert({
         user_id: ctx.userId,
-        name: String(args.payload['name'] ?? ''),
+        name: exigir(String(args.payload['name'] ?? ''), 'o nome da condição'),
         ...pick(['severity', 'notes', 'active']),
         source: 'self_reported',
       });
@@ -426,7 +467,7 @@ async function handleSaveProfileFact(
     case 'allergy':
       await db.from('user_allergies').insert({
         user_id: ctx.userId,
-        substance: String(args.payload['substance'] ?? args.payload['name'] ?? ''),
+        substance: exigir(String(args.payload['substance'] ?? args.payload['name'] ?? ''), 'a substância da alergia'),
         ...pick(['severity', 'reaction']),
         source: 'self_reported',
       });
@@ -434,7 +475,7 @@ async function handleSaveProfileFact(
     case 'medication':
       await db.from('user_medications').insert({
         user_id: ctx.userId,
-        medication_name: String(args.payload['medication_name'] ?? args.payload['name'] ?? ''),
+        medication_name: exigir(String(args.payload['medication_name'] ?? args.payload['name'] ?? ''), 'o nome do medicamento'),
         ...pick(['dosage', 'frequency', 'form', 'active']),
         source: 'self_reported',
       });
@@ -455,11 +496,14 @@ async function handleSaveProfileFact(
       const fn = String(args.payload['full_name'] ?? '').trim();
       if (pn && pn.length <= 40) patch['preferred_name'] = pn.slice(0, 40);
       if (fn && fn.length <= 120) patch['full_name'] = fn.slice(0, 120);
-      if (Object.keys(patch).length) await db.from('users').update(patch).eq('id', ctx.userId);
+      // Patch vazio = nada a gravar. É o caso Rodrigo: falhar alto em vez de "success" mudo.
+      exigir(Object.keys(patch).length ? 'ok' : '', 'preferred_name ou full_name');
+      await db.from('users').update(patch).eq('id', ctx.userId);
       break;
     }
     default: {
       // MERGE no metadata — substituir o objeto inteiro apagava fatos anteriores.
+      exigir(Object.keys(args.payload ?? {}).length ? 'ok' : '', 'o conteúdo do payload');
       const { data: u } = await db.from('users').select('metadata').eq('id', ctx.userId).maybeSingle();
       const merged = { ...((u?.metadata as Record<string, unknown>) ?? {}), ...args.payload };
       await db.from('users').update({ metadata: merged }).eq('id', ctx.userId);
@@ -1459,8 +1503,19 @@ async function startPharmacyDiscovery(
   const backupCandidates: PlaceResult[] = [];   // sobras → top-up (3min, aditivo)
   const preferredSet = new Set(preferred);
 
+  let redesPuladas = 0;
   for (const pharmacy of rankedAll) {
     const isPref = preferredSet.has(pharmacy);
+    // Rede grande com catálogo público NÃO recebe WhatsApp: a Xarlote lê o preço dela por
+    // API em 1 segundo, enquanto o balconista de uma Drogasil nunca responde a um número
+    // desconhecido (aconteceu em 05/08 e 26/08 — "Initiating negotiation with Drogasil").
+    // Gastar um dos 5 slots com ela é tirar o slot de uma farmácia que responderia.
+    // EXCEÇÃO: se o usuário pediu a rede PELO NOME, respeitamos — ignorar o pedido dele
+    // em silêncio é pior do que uma cotação que não volta.
+    if (!isPref && isPharmacyChain(pharmacy.name)) {
+      redesPuladas++;
+      continue;
+    }
     // Para de considerar quando o time (não-preferido) já encheu — MAS preferidas seguem
     // sempre (o usuário pediu por nome). Cache-hit não gasta Details, então NÃO paramos por
     // budget: o enrich devolve 'budget' quando PRECISARIA chamar o Google e não pode.
@@ -1498,7 +1553,7 @@ async function startPharmacyDiscovery(
   for (const left of [...slotPool, ...fixoPool].slice(Math.max(0, cap - preferredPool.length))) {
     if (!finalTeam.includes(left)) backupCandidates.push(left.place);
   }
-  await writeLog('info', 'places', `Time final (${finalTeam.length}): ${finalTeam.map((e) => `${e.place.name} [${e.tier}]`).join(' · ') || 'nenhuma'} — ${detailsCalls} Details, ${wameCalls} site(s) minerado(s), ${backupCandidates.length} backup(s)`, {
+  await writeLog('info', 'places', `Time final (${finalTeam.length}): ${finalTeam.map((e) => `${e.place.name} [${e.tier}]`).join(' · ') || 'nenhuma'} — ${detailsCalls} Details, ${wameCalls} site(s) minerado(s), ${backupCandidates.length} backup(s)${redesPuladas ? `, ${redesPuladas} rede(s) grande(s) deixada(s) pro catálogo` : ''}`, {
     traceId: ctx.traceId, orderId,
   });
 
@@ -1561,30 +1616,45 @@ async function startPharmacyDiscovery(
     farmácias: finalTeam.map((e, i) => `${i + 1}. ${e.place.name} [${e.tier}] (${e.place.distanceKm?.toFixed(2)}km)`),
   });
 
-  // Notifica o usuário — com HONESTIDADE NOTURNA: se a maioria das escolhidas está
-  // fechada agora (open_now), avisa que a resposta vem quando abrirem (senão ele fica
-  // esperando resposta de loja fechada, caso Glauber 22h).
-  const openKnown = finalTeam.filter((e) => e.place.isOpen !== undefined);
-  const allClosed = openKnown.length >= 3 && openKnown.every((e) => e.place.isOpen === false);
-  const nightNote = allClosed
-    ? ' Ah, esse horário a maioria já tá fechada — deixei a mensagem lá e assim que abrirem elas costumam responder cedinho, tá?'
-    : '';
-  await sendOutbound(
-    ctx.conversationId,
-    ctx.phoneE164,
-    `Achei ${quoteIds.length} farmácia${quoteIds.length > 1 ? 's' : ''} aqui na sua região e já entrei em contato com ${quoteIds.length > 1 ? 'elas' : 'ela'} ✨ assim que chegarem as respostas eu te aviso na hora.${nightNote}`,
-    ctx.traceId,
-  );
-
-  // Em PARALELO (não bloqueia as negociações): cota nas grandes redes e apresenta o pool com
-  // link pra pagar agora. Fire-and-forget — a mensagem chega em ~2s, junto do WhatsApp do bairro.
+  // ─── A REDE VEM PRIMEIRO ────────────────────────────────────────────────────
+  // Medição de 01/09/2026 sobre 240 cotações reais: a farmácia de bairro deu preço em
+  // 6,7% das vezes (197 `timeout`, 27 "não tenho"). A cotação por catálogo volta em ~2s
+  // com preço, frete e prazo, e em Goiânia três redes entregam em 60 min. Anunciar
+  // "já entrei em contato, te aviso" ANTES disso é prometer espera quando a resposta
+  // já está pronta — e era essa promessa que ficava sem cumprir.
+  //
+  // O `await` é deliberado: são ~2s, e a ORDEM das duas mensagens é o produto. As
+  // negociações do bairro só saem depois daqui, então o custo é 2s no pior caso.
+  let redesApresentadas = 0;
   if (userCep) {
-    presentPlatformQuotes({
+    const pres = await presentPlatformQuotes({
       orderId, items, cep: userCep,
       conversationId: ctx.conversationId, phoneE164: ctx.phoneE164, traceId: ctx.traceId,
       soleChannel: false,
-    }).catch((err) => writeLog('warn', 'platform', `Falha apresentando plataformas (paralelo): ${String(err).slice(0, 140)}`, { traceId: ctx.traceId, orderId }));
+    }).catch(async (err) => {
+      await writeLog('warn', 'platform', `Falha apresentando plataformas (primeiro canal): ${String(err).slice(0, 140)}`, { traceId: ctx.traceId, orderId });
+      return { networksPresented: 0, itemsCovered: 0 };
+    });
+    redesApresentadas = pres.networksPresented;
   }
+
+  // ─── E O BAIRRO COMO COMPLEMENTO ────────────────────────────────────────────
+  // HONESTIDADE NOTURNA: se a maioria das escolhidas está fechada agora (open_now),
+  // avisa que a resposta vem quando abrirem (senão ele fica esperando resposta de loja
+  // fechada, caso Glauber 22h). Quando a rede JÁ resolveu, a loja fechada deixa de ser
+  // má notícia — a pessoa não está mais dependendo dela.
+  const openKnown = finalTeam.filter((e) => e.place.isOpen !== undefined);
+  const allClosed = openKnown.length >= 3 && openKnown.every((e) => e.place.isOpen === false);
+  const nightNote = allClosed
+    ? (redesApresentadas > 0
+        ? ' (esse horário a maioria do bairro já fechou, então elas devem responder cedinho)'
+        : ' Ah, esse horário a maioria já tá fechada — deixei a mensagem lá e assim que abrirem elas costumam responder cedinho, tá?')
+    : '';
+  const plural = quoteIds.length > 1;
+  const textoBairro = redesApresentadas > 0
+    ? `Também tô cotando em ${quoteIds.length} farmácia${plural ? 's' : ''} do seu bairro — se sair mais em conta que isso aí de cima, eu te aviso na hora 😊${nightNote}`
+    : `Achei ${quoteIds.length} farmácia${plural ? 's' : ''} aqui na sua região e já entrei em contato com ${plural ? 'elas' : 'ela'} ✨ assim que chegarem as respostas eu te aviso na hora.${nightNote}`;
+  await sendOutbound(ctx.conversationId, ctx.phoneE164, textoBairro, ctx.traceId);
 
   // Setor/bairro real do usuário pra passar pra farmácia (não a cidade da farmácia em si).
   const userNeighborhood =
@@ -2037,7 +2107,7 @@ async function acharRemedioDoTitulo(titulo: string, userId: string): Promise<str
 }
 
 async function handleCreateReminder(
-  args: { type: string; title?: string; body?: string; scheduled_at?: string; rrule?: string; payload?: Record<string, unknown>; depends_on_title?: string; event_at?: string },
+  args: { type: string; title?: string; body?: string; scheduled_at?: string; rrule?: string; dia_do_mes?: number; payload?: Record<string, unknown>; depends_on_title?: string; event_at?: string; duration_days?: number | string },
   ctx: ToolContext
 ) {
   // next_run_at é o que o dispatcher olha. Recorrente sem scheduled_at calcula
@@ -2056,8 +2126,29 @@ async function handleCreateReminder(
   // junto com o rrule em lembrete recorrente. `"" ?? x` devolve `""` (nullish
   // coalescing NÃO trata string vazia como nulo) → firstRun="" → cai no refuse e
   // o nextOccurrence NUNCA era chamado. Normalizamos vazio/whitespace → null.
-  const scheduledAt = args.scheduled_at?.trim() ? args.scheduled_at.trim() : null;
+  let scheduledAt = args.scheduled_at?.trim() ? args.scheduled_at.trim() : null;
   const rrule = args.rrule?.trim() ? args.rrule.trim() : null;
+
+  // 📅 "DIA N" É CONTA DO SERVIDOR, NÃO DO MODELO (incidente Glauber, 31/08/2026).
+  //
+  // Ele pediu "me lembrar no dia 02" e o modelo agendou 02/10 em vez de 02/09 — um mês de
+  // atraso num resultado de exame de oncologia. O modelo acerta a HORA e erra o MÊS, então
+  // aproveitamos a hora do palpite dele e recalculamos a data aqui, com a mesma máquina de
+  // fuso dos recorrentes. Sem `rrule`, porque "dia 2" dito uma vez é evento único.
+  if (args.dia_do_mes != null && !rrule) {
+    const hora = horaDeIso(scheduledAt) ?? { h: 8, m: 0 };
+    const calculado = proximoDiaDoMes(args.dia_do_mes, hora, new Date(), userTz);
+    if (calculado) {
+      // Loga QUANDO discorda: é a prova de que a trava está trabalhando, e o único jeito de
+      // saber que o modelo continua errando (ou parou) sem esperar outro paciente reclamar.
+      if (scheduledAt && scheduledAt.slice(0, 10) !== calculado.slice(0, 10)) {
+        await writeLog('warn', 'tool', `create_reminder: modelo disse ${scheduledAt.slice(0, 10)} pra "dia ${args.dia_do_mes}", servidor corrigiu pra ${calculado.slice(0, 10)}`, {
+          traceId: ctx.traceId, userId: ctx.userId,
+        });
+      }
+      scheduledAt = calculado;
+    }
+  }
 
   let firstRun = resolveReminderFirstRun(scheduledAt, rrule, new Date(), userTz);
 
@@ -2098,6 +2189,39 @@ async function handleCreateReminder(
     return;
   }
 
+  // ⏳ FIM DA RECORRÊNCIA — CONTA DO SERVIDOR (auditoria 08/09/2026, caso Levofloxacino).
+  //
+  // O modelo dizia "por 10 dias" de três jeitos — `COUNT=10` no rrule, `duration_days: 10`
+  // na tool, e "até acabar a caixa" na conversa — e nenhum dos três chegava ao banco: o
+  // motor ignorava COUNT/UNTIL e `duration_days` nem era lido aqui. Todo antibiótico era
+  // um lembrete eterno; a Domperidona "de 45 dias" idem. Agora:
+  //   • COUNT/UNTIL no rrule são honrados (rrule.ts) e COUNT vira UNTIL explícito, ancorado
+  //     no PRIMEIRO disparo — a forma que qualquer leitor entende, inclusive o app;
+  //   • `duration_days: N` = N dias INCLUINDO o dia do primeiro disparo → UNTIL 23:59 do
+  //     último dia;
+  //   • o modelo recebe na observação o fim REAL ("10 disparos, o último em 13/09") — é
+  //     daí que ele fala "por 10 dias", não de um "X" que ninguém preenche.
+  let rruleFinal = rrule;
+  let fimDaSerie: Date | null = null;
+  if (rrule && firstRun) {
+    const parsed = parseRrule(rrule);
+    const ancora = new Date(firstRun);
+    if (parsed?.count || parsed?.until) fimDaSerie = fimDaRecorrencia(rrule, ancora, userTz);
+    const dur = Number(args.duration_days);
+    if (!fimDaSerie && Number.isFinite(dur) && dur >= 1 && dur <= 366) {
+      fimDaSerie = fimDoDiaLocal(ancora, Math.floor(dur) - 1, userTz);
+    }
+    if (fimDaSerie) {
+      if (fimDaSerie.getTime() < ancora.getTime()) {
+        await writeLog('warn', 'tool', `create_reminder: fim (${fimDaSerie.toISOString().slice(0, 10)}) anterior ao primeiro disparo — lembrete NÃO criado`, { traceId: ctx.traceId, userId: ctx.userId });
+        throw new ToolFailure(`NÃO criei o lembrete "${titleForMsg}": o fim informado (${fimDaSerie.toISOString().slice(0, 10)}) vem antes do primeiro disparo. Confirme com o paciente por quantos dias é e chame de novo.`);
+      }
+      rruleFinal = rruleComFim(rrule, fimDaSerie, userTz);
+    }
+  }
+  // Sem fim explícito, o modelo pode ter passado COUNT e o motor entende via âncora;
+  // com fim explícito, `resolveReminderFirstRun` continua válido (UNTIL ≥ primeiro disparo).
+
   // GUARD DE DUPLICATA (caso real: LLM re-chamou create_reminder 3x → usuário ia
   // receber o mesmo lembrete triplicado). Mesmo user + mesmo título + mesma
   // recorrência/horário ainda pendente = idempotente, não duplica.
@@ -2108,8 +2232,8 @@ async function handleCreateReminder(
     .eq('user_id', ctx.userId)
     .eq('status', 'pending')
     .ilike('title', escapeLike(title));
-  const { data: dup } = await (rrule
-    ? dupQuery.eq('rrule', rrule)
+  const { data: dup } = await (rruleFinal
+    ? dupQuery.eq('rrule', rruleFinal)
     : dupQuery.eq('scheduled_at', scheduledAt ?? ''))
     .limit(1).maybeSingle();
   if (dup?.id) {
@@ -2162,6 +2286,19 @@ async function handleCreateReminder(
     }
   }
 
+  // 🧹 PLACEHOLDER NÃO SAI PRO PACIENTE (auditoria 08/09/2026): "Faltam X dias pra acabar a
+  // caixa!" foi entregue com o X literal, cinco dias seguidos. A oração com marca de
+  // preenchimento cai aqui; o modelo fica sabendo pela observação (abaixo) e o fim real da
+  // série chega junto — é ele que responde "quantos dias faltam".
+  const saneado = sanitizarCorpoDeLembrete(body);
+  const placeholdersRemovidos = saneado.removidas.length;
+  if (placeholdersRemovidos) {
+    await writeLog('warn', 'tool', `create_reminder: ${placeholdersRemovidos} oração(ões) com placeholder removida(s) do body — "${title}"`, {
+      traceId: ctx.traceId, userId: ctx.userId,
+    });
+    body = saneado.body;
+  }
+
   // 💊 LIGA O LEMBRETE AO REMÉDIO DO PERFIL, quando dá pra ter certeza.
   //
   // `medication_log` — a fonte da adesão do app e do `calc_adherence_score` — tem
@@ -2183,7 +2320,7 @@ async function handleCreateReminder(
     // body:"" (string vazia da LLM) → null, senão o dispatcher mandaria msg vazia.
     body,
     scheduled_at: scheduledAt,
-    rrule,
+    rrule: rruleFinal,
     next_run_at: firstRun,
     status: 'pending',
     // event_at no payload → o dispatcher re-ancora rows de véspera no disparo também.
@@ -2194,7 +2331,11 @@ async function handleCreateReminder(
     // ele só "acha" que criou — e é assim que nascem o lembrete duplicado e o "já agendei"
     // quando nada foi criado.
     if (ctx.observation) {
-      ctx.observation.note = `Lembrete criado: "${title}" — ${describeReminder(rrule, firstRun)}. Já está ativo; não crie de novo.`;
+      const fimTxt = describeReminderEnd(rruleFinal, firstRun, userTz);
+      const aviso = placeholdersRemovidos
+        ? ` ⚠️ Removi do body ${placeholdersRemovidos} frase(s) com placeholder não preenchido (ex.: "X dias") — NUNCA escreva contagens que você não sabe; o fim da série está acima, use ele se quiser falar em dias.`
+        : '';
+      ctx.observation.note = `Lembrete criado: "${title}" — ${describeReminder(rruleFinal, firstRun)}${fimTxt}. Já está ativo; não crie de novo.${aviso}`;
     }
   }
   if (insErr) {
@@ -2235,6 +2376,20 @@ function describeReminder(rrule: string | null, nextRunAtIso: string): string {
   }
   if (parsed?.freq === 'DAILY') return `todo dia às ${hora}`;
   return `recorrente, próximo às ${hora}`;
+}
+
+/**
+ * O FIM da série, pra confirmação ao modelo: ", 10 disparos, o último em 13/09". Vazio quando
+ * não há fim (rotina contínua). É esta linha que permite dizer "por 10 dias" sem inventar.
+ */
+function describeReminderEnd(rrule: string | null, firstRunIso: string, tz?: string): string {
+  if (!rrule) return '';
+  const ancora = new Date(firstRunIso);
+  const fim = fimDaRecorrencia(rrule, ancora, tz);
+  if (!fim) return '';
+  const n = contarOcorrencias(rrule, ancora, tz);
+  const data = fim.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', timeZone: tz ?? 'America/Sao_Paulo' });
+  return n ? `, ${n} disparo(s), o último em ${data}` : `, até ${data}`;
 }
 
 async function handleCancelReminders(args: { title_query?: string; all?: boolean }, ctx: ToolContext) {
@@ -2629,4 +2784,93 @@ function buildPaymentMessage(quote: Record<string, unknown>, supplierName: strin
 
   lines.push('\nA farmácia foi notificada. Qualquer dúvida, é só me chamar! 💙');
   return lines.join('\n');
+}
+
+// ─── Buscar exames no portal do laboratório ──────────────────────────────────
+// Desenho e recusas de princípio: docs/PLANO_EXAMES_LAB.md.
+
+interface FetchLabArgs {
+  laboratorio?: string;
+  portal_url?: string;
+  login?: string;
+  senha?: string;
+  protocolo?: string;
+}
+
+const LAB_FETCH_POLICY = 'lab-fetch-1.0';
+const LAB_FETCH_MAX_POR_DIA = 3;
+
+/** A pessoa disse SIM, com as palavras dela, nesta mensagem? Determinístico, sem modelo. */
+export function autorizouBuscaNoPortal(texto: string | null | undefined): boolean {
+  const t = (texto ?? '').trim().toLowerCase();
+  if (!t) return false;
+  // Negação em qualquer lugar vence: "não, pode deixar" / "sim, mas não agora".
+  // Fronteira só ANTES da palavra e por `(^|\s)`: "deixa" precisa casar "deixar", e o `\b`
+  // do JavaScript não conhece acento (regra da casa — 3 alternativas do regex de emergência
+  // ficaram mortas meses por isso).
+  if (/(^|\s)(n[ãa]o|nunca|deix|depois|espera)/.test(t)) return false;
+  return /^(sim|pode|autorizo|autorizado|ok|okay|claro|vai|bora|isso|quero|confirmo|beleza|manda|busca)(\s|$|[!.,])/.test(t);
+}
+
+async function handleFetchLabResults(args: FetchLabArgs, ctx: ToolContext): Promise<void> {
+  if (!labFetchDisponivel()) {
+    throw new ToolFailure('NADA FOI FEITO: buscar exames no site do laboratório não está disponível agora. Diga que ela pode mandar o PDF que você lê e guarda.');
+  }
+  const login = (args.login ?? '').trim();
+  const senha = (args.senha ?? '').trim();
+  const laboratorio = (args.laboratorio ?? '').trim() || null;
+  if (!login || !senha) {
+    throw new ToolFailure('NADA FOI FEITO: faltou login ou senha. Se a foto não deixou claro, PERGUNTE à pessoa — não invente.');
+  }
+
+  // 🔐 GATE DE CONSENTIMENTO — a prova é a fala da pessoa, não a sua afirmação de que ela
+  // concordou. A mensagem de entrada DESTE turno precisa ser um "sim" inequívoco.
+  const textoDaPessoa = ctx.inboundMsg?.content ?? '';
+  if (!autorizouBuscaNoPortal(textoDaPessoa)) {
+    throw new ToolFailure(
+      'NADA FOI FEITO: a pessoa ainda NÃO autorizou explicitamente nesta mensagem. Pergunte: '
+      + '"Quer que eu entre no site do laboratório com esse acesso e busque seus resultados? Uso o login uma vez e não guardo a senha. Responde sim pra autorizar." '
+      + 'Só chame de novo quando ela responder sim.',
+    );
+  }
+
+  // Rate limit por pessoa: 3/dia. Cada busca abre um navegador e digita uma senha em site
+  // de terceiro — não é coisa de repetir em loop.
+  const desde = new Date(Date.now() - 24 * 3600_000).toISOString();
+  const { count } = await db.from('lab_fetches').select('id', { count: 'exact', head: true })
+    .eq('user_id', ctx.userId).gte('created_at', desde).in('status', ['na_fila', 'rodando', 'concluida']);
+  if ((count ?? 0) >= LAB_FETCH_MAX_POR_DIA) {
+    throw new ToolFailure('NADA FOI FEITO: já foram 3 buscas hoje para esta pessoa. Diga que amanhã dá pra tentar de novo, ou que ela pode mandar o PDF.');
+  }
+
+  // Consentimento registrado ANTES de enfileirar, apontando para a mensagem dela.
+  const { data: consent } = await db.from('consent_events').insert({
+    user_id: ctx.userId, event_type: 'accept', policy_version: LAB_FETCH_POLICY, channel: 'whatsapp',
+    evidence_message_id: ctx.inboundMsg?.id ?? null, evidence_text: textoDaPessoa.slice(0, 300),
+  }).select('id').single();
+
+  const { data: fetch, error } = await db.from('lab_fetches').insert({
+    user_id: ctx.userId, conversation_id: ctx.conversationId, laboratorio,
+    status: 'na_fila', consent_event_id: (consent?.id as string | undefined) ?? null,
+  }).select('id').single();
+  if (error || !fetch?.id) {
+    throw new ToolFailure('NADA FOI FEITO: não consegui registrar a busca. Diga que houve um problema do seu lado e que ela pode mandar o PDF.');
+  }
+
+  const chave = chaveDoCofre();
+  if (!chave) throw new ToolFailure('NADA FOI FEITO: cofre indisponível.');
+  const credenciaisCifradas = cifrar(JSON.stringify({ login, senha, protocolo: (args.protocolo ?? '').trim() || null }), chave);
+
+  await enqueueLabFetch({
+    fetchId: fetch.id as string, userId: ctx.userId, conversationId: ctx.conversationId, phoneE164: ctx.phoneE164,
+    traceId: ctx.traceId, laboratorio, portalUrl: (args.portal_url ?? '').trim() || null, credenciaisCifradas,
+  });
+
+  await writeAudit({
+    actorType: 'user', actorId: ctx.userId, action: 'lab_fetch.requested', userId: ctx.userId,
+    conversationId: ctx.conversationId, targetTable: 'lab_fetches', targetId: fetch.id as string,
+    messageId: ctx.inboundMsg?.id ?? null, traceId: ctx.traceId,
+    metadata: { laboratorio, consentEventId: consent?.id ?? null },
+  });
+  await writeLog('info', 'lab', 'busca de exames enfileirada (consentimento registrado)', { traceId: ctx.traceId, userId: ctx.userId });
 }

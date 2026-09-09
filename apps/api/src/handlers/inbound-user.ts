@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -36,7 +36,7 @@ function agentLoopEnabled(): boolean {
   return process.env['AGENT_LOOP_ENABLED'] !== 'false';
 }
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard, QuoteOption } from '@iasaude/shared';
-import { chat, buildXarloteSystemPrompt, xarloteTools, messagesToHistory, trimHistory, embed, userContentWithImage, dataUrl, type ChatContent, type ChatMessage, type ToolCall } from '@iasaude/llm';
+import { chat, buildXarloteSystemPrompt, ferramentasParaAtor, messagesToHistory, embed, userContentWithImage, dataUrl, type ChatContent, type ChatMessage, type ToolCall } from '@iasaude/llm';
 import { sendMenu, isSimulatorMode, fetchInboundMedia, nomeArquivoDeInbound } from '@iasaude/whatsapp';
 import { transcribeAudio, extrairTextoDePdf, mensagemDePdfIlegivel, type LeituraDePdf } from '@iasaude/integrations';
 import { sniffMidia, mensagemDeRecusa } from '../lib/media-sniff.js';
@@ -47,9 +47,11 @@ import { executeForgetMe } from './forget-me.js';
 import { publishMessageEvent } from '../lib/app-publish.js';
 import { extractAppClientId } from '../lib/app-inbound.js';
 import { sendOutbound, sendOutboundAudio } from './outbound.js';
+import { labFetchPronto } from '../lib/lab-vault.js';
+import { getRedisClient } from '../queue-config.js';
 import { handleToolCall, type ToolResult, type MidiaDoTurno } from './tool-executor.js';
 import { carregarVinculosDoCuidador } from '../lib/care-links.js';
-import { uploadInboundMedia } from './media-host.js';
+import { uploadInboundMedia, downloadStoredMedia } from './media-host.js';
 import { saveContactsToMemory } from './reach-out.js';
 import { findPendingClarificationForUser } from './clarification.js';
 import { loadLatestOrderState, buildOrderStateBlock } from './order-state.js';
@@ -229,7 +231,7 @@ export function blocoDeDocumentoParaModelo(d: {
     MARCA_INICIO,
     corpo + aviso,
     MARCA_FIM,
-    'Se for exame/laudo: comente o que leu SEM interpretar clinicamente (nunca diga se está normal ou alterado) e OFEREÇA guardar no perfil dele; se ele confirmar, chame save_exam_result com os marcadores que você leu.',
+    'Se for exame/laudo: leia e INTERPRETE conforme a seção EXAMES, LAUDOS E SEGUNDA OPINIÃO do seu prompt (o que está fora da referência, o que costuma significar, sua opinião honesta, ressalva de uma linha) e OFEREÇA guardar no perfil dele; se ele confirmar, chame save_exam_result com os marcadores que você leu (o resumo guardado é neutro: só o que está escrito).',
     'Se for receita: NÃO chame parse_prescription_image (ela só lê FOTO) — confirme os medicamentos com o paciente a partir do texto acima.',
     `${encaminhar}]`,
   ].join('\n');
@@ -272,6 +274,43 @@ async function lerPdf(buf: Buffer, traceId: string): Promise<LeituraDePdf> {
   } catch (err) {
     await writeLog('error', 'media', `extração de texto do PDF explodiu: ${String(err).slice(0, 200)}`, { traceId });
     return { ok: false, motivo: 'falha_ao_ler', paginas: 0 };
+  }
+}
+
+/**
+ * Descrição OBJETIVA de uma foto do paciente, pra ficar em `messages.transcript` e voltar ao
+ * prompt nos turnos seguintes (auditoria 08/09/2026, caso Ludmila/Hiago).
+ *
+ * É o `trechoDeTranscript` da foto: sem isto, uma imagem sem legenda não deixava rastro
+ * nenhum no histórico — nem "[foto]". Roda FORA do caminho crítico (o paciente já recebeu a
+ * resposta), custa uma chamada de visão curta, e devolve null em qualquer falha: aí fica o
+ * carimbo "[foto enviada pelo paciente]", que já é melhor do que o vazio.
+ *
+ * Sem interpretação, de propósito: o transcript é MEMÓRIA do que estava na foto, não opinião.
+ * Opinar é papel do turno, olhando a foto de novo (ver foto-recente.ts).
+ */
+const PROMPT_DESCRICAO_DE_FOTO = 'Descreva esta imagem de forma OBJETIVA para o registro interno da conversa, em português, em até 700 caracteres, sem interpretar nem opinar. Diga: que tipo de documento ou foto é; de quem (nome, se aparecer); data e local (clínica/laboratório), se aparecerem; e TODOS os valores, marcadores, medicamentos, conclusões de laudo ou textos relevantes, com unidades e faixas de referência quando houver. Se não for documento, uma frase do que se vê. Texto corrido, sem markdown, sem listas.';
+
+export async function descreverImagemParaHistorico(
+  buffer: Buffer,
+  mime: string,
+  cfg: { vision_model?: string; llm_model?: string; llm_api_key?: string },
+  traceId?: string,
+): Promise<string | null> {
+  try {
+    const r = await chat(userContentWithImage(PROMPT_DESCRICAO_DE_FOTO, [dataUrl(buffer.toString('base64'), mime)]), {
+      model: cfg.vision_model || cfg.llm_model || 'openai/gpt-4.1-mini',
+      apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'],
+      temperature: 0,
+      maxOutputTokens: 500,
+      timeoutMs: 40_000,
+    });
+    const t = r.text.replace(/\s+/g, ' ').trim();
+    if (!t) return null;
+    return t.length > 900 ? `${t.slice(0, 900)}…` : t;
+  } catch (err) {
+    await writeLog('warn', 'vision', `descrição da foto pro histórico falhou: ${String(err).slice(0, 140)}`, { traceId });
+    return null;
   }
 }
 
@@ -666,6 +705,16 @@ async function processInboundUserInner(
   // sempre o usuário dizendo o nome dele. A resposta da Xarlote nesse turno é a
   // saudação "Prazer, X!" que merece sair como áudio.
   const wasProfiling = user.onboarding_status === 'profiling';
+  /**
+   * 🎙️ A SAUDAÇÃO É DO SERVIDOR, NÃO DO MODELO (auditoria 09/09/2026).
+   *
+   * Preenchido só quando o paciente REALMENTE respondeu um nome à pergunta "como gosta de
+   * ser chamado?". Nesse caso o conteúdo certo da próxima mensagem é conhecido de antemão —
+   * e é ela que vira o ÁUDIO de boas-vindas e carrega a oferta de se conhecerem. Ver
+   * `saudacaoDeConhecimento`. Quando o paciente responde OUTRA coisa (um pedido, por
+   * exemplo), isto fica null e o modelo conduz normalmente.
+   */
+  let saudacaoDoServidor: string | null = null;
   if (wasProfiling) {
     // PONTO 8 (incidente Valdivino→Vadivino): a resposta à pergunta "como gosta de ser
     // chamado?" NUNCA era persistida → preferred_name ficava no pushName do WhatsApp. Agora
@@ -680,6 +729,7 @@ async function processInboundUserInner(
       const cleanName = typedName.replace(/\s+/g, ' ').slice(0, 40);
       await db.from('users').update({ preferred_name: cleanName, onboarding_status: 'active' }).eq('id', user.id);
       user = { ...user, preferred_name: cleanName, onboarding_status: 'active' };
+      saudacaoDoServidor = saudacaoDeConhecimento(cleanName);
     } else {
       await db.from('users').update({ onboarding_status: 'active' }).eq('id', user.id);
       user = { ...user, onboarding_status: 'active' };
@@ -734,7 +784,15 @@ async function processInboundUserInner(
     }
   };
 
-  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif, activeRemindersRes, recentTasksRes, orderState, consultStateBlock, careLinks] = await Promise.all([
+  const [history, user360, activeOrderRes, relevantCards, skills, paymentHistRes, pendingClarif, activeRemindersRes, recentTasksRes, orderState, consultStateBlock, careLinks, labPronto] = await Promise.all([
+    // 🎚️ ÚNICO botão do tamanho do contexto da Xarlote. 30 buscadas − a atual = as
+    // 29 que o LLM vê (é o `historyLen: 29` dos logs). Havia um `trimHistory(…, 20)`
+    // logo abaixo que sugeria teto de 40 mensagens e NUNCA disparava (30 < 40) —
+    // removido em 31/08/2026, junto dos outros 4 call sites, todos igualmente mortos.
+    // A armadilha era de manutenção: quem subisse este 30 pra 60 achando que ganhava
+    // contexto passaria a ser cortado em 40 sem nenhum sinal. Agora o número aqui é a
+    // verdade inteira. O que sai desta janela não se perde: o conversation-compactor
+    // condensa em memory cards `episode` (que, desde a migration 0031, não desbotam).
     getConversationMessages(conversation.id, 30),
     queryUser360(user.id),
     db.from('orders')
@@ -759,7 +817,7 @@ async function processInboundUserInner(
     // plano duplicado (caso real: 2 planos de água sobrepostos = 15 pings/dia) e
     // pra saber o que cancelar via cancel_reminders ao substituir um plano.
     db.from('reminders')
-      .select('title, type, rrule, next_run_at, payload')
+      .select('title, type, rrule, next_run_at, payload, created_at')
       .eq('user_id', user.id)
       .eq('status', 'pending')
       .order('next_run_at', { ascending: true })
@@ -786,9 +844,27 @@ async function processInboundUserInner(
     // por índice parcial — o custo é desprezível e entra no mesmo Promise.all pra não
     // acrescentar um round-trip serial ao caminho quente.
     carregarVinculosDoCuidador(user.id).catch(() => []),
+    // 🧪 Busca de exames no laboratório: prontidão PROVADA, não declarada. `true` só quando
+    // um worker abriu um Chromium de verdade há menos de 2 min (chave no Redis com TTL).
+    // Falha fechada: Redis fora ou worker morto = a tool some do prompt, sem aviso a ninguém.
+    labFetchPronto(getRedisClient()).catch(() => false),
   ]);
 
-  const geminiHistory = trimHistory(messagesToHistory(history.slice(0, -1)), 20);
+  const geminiHistory = messagesToHistory(history.slice(0, -1));
+
+  // 🤝 Sem vínculo de cuidador, o campo `para_quem` NEM APARECE no schema das ferramentas.
+  // Incidente Glauber (31/08): o campo era exposto a todo mundo, mas a instrução de quando
+  // usá-lo mora na seção "QUEM VOCÊ CUIDA" do prompt — que é vazia pra quem não cuida de
+  // ninguém. Um campo "para quem?" sem instrução, numa conversa de uma pessoa só, convida
+  // a resposta óbvia: o nome dela. Aí o guard recusava ("você não cuida de ninguém chamado
+  // Glauber Andrade") e o exame dele não foi salvo. Tirar a pergunta de quem não pode
+  // respondê-la elimina a classe inteira — e é a MESMA condição que decide a seção do prompt.
+  const temVinculos = (careLinks ?? []).some((v) => v.status === 'ativo');
+  // 🧪 Buscar exames no portal do laboratório só é OFERECIDA quando um worker provou que
+  // abre navegador (ver `labPronto` acima). Sem isso o modelo não promete o que o servidor
+  // não faz — o paciente nunca ouve "tô entrando" de um sistema sem Chromium.
+  const ferramentas = ferramentasParaAtor({ temVinculos })
+    .filter((t) => t.function.name !== 'fetch_lab_results' || labPronto === true);
   const activeOrderSummary = activeOrderRes.data?.summary ?? null;
 
   // Preferência de pagamento aprendida: método mais usado nos pedidos recentes
@@ -869,6 +945,7 @@ async function processInboundUserInner(
   // a pergunta é natural e a taxa de resposta é maior.
   {
     const PERGUNTA: Record<OnboardingTopic, string> = {
+      allergy: '- **Alergia a medicamento**: *"Você tem alergia a algum remédio?"* → `save_user_profile_fact` (category `allergy`, payload `{"substance": "<o que ela disse>"}`). ⚠️ É a PRIMEIRA e a mais importante: sem ela você cota remédio no escuro. Se ela disser que não tem, NÃO grave nada e siga.',
       medication: '- **Remédio de uso contínuo**: *"Você toma algum remédio todo dia?"* → guarde com `save_user_profile_fact` (category `medication`).',
       condition: '- **Condição acompanhada**: *"Tem alguma condição que você acompanha? Pressão, diabetes, tireoide, colesterol…"* (os exemplos são obrigatórios — sem eles a pessoa trava e diz "não") → `save_user_profile_fact` (category `condition`).',
       health_plan: '- **Convênio**: *"E pra consulta ou exame, você tem plano de saúde ou prefere particular?"* → `save_user_profile_fact` (category `other`, payload `{"health_plan": "<nome do plano ou \'particular\'>"}`). ⚠️ Diga SEMPRE "pra consulta ou exame": em FARMÁCIA você não aplica desconto de convênio, e sem esse recorte a pessoa entende errado.',
@@ -877,13 +954,17 @@ async function processInboundUserInner(
       onboardingStatus: user.onboarding_status,
       createdAtIso: (user.created_at as string | null | undefined) ?? null,
       nowMs: Date.now(),
+      hasAllergies: Boolean(allergies?.length),
       hasMedications: Boolean(medications?.length),
       hasConditions: Boolean(conditions?.length),
       hasHealthPlan: Boolean(userHealthPlan),
-      // Já ofereceu nesta conversa? Deriva do próprio histórico — nada é gravado pra isso.
+      // A oferta já saiu nesta conversa? Deriva do histórico — nada é gravado pra isso.
+      // ⚠️ NÃO é mais gate (ver onboarding.ts): a saudação É a oferta, então no turno em que
+      // a pessoa diz "sim" isto fica TRUE — e usá-lo pra matar o bloco apagaria a orientação
+      // exatamente quando ela é necessária. Aqui ele só escolhe o texto da conduta.
       alreadyOffered: (history ?? []).some((m) => {
         const c = typeof (m as { content?: unknown }).content === 'string' ? (m as { content: string }).content : '';
-        return (m as { direction?: string }).direction === 'out' && /nos conhecer melhor|perguntinhas/i.test(c);
+        return (m as { direction?: string }).direction === 'out' && OFERTA_RE.test(c);
       }),
       // Recusa DURÁVEL: `alreadyOffered` só enxerga a janela de histórico carregada, então
       // sem isto a pergunta voltaria dias depois pra quem já disse não.
@@ -897,9 +978,11 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
 
 **COMO CONDUZIR (a ordem importa):**
 1. Primeiro responda o que ele trouxe nesta mensagem. Sempre. O paciente vem antes do roteiro.
-2. Se ele não trouxe nada específico (só cumprimentou/agradeceu), OFEREÇA a escolha, uma vez só: *"Posso te fazer duas ou três perguntinhas rápidas pra te conhecer melhor? Ou, se preferir, já me diz o que você precisa 💙"*
-3. Com o "sim", faça **UMA pergunta por mensagem** — nunca as três juntas, nunca em lista.
-4. Recebeu a resposta → chame \`save_user_profile_fact\` na hora e emende a próxima com naturalidade.
+${decision.alreadyOffered
+  ? '2. **Você JÁ ofereceu** as perguntas na sua saudação. NÃO ofereça de novo. Se ele ACEITOU (disse "pode", "sim", "vamos", "manda"), faça a primeira pergunta da lista acima AGORA, sozinha. Se ele trouxe outro assunto, atenda e deixe o roteiro de lado.'
+  : '2. Se ele não trouxe nada específico (só cumprimentou/agradeceu), OFEREÇA a escolha, uma vez só: *"Posso te fazer umas perguntinhas rápidas pra te conhecer melhor? Ou, se preferir, já me diz o que você precisa 💙"*'}
+3. Com o "sim", faça **UMA pergunta por mensagem** — nunca duas juntas, nunca em lista. Siga a ordem acima (alergia primeiro).
+4. Recebeu a resposta → chame \`save_user_profile_fact\` na hora e emende a próxima com naturalidade. **Nunca chame a tool com payload vazio**: se você não entendeu o que ele respondeu, pergunte de novo em vez de gravar nada.
 
 **QUANDO PARAR (inegociável):**
 - Ele pediu QUALQUER coisa (remédio, consulta, dúvida, lembrete) → **abandone o roteiro imediatamente** e atenda. Não volte ao assunto nesse turno.
@@ -926,7 +1009,7 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
   }
 
   // Lembretes ativos — visibilidade pro gerenciamento (criar/cancelar/substituir).
-  const activeReminders = (activeRemindersRes.data ?? []) as Array<{ title: string; type: string; rrule: string | null; next_run_at: string; payload: Record<string, unknown> | null }>;
+  const activeReminders = (activeRemindersRes.data ?? []) as Array<{ title: string; type: string; rrule: string | null; next_run_at: string; payload: Record<string, unknown> | null; created_at?: string | null }>;
   if (activeReminders.length > 0) {
     const fmtHora = (iso: string) => new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
     const fmtData = (iso: string) => new Date(iso).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', timeZone: 'America/Sao_Paulo' });
@@ -935,7 +1018,11 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
       const tag = cond?.condition === 'if_not_confirmed'
         ? ` — ⚙️ backup condicional de "${cond.depends_on_title ?? ''}" (só dispara se o primário não for confirmado)`
         : '';
-      return `- "${r.title}" (${r.type}) — ${r.rrule ? `recorrente, próximo às ${fmtHora(r.next_run_at)}` : `único em ${fmtData(r.next_run_at)} às ${fmtHora(r.next_run_at)}`}${tag}`;
+      // Série com FIM (UNTIL/COUNT, honrados desde 08/09/2026): o modelo enxerga "até 13/09" e
+      // fala em dias com base nisso — nunca mais "faltam X dias".
+      const fim = r.rrule ? fimDaRecorrencia(r.rrule, r.created_at ? new Date(r.created_at) : null) : null;
+      const ate = fim ? `, até ${fmtData(fim.toISOString())}` : '';
+      return `- "${r.title}" (${r.type}) — ${r.rrule ? `recorrente${ate}, próximo às ${fmtHora(r.next_run_at)}` : `único em ${fmtData(r.next_run_at)} às ${fmtHora(r.next_run_at)}`}${tag}`;
     });
     systemPrompt += `\n\n## ⏰ LEMBRETES ATIVOS DESTE USUÁRIO (${activeReminders.length})\n${linhas.join('\n')}\n\nEsta lista é a VERDADE — vale mais que qualquer coisa dita no histórico da conversa. Estes JÁ EXISTEM. NÃO crie de novo os mesmos (mesmo assunto/horário) — se ele reperguntar "agendou?"/"criou?", responda SIM olhando esta lista, sem chamar create_reminder. Pra MUDAR/REDIVIDIR um plano, chame cancel_reminders (title_query) ANTES de criar os novos — nunca deixe dois planos do mesmo assunto coexistirem. Se pedir pra parar, cancel_reminders resolve sozinho.`;
   } else {
@@ -1014,6 +1101,19 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
     }
   }
 
+  // 🧾 O NEGATIVO EXPLÍCITO DO EXAME (auditoria 08/09/2026, caso Ludmila/Hiago 04/09).
+  // A foto do exame chegou às 16:54; às 16:55 o modelo escreveu "já guardei tudo aqui no
+  // perfil" sem ter chamado ferramenta nenhuma. O bloco acima só lista o que RODOU — e um
+  // silêncio o modelo preenche com o que soa bem (regra 27: estado vazio precisa FALAR).
+  {
+    const arquivoRecente = inbound.contentType === 'image' || inbound.contentType === 'document'
+      || history.slice(-6).some((m) => m.direction === 'in' && (m.content_type === 'image' || m.content_type === 'document'));
+    const guardou = recentTasks.some((t) => t.tool_name === 'save_exam_result' && t.status === 'success');
+    if (arquivoRecente && !guardou) {
+      systemPrompt += `\n\n## 🧾 NADA FOI GUARDADO AINDA\nChegou um arquivo do paciente há pouco e **\`save_exam_result\` NÃO rodou** nos últimos minutos — não existe registro dele no perfil. Se ele quiser guardar (ou já tiver dito "sim"), chame a ferramenta AGORA; se não, responda o que ele perguntou SEM dizer "guardei"/"já está salvo" — o sistema derruba essa frase.`;
+    }
+  }
+
   if (promptsConfig.sara_suffix.trim()) {
     systemPrompt += `\n\n## INSTRUÇÕES ADICIONAIS (configuradas no dashboard)\n${promptsConfig.sara_suffix.trim()}`;
   }
@@ -1079,6 +1179,8 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
    * `parse_prescription_image` responder "não consegui processar, manda de novo" para sempre.
    */
   let midiaDoTurno: MidiaDoTurno | null = null;
+  /** Fotos de turnos anteriores re-anexadas a este (ver foto-recente.ts). */
+  let fotosReanexadas = 0;
 
   if (inbound.sharedContacts?.length) {
     // Contato(s) do WhatsApp compartilhado(s): mostra nome+telefone pro LLM (pra ele
@@ -1248,6 +1350,19 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
           await writeLog('info', 'media', `imagem do paciente hospedada pra encaminhamento (${hosted.path})`, { traceId });
         }
       }).catch(() => { /* best-effort */ });
+      // 🧠 A FOTO PRECISA SOBREVIVER AO TURNO (auditoria 08/09/2026, caso Ludmila/Hiago).
+      // `messagesToHistory` monta o histórico de `transcript || content`; uma foto sem
+      // legenda não tinha nenhum dos dois e SUMIA do histórico — no turno seguinte o modelo
+      // via a própria resposta ("Vi aqui um doppler…") sem a pergunta que a provocou, e a
+      // memória trazia o exame de maio. Primeiro um carimbo barato e imediato (a foto
+      // existiu); depois, fora do caminho crítico, a descrição objetiva do que ela mostra —
+      // o mesmo papel do `trechoDeTranscript` no PDF.
+      const legendaTx = legenda ? ` (legenda: "${legenda.slice(0, 120)}")` : '';
+      await db.from('messages').update({ transcript: `[foto enviada pelo paciente${legendaTx}]` }).eq('id', inboundMsg.id).then(() => undefined, () => undefined);
+      void descreverImagemParaHistorico(midia.buffer, mimeReal, promptsConfig, traceId).then(async (desc) => {
+        if (!desc) return;
+        await db.from('messages').update({ transcript: `[foto enviada pelo paciente${legendaTx}: ${desc}]` }).eq('id', inboundMsg.id);
+      }).catch(() => { /* best-effort */ });
     } else if (tipoReal === 'document' && midia) {
       // ─── PDF (laudo do laboratório, receita digital, pedido médico) ─────────────────
       // Aqui a hospedagem é AWAIT, ao contrário da foto: o bloco que o modelo lê AFIRMA que o
@@ -1334,6 +1449,31 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
     }
   } else {
     userMsgPreview = typeof userMsgContent === 'string' ? userMsgContent : '[multimodal]';
+    // 📎 A FOTO DE HÁ POUCO VOLTA PRO TURNO (auditoria 08/09/2026, caso Ludmila/Hiago).
+    // "O que acha desse exame?" 9 s depois da foto era respondido SEM a foto — o turno de
+    // texto não carrega imagem, e o modelo respondeu com o exame de maio que a memória
+    // trouxe. Agora, texto logo depois de foto(s) recente(s) do paciente = as fotos voltam
+    // como imagem, com o aviso de que já foram comentadas. Janela e limite em foto-recente.ts.
+    if (typeof userMsgContent === 'string' && inbound.contentType === 'text' && textoDoPaciente) {
+      const recentes = selecionarFotosRecentes(history.slice(0, -1));
+      if (recentes.length) {
+        const anexos: string[] = [];
+        for (const m of recentes) {
+          const buf = await downloadStoredMedia(m.media_storage_path as string);
+          if (buf) anexos.push(dataUrl(buf.toString('base64'), m.media_mime || 'image/jpeg'));
+        }
+        if (anexos.length) {
+          const min = Math.max(0, Math.round((Date.now() - new Date(recentes[0]!.created_at).getTime()) / 60_000));
+          userMsgContent = userContentWithImage(
+            `[A(s) foto(s) abaixo foi(ram) enviada(s) pelo paciente há ${min} min, nesta mesma conversa — você já comentou sobre ela(s). Agora ele escreveu: "${textoDoPaciente}". Se a pergunta for sobre a foto, responda OLHANDO a foto de novo, não pela memória nem por exames antigos do perfil.]`,
+            anexos,
+          );
+          fotosReanexadas = anexos.length;
+          userMsgPreview = `[texto + ${anexos.length} foto(s) recente(s)] ${textoDoPaciente}`;
+          await writeLog('info', 'vision', `foto recente re-anexada ao turno (${anexos.length}, a mais nova há ${min} min)`, { traceId });
+        }
+      }
+    }
   }
 
   // 10. Call LLM (Xarlote) — usa vision_model quando a mensagem é multimodal (imagem)
@@ -1353,7 +1493,7 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
       apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
       systemInstruction: systemPrompt,
       history: geminiHistory,
-      tools: xarloteTools,
+      tools: ferramentas,
       temperature: 0.4,
       // 2000 (era 1500/1024): turnos com VÁRIAS tool calls (ex.: plano de 2 lembretes +
       // condicional) gastam tokens nos args e truncavam o texto no meio (incidente Glauber:
@@ -1426,6 +1566,9 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
     careLinks,
     inboundMsg,
     inbound,
+    // O que ele disse, resolvido (texto/legenda/transcrição) — pra tool saber se ele
+    // NOMEOU o remédio ou só respondeu "tomei" (adherence-guard).
+    textoDoPaciente,
     ordersCreatedThisTurn: new Set<string>(),
     // UMA VOZ: handlers auto-contidos (message_supplier) setam suppressLlmText — o texto
     // do LLM não sai junto contradizendo a resposta real da tool (incidente 07/07 17:34).
@@ -1535,9 +1678,59 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
   let agentRounds = 0;
   let redFlagFiredInLoop = false;
   let lastNonEmptyRoundText = '';
+  // 🧾 O turno gira em torno de um ARQUIVO do paciente? É quando "já guardei tudo" sem
+  // ferramenta deixa de ser fala sobre o passado e vira a mentira que ele leva pra casa.
+  const contextoDeArquivo = midiaDoTurno != null || fotosReanexadas > 0
+    || history.slice(-6).some((m) => m.direction === 'in' && (m.content_type === 'image' || m.content_type === 'document'));
+  let rodadaDeCorrecaoFeita = false;
 
   for (;;) {
     agentRounds++;
+
+    // 🧾 ANÚNCIO SEM PROVA → UMA RODADA DE CORREÇÃO (auditoria 08/09/2026, caso Ludmila 04/09).
+    // O modelo escreveu "Já guardei tudo aqui no perfil" sem chamar save_exam_result. A
+    // instrução no prompt já proibia; instrução é pedido, guarda é garantia. Aqui o texto
+    // final volta pro modelo com a prova de que nada rodou, e ele escolhe: chama a
+    // ferramenta (aí a frase vira verdade) ou reescreve sem afirmar. Se insistir, a
+    // guarda pós-loop derruba a oração. Uma rodada só, e só com arquivo em jogo.
+    if (llmResponse.toolCalls.length === 0 && !rodadaDeCorrecaoFeita && contextoDeArquivo && agentLoopEnabled()
+      && agentRounds < AGENT_MAX_ROUNDS && Date.now() < agentDeadline && !distressPreempted && !redFlagFiredInLoop) {
+      const okNames = executedToolCalls.filter((t) => t.ok).map((t) => t.name);
+      const semProva = verificarAnuncios(llmResponse.text, [], okNames).suspect
+        .filter((sus) => FAMILIAS_COM_PROVA_NO_TURNO.includes(sus.kind));
+      if (semProva.length) {
+        rodadaDeCorrecaoFeita = true;
+        const alvo = semProva[0]!;
+        await writeLog('warn', 'agent', `🧾 anúncio de "${alvo.kind}" sem ferramenta no turno → rodada de correção`, { traceId, evidence: alvo.evidence });
+        priorMessages.push({ role: 'assistant', content: llmResponse.text });
+        priorMessages.push({
+          role: 'user',
+          content: `[VERIFICAÇÃO AUTOMÁTICA DO SISTEMA — o paciente NÃO escreveu isto e não vai ver isto] Você acabou de escrever: "${alvo.evidence}". Mas NENHUMA ferramenta de registro (save_exam_result, save_user_profile_fact, log_medication_taken…) foi chamada neste turno — então isso NÃO aconteceu, e o paciente vai acreditar que está guardado quando não está. Refaça a resposta de UM dos dois jeitos: (a) se ele já autorizou guardar, chame a ferramenta AGORA e só depois responda; (b) senão, responda o que ele perguntou normalmente, SEM afirmar que guardou/salvou/registrou, e pergunte se quer que você guarde. Não peça desculpas e não mencione esta verificação.`,
+        });
+        // O texto mentiroso NÃO fica como fallback: se a correção vier só com ferramenta e
+        // sem texto, é melhor o narrador honesto do que ressuscitar "já guardei tudo".
+        lastNonEmptyRoundText = '';
+        const corrStart = Date.now();
+        try {
+          llmResponse = await chat(userMsgContent, {
+            model,
+            apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
+            systemInstruction: systemPrompt,
+            history: geminiHistory,
+            tools: ferramentas,
+            temperature: 0.4,
+            maxOutputTokens: 2000,
+            timeoutMs: 25_000,
+            priorMessages,
+          });
+        } catch (err) {
+          await writeLog('warn', 'llm', `rodada de correção falhou (${String(err).slice(0, 120)}) — a guarda pós-loop derruba a frase`, { traceId });
+          break;
+        }
+        await writeLog('info', 'llm', `↻ rodada de correção [${llmResponse.model}] — ${llmResponse.tokensIn}in/${llmResponse.tokensOut}out, ${Date.now() - corrStart}ms${llmResponse.toolCalls.length ? ` — tools: ${llmResponse.toolCalls.map((t) => t.name).join(', ')}` : ' — resposta reescrita'}`, { traceId });
+        continue;
+      }
+    }
     const roundResults: Array<{ tc: ToolCall; res: ToolResult }> = [];
     let skippedAny = false;
     for (const tc of llmResponse.toolCalls) {
@@ -1601,7 +1794,7 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
         apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
         systemInstruction: systemPrompt,
         history: geminiHistory,
-        tools: xarloteTools,
+        tools: ferramentas,
         temperature: 0.4,
         maxOutputTokens: 2000,
         // Rodadas ≥2 têm timeout CURTO: o paciente já está esperando desde a rodada 1 e o
@@ -1987,7 +2180,7 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
             apiKey: promptsConfig.llm_api_key || process.env['OPENROUTER_API_KEY'],
             systemInstruction: systemPrompt,
             history: retryHistory,
-            tools: xarloteTools,
+            tools: ferramentas,
             temperature: 0.1,
             maxOutputTokens: 600,
             timeoutMs: 20_000,
@@ -2296,6 +2489,23 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
     }
   }
 
+  // 🧾 A MENTIRA QUE SOBREVIVEU À CORREÇÃO NÃO SAI (auditoria 08/09/2026). Com arquivo em
+  // jogo, "já guardei"/"está salvo" sem ferramenta de registro no turno é derrubado por
+  // oração — o resto da resposta segue. Se não sobrar nada, a frase honesta padrão.
+  if (replyText && contextoDeArquivo) {
+    const okNames = executedToolCalls.filter((t) => t.ok).map((t) => t.name);
+    const teimosos = verificarAnuncios(replyText, [], okNames).suspect
+      .filter((sus) => FAMILIAS_COM_PROVA_NO_TURNO.includes(sus.kind));
+    if (teimosos.length) {
+      const limpo = semAnuncios(replyText, teimosos.map((sus) => sus.kind));
+      await writeLog('error', 'agent', `🚫 Anti-mentira: "${teimosos[0]!.kind}" anunciado sem ferramenta mesmo após correção → ${limpo.removidas.length} oração(ões) derrubada(s)`, {
+        traceId, evidence: teimosos[0]!.evidence,
+      });
+      void writeEvent({ eventName: 'agent.claim_stripped', userId: user.id, conversationId: conversation.id, payload: { kind: teimosos[0]!.kind, removidas: limpo.removidas.length } });
+      replyText = limpo.texto.trim() || 'Ainda não guardei nada no perfil, tá? Quer que eu guarde esse resultado aqui pra gente consultar depois?';
+    }
+  }
+
   // 🚫 ANTI-MENTIRA DE LEMBRETE (incidente Waldir): afirmou agendar, mas nem o LLM nem o retry
   // criaram → NÃO deixa sair "te lembro às 7h" (mentira que fez o Waldir não ser avisado).
   // Só quando o texto do LLM ia mesmo sair (não suprimido por outro handler — evita 2ª voz).
@@ -2354,6 +2564,30 @@ ${decision.missing.map((t) => PERGUNTA[t]).join('\n')}
         await writeLog('warn', 'llm', `Turno vazio (sem texto e sem tool — LLM truncado?) — fallback gracioso`, { traceId, tokensOut: llmResponse.tokensOut });
       }
     }
+  }
+
+  /**
+   * 🎙️ SAUDAÇÃO DETERMINÍSTICA — a última palavra é do servidor.
+   *
+   * Fica DEPOIS de todos os backstops de propósito: o que quer que o modelo tenha escrito no
+   * turno do nome, quem fala com o paciente aqui é esta frase. Foi o turno em que o Rodrigo
+   * recebeu "Prontinho, já cuidei disso aqui!" como áudio de boas-vindas (24/08), e é o turno
+   * onde a oferta de se conhecerem PRECISA sair — em seis semanas ela não saiu nenhuma vez
+   * quando dependia de o modelo decidir.
+   *
+   * Só entra quando o paciente REALMENTE respondeu um nome (`looksLikeName`): se ele
+   * respondeu outra coisa — um pedido, uma dúvida — `saudacaoDoServidor` é null e o texto do
+   * modelo segue, porque aí o certo é atender o que ele trouxe.
+   */
+  if (saudacaoDoServidor) {
+    if (replyText && replyText !== saudacaoDoServidor) {
+      await writeLog('info', 'agent', `saudação do servidor substituiu o texto do modelo no turno do nome`, {
+        traceId, userId: user.id, descartado: replyText.slice(0, 80),
+      });
+    }
+    // `suppressReply` já não é consultado daqui pra frente (o envio testa só `replyText`),
+    // então atribuir a saudação basta pra ela sair — inclusive num turno que teria sido mudo.
+    replyText = saudacaoDoServidor;
   }
 
   // 12b. Send response — texto OU áudio (voice intro na primeira saudação)
