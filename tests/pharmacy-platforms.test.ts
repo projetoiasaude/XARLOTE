@@ -109,8 +109,8 @@ describe('parseVtexSimulation (preço/estoque/entrega por CEP)', () => {
   it('separa ENTREGA de RETIRADA e escolhe a mais rápida de cada', () => {
     const f = parseVtexSimulation(SIM)!;
     // entrega mais rápida = EXPRESSA (2h) e não NORMAL (1 dia útil)
-    expect(f.delivery).toEqual({ etaText: '2 horas', feeReais: 14.9 });
-    expect(f.pickup).toEqual({ etaText: '60 min', feeReais: 0 });
+    expect(f.delivery).toEqual({ etaText: '2 horas', feeReais: 14.9, etaMinutes: 120 });
+    expect(f.pickup).toEqual({ etaText: '60 min', feeReais: 0, etaMinutes: 60 });
   });
 
   it('sem entrega em domicílio (só retirada) → delivery null', () => {
@@ -308,13 +308,30 @@ describe('buildVtexCartLink + registry', () => {
     if (prev) process.env['ZENROWS_API_KEY'] = prev;
   });
 
-  it('activeNetworks COM ZENROWS_API_KEY inclui a RD (Drogasil) = 13 redes', () => {
+  it('nem COM a chave a RD entra — Drogasil desligada em 01/09 (Akamai venceu o ZenRows)', () => {
+    // O gate `access === 'akamai' && zenrows` continua valendo; o que mudou foi o
+    // `enabled` da Drogasil. Medido em 01/09/2026: o ZenRows responde 200 com o SENSOR
+    // do Akamai Bot Manager em vez da página, em proxy puro E com js_render. Deixá-la
+    // ligada custava 1 crédito por cotação num request que sempre falha.
     const prev = process.env['ZENROWS_API_KEY'];
     process.env['ZENROWS_API_KEY'] = 'test-key';
     const ids = activeNetworks().map((n) => n.id);
-    expect(ids).toContain('drogasil');
+    expect(ids).not.toContain('drogasil');
     expect(ids).toContain('nissei');
-    expect(ids.length).toBe(13);
+    expect(ids.length).toBe(12);
+    if (prev) process.env['ZENROWS_API_KEY'] = prev; else delete process.env['ZENROWS_API_KEY'];
+  });
+
+  it('o GATE do proxy segue de pé: nenhuma rede akamai entra sem a chave', () => {
+    // Guarda o mecanismo, não a configuração. Se alguém religar a Drogasil (ou a Raia)
+    // depois de resolver o anti-bot, este teste é quem garante que ela não entra no pool
+    // num ambiente sem ZENROWS_API_KEY — onde ela falharia em silêncio, como em agosto.
+    const prev = process.env['ZENROWS_API_KEY'];
+    delete process.env['ZENROWS_API_KEY'];
+    expect(activeNetworks().some((n) => n.access === 'akamai')).toBe(false);
+    process.env['ZENROWS_API_KEY'] = 'test-key';
+    const comChave = activeNetworks().filter((n) => n.access === 'akamai');
+    expect(comChave.every((n) => n.enabled)).toBe(true);
     if (prev) process.env['ZENROWS_API_KEY'] = prev; else delete process.env['ZENROWS_API_KEY'];
   });
 });
@@ -395,7 +412,7 @@ describe('cesta multi-item (auditoria 1º pedido — P2)', () => {
     expect(r.total).toBeCloseTo(26.99 + 4.99 * 2, 2); // 36.97
     expect(r.perSku['52332']).toEqual({ price: 26.99, available: true });
     expect(r.allAvailable).toBe(true);
-    expect(r.delivery).toEqual({ etaText: '60 min', feeReais: 7.9 });
+    expect(r.delivery).toEqual({ etaText: '60 min', feeReais: 7.9, etaMinutes: 60 });
   });
 
   it('parseVtexBasketSimulation: item indisponível não entra no total e marca allAvailable=false', () => {

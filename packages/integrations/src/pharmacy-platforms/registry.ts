@@ -41,7 +41,18 @@ export const PLATFORM_REGISTRY: readonly PlatformNetwork[] = [
 
   // ── Grupo B: Akamai — via proxy ZenRows (rd-adapter). Drogasil é o REPRESENTANTE do grupo
   // RD (Raia/Onofre têm o mesmo catálogo/preço → ficam off pra não gastar crédito à toa). ──
-  { id: 'drogasil', label: 'Drogasil', host: 'https://www.drogasil.com.br', salesChannel: '1', access: 'akamai', group: 'RD', enabled: true },
+  //
+  // DESLIGADA em 01/09/2026. O ZenRows deixou de vencer o Akamai: responde HTTP 200 com
+  // ~2.4KB contendo o SENSOR do Bot Manager (`<script src="/<hash>/<hash>/ax/...">`) em
+  // vez da página. Testado degrau a degrau (`scripts/diagnose-rd.ts`): proxy puro e
+  // `js_render` devolvem o mesmo sensor; `premium_proxy` devolve 422 RESP001. Em julho
+  // funcionava — 3 cotações reais chegaram a paciente; em agosto foram ZERO, e ninguém
+  // percebeu porque o adaptador devolve [] em silêncio.
+  //
+  // Ficar ligada custava 1 crédito por cotação num request que SEMPRE falha. Religar
+  // exige ou outro provedor anti-bot, ou — o caminho que presta — o feed de produtos do
+  // programa de afiliados da RD, que entrega o mesmo dado de graça e sem briga.
+  { id: 'drogasil', label: 'Drogasil', host: 'https://www.drogasil.com.br', salesChannel: '1', access: 'akamai', group: 'RD', enabled: false },
   { id: 'droga-raia', label: 'Droga Raia', host: 'https://www.drogaraia.com.br', salesChannel: '1', access: 'akamai', group: 'RD', enabled: false },
   { id: 'araujo', label: 'Drogaria Araujo', host: 'https://www.araujo.com.br', salesChannel: '1', access: 'akamai', group: 'Araujo', enabled: false },
   { id: 'onofre', label: 'Onofre', host: 'https://www.onofre.com.br', salesChannel: '1', access: 'akamai', group: 'RD', enabled: false },

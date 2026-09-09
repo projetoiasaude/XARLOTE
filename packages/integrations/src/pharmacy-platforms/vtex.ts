@@ -151,7 +151,7 @@ function pickBestSla(slas: Record<string, unknown>[]): FulfillmentOption | null 
       best = { rankMin, fee, est };
     }
   }
-  return best ? { etaText: formatShippingEstimate(best.est), feeReais: best.fee } : null;
+  return best ? { etaText: formatShippingEstimate(best.est), feeReais: best.fee, etaMinutes: best.rankMin } : null;
 }
 
 /** Converte shippingEstimate num nº de minutos comparável (pra achar a opção mais rápida). */

@@ -12,6 +12,7 @@
 import { activeNetworks, type PlatformNetwork } from './registry.js';
 import { rankProductMatches, medNameForSearch } from './matching.js';
 import { searchVtexProducts, simulateVtexByCep, buildVtexCartLink, buildVtexCartLinkMulti, simulateVtexBasket, onlyDigits, type BasketItem } from './vtex.js';
+import { ordenarCotacoesDeRede } from '@iasaude/shared';
 import { quoteRDProduct, zenrowsConfigured } from './rd-adapter.js';
 import { quoteNisseiProduct } from './nissei-adapter.js';
 import { quoteUltrafarmaProduct } from './ultrafarma-adapter.js';
@@ -207,7 +208,11 @@ export async function quotePlatforms(
     quotes = [...bestByGroup.values()];
   }
 
-  return quotes.sort((a, b) => a.price - b.price);
+  // Ordena por CHEGADA e por TOTAL ENTREGUE, não por preço de etiqueta — ver
+  // `compararCotacoesDeRede`. Uma cotação de item único é uma cesta de uma linha.
+  return ordenarCotacoesDeRede(
+    quotes.map((q) => ({ ...q, lines: [q.sku] as readonly unknown[], total: q.price })),
+  ).map(({ lines: _l, total: _t, ...q }) => q as PlatformQuote);
 }
 
 // ─── Cesta: pedido com N remédios → 1 carrinho por rede (auditoria 1º pedido) ──
@@ -430,7 +435,7 @@ export async function quotePlatformBasket(
     }
     quotes = [...best.values()];
   }
-  return quotes.sort((a, b) => (b.lines.length - a.lines.length) || (a.total - b.total));
+  return ordenarCotacoesDeRede(quotes);
 }
 
 /** Limpa o cache em memória (teste/manutenção). */

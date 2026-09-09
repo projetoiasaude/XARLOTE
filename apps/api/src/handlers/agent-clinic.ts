@@ -15,7 +15,6 @@ import {
   buildAgentClinicSystemPrompt,
   agentClinicTools,
   messagesToHistory,
-  trimHistory,
   type AgentClinicContext,
 } from '@iasaude/llm';
 import {
@@ -403,7 +402,7 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
       model: cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
       apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'],
       systemInstruction: systemPrompt,
-      history: trimHistory(messagesToHistory(history.slice(0, -1) as Message[]), 12),
+      history: messagesToHistory(history.slice(0, -1) as Message[]),
       tools: agentClinicTools,
       temperature: 0.3,
       maxOutputTokens: 400,
@@ -428,7 +427,7 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
         model: cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
         apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'],
         systemInstruction: `${systemPrompt}\n\n## ⚠️ ATENÇÃO — SUA RESPOSTA ANTERIOR VEIO VAZIA\nVocê não gerou texto NEM chamou tool. Isso deixa a recepção falando com uma parede. Nesta tentativa é OBRIGATÓRIO: se a mensagem dela traz horário, chame \`record_consultation_quote\`; se ela CONFIRMOU um agendamento, chame \`record_appointment_confirmation\`; em qualquer caso, escreva a resposta pra recepção.`,
-        history: trimHistory(messagesToHistory(history.slice(0, -1) as Message[]), 12),
+        history: messagesToHistory(history.slice(0, -1) as Message[]),
         tools: agentClinicTools,
         temperature: 0.3,
         maxOutputTokens: 400,

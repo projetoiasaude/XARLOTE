@@ -9,7 +9,7 @@
  * Ver docs/PHARMACY_PLATFORMS.md.
  */
 import { writeLog } from '@iasaude/db';
-import { itemDisplayName, extractCep, type OrderItem } from '@iasaude/shared';
+import { itemDisplayName, extractCep, totalEntregue, faixaDePrazo, temOpcaoImediata, type OrderItem } from '@iasaude/shared';
 import { quotePlatformBasket, medNameForSearch, type PlatformBasketQuote, type BasketRequestItem } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 
@@ -36,10 +36,36 @@ function fulfillmentLine(q: PlatformBasketQuote): string {
   return parts.join(' · ');
 }
 
+/**
+ * Selo de rapidez na manchete. A pessoa decide por DUAS coisas — quando chega e quanto
+ * custa — e as duas precisam estar na primeira linha. Enterrar o prazo embaixo do preço
+ * foi o que deixou "R$ 12,56" parecer melhor que "R$ 14,98" quando o primeiro chegava
+ * dez dias depois e custava R$ 40,98 no fim.
+ */
+function seloDePrazo(q: PlatformBasketQuote): string {
+  switch (faixaDePrazo(q)) {
+    case 'agora':
+      return `⚡ chega em ${q.delivery!.etaText}`;
+    case 'hoje':
+      return `chega em ${q.delivery!.etaText}`;
+    case 'dias':
+      return `chega em ${q.delivery!.etaText}`;
+    case 'so-retirada':
+      return `retira em ${q.pickup!.etaText}`;
+    default:
+      return 'sem entrega pro seu CEP';
+  }
+}
+
 /** Bloco de UMA rede: total + cada item (pedido → produto real) + o que falta + link(s). */
 function renderNetworkBlock(idx: number, q: PlatformBasketQuote): string {
   const count = q.lines.length > 1 ? ` (${q.lines.length} itens)` : '';
-  const head = `${NUM_EMOJI[idx] ?? '•'} *${q.networkLabel}* — ${formatBRL(q.total)}${count}`;
+  // A MANCHETE é o total ENTREGUE — o número que sai do bolso. O preço do remédio e o
+  // frete aparecem quebrados logo abaixo, pra ninguém achar que escondemos o frete.
+  const head = `${NUM_EMOJI[idx] ?? '•'} *${q.networkLabel}* — ${formatBRL(totalEntregue(q))}${count} · ${seloDePrazo(q)}`;
+  const quebra = q.delivery && q.delivery.feeReais > 0
+    ? `   ${formatBRL(q.total)} + ${formatBRL(q.delivery.feeReais)} de entrega`
+    : null;
   const logi = fulfillmentLine(q);
   // Rede que NÃO monta carrinho único (RD) traz link por linha → 1 link por remédio (senão o
   // 2º item sumiria atrás do link do 1º). VTEX = 1 carrinho com tudo (q.checkoutUrl).
@@ -51,7 +77,7 @@ function renderNetworkBlock(idx: number, q: PlatformBasketQuote): string {
   });
   const miss = q.missing.length ? `\n   ⚠️ não achei aqui: ${q.missing.join(', ')}` : '';
   const foot = perItemLinks ? '\n   (cada remédio no seu link acima)' : `\n   🛒 ${q.checkoutUrl}`;
-  return `${head}${logi ? `\n   ${logi}` : ''}\n${itemLines.join('\n')}${miss}${foot}`;
+  return `${head}${quebra ? `\n${quebra}` : ''}${logi ? `\n   ${logi}` : ''}\n${itemLines.join('\n')}${miss}${foot}`;
 }
 
 export interface PresentPlatformQuotesResult {
@@ -117,9 +143,17 @@ export async function presentPlatformQuotes(params: {
   const top = quotes.slice(0, MAX_NETWORKS);
   const blocks = top.map((q, i) => renderNetworkBlock(i, q));
 
+  // Quando existe opção que resolve HOJE, isso é a notícia — e vem antes de qualquer
+  // outra coisa. Foi a promessa que a via de WhatsApp não conseguiu cumprir em 82% das
+  // vezes; aqui ela é verificável antes de sair da boca.
+  const daPraHoje = temOpcaoImediata(top);
   const intro = introText ?? (soleChannel
-    ? 'Não achei farmácia de bairro com WhatsApp aqui na sua região agora 😕 mas dá pra pedir nas grandes redes pertinho de você — é só tocar e finalizar o pagamento no site 👇\n\n'
-    : 'Também achei nas grandes redes aqui perto — é só tocar e finalizar o pagamento no site 👇\n\n');
+    ? (daPraHoje
+        ? 'Achei aqui pertinho e você consegue *hoje mesmo* 👇 é só tocar e finalizar o pagamento no site da farmácia.\n\n'
+        : 'Não achei farmácia de bairro com WhatsApp aqui na sua região agora 😕 mas dá pra pedir nas grandes redes pertinho de você — é só tocar e finalizar o pagamento no site 👇\n\n')
+    : (daPraHoje
+        ? 'Já tenho uma opção que chega *hoje* 👇 é só tocar e finalizar o pagamento no site da farmácia.\n\n'
+        : 'Também achei nas grandes redes aqui perto — é só tocar e finalizar o pagamento no site 👇\n\n'));
   const outro = outroText ?? (soleChannel
     ? '\n\nQualquer dúvida na hora de finalizar, é só me chamar 💙'
     : '\n\nEnquanto isso sigo cotando nas farmácias do bairro — se aparecer melhor, te aviso! 😊');
@@ -129,7 +163,7 @@ export async function presentPlatformQuotes(params: {
   const itemsCovered = new Set(top.flatMap((q) => q.lines.map((l) => l.requested))).size;
   await writeLog('info', 'platform', `Cotação de plataformas (cesta): ${top.length} rede(s), ${itemsCovered}/${basket.length} item(ns) coberto(s)`, {
     traceId, orderId,
-    redes: top.map((q) => `${q.networkLabel} ${formatBRL(q.total)} (${q.lines.length}/${basket.length}${q.missing.length ? `, falta ${q.missing.join('+')}` : ''})`),
+    redes: top.map((q) => `${q.networkLabel} ${formatBRL(totalEntregue(q))} entregue/${faixaDePrazo(q)} (${q.lines.length}/${basket.length}${q.missing.length ? `, falta ${q.missing.join('+')}` : ''})`),
   });
   return { networksPresented: top.length, itemsCovered };
 }

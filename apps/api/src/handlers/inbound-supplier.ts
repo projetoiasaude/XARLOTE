@@ -5,7 +5,6 @@ import {
   buildAgentPharmacySystemPrompt,
   agentPharmacyTools,
   messagesToHistory,
-  trimHistory,
   userContentWithImage,
   dataUrl,
 } from '@iasaude/llm';
@@ -509,7 +508,7 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
       model: cfg.llm_model || process.env['OPENROUTER_MODEL'] || 'openai/gpt-4.1-mini',
       apiKey: cfg.llm_api_key || process.env['OPENROUTER_API_KEY'],
       systemInstruction: systemPrompt,
-      history: trimHistory(messagesToHistory(history.slice(0, -1) as Message[]), 12),
+      history: messagesToHistory(history.slice(0, -1) as Message[]),
       tools: agentPharmacyTools,
       temperature: 0.3,
       maxOutputTokens: 400,
@@ -1333,7 +1332,7 @@ export async function initiatePharmacyNegotiation(
 
   let opening: string;
   try {
-    const warmHistory = isWarm ? trimHistory(messagesToHistory(await getConversationMessages(conv.id, 12) as Message[]), 10) : [];
+    const warmHistory = isWarm ? messagesToHistory(await getConversationMessages(conv.id, 12) as Message[]) : [];
     const openingInstr = isWarm
       ? '\n\nCONTINUAÇÃO DE CONVERSA: você JÁ conversou com esta farmácia (histórico acima) — ela te conhece. Escreva UMA mensagem curta e natural pedindo a cotação NOVA dos itens: SEM se re-apresentar (nada de "aqui é a Xarlote"/"assistente"), cumprimento leve no máximo; se houver assunto pendente com ela (ex.: entrega de um pedido anterior ainda não confirmada), reconheça em meia frase antes ("antes de mais nada, saiu aquela entrega?"). Tom de WhatsApp de gente: curto, sem formalidade, no máximo 1 emoji. Não use tools.'
       : '\n\nEsta é a primeira mensagem. Escreva a abertura para a farmácia perguntando de forma curta e natural se ela TEM os itens, o preço e o prazo de entrega — SEM se apresentar (nada de "aqui é a Xarlote"/"assistente"/"sou a Xarlote"), sem mencionar IA/agente/sistema, sem emojis. Direto ao ponto, como uma pessoa perguntaria. Não use tools ainda.';

@@ -47,6 +47,14 @@ export interface FulfillmentOption {
   etaText: string;
   /** frete em reais (0 = grátis) */
   feeReais: number;
+  /**
+   * O MESMO prazo em minutos, pra ordenar sem re-parsear texto.
+   *
+   * O número já existia dentro de `pickBestSla` e era jogado fora; quem quisesse
+   * ordenar por rapidez tinha que interpretar "5 dias úteis" de volta. Guardar os
+   * dois é a diferença entre comparar e adivinhar.
+   */
+  etaMinutes: number;
 }
 
 // ─── Cesta (pedido com N medicamentos numa MESMA rede → 1 carrinho) ───────────
