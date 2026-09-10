@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -2588,6 +2588,17 @@ ${decision.alreadyOffered
     // `suppressReply` já não é consultado daqui pra frente (o envio testa só `replyText`),
     // então atribuir a saudação basta pra ela sair — inclusive num turno que teria sido mudo.
     replyText = saudacaoDoServidor;
+  }
+
+  // ✍️ CONFUSÍVEIS (auditoria 10/09/2026): "Cansei os lembretes antigos" saiu duas vezes onde
+  // era "Cancelei". É palavra real — nenhum corretor pega. Lista curta e explícita em
+  // reminder-guards; roda por último, no texto que vai pro paciente.
+  if (replyText) {
+    const c = consertarConfusiveis(replyText);
+    if (c.reparos.length) {
+      await writeLog('info', 'agent', `confusível corrigido antes do envio: ${c.reparos.join('; ')}`, { traceId });
+      replyText = c.texto;
+    }
   }
 
   // 12b. Send response — texto OU áudio (voice intro na primeira saudação)

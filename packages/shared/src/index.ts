@@ -4,6 +4,7 @@ export * from './circuit-breaker.js';
 export * from './rrule.js';
 export * from './reminder-deictics.js';
 export * from './reminder-body.js';
+export * from './reminder-guards.js';
 export * from './adherence-guard.js';
 export * from './foto-recente.js';
 export * from './waba-window.js';

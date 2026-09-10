@@ -3,7 +3,7 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem, CareLinkView } from '@iasaude/shared';
-import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool } from '@iasaude/shared';
+import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, pediuCancelarTudo, ehRruleComListaDeMinutos, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool } from '@iasaude/shared';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -2150,6 +2150,17 @@ async function handleCreateReminder(
     }
   }
 
+  // 🕒 DOIS HORÁRIOS COM MINUTOS DIFERENTES NÃO CABEM NUM RRULE (auditoria 10/09/2026).
+  // `BYHOUR=11,20;BYMINUTE=30,0` queria dizer "11h30 e 20h"; em RFC 5545 é produto
+  // cartesiano (4 disparos/dia), e o motor recusa. Aqui a recusa vira instrução PRECISA — a
+  // genérica ("não entendi o horário") fazia o modelo tentar a mesma coisa de novo.
+  if (ehRruleComListaDeMinutos(rrule)) {
+    await writeLog('warn', 'tool', `create_reminder com BYMINUTE em lista (${rrule}) — recusado, modelo instruído a criar um lembrete por horário`, {
+      traceId: ctx.traceId, userId: ctx.userId,
+    });
+    throw new ToolFailure(`NÃO criei "${titleForMsg}": o rrule "${rrule}" tem dois minutos diferentes (BYMINUTE em lista), e isso significaria disparar em TODAS as combinações de hora e minuto. Dois horários diferentes do mesmo remédio = DOIS lembretes. Chame create_reminder duas vezes, um por horário (ex.: "${title} (almoço)" com BYHOUR=11;BYMINUTE=30 e "${title} (jantar)" com BYHOUR=20;BYMINUTE=0), com o mesmo duration_days nos dois.`);
+  }
+
   let firstRun = resolveReminderFirstRun(scheduledAt, rrule, new Date(), userTz);
 
   // CASO REAL (rajada das 10:50): a LLM manda scheduled_at de HOJE já passado
@@ -2183,8 +2194,12 @@ async function handleCreateReminder(
     await writeLog('warn', 'tool', `create_reminder sem ${!title ? 'título' : 'horário'} utilizável (title=${args.title ?? '∅'}, scheduled_at=${args.scheduled_at ?? '∅'}, rrule=${args.rrule ?? '∅'}) — lembrete NÃO criado, usuário avisado`, {
       traceId: ctx.traceId, userId: ctx.userId,
     });
+    // Sem título a frase antiga saía 'o lembrete "esse lembrete"' (Glauber, 08/09 16:16) —
+    // interpolação de fallback na cara do paciente. Duas frases, uma pra cada falta.
     await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      `Opa, não consegui entender o horário pro lembrete "${titleForMsg}" 😅 Me fala de novo o horário certinho? Ex: "todo dia às 8h" ou "amanhã às 14h".`,
+      title
+        ? `Opa, não consegui entender o horário pro lembrete "${title}" 😅 Me fala de novo o horário certinho? Ex: "todo dia às 8h" ou "amanhã às 14h".`
+        : 'Opa, me perdi aqui 😅 Me fala de novo o que você quer que eu lembre e em que horário? Ex: "Nimesulida todo dia às 8h e às 20h".',
       ctx.traceId);
     return;
   }
@@ -2242,6 +2257,26 @@ async function handleCreateReminder(
     });
     return;
   }
+
+  /**
+   * ⚠️ MESMO TÍTULO, OUTRA RECORRÊNCIA (auditoria 10/09/2026 — três Nimesulidas).
+   *
+   * O guard acima só pega rrule IDÊNTICO. Em 08/09 o modelo criou "Nimesulida 100mg" com
+   * `BYHOUR=8,20` e, dois minutos depois, mais duas com `BYHOUR=8;COUNT=6` e
+   * `BYHOUR=20;COUNT=6` — sem cancelar a primeira. Às 20:00 saíram duas mensagens iguais.
+   * Não bloqueia (dois horários do mesmo remédio em dois lembretes é o caminho CERTO), mas
+   * conta ao modelo o que já existe, com o horário, pra ele cancelar o velho se for o mesmo
+   * plano. O dispatcher ainda funde o que escapar (agruparDuplicatasDeDisparo).
+   */
+  const { data: homonimos } = await db.from('reminders')
+    .select('id, title, rrule, next_run_at')
+    .eq('user_id', ctx.userId)
+    .eq('status', 'pending')
+    .ilike('title', escapeLike(title))
+    .limit(5);
+  const avisoHomonimo = (homonimos ?? []).length
+    ? ` ⚠️ JÁ EXISTE${(homonimos ?? []).length > 1 ? 'M' : ''} lembrete(s) ativo(s) com este mesmo título: ${(homonimos ?? []).map((h) => `"${h.title}" (${describeReminder(h.rrule as string | null, h.next_run_at as string)})`).join('; ')}. Se este novo SUBSTITUI aquele, chame cancel_reminders(title_query:"${title}") AGORA — senão o paciente recebe em dobro. Se são horários diferentes do mesmo remédio, está certo, deixe os dois.`
+    : '';
 
   // LEMBRETE CONDICIONAL (0020 — incidente Glauber): backup "só se não confirmar" o primário.
   // Resolve o id do primário (best-effort); se ainda não existe (tool calls do mesmo turno em
@@ -2335,7 +2370,7 @@ async function handleCreateReminder(
       const aviso = placeholdersRemovidos
         ? ` ⚠️ Removi do body ${placeholdersRemovidos} frase(s) com placeholder não preenchido (ex.: "X dias") — NUNCA escreva contagens que você não sabe; o fim da série está acima, use ele se quiser falar em dias.`
         : '';
-      ctx.observation.note = `Lembrete criado: "${title}" — ${describeReminder(rruleFinal, firstRun)}${fimTxt}. Já está ativo; não crie de novo.${aviso}`;
+      ctx.observation.note = `Lembrete criado: "${title}" — ${describeReminder(rruleFinal, firstRun)}${fimTxt}. Já está ativo; não crie de novo.${aviso}${avisoHomonimo}`;
     }
   }
   if (insErr) {
@@ -2451,6 +2486,26 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
     await writeLog('warn', 'tool', `cancel_reminders recebeu all=true E title_query="${q}" — o título vence (all ignorado)`, {
       traceId: ctx.traceId, userId: ctx.userId,
     });
+  }
+  /**
+   * 🔴 "TODOS" SÓ COM A FALA DO PACIENTE (auditoria 10/09/2026).
+   *
+   * Com o título vencendo, o que sobra é `{all: true}` SOZINHO — e nada impedia o modelo de
+   * mandar isso por conta própria, do mesmo jeito que mandou junto com o título. Apagar o
+   * prontuário de lembretes é a ação mais destrutiva que esta ferramenta tem, e ela é
+   * irreversível para quem depende do lembrete pra tomar remédio.
+   *
+   * Então a prova é a fala DELE, não a decisão do modelo — a mesma escola do gate de
+   * consentimento do laboratório. `pediuCancelarTudo` é puro e determinístico; quando não
+   * há esse pedido, a ferramenta recusa e devolve a lista pro modelo perguntar QUAL.
+   */
+  if (cancelarTudo && !pediuCancelarTudo(ctx.textoDoPaciente)) {
+    const { data: ativos } = await db.from('reminders').select('title').eq('user_id', ctx.userId).eq('status', 'pending').limit(20);
+    const lista = (ativos ?? []).map((r) => `"${r.title}"`).join(', ') || '(nenhum)';
+    await writeLog('warn', 'tool', `cancel_reminders all=true RECUSADO — o paciente não pediu "todos" nesta mensagem`, {
+      traceId: ctx.traceId, userId: ctx.userId,
+    });
+    throw new ToolFailure(`NENHUM lembrete foi cancelado: você pediu all=true, mas o paciente NÃO disse que quer cancelar TODOS os lembretes nesta mensagem. Os ativos são: ${lista}. Se ele quer parar UM grupo, chame de novo com title_query (ex.: "Nimesulida"). Se quer parar todos, pergunte e espere ele confirmar com as palavras dele. NÃO diga que cancelou nada.`);
   }
 
   // Match acento-insensível em JS: o ILIKE do Postgres não dobra diacríticos, e a LLM

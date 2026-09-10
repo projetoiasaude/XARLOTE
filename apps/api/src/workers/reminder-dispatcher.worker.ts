@@ -15,7 +15,7 @@
  */
 import { db, writeEvent, writeLog, listDeviceTokens, deleteDeviceTokens } from '@iasaude/db';
 import { isSimulatorMode, providerFor } from '@iasaude/whatsapp';
-import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBody, isWabaWindowOpen, avaliarFadiga, perguntaDeContinuidade, sanitizarCorpoDeLembrete } from '@iasaude/shared';
+import { SARA_INSTANCE, nextOccurrence, isPlaceholderPhone, normalizeReminderBody, isWabaWindowOpen, avaliarFadiga, perguntaDeContinuidade, sanitizarCorpoDeLembrete, agruparDuplicatasDeDisparo, shouldPauseRoutineSilent, avisoDePausaPorSilencio, ROUTINE_SILENT_PAUSE_DAYS } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
 import { sendPush } from '@iasaude/integrations';
 import { dispatchOutbound } from '../queues/outbound.queue.js';
@@ -227,6 +227,17 @@ export async function dispatchReminders(): Promise<void> {
   // ignorava o cooldown). Agora os DOIS caminhos compartilham este set + o cooldown por-tempo.
   const templateSentThisTick = new Set<string>();
 
+  /**
+   * 🧬 MESMO PACIENTE + MESMO TÍTULO + MESMO MINUTO = UMA MENSAGEM (auditoria 10/09/2026).
+   * Em 08/09 o Glauber tinha TRÊS "Nimesulida 100mg" ativas (o modelo criou sem cancelar) e
+   * às 20:00 recebeu duas mensagens iguais com 3 s de diferença. A criação passou a avisar o
+   * modelo; esta é a segunda trava, pro que escapar. A duplicata é RECLAMADA normalmente
+   * (next_run_at avança, não re-dispara) e só não manda a própria mensagem.
+   */
+  const duplicataDe = agruparDuplicatasDeDisparo(due as unknown as DueReminder[]);
+  /** Pacientes que já receberam o aviso de pausa NESTE tick — um só, mesmo com N rotinas. */
+  const pausaAvisadaNoTick = new Set<string>();
+
   for (const reminder of due as unknown as DueReminder[]) {
     const user = reminder.users;
     if (!user?.phone_e164) continue;
@@ -274,6 +285,18 @@ export async function dispatchReminders(): Promise<void> {
     if (reminder.rrule && lateMs > STALE_MS) {
       releaseTemplateSlot(reminder.user_id, reminder.id); // dono pulado → libera pro próximo
       await writeLog('warn', 'reminder', `lembrete recorrente pulado — atrasado ${Math.round(lateMs / 60000)}min (aguarda próxima ocorrência)`, {});
+      continue;
+    }
+
+    // Cópia do mesmo lembrete no mesmo minuto: o dono manda, esta cala. Já foi reclamada
+    // acima, então a recorrência dela segue intacta (e continua sendo fundida todo dia até
+    // alguém cancelar — o log é o que torna isso visível).
+    const donoDaDuplicata = duplicataDe.get(reminder.id);
+    if (donoDaDuplicata) {
+      releaseTemplateSlot(reminder.user_id, reminder.id);
+      await writeLog('warn', 'reminder', `lembrete "${reminder.title}" é DUPLICATA de outro do mesmo paciente no mesmo minuto — mensagem não enviada (dono ${donoDaDuplicata}). Cancele um dos dois.`, {
+        reminderId: reminder.id, ownerId: donoDaDuplicata, userId: reminder.user_id,
+      });
       continue;
     }
 
@@ -629,8 +652,55 @@ export async function dispatchReminders(): Promise<void> {
     // One-shot que voltou pra fila de re-tentativa (ver RESGATE abaixo): não repete o push
     // do app a cada tentativa — senão 8 tentativas viram 8 notificações do mesmo aviso.
     let oneShotRetryAttempt = 0;
+    /**
+     * 😴 ROTINA PARA QUEM ESTÁ MUDO HÁ DIAS (auditoria 10/09/2026 — caso Ciro).
+     *
+     * Creatina e whey todo dia às 7h20, template pago todo dia, e o paciente mudo desde
+     * 02/09: 16 mensagens, zero respostas. O check-in de re-engajamento nunca saía porque o
+     * próprio lembrete diário consumia o slot de template. Isso não é cuidado, é ruído — e a
+     * 1.000 pacientes é R$ por dia jogado num número que não responde.
+     *
+     * Só ROTINA (não-clínica) e só RECORRENTE — remédio e consulta nunca pausam por silêncio.
+     * Um aviso ÚNICO (vai pelo template, que é o único canal com a janela fechada) e depois
+     * silêncio. Retomada AUTOMÁTICA: a pessoa responde, `windowSilentMs` cai, a condição
+     * some. Nada vira status; nada precisa ser "despausado".
+     */
+    const silentDays = Number.isFinite(windowSilentMs) ? windowSilentMs / 86_400_000 : Infinity;
+    const pausaPorSilencio = needsWindow && shouldPauseRoutineSilent({
+      recurring: Boolean(reminder.rrule), critical: isCritical, silentDays,
+    });
+    let avisoDePausaEnviado = false;
     if (!isSimulatorMode()) {
-      if (windowOpen) {
+      if (pausaPorSilencio) {
+        const jaAvisou = Boolean(uMeta['routine_pause_notice_at']) || pausaAvisadaNoTick.has(reminder.user_id);
+        if (!jaAvisou && reengageTemplateEnabled() && reengageTplAllowed) {
+          const juntos = coalescedTitles.get(reminder.id) ?? [reminder.title];
+          const tituloCombinado = juntos.length > 1 ? `${juntos.slice(0, -1).join(', ')} e ${juntos[juntos.length - 1]}` : reminder.title;
+          const tpl = buildReengageTemplate(name.split(' ')[0] ?? name, avisoDePausaPorSilencio(tituloCombinado));
+          await dispatchOutbound({ kind: 'template', instance: SARA_INSTANCE, phoneE164: user.phone_e164, templateName: tpl.name, templateLanguage: tpl.language, templateVariables: tpl.variables, text: tpl.text, messageId: mirroredMessageId ?? undefined });
+          templateSentThisTick.add(reminder.user_id);
+          pausaAvisadaNoTick.add(reminder.user_id);
+          if (mirroredMessageId) await db.from('messages').update({ content: tpl.text }).eq('id', mirroredMessageId);
+          // Carimbo no USUÁRIO (não no lembrete): o Ciro tem Creatina E Whey no mesmo minuto,
+          // e um carimbo por lembrete mandaria o aviso duas vezes em dias seguidos.
+          await db.from('users').update({ metadata: { ...uMeta, reengage_template_at: now.toISOString(), routine_pause_notice_at: now.toISOString() } }).eq('id', reminder.user_id);
+          avisoDePausaEnviado = true;
+          deliveryStatus = 'delivered'; // o AVISO chegou; o lembrete em si não
+          naoEntregouHoje = true;
+          await writeLog('info', 'reminder', `pausa por silêncio: aviso ÚNICO enviado (mudo há ${Math.round(silentDays)}d) — "${tituloCombinado}" pausa até ele responder`, {
+            reminderId: reminder.id, userId: reminder.user_id,
+          });
+          void writeEvent({ eventName: 'reminder.routine_paused_silent', userId: reminder.user_id, conversationId: conv?.id, payload: { reminder_id: reminder.id, silent_days: Math.round(silentDays), notified: true } });
+        } else {
+          deliveryStatus = 'suppressed';
+          naoEntregouHoje = true;
+          if (primeiraVezHoje && streak % ROUTINE_SILENT_PAUSE_DAYS === 0) {
+            await writeLog('info', 'reminder', `lembrete de rotina "${reminder.title}" PAUSADO por silêncio (mudo há ${Math.round(silentDays)}d${jaAvisou ? ', já avisado' : ', aviso aguardando slot de template'}). Volta sozinho quando ele responder.`, {
+              reminderId: reminder.id, userId: reminder.user_id,
+            });
+          }
+        }
+      } else if (windowOpen) {
         // messageId → o WORKER da fila re-carimba o RESULTADO REAL (delivered/failed) por cima
         // do 'delivered' otimista. Sem isto, um envio que falha (ex.: HTTP 500) ficava 'delivered'
         // mentiroso — foi o phantom dos 5 lembretes-template da manhã de 21/07.
@@ -844,6 +914,12 @@ export async function dispatchReminders(): Promise<void> {
       if (prevPl['blocked_streak'] || prevPl['blocked_log_day']) {
         const { blocked_streak: _s, blocked_log_day: _d, ...resto } = prevPl;
         await db.from('reminders').update({ payload: resto }).eq('id', reminder.id);
+      }
+      // A pessoa voltou (o lembrete foi ENTREGUE, então a janela reabriu): limpa o carimbo do
+      // aviso de pausa pra que um silêncio futuro ganhe um aviso novo, não silêncio mudo.
+      if (uMeta['routine_pause_notice_at'] && !avisoDePausaEnviado) {
+        const { routine_pause_notice_at: _n, ...metaResto } = uMeta;
+        await db.from('users').update({ metadata: metaResto }).eq('id', reminder.user_id);
       }
     } else if (naoEntregouHoje && reminder.rrule && primeiraVezHoje) {
       // ⚠️ SÓ RECORRENTE, e SÓ na primeira ocorrência do dia. Num one-shot o bloco de
