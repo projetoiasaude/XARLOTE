@@ -400,7 +400,9 @@ export const xarloteTools: ToolDefinition[] = [
           },
           all: {
             type: 'boolean',
-            description: 'true = cancela TODOS os lembretes ativos do usuário. Só use se ele pedir explicitamente ("cancela todos os meus lembretes").',
+            description:
+              'true = cancela TODOS os lembretes ativos do usuário, de todos os remédios. Só use se ele pedir isso explicitamente ("cancela todos os meus lembretes"). '
+              + '⚠️ NUNCA mande junto com title_query: se você quer cancelar um grupo, use SÓ o title_query. Mandar os dois já apagou o prontuário inteiro de um paciente (08/09) — ele perdeu quatro medicações de uma vez. Havendo os dois, o servidor ignora este campo e obedece ao título.',
           },
         },
         required: [],

@@ -76,6 +76,20 @@ export function parseRrule(rrule: string): ParsedRrule | null {
   }
   const byMinute = fields.get('BYMINUTE');
   if (byMinute !== undefined) {
+    /**
+     * ⚠️ BYMINUTE COM LISTA + BYHOUR COM LISTA É AMBÍGUO E PERIGOSO (Glauber, 09/09).
+     *
+     * O modelo emitiu `BYHOUR=11,20;BYMINUTE=30,0` querendo dizer "11h30 e 20h00". Mas em
+     * RFC 5545 isso é PRODUTO CARTESIANO: 11:00, 11:30, 20:00 e 20:30 — quatro disparos por
+     * dia para um remédio de duas doses. Interpretar ao pé da letra dobraria a cobrança;
+     * parear por posição (11↔30, 20↔0) seria inventar uma semântica que o padrão não tem e
+     * que ninguém que ler o rrule vai supor.
+     *
+     * Então a lista de minutos é RECUSADA (o `undefined` faz `parseRrule` devolver null e o
+     * `create_reminder` responder ao modelo que crie DOIS lembretes). Lista só em BYHOUR,
+     * com um minuto único, continua valendo — é o caso comum e não ambíguo ("8h e 20h").
+     */
+    if (byMinute.includes(',')) return null;
     const m = parseInt(byMinute, 10);
     if (!Number.isNaN(m) && m >= 0 && m <= 59) parsed.byMinute = m;
   }

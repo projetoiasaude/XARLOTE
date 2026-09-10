@@ -2426,10 +2426,37 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
     throw new ToolFailure('NENHUM lembrete foi cancelado (falha técnica ao ler seus lembretes) — eles vão continuar disparando. NÃO diga que cancelou; avise que deu um problema e que ele pode pedir de novo.');
   }
 
+  /**
+   * 🔴 `all: true` JUNTO COM `title_query` APAGOU O PRONTUÁRIO INTEIRO (Glauber, 08 e 09/09).
+   *
+   * A linha era `filter((r) => args.all || …includes(qn))`. O `||` faz curto-circuito: com
+   * `all` verdadeiro, TODO lembrete casa e o `title_query` é jogado fora. O modelo chamou
+   * `{all: true, title_query: "Nimesulida"}` achando que o título limitava o escopo — e o
+   * paciente perdeu, de uma vez, Esomeprazol, Domperidona (almoço e jantar) e Levofloxacino.
+   * No dia seguinte a mesma chamada com `{all: true, title_query: "Domperidona"}` levou a
+   * Nimesulida, que ele estava tomando de 12 em 12 horas até 14/09. Ele saiu de quatro
+   * medicações lembradas para uma — e ouviu "cancelei os lembretes antigos da Nimesulida",
+   * porque nem a Xarlote sabia o que tinha destruído.
+   *
+   * Nas outras 13 chamadas da história do produto o modelo mandou só `title_query`. As duas
+   * que mandaram os dois campos são de 08 e 09/09 — comportamento novo, e caro.
+   *
+   * A regra agora: **escopo explícito vence**. `all` só significa "todos" quando NÃO há
+   * título; havendo os dois, o título manda, porque é o sinal mais específico da intenção.
+   * Cancelar tudo é destrutivo e irreversível pro paciente: na dúvida entre apagar tudo e
+   * apagar um grupo, apaga-se o grupo.
+   */
+  const cancelarTudo = Boolean(args.all) && !q;
+  if (args.all && q) {
+    await writeLog('warn', 'tool', `cancel_reminders recebeu all=true E title_query="${q}" — o título vence (all ignorado)`, {
+      traceId: ctx.traceId, userId: ctx.userId,
+    });
+  }
+
   // Match acento-insensível em JS: o ILIKE do Postgres não dobra diacríticos, e a LLM
   // manda "agua" sem acento — casava 0 rows EM SILÊNCIO (o antigo E3, planos duplicados).
   const qn = foldAccents(q);
-  const casaram = (pendentes ?? []).filter((r) => args.all || foldAccents(r.title ?? '').includes(qn));
+  const casaram = (pendentes ?? []).filter((r) => cancelarTudo || foldAccents(r.title ?? '').includes(qn));
 
   // 🛡️ INVARIANTE: lembrete de consulta VIVA pertence ao ciclo de vida da consulta, não
   // ao curinga de título. Pra parar de ser lembrado de uma consulta o caminho é
@@ -2467,7 +2494,7 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
   const cancelled = aCancelar;
 
   if (protegidos.length > 0) {
-    await writeLog('warn', 'tool', `cancel_reminders: ${protegidos.length} lembrete(s) de consulta VIVA protegidos do curinga "${args.all ? '*' : q}"`, {
+    await writeLog('warn', 'tool', `cancel_reminders: ${protegidos.length} lembrete(s) de consulta VIVA protegidos do curinga "${cancelarTudo ? '*' : q}"`, {
       traceId: ctx.traceId, userId: ctx.userId, protegidos: protegidos.map((r) => r.title),
     });
   }
@@ -2475,7 +2502,7 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
   // AINDA 0: NÃO fica em silêncio (a LLM já pode ter dito "cancelei"). Fala a verdade.
   // Mas se houve PROTEGIDOS, "não achei lembrete com X" seria mentira — achamos e
   // preservamos de propósito. Nesse caso quem fala é o modelo, com a nota da observation.
-  if (count === 0 && !args.all && protegidos.length === 0) {
+  if (count === 0 && !cancelarTudo && protegidos.length === 0) {
     const { data: ativos } = await db.from('reminders')
       .select('title').eq('user_id', ctx.userId).eq('status', 'pending').limit(15);
     if (ativos?.length) {
@@ -2498,9 +2525,9 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
       : '';
     ctx.observation.note = count > 0
       ? `${count} lembrete(s) cancelado(s) de verdade: ${lista}. Confira se é isso que o paciente pediu — se você apagou algo que ele NÃO pediu pra apagar, recrie agora e conte a ele.${protegidosTxt}`
-      : `NENHUM lembrete foi cancelado (nada casou com "${args.all ? '*' : q}").${protegidosTxt || ' NÃO diga que cancelou. O paciente já recebeu a lista dos ativos pra escolher.'}`;
+      : `NENHUM lembrete foi cancelado (nada casou com "${cancelarTudo ? '*' : q}").${protegidosTxt || ' NÃO diga que cancelou. O paciente já recebeu a lista dos ativos pra escolher.'}`;
   }
-  await writeLog('info', 'tool', `cancel_reminders: ${count} lembrete(s) cancelado(s) (query="${args.all ? '*' : q}")`, {
+  await writeLog('info', 'tool', `cancel_reminders: ${count} lembrete(s) cancelado(s) (query="${cancelarTudo ? '*' : q}")`, {
     traceId: ctx.traceId, userId: ctx.userId,
   });
   await writeAudit({
@@ -2510,7 +2537,7 @@ async function handleCancelReminders(args: { title_query?: string; all?: boolean
     targetTable: 'reminders',
     conversationId: ctx.conversationId,
     traceId: ctx.traceId,
-    metadata: { count, query: args.all ? '*' : q },
+    metadata: { count, query: cancelarTudo ? '*' : q },
   });
 }
 
