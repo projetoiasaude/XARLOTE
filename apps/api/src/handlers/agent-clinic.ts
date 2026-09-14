@@ -30,6 +30,11 @@ import {
   describePreconditionsForPatient,
   limparPlaceholder,
   decidirRepasseAoPaciente,
+  analisarMensagemDeRobo,
+  responderRobo,
+  roboEmLoop,
+  pareceNarracaoInterna,
+  CORTESIA_NEUTRA,
 } from '@iasaude/shared';
 import type { NormalizedInbound, Message } from '@iasaude/shared';
 import { commitAppointment } from './appointment-commit.js';
@@ -249,6 +254,60 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
   if (!quote) {
     await writeLog('warn', 'clinic', 'Nenhuma cotação ativa pra essa clínica', { traceId, conversationId });
     return;
+  }
+
+  // 3c. 🤖 ROBÔ DE MENU DO OUTRO LADO (caso Duda, 10/09 — GastroEla). Antes do modelo e antes
+  // do limite de turnos: robô não conversa, espera EXATAMENTE o que pediu. Reconhecido o robô
+  // (`analisarMensagemDeRobo`, puro), a resposta é determinística (`responderRobo`): o número da
+  // opção de agendamento, o dado do perfil se já o temos, UMA pergunta ao paciente (dedupe por
+  // assunto no relay), silêncio pra saudação automática — e, em loop (mesmo prompt ≥3×) ou sem
+  // caminho de agendamento, encerra a cotação com motivo honesto em vez de queimar 24 turnos.
+  if (!isAppointmentConfirmation) {
+    const analise = analisarMensagemDeRobo(text);
+    if (analise.robo) {
+      const { data: recentes } = await db.from('messages').select('direction, content').eq('conversation_id', conversationId).order('created_at', { ascending: false }).limit(16);
+      const cronologicas = ([...(recentes ?? [])].reverse() as Array<{ direction: 'in' | 'out'; content: string | null }>);
+      const ultimaOpcao = ((recentes ?? []).find((m) => m.direction === 'out' && /^\d{1,2}$/.test(((m.content as string | null) ?? '').trim()))?.content as string | null)?.trim() ?? null;
+      const consultRow = quote.consultations as { user_id?: string; preferences?: Record<string, unknown> | null } | null;
+      const prefsRobo = (consultRow?.preferences ?? {}) as Record<string, unknown>;
+      const pdataRobo = ((prefsRobo['patient_data'] ?? {}) as Record<string, string>);
+      const { data: uRobo } = consultRow?.user_id
+        ? await db.from('users').select('preferred_name, full_name, document_cpf, birth_date, phone_e164').eq('id', consultRow.user_id).maybeSingle()
+        : { data: null };
+      const dados = {
+        nomeCompleto: (uRobo?.full_name as string | null) ?? null,
+        nascimento: fmtBirthBR((uRobo?.birth_date as string | null) ?? null),
+        cpf: fmtCpfBR((uRobo?.document_cpf as string | null) ?? null),
+        telefone: (uRobo?.phone_e164 as string | null) ?? null,
+        convenio: pdataRobo['health_plan'] ?? (prefsRobo['plan'] as string | undefined) ?? null,
+        carteirinha: pdataRobo['plan_card_number'] ?? null,
+      };
+      const encerrarPorRobo = async (motivo: string) => {
+        await db.from('consultation_quotes').update({ notes: `atendimento automático (robô): ${motivo}` }).eq('id', quote.id);
+        await writeLog('warn', 'clinic', `🤖 Robô de menu sem saída — cotação encerrada: ${motivo}`, { traceId, conversationId, quoteId: quote.id });
+        await finalizeConsultationQuote(quote.id, quote.consultation_id, 'unavailable', traceId);
+      };
+      if (roboEmLoop(cronologicas)) {
+        await encerrarPorRobo('o mesmo prompt repetido 3+ vezes (loop)');
+        return;
+      }
+      const acao = responderRobo(analise, dados, ultimaOpcao);
+      await writeLog('info', 'clinic', `🤖 Robô de menu (${analise.tipo}) → ${acao.acao}${'motivo' in acao ? `: ${acao.motivo}` : ''}`, { traceId, conversationId, quoteId: quote.id });
+      switch (acao.acao) {
+        case 'enviar':
+          await sendOutboundToClinic(conversationId, clinicPhone, acao.texto, traceId);
+          return;
+        case 'perguntar_paciente':
+          await relayClinicQuestionToUser(quote, acao.pergunta, traceId)
+            .catch((e) => writeLog('error', 'clinic', `Robô: falha ao perguntar ao paciente: ${String(e).slice(0, 120)}`, { traceId }));
+          return;
+        case 'esperar':
+          return;
+        case 'desistir':
+          await encerrarPorRobo(acao.motivo);
+          return;
+      }
+    }
   }
 
   // 4. Turn limit (12 turnos = 24 msgs) — freio contra conversa em LOOP com a recepção.
@@ -946,9 +1005,16 @@ export async function processInboundClinic(ctx: ClinicInboundCtx): Promise<void>
     // mandar a cortesia genérica agora seria mensagem dupla pra recepção.
     await writeLog('info', 'agent-clinic', 'Resposta à clínica já enviada no loop de tools — pulando o passo 9', { traceId, conversationId });
   } else if (llmResponse.text.trim() && !silentOutcome) {
+    // 🛡️ NARRAÇÃO INTERNA nunca vai pra recepção (caso Duda: "A clínica está pedindo o nome
+    // completo do paciente… Vou precisar perguntar ao paciente" saiu pro robô, duas vezes).
+    let textoClinica = llmResponse.text.trim();
+    if (pareceNarracaoInterna(textoClinica)) {
+      await writeLog('warn', 'agent-clinic', `🛡️ Narração interna barrada antes de ir à clínica: "${textoClinica.slice(0, 80)}"`, { traceId, conversationId });
+      textoClinica = clarificationRequested ? pickClinicFallbackMessage({ appointmentConfirmed: false, clarificationRequested: true }) : CORTESIA_NEUTRA;
+    }
     // llmMeta carimbado: texto GERADO por modelo fica distinguível de cortesia
     // determinística e de mensagem manual (todas as três existiam no dia 03/08).
-    await sendOutboundToClinic(conversationId, clinicPhone, llmResponse.text.trim(), traceId, undefined, {
+    await sendOutboundToClinic(conversationId, clinicPhone, textoClinica, traceId, undefined, {
       model: llmResponse.model, tokensIn: llmResponse.tokensIn, tokensOut: llmResponse.tokensOut, latencyMs: llmResponse.latencyMs,
     });
   } else if (!llmResponse.text.trim() && !silentOutcome && (quoteRecorded || appointmentConfirmed || clarificationRequested || singleTargetDeadEnd)) {

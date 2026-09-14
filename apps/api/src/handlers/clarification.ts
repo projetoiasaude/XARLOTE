@@ -1,5 +1,5 @@
 import { db, writeLog } from '@iasaude/db';
-import { formatSupplierRelayToUser } from '@iasaude/shared';
+import { formatSupplierRelayToUser, mesmoAssunto } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier, sendOutboundToClinic } from './outbound-agent.js';
 
@@ -61,6 +61,26 @@ export interface PendingClarification {
 // ─── FARMÁCIA ────────────────────────────────────────────────────────────────
 
 /** A farmácia pediu um dado do paciente → marca a cotação e leva a pergunta ao cliente. */
+/**
+ * JÁ PERGUNTEI ISSO AO PACIENTE HÁ POUCO? (caso Duda, 10/09: 6 paráfrases de "seu nome
+ * completo" em 37 s — o dedupe era por texto exato e o modelo reescreve a frase toda vez.)
+ * Mesmo ASSUNTO (nome_completo, nascimento, cpf… ou tokens de conteúdo ≥ 0,5) com a cotação
+ * ainda `awaiting_user` há menos de 30 min → não re-pergunta.
+ */
+async function perguntaRepetidaHaPouco(
+  tabela: 'quotes' | 'consultation_quotes',
+  quoteId: string,
+  pergunta: string,
+): Promise<boolean> {
+  const { data: q } = await db.from(tabela)
+    .select('clarification_status, clarification_question, clarification_asked_at')
+    .eq('id', quoteId).maybeSingle();
+  if (!q || q.clarification_status !== 'awaiting_user' || !q.clarification_asked_at) return false;
+  const ha = Date.now() - new Date(q.clarification_asked_at as string).getTime();
+  if (ha > 30 * 60_000) return false;
+  return mesmoAssunto(q.clarification_question as string | null, pergunta);
+}
+
 export async function relaySupplierQuestionToUser(
   quote: { id: string; order_id: string; conversation_id: string | null; suppliers?: { name?: string } | null },
   question: string,
@@ -81,6 +101,10 @@ export async function relaySupplierQuestionToUser(
     return;
   }
 
+  if (await perguntaRepetidaHaPouco('quotes', quote.id, question)) {
+    await writeLog('info', 'clarification', `Pergunta da farmácia NÃO re-enviada — mesmo assunto já aguardando o paciente há <30 min`, { traceId, quoteId: quote.id });
+    return;
+  }
   await db.from('quotes').update({
     clarification_status: 'awaiting_user',
     clarification_question: question,
@@ -118,6 +142,10 @@ export async function relayClinicQuestionToUser(
   question: string,
   traceId: string,
 ): Promise<void> {
+  if (await perguntaRepetidaHaPouco('consultation_quotes', quote.id, question)) {
+    await writeLog('info', 'clarification', `Pergunta da clínica NÃO re-enviada — mesmo assunto já aguardando o paciente há <30 min`, { traceId, quoteId: quote.id });
+    return;
+  }
   await db.from('consultation_quotes').update({
     clarification_status: 'awaiting_user',
     clarification_question: question,
@@ -314,6 +342,14 @@ export async function relayUserAnswerToEstablishment(
     if (cpfDigits.length === 11 && /\bcpf\b/i.test(pending.question ?? '') && uid) {
       await db.from('users').update({ document_cpf: cpfDigits }).eq('id', uid);
       await writeLog('info', 'clarification', 'CPF do cliente salvo no perfil (reuso automático)', { traceId });
+    }
+
+    // NOME COMPLETO → perfil global (users.full_name) se ainda vazio (caso Duda, 10/09: deu o nome
+    // à GastroEla e a próxima clínica perguntaria de novo). Só aceita o que parece nome: 2–6
+    // palavras, letras e espaços, sem dígitos.
+    if (uid && /nome\s+completo/i.test(pending.question ?? '') && /^[A-Za-zÀ-ú' ]{5,80}$/.test(ans) && ans.trim().split(/\s+/).length >= 2 && ans.trim().split(/\s+/).length <= 6) {
+      await db.from('users').update({ full_name: ans.trim() }).eq('id', uid).is('full_name', null);
+      await writeLog('info', 'clarification', 'Nome completo do paciente salvo no perfil (reuso automático)', { traceId });
     }
 
     // Nascimento → perfil global (users.birth_date) se ainda vazio.

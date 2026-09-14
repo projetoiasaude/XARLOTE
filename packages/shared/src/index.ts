@@ -38,3 +38,5 @@ export * from './rota-farmacia.js';
 export * from './nome-remedio.js';
 export * from './pos-cotacao.js';
 export * from './endereco-entrega.js';
+export * from './robo-de-atendimento.js';
+export * from './adesao-ack.js';

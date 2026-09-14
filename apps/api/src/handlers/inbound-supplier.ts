@@ -18,6 +18,7 @@ import {
   sugestaoDeNomeDaFarmacia, perguntaSobreSugestaoDeNome,
   interpretarMensagemPosCotacao, CORTESIA_NOME_ANTES_DE_FECHAR, ofertaMudou, mensagemDeAtualizacaoDaOferta, normalizarPrecoDaCotacao,
   extractDeliverySector,
+  pareceNarracaoInterna, CORTESIA_NEUTRA,
 } from '@iasaude/shared';
 import type { NormalizedInbound, OrderItem, Message } from '@iasaude/shared';
 import { loadPrompts } from '../config/prompts.js';
@@ -713,6 +714,11 @@ export async function processInboundSupplier(ctx: SupplierInboundCtx): Promise<v
     }
   }
 
+  if (textoParaFarmacia && pareceNarracaoInterna(textoParaFarmacia)) {
+    // Narração interna ("o cliente quer…", "vou perguntar ao paciente") nunca vai pra farmácia.
+    await writeLog('warn', 'agent', `🛡️ Narração interna barrada antes de ir à farmácia: "${textoParaFarmacia.slice(0, 80)}"`, { traceId, conversationId });
+    textoParaFarmacia = CORTESIA_NEUTRA;
+  }
   if (textoParaFarmacia && !silentOutcome) {
     await sendOutboundToSupplier(conversationId, supplierPhone, textoParaFarmacia, traceId);
   } else if (!llmResponse.text.trim() && referralRecorded) {

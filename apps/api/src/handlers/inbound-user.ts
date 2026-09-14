@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, afirmacaoDeProdutoSemProva, ehAncoraDeFechamento, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, afirmacaoDeProdutoSemProva, ehAncoraDeFechamento, classificarAckDeDose, lembretesQueTocaramJuntos, anunciouRegistroDeDose, falaHonestaDeDose, tokenPrincipal, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -2212,53 +2212,54 @@ ${decision.alreadyOffered
   // anotado!" mas NÃO chamou log_medication_taken → last_confirmed_at ficou null → o gate
   // do backup condicional (0020) acha que ele NÃO confirmou e o backup dispara à toa (ou
   // pior: a adesão não é registrada). Determinístico: confirmação clara + lembrete disparado
-  // há pouco + tool não chamada → chamamos log_medication_taken nós mesmos com o TÍTULO do
-  // lembrete (match exato garantido — é o mesmo título que o gate/create usam). A narração
-  // "anotado!" do LLM vira VERDADE (mesma filosofia do retry 11d). Não mexe no texto.
+  // há pouco + tool não chamada → carimbamos nós mesmos.
+  //
+  // 14/09 (caso Glauber, 11–12/09): três furos do mesmo backstop, agora em `adesao-ack.ts`:
+  //  (1) "Simmmmm" não casava `^sim$` → nada registrado e "Anotado ✅" dito — normalizarAck;
+  //  (2) Domperidona e Nimesulida tocam no MESMO minuto e "Tomei" confirmava só a mais recente
+  //      (`limit(1)`) — lembretesQueTocaramJuntos confirma tudo que tocou (regra 113);
+  //  (3) lembrete criado sem `medication_id` → só carimbava `last_confirmed_at` e a adesão do
+  //      app não se movia — fallback por NOME nos remédios do perfil (nunca inventa remédio).
+  // E, mais abaixo (12c), a HONESTIDADE: se nem a tool nem o backstop registraram e o texto
+  // diz "anotado", a frase vira pergunta.
+  let doseRegistradaNoTurno = llmResponse.toolCalls.some((t) => t.name === 'log_medication_taken');
+  let lembretesRecentesTitulos: string[] = [];
   {
     const calledLog = llmResponse.toolCalls.some((t) => t.name === 'log_medication_taken');
-    const userText = textoDoPaciente;
-    // Confirmação FORTE = verbo de TOMADA DE MEDICAÇÃO (review 10/07 #21: "tomei um susto",
-    // "bebi um suco", "usei o app", "passei mal" NÃO são adesão). Verbos genéricos
-    // (bebi/passei/usei/coloquei) só valem com checagem de coerência pós-fetch (tipo do
-    // lembrete / palavra do título na frase). Objetos não-medicamentosos vetam.
-    const strongVerb = /\b(tomei|pinguei|apliquei|injetei)\b/i.test(userText);
-    const genericVerb = /\b(bebi|passei|usei|coloquei)\b/i.test(userText);
-    const negated = /\b(n[ãa]o|nao|esqueci|ainda n|depois|daqui a pouco|vou tomar|amanh[ãa])\b/i.test(userText);
-    const nonMedObject = /\b(tomei|levei)\s+(um\s+)?(susto|caf[ée]|banho|sol|chuva|cerveja|vinho|refri|uma?\s+(decis[ãa]o|surra))|\bpassei\s+(mal|vergonha|raiva)|\busei\s+o\s+(app|aplicativo|site)\b/i.test(userText);
-    const strongConfirm = (strongVerb || genericVerb) && !negated && !nonMedObject;
+    const ack = classificarAckDeDose(textoDoPaciente);
+    const strongConfirm = (ack.forte || ack.generico) && !ack.negado && !ack.objetoNaoMedicamentoso;
     // Ack FRACO ("ok"/"sim"/"👍") é ambíguo — pode responder OUTRA pergunta da Xarlote
     // (review #20: "quer que eu amplie a busca?" → "ok" carimbava remédio). Só vale se o
-    // turno não teve NENHUMA outra tool (sinal de que o ack respondeu outra coisa) e, mais
-    // abaixo, se a ÚLTIMA fala da Xarlote foi o próprio disparo do lembrete.
-    const weakAck = /^(ok(ay)?|sim|feito|pronto|tomado|blz|beleza|👍|✅|joia|j[óo]ia)[.!\s]*$/i.test(userText)
-      && llmResponse.toolCalls.length === 0;
-    if (!calledLog && (strongConfirm || weakAck) && !distressPreempted) {
+    // turno não teve NENHUMA outra tool e, mais abaixo, se a ÚLTIMA fala da Xarlote foi o
+    // próprio disparo do lembrete.
+    const weakAck = ack.fraco && llmResponse.toolCalls.length === 0;
+    if ((strongConfirm || weakAck) && !distressPreempted) {
       const windowMs = strongConfirm ? 3 * 60 * 60_000 : 20 * 60_000;
-      const { data: recentRem } = await db.from('reminders')
+      const { data: recentesRaw } = await db.from('reminders')
         .select('id, title, type, last_run_at, medication_id')
         .eq('user_id', user.id)
         .in('status', ['pending', 'sent'])
         .gte('last_run_at', new Date(Date.now() - windowMs).toISOString())
         .order('last_run_at', { ascending: false })
-        .limit(1).maybeSingle();
+        .limit(6);
+      // TODOS os que tocaram juntos com o mais recente (≤3 min), não só o primeiro.
+      const juntos = lembretesQueTocaramJuntos((recentesRaw ?? []) as Array<{ id: string; title: string; type: string; last_run_at: string | null; medication_id: string | null }>);
+      lembretesRecentesTitulos = juntos.map((r) => r.title);
+      const maisRecente = juntos[0] ?? null;
       // Coerência verbo↔lembrete: "bebi" só confirma lembrete de hidratação; verbo genérico
-      // (passei/usei/coloquei sem verbo forte) exige palavra do título (≥4 chars) na frase
-      // (ex.: "passei nas sobrancelhas" ↔ título "Passar remédio nas sobrancelhas").
-      let coherent = Boolean(recentRem?.title);
-      if (coherent && !strongVerb && !weakAck) {
-        if (/\bbebi\b/i.test(userText)) {
-          coherent = recentRem!.type === 'hydration';
-        } else {
-          const fold = (s: string) => s.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
-          const titleWords = fold(recentRem!.title).split(/\W+/).filter((w) => w.length >= 4);
-          const textFolded = fold(userText);
-          coherent = titleWords.some((w) => textFolded.includes(w.slice(0, Math.max(4, w.length - 2))));
-        }
-      }
-      // Ack fraco: a última fala da Xarlote precisa ser o PRÓPRIO disparo do lembrete
-      // (mirror inserido no despacho ±90s do last_run_at) — sem pergunta no meio.
-      if (coherent && weakAck && recentRem?.last_run_at) {
+      // (passei/usei/coloquei sem verbo forte) exige palavra do título (≥4 chars) na frase.
+      const fold = (x: string) => x.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+      const coerenteCom = (rem: { title: string; type: string }): boolean => {
+        if (ack.forte || weakAck) return true;
+        if (/\bbebi\b/i.test(ack.texto)) return rem.type === 'hydration';
+        const titleWords = fold(rem.title).split(/\W+/).filter((w) => w.length >= 4);
+        const textFolded = fold(ack.texto);
+        return titleWords.some((w) => textFolded.includes(w.slice(0, Math.max(4, w.length - 2))));
+      };
+      let alvos = juntos.filter(coerenteCom);
+      // Ack fraco: a última fala da Xarlote precisa ser o PRÓPRIO disparo (mirror inserido no
+      // despacho ±90s do last_run_at) — sem pergunta no meio.
+      if (alvos.length && weakAck && maisRecente?.last_run_at) {
         const { data: lastOut } = await db.from('messages')
           .select('created_at')
           .eq('conversation_id', conversation.id)
@@ -2266,48 +2267,57 @@ ${decision.alreadyOffered
           .order('created_at', { ascending: false })
           .limit(1).maybeSingle();
         const outTs = lastOut?.created_at ? new Date(lastOut.created_at as string).getTime() : 0;
-        coherent = Math.abs(outTs - new Date(recentRem.last_run_at).getTime()) < 90_000;
+        if (Math.abs(outTs - new Date(maisRecente.last_run_at).getTime()) >= 90_000) alvos = [];
       }
-      if (recentRem && coherent) {
-        // Carimba DIRETO por id (determinístico, zero efeito colateral) — passar o TÍTULO
-        // pro log_medication_taken criava user_medications FANTASMA ("Hora do Dipirona
-        // 500mg" virava remédio no perfil — review #23). Adesão/analytics via event_log.
-        await db.from('reminders').update({ last_confirmed_at: new Date().toISOString() }).eq('id', recentRem.id);
-
-        // 💊 E VIRA LINHA DE ADESÃO — quando o lembrete aponta pra um remédio de verdade.
-        //
-        // Carimbar `last_confirmed_at` fazia o lembrete parar de insistir, mas parava aí:
-        // `medication_log` é a fonte da adesão que o paciente vê no app e do
-        // `calc_adherence_score`. O resultado era o pior tipo de silêncio — ele responde
-        // "tomei" todos os dias no WhatsApp e o número na tela dele não se mexe.
-        //
-        // `medication_id` é NOT NULL, e é por isso que a versão anterior não escrevia nada:
-        // passar o TÍTULO pro `log_medication_taken` criava `user_medications` fantasma.
-        // Aqui não se inventa remédio — só se registra quando o vínculo JÁ existe.
-        if (recentRem.medication_id) {
-          const { error: errAdesao } = await db.from('medication_log').insert({
-            user_id: user.id,
-            medication_id: recentRem.medication_id,
-            reminder_id: recentRem.id,
-            status: 'taken',
-            scheduled_at: recentRem.last_run_at ?? new Date().toISOString(),
-            responded_at: new Date().toISOString(),
-            response_text: userText.slice(0, 200),
-          });
-          if (errAdesao) {
-            await writeLog('warn', 'agent', `adesão NÃO registrada no medication_log: ${errAdesao.message.slice(0, 110)}`, {
-              traceId, userId: user.id, reminderId: recentRem.id,
-            });
-          }
+      if (!calledLog && alvos.length) {
+        // Remédios do perfil, pra ligar lembrete sem medication_id pelo NOME (token principal).
+        const { data: medsPerfil } = await db.from('user_medications')
+          .select('id, medication_name')
+          .eq('user_id', user.id)
+          .eq('active', true);
+        const porToken = new Map<string, string>();
+        for (const m of (medsPerfil ?? []) as Array<{ id: string; medication_name: string }>) {
+          const tok = tokenPrincipal(m.medication_name);
+          if (tok && !porToken.has(tok)) porToken.set(tok, m.id);
         }
-        await writeLog('warn', 'agent', `🛟 Backstop de confirmação: adesão registrada sem log_medication_taken (reminder ${recentRem.id})`, {
-          traceId, userId: user.id, reminderId: recentRem.id,
-        });
-        void writeEvent({
-          eventName: 'reminder.confirmed_backstop',
-          userId: user.id,
-          conversationId: conversation.id,
-          payload: { reminder_id: recentRem.id, via: strongConfirm ? 'strong' : 'weak_ack' },
+        for (const rem of alvos) {
+          await db.from('reminders').update({ last_confirmed_at: new Date().toISOString() }).eq('id', rem.id);
+          let medId: string | null = rem.medication_id;
+          if (!medId) {
+            const tok = tokenPrincipal(rem.title);
+            const achado = tok ? porToken.get(tok) ?? null : null;
+            if (achado) {
+              medId = achado;
+              await db.from('reminders').update({ medication_id: achado }).eq('id', rem.id);
+              await writeLog('info', 'agent', `Lembrete "${rem.title}" ligado ao remédio do perfil pelo nome (adesão passa a contar)`, { traceId, userId: user.id, reminderId: rem.id });
+            }
+          }
+          if (medId) {
+            const { error: errAdesao } = await db.from('medication_log').insert({
+              user_id: user.id,
+              medication_id: medId,
+              reminder_id: rem.id,
+              status: 'taken',
+              scheduled_at: rem.last_run_at ?? new Date().toISOString(),
+              responded_at: new Date().toISOString(),
+              response_text: textoDoPaciente.slice(0, 200),
+            });
+            if (errAdesao) {
+              await writeLog('warn', 'agent', `adesão NÃO registrada no medication_log: ${errAdesao.message.slice(0, 110)}`, { traceId, userId: user.id, reminderId: rem.id });
+            }
+          } else {
+            await writeLog('info', 'agent', `Lembrete "${rem.title}" confirmado, mas sem remédio no perfil pra registrar adesão (só carimbado)`, { traceId, userId: user.id, reminderId: rem.id });
+          }
+          void writeEvent({
+            eventName: 'reminder.confirmed_backstop',
+            userId: user.id,
+            conversationId: conversation.id,
+            payload: { reminder_id: rem.id, via: strongConfirm ? 'strong' : 'weak_ack', juntos: alvos.length },
+          });
+        }
+        doseRegistradaNoTurno = true;
+        await writeLog('warn', 'agent', `🛟 Backstop de confirmação: ${alvos.length} lembrete(s) confirmado(s) sem log_medication_taken (${alvos.map((r) => r.title).join(' + ')})`, {
+          traceId, userId: user.id, reminderIds: alvos.map((r) => r.id),
         });
       }
     }
@@ -2594,6 +2604,24 @@ ${decision.alreadyOffered
     // `suppressReply` já não é consultado daqui pra frente (o envio testa só `replyText`),
     // então atribuir a saudação basta pra ela sair — inclusive num turno que teria sido mudo.
     replyText = saudacaoDoServidor;
+  }
+
+  // 💊 HONESTIDADE DE DOSE (caso Glauber, 11/09/2026): "Anotado ✅" pra um "Simmmmm" que nem a
+  // tool nem o backstop registraram. Se houve lembrete recém-tocado, nada foi registrado e o
+  // texto anuncia registro, a frase vira a pergunta que registra de verdade.
+  if (replyText && !doseRegistradaNoTurno && anunciouRegistroDeDose(replyText)) {
+    // O ack pode não ter sido reconhecido ("tudo certo") — ainda assim, se um lembrete tocou há
+    // pouco, "anotado" sem registro é mentira. Busca os que tocaram nas últimas 3h.
+    if (!lembretesRecentesTitulos.length) {
+      const { data: rec } = await db.from('reminders').select('id, title, last_run_at').eq('user_id', user.id)
+        .in('status', ['pending', 'sent']).gte('last_run_at', new Date(Date.now() - 3 * 60 * 60_000).toISOString())
+        .order('last_run_at', { ascending: false }).limit(6);
+      lembretesRecentesTitulos = lembretesQueTocaramJuntos((rec ?? []) as Array<{ id: string; title: string; last_run_at: string | null }>).map((r) => r.title);
+    }
+    if (lembretesRecentesTitulos.length) {
+      await writeLog('warn', 'agent', `🛡️ "anotado/marcado" sem registro de dose (lembretes: ${lembretesRecentesTitulos.join(' + ')}) — resposta trocada pela pergunta honesta`, { traceId, userId: user.id });
+      replyText = falaHonestaDeDose(lembretesRecentesTitulos);
+    }
   }
 
   // 🧾 AFIRMAÇÃO DE PRODUTO SEM PROVA (caso Ludmila, 10/09/2026): "Sim, é o Daflon Flex 1000mg

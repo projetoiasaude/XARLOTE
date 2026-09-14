@@ -68,7 +68,9 @@ export function checkOutboundSanity(raw: string): SanityResult {
   }
 
   // 5. Mensagem vazia ou quase — não se manda "." pra uma clínica.
-  if (text.trim().length < 3) {
+  //    EXCEÇÃO (caso Duda, 10/09): "3" é a resposta CERTA a um menu de robô ("digite o número").
+  //    O agente acertou três vezes e esta regra bloqueou as três. Número de 1–2 dígitos passa.
+  if (text.trim().length < 3 && !/^\d{1,2}$/.test(text.trim())) {
     blockers.push('texto vazio ou curto demais');
   }
 

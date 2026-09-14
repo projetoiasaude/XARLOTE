@@ -31,8 +31,9 @@
  */
 import { foldPt } from './br-datetime.js';
 import { ehMenuDeAutoatendimento } from './pharmacy.js';
+import { analisarMensagemDeRobo } from './robo-de-atendimento.js';
 
-export type MotivoNaoRepassar = 'curto_demais' | 'menu' | 'cortesia' | 'operacional';
+export type MotivoNaoRepassar = 'curto_demais' | 'menu' | 'cortesia' | 'operacional' | 'robo';
 
 export type DecisaoRepasse =
   | { repassar: true; porque: string }
@@ -102,6 +103,14 @@ export function decidirRepasseAoPaciente(texto: string): DecisaoRepasse {
   // 1. Acionável vence tudo — inclusive um menu que traga exigência de documento.
   const acionavel = ACIONAVEL.find(([re]) => re.test(f));
   if (acionavel) return { repassar: true, porque: acionavel[1] };
+
+  // 1b. PROMPT DE ROBÔ sem conteúdo acionável ("informe apenas o número da opção desejada",
+  //     "informe o seu nome completo", saudação automática, "opção inválida") é pra quem
+  //     NEGOCIA — nunca vai ao paciente (caso Duda, 10/09: o backstop repassou "informe apenas
+  //     o número" cru). Vem DEPOIS do acionável: exigência de documento dentro de um prompt
+  //     (caso Glauber) continua passando.
+  const robo = analisarMensagemDeRobo(t);
+  if (robo.robo) return { repassar: false, motivo: robo.tipo === 'menu' ? 'menu' : 'robo' };
 
   // 2. Menu de autoatendimento sem nada acionável dentro.
   if (ehMenuDeAutoatendimento(t)) return { repassar: false, motivo: 'menu' };
