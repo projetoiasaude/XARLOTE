@@ -39,6 +39,7 @@ const CUSTOM_ADAPTERS: Record<string, CustomAdapter> = {
 
 export * from './types.js';
 export * from './registry.js';
+export { PLATFORM_REGISTRY } from './registry.js';
 export {
   searchVtexProducts,
   simulateVtexByCep,

@@ -3,7 +3,9 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem, CareLinkView } from '@iasaude/shared';
-import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, pediuCancelarTudo, ehRruleComListaDeMinutos, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool } from '@iasaude/shared';
+import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, pediuCancelarTudo, ehRruleComListaDeMinutos, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool,
+  decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
+import { verificarExistenciaDoRemedio } from './verificar-nome-remedio.js';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
@@ -834,7 +836,7 @@ async function handleCancelOrder(args: { order_id?: string; reason?: string }, c
  * NUNCA loga o endereço (PII — CLAUDE.md #3): só o label + id.
  */
 async function handleSaveAddress(
-  args: { label: string; full_address?: string; complement?: string; notes?: string; set_default?: boolean; confirmed_residential?: boolean },
+  args: { label: string; full_address?: string; complement?: string; notes?: string; set_default?: boolean; confirmed_residential?: boolean; apply_to_active_order?: boolean },
   ctx: ToolContext,
 ): Promise<void> {
   const label = (args.label ?? '').trim() || 'principal';
@@ -935,12 +937,63 @@ async function handleSaveAddress(
     targetTable: 'user_addresses', targetId: addrId ?? undefined,
     conversationId: ctx.conversationId, traceId: ctx.traceId, metadata: { label },
   });
+
+  // 📦 CORREÇÃO NO MEIO DO PEDIDO (caso Ludmila, 10/09): ela corrigiu o endereço com o pedido em
+  // cotação; a correção virou mensagem solta à farmácia e o pedido/perfil ficaram errados. Agora
+  // o endereço salvo TAMBÉM vira o endereço do pedido vivo, e a farmácia que já cotou recebe UMA
+  // mensagem com o endereço certo pedindo o frete pra lá (via fila do agente; janela respeitada).
+  if (args.apply_to_active_order !== false && addrId) {
+    const { data: ativo } = await db.from('orders').select('id, delivery_address').eq('user_id', ctx.userId)
+      .in('status', ['quoting', 'quoted']).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (ativo?.id) {
+      const enderecoNovo = [
+        [street, number].filter(Boolean).join(', '),
+        (args.complement ?? '').trim() || null, neighborhood,
+        [city, state].filter(Boolean).join(' - '), cep,
+      ].filter((p) => p && String(p).trim()).join(', ') || addrText || null;
+      await db.from('orders').update({ delivery_address: enderecoNovo, delivery_lat: lat, delivery_lng: lng, user_address_id: addrId }).eq('id', ativo.id);
+      const { data: cotadas } = await db.from('quotes').select('id, conversation_id, suppliers(name, whatsapp_e164, phone_e164)').eq('order_id', ativo.id).eq('status', 'quoted');
+      let avisadas = 0;
+      for (const q of cotadas ?? []) {
+        const sup = q.suppliers as { name?: string; whatsapp_e164?: string | null; phone_e164?: string | null } | null;
+        const fone = sup?.whatsapp_e164 || sup?.phone_e164 || null;
+        if (!q.conversation_id || !fone || isPlaceholderPhone(fone)) continue;
+        const curto = shortSupplierAddress(enderecoNovo) || enderecoNovo || 'o endereço que te passei';
+        const ok = await sendOutboundToSupplier(q.conversation_id as string, fone, `Corrigindo o endereço da entrega: é ${curto}. Quanto fica o frete pra lá?`, ctx.traceId);
+        if (ok) avisadas++;
+      }
+      await writeLog('info', 'order', `Endereço corrigido aplicado ao pedido ${String(ativo.id).slice(0, 8)}; ${avisadas} farmácia(s) avisada(s)`, { traceId: ctx.traceId, orderId: ativo.id });
+      if (ctx.observation) {
+        ctx.observation.note = `Endereço "${label}" salvo E aplicado ao pedido em andamento (${enderecoNovo}). ${avisadas ? `Já avisei ${avisadas} farmácia(s) que cotaram e pedi o frete pro endereço certo — não mande message_supplier pra isso.` : 'Nenhuma farmácia precisou ser avisada ainda.'}`;
+      }
+    }
+  }
 }
 
 async function handleStartPharmacyOrder(
   args: { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string; preferred_pharmacy_names?: string[] },
   ctx: ToolContext
 ) {
+  // ─── ITENS COMO DADO HONESTO (caso Ludmila, 10/09) ─────────────────────────
+  // `substitutes_ok` era OBRIGATÓRIO no schema → o modelo preenchia `true` sozinho e a farmácia
+  // ouvia "Venaflon serve sim" sem a paciente ter sido perguntada. Agora: true/false SÓ quando
+  // vieram como boolean (o prompt manda passar só se o paciente disse); o resto vira null =
+  // "não perguntado". `source` diz de onde o nome veio (texto/foto/áudio).
+  // O booleano só é honrado se o PACIENTE falou de genérico/similar/marca (teste cego 13/09: o
+  // modelo de visão preencheu `false` sozinho ao ler a receita). Consentimento pela fala.
+  const { data: falasRecentes } = await db.from('messages').select('content, transcript').eq('conversation_id', ctx.conversationId).eq('direction', 'in').order('created_at', { ascending: false }).limit(3);
+  const falas = [ctx.textoDoPaciente, ...((falasRecentes ?? []).map((m) => (m.content as string | null) ?? (m.transcript as string | null)))];
+  const falouDeSubstituto = pacienteFalouDeSubstituto(falas);
+  args.items = (args.items ?? []).map((i) => ({
+    ...i,
+    name: String(i.name ?? '').trim(),
+    substitutes_ok: typeof i.substitutes_ok === 'boolean' && falouDeSubstituto ? i.substitutes_ok : null,
+    source: (['texto', 'foto', 'audio'] as const).includes((i.source ?? 'texto') as OrigemDoNome) ? (i.source ?? 'texto') : 'texto',
+  }));
+  if (!args.items.length || !args.items[0]?.name) {
+    throw new ToolFailure('NENHUM pedido foi criado: faltou o nome do medicamento. Pergunte ao paciente qual remédio ele quer.');
+  }
+
   // ─── IDEMPOTÊNCIA + TROCA DE PRODUTO ───────────────────────────────────────
   // Se já existe uma order ativa (quoting/quoted/confirming) pra esse usuário:
   //   • MESMO medicamento → NÃO cria outra e NÃO reinicia contato (proteção
@@ -1020,6 +1073,22 @@ async function handleStartPharmacyOrder(
       .order('is_default', { ascending: false })
       .limit(1)
       .maybeSingle();
+    // 🗣️ CONSENTIMENTO PELA FALA (caso Ludmila): o modelo escolheu "trabalho" sozinho — ela só
+    // mandou a foto e "consegue cotar?". Um endereço salvo só entra se o paciente o MENCIONOU
+    // (rótulo, "mesmo endereço", a rua) neste turno ou no anterior. Senão, pergunta pra onde vai.
+    if (saved) {
+      const { data: ultimas } = await db.from('messages').select('content, transcript').eq('conversation_id', ctx.conversationId).eq('direction', 'in').order('created_at', { ascending: false }).limit(2);
+      const falas = [ctx.textoDoPaciente, ...((ultimas ?? []).map((m) => (m.content as string | null) ?? (m.transcript as string | null)))];
+      if (!enderecoFoiMencionado(falas, { label: String(saved.label ?? ''), street: (saved.street as string | null) ?? null })) {
+        const { data: todos } = await db.from('user_addresses').select('label, street, number, neighborhood').eq('user_id', ctx.userId).order('is_default', { ascending: false }).limit(4);
+        const lista = (todos ?? []).map((a) => `*${a.label}* (${[a.street, a.number, a.neighborhood].filter(Boolean).join(', ') || 'endereço salvo'})`).join(', ');
+        await writeLog('warn', 'order', `start_pharmacy_order: endereço salvo "${saved.label}" NÃO foi mencionado pelo paciente — perguntando pra onde vai em vez de assumir`, { traceId: ctx.traceId });
+        await sendOutbound(ctx.conversationId, ctx.phoneE164,
+          `Pra onde eu mando? Tenho aqui ${lista || 'um endereço salvo'} — ou me passa um endereço novo (com o CEP) 💙`, ctx.traceId);
+        if (ctx.observation) ctx.observation.note = 'NENHUM pedido foi criado: o paciente ainda não disse pra qual endereço vai (não assuma um salvo). A pergunta já foi enviada; aguarde a resposta dele.';
+        return;
+      }
+    }
     if (saved?.latitude != null && saved?.longitude != null) {
       lat = saved.latitude as number;
       lng = saved.longitude as number;
@@ -1134,6 +1203,24 @@ async function handleStartPharmacyOrder(
       ctx.traceId,
     );
     return;
+  }
+
+  // 🔎 O NOME EXISTE? (caso Ludmila: "Aflor 1000 Flex" lido da receita foi pra 5 farmácias.)
+  // Catálogo real das grandes redes decide; a regra do que fazer é pura (nome-remedio.ts):
+  // foto/áudio + inexistente → confirma com o paciente ANTES de acionar alguém; texto do
+  // paciente + inexistente → segue (a palavra dele vence); redes fora → segue sem verificar.
+  for (const item of args.items) {
+    const origem = (item.source ?? 'texto') as OrigemDoNome;
+    const ver = await verificarExistenciaDoRemedio(item.name, ctx.traceId);
+    item.name_verified = ver.existe;
+    const decisao = decidirVerificacaoDeNome({ origem, existe: ver.existe });
+    await writeLog('info', 'pharmacy', `Nome "${item.name}" (${origem}): existe=${ver.existe} via ${ver.fonte} → ${decisao}${ver.exemplos.length ? ` (ex.: ${ver.exemplos[0]})` : ''}`, { traceId: ctx.traceId });
+    if (decisao === 'confirmar') {
+      const pergunta = perguntaDeConfirmacaoDeNome(itemDisplayName(item.name, item.dosage), origem);
+      await sendOutbound(ctx.conversationId, ctx.phoneE164, pergunta, ctx.traceId);
+      if (ctx.observation) ctx.observation.note = `NENHUM pedido foi criado: "${item.name}" foi lido de ${origem === 'foto' ? 'uma foto' : 'um áudio'} e NÃO existe em nenhum catálogo de farmácia — provavelmente foi lido errado. A pergunta de confirmação já foi enviada ao paciente; aguarde a resposta. NÃO diga que está cotando.`;
+      return;
+    }
   }
 
   // Só avisa que está buscando quando já tem coordenadas
@@ -1985,6 +2072,17 @@ async function handleMessageSupplier(args: { supplier_hint?: string; message?: s
     return;
   }
 
+  // 🧠 ESTADO ANTES DE FALAR (caso Ludmila, 10/09): a Xarlote perguntou o frete à Coimbra três
+  // vezes — a farmácia já tinha respondido "5 reais de frete". Se a cotação JÁ responde o que a
+  // mensagem pergunta, a mensagem não sai: o fato volta pro modelo, que responde ao paciente.
+  {
+    const fato = perguntaJaRespondida(message, { supplierName: target.supplierName, total: target.total, deliveryFee: target.deliveryFee, etaMinutes: target.etaMinutes });
+    if (fato) {
+      await writeLog('info', 'order', `message_supplier NÃO enviado — a pergunta já está respondida na cotação (${target.supplierName})`, { traceId: ctx.traceId, orderId: state.orderId, quoteId: target.quoteId });
+      throw new ToolFailure(`Mensagem NÃO enviada (não precisa): ${fato}`);
+    }
+  }
+
   // Fora da janela de texto livre (WABA/zpro): seja HONESTA sobre o PORQUÊ. O copy antigo dizia
   // "faz mais de 24h" pra QUALQUER caso — inclusive uma farmácia contatada agora há pouco que
   // simplesmente não respondeu (incidente Arthur 16/07: contato às 11h36, e às 13h ela afirmou
@@ -2658,6 +2756,15 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     throw new ToolFailure('NADA FOI CONFIRMADO: essa opção de farmácia não existe neste pedido. Releia as opções do PEDIDO ATIVO no seu contexto e peça ao paciente pra escolher de novo — não afirme que fechou a compra.');
   }
 
+  // 🧾 SUBSTITUTO SÓ COM ACEITE DITO PELO PACIENTE (caso Ludmila): a cotação carrega o que a
+  // farmácia tem; se é um similar, fechar exige que a fala do paciente aceite o similar — o
+  // modelo não decide isso por ele.
+  const produtoCotado = ((quote.items_available as ProdutoCotado[] | null) ?? [])[0] ?? null;
+  if (produtoCotado?.substituto === true && !aceitouSubstituto(ctx.textoDoPaciente)) {
+    const supNome = (quote.suppliers as { name?: string } | null)?.name ?? 'a farmácia';
+    throw new ToolFailure(`NADA FOI CONFIRMADO: a ${supNome} NÃO tem o ${produtoCotado.pedido} — cotou ${linhaDoProduto(produtoCotado)}. O paciente ainda não disse que aceita o similar. Pergunte de forma clara: "a ${supNome} só tem o ${produtoCotado.cotado ?? 'similar'}; quer fechar com ele ou prefere que eu procure o ${produtoCotado.pedido}?" e só confirme quando ele aceitar o similar.`);
+  }
+
   // 2. Só AGORA transiciona o pedido pra 'confirming' + registra a escolha — via CAS ATÔMICO.
   // O guard de leitura no passo 0 tem um TOCTOU: entre ele e este update, um turno concorrente
   // (duplo "sim", ou backstop + tool do LLM em turnos distintos) podia passar os dois pelo guard e
@@ -2775,7 +2882,12 @@ async function handleConfirmOrder(args: { order_id: string; quote_id: string }, 
     // Nome do destinatário JÁ na 1ª msg (associado ao pedido) + de novo no recipientPart da 2ª
     // (auditoria 1º pedido: farmácia anotou "Igor" no lugar de "Hiago" — o nome aparecer cedo
     // e 2× reduz o erro de anotação humana da farmácia).
-    const msg1 = `${opening} ${itemsInline}${recipient ? ` pro ${recipient}` : ' pra mim'}`;
+    // O produto que a farmácia DISSE que tem (similar/apresentação) vai no fechamento — a
+    // farmácia separa o que cotou, não o que estava na receita (caso Ludmila: Venaflon ≠ Daflon Flex).
+    const produtoFechado = produtoCotado?.cotado
+      ? `${produtoCotado.cotado}${produtoCotado.apresentacao ? ` (${produtoCotado.apresentacao})` : ''}${produtoCotado.substituto ? ', o similar que você me passou' : ''}`
+      : itemsInline;
+    const msg1 = `${opening} ${produtoFechado}${recipient ? ` pro ${recipient}` : ' pra mim'}`;
 
     // Prazo em fala natural — SÓ quando extraímos uma HORA clara do aceite. Cláusula livre
     // (ex.: "vai ser cartão", "obrigado") NÃO vai pra farmácia (review: mandaria ruído tipo

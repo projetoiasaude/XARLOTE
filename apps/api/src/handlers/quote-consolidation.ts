@@ -1,5 +1,5 @@
 import { db, writeLog } from '@iasaude/db';
-import { sanitizeSupplierNote, noteSignalsConditionalOffer, formatOrderTotal } from '@iasaude/shared';
+import { sanitizeSupplierNote, noteSignalsConditionalOffer, formatOrderTotal, linhaDoProduto, type ProdutoCotado } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { hasPendingClarification } from './clarification.js';
 
@@ -326,12 +326,13 @@ export async function notifyBetterQuoteIfPresented(
 
   const { data: nq } = await db
     .from('quotes')
-    .select('id, total, delivery_fee, supplier_id, suppliers(name)')
+    .select('id, total, delivery_fee, supplier_id, items_available, suppliers(name)')
     .eq('id', newQuoteId)
     .maybeSingle();
   if (!nq || nq.total == null) return;
   const newTotal = Number(nq.total);
   const newFee = nq.delivery_fee == null ? null : Number(nq.delivery_fee);
+  const novoProduto = produtoDa({ items_available: (nq.items_available as ProdutoCotado[] | null) ?? null });
 
   // COMPARAÇÃO HONESTA (review 12/07): só avisa se o REMÉDIO for estritamente mais barato E
   // nenhuma opção já apresentada com frete CONHECIDO tiver efetivo ≤ o efetivo (melhor caso)
@@ -353,7 +354,8 @@ export async function notifyBetterQuoteIfPresented(
   // gravando quase juntas perdiam uma no read-modify-write). Se outra atualização entrou no
   // meio, não sobrescreve (o aviso ainda sai; a próxima passada anexa).
   const nextOption = Math.max(0, ...options.map((o) => o.option)) + 1;
-  options.push({ option: nextOption, quote_id: nq.id as string, supplier_name: supName, total: newTotal, delivery_fee: newFee });
+  options.push({ option: nextOption, quote_id: nq.id as string, supplier_name: supName, total: newTotal, delivery_fee: newFee,
+    ...({ product: novoProduto?.cotado ?? null, is_substitute: novoProduto?.substituto ?? null, product_line: linhaDoProduto(novoProduto) } as Record<string, unknown>) });
   summary.options = options;
   await db.from('orders')
     .update({ summary: JSON.stringify(summary, null, 2) })
@@ -377,7 +379,9 @@ export async function notifyBetterQuoteIfPresented(
   await sendOutbound(
     order.conversation_id as string,
     userPhone,
-    `Opa, chegou uma opção com o remédio mais barato: *${supName}* por R$${newTotal.toFixed(2)}${freteTxt} 💙 Quer trocar pra ela? É só me dizer o nome — ou seguimos com a que você já ia escolher.`,
+    novoProduto?.substituto === true
+      ? `Opa, chegou uma opção mais barata na *${supName}* por R$${newTotal.toFixed(2)}${freteTxt} — mas atenção: ${linhaDoProduto(novoProduto)} 💙 Quer trocar pra ela mesmo assim? É só me dizer o nome — ou seguimos com a que você já ia escolher.`
+      : `Opa, chegou uma opção com o remédio mais barato: *${supName}* por R$${newTotal.toFixed(2)}${freteTxt} 💙 Quer trocar pra ela? É só me dizer o nome — ou seguimos com a que você já ia escolher.`,
     traceId,
   );
   await writeLog('info', 'order', `💰 Cotação mais barata pós-apresentação avisada (${supName} R$${newTotal} < R$${minPresentedTotal})`, {
@@ -425,6 +429,14 @@ interface QuoteRow {
   notes: string | null;
   distance_km: number | null;
   supplier_id: string;
+  /** O que a farmácia disse que tem (ProdutoCotado[]) — ver produto-cotado.ts. */
+  items_available?: ProdutoCotado[] | null;
+}
+
+/** Primeiro produto cotado da cotação (hoje o pedido tem 1 item na prática). */
+function produtoDa(q: Pick<QuoteRow, 'items_available'>): ProdutoCotado | null {
+  const arr = Array.isArray(q.items_available) ? q.items_available : [];
+  return arr[0] ?? null;
 }
 
 interface SupplierRow {
@@ -464,7 +476,7 @@ export async function consolidateQuotes(
 
   const { data: quotes } = await db
     .from('quotes')
-    .select('id, status, total, subtotal, delivery_fee, eta_minutes, payment_methods, pix_key, payment_link, notes, distance_km, supplier_id')
+    .select('id, status, total, subtotal, delivery_fee, eta_minutes, payment_methods, pix_key, payment_link, notes, distance_km, supplier_id, items_available')
     .eq('order_id', orderId);
 
   const successful = (quotes ?? []).filter((q) => q.status === 'quoted') as QuoteRow[];
@@ -496,10 +508,17 @@ export async function consolidateQuotes(
   const { data: suppliers } = await db.from('suppliers').select('id, name').in('id', supplierIds);
   const supplierMap = new Map<string, string>((suppliers ?? []).map((s: SupplierRow) => [s.id, s.name]));
 
-  // Sort by total price (ascending), show up to 3
+  // Ordena por preço (crescente); SUBSTITUTOS vão por último — o produto pedido vem antes de
+  // "um similar mais barato" (caso Ludmila: o Venaflon de R$64,90 apareceu como se fosse o
+  // Daflon Flex). Mostra até 3.
   const sorted = [...successful]
     .filter((q) => q.total != null)
-    .sort((a, b) => (a.total ?? 999) - (b.total ?? 999))
+    .sort((a, b) => {
+      const sa = produtoDa(a)?.substituto === true ? 1 : 0;
+      const sb = produtoDa(b)?.substituto === true ? 1 : 0;
+      if (sa !== sb) return sa - sb;
+      return (a.total ?? 999) - (b.total ?? 999);
+    })
     .slice(0, 3);
 
   if (sorted.length === 0) {
@@ -532,8 +551,11 @@ export async function consolidateQuotes(
     // que o fallback determinístico grava — nunca de texto livre do LLM (que poderia
     // vazar nota interna truncada tipo "só tem plano Unimed" ao usuário; review).
     const substMatch = (q.notes ?? '').match(/subst:\s*(só tem \d+\s*comp)/i);
-    const subst = substMatch ? `\n   ⚠️ ${(substMatch[1] as string).trim()}` : '';
-    lines.push(`${NUMBERS[i] ?? `${i + 1}.`} *${name}* — ${totalStr}\n   ${parts}${pix}${subst}`);
+    const produto = produtoDa(q);
+    const subst = substMatch && !produto?.apresentacao ? `\n   ⚠️ ${(substMatch[1] as string).trim()}` : '';
+    // A LINHA DO PRODUTO (caso Ludmila): o que a farmácia disse que tem — ou a confissão de que
+    // ela não nomeou. Nunca mais "Coimbra — R$64,90" como se fosse o remédio da receita.
+    lines.push(`${NUMBERS[i] ?? `${i + 1}.`} *${name}* — ${totalStr}\n   ${linhaDoProduto(produto)}\n   ${parts}${pix}${subst}`);
   }
 
   const unavailableCount = (quotes ?? []).filter((q) => ['unavailable', 'timeout'].includes(q.status)).length;
@@ -561,8 +583,12 @@ export async function consolidateQuotes(
       payment_methods: q.payment_methods,
       pix_key: q.pix_key,
       payment_link: q.payment_link,
+      // Identidade do produto (caso Ludmila): o modelo enxerga o que foi cotado e se é substituto.
+      product: produtoDa(q)?.cotado ?? null,
+      is_substitute: produtoDa(q)?.substituto ?? null,
+      product_line: linhaDoProduto(produtoDa(q)),
     })),
-    instructions: 'Quando o usuário escolher uma opção (ex: "quero a 1", "prefiro a Droga Raia", "pode ser a mais barata"), identifique qual option corresponde e chame confirm_order_selection com o order_id e o quote_id corretos.',
+    instructions: 'Quando o usuário escolher uma opção (ex: "quero a 1", "prefiro a Droga Raia", "pode ser a mais barata"), identifique qual option corresponde e chame confirm_order_selection com o order_id e o quote_id corretos. ⚠️ product/is_substitute dizem O QUE a farmácia tem: NUNCA afirme que uma opção é o remédio pedido se product for null ou is_substitute for true — diga exatamente o product_line.',
   };
 
   // O `summary` vai SOZINHO: se ele falhar junto de outra coluna, as opções ficam
@@ -638,4 +664,56 @@ function buildFailureReport(quotes: QuoteRow[], nameOf: Map<string, string>): st
     offer = 'Nenhuma fechou dessa vez 😔 Quer que eu procure num raio maior?';
   }
   return `Falei com ${total} farmácia${total > 1 ? 's' : ''} — ${respStr}.${outras}\n\n${offer}`;
+}
+
+/**
+ * A OFERTA DE UMA FARMÁCIA MUDOU depois de apresentada (frete chegou, substituto sinalizado,
+ * total corrigido — caso Ludmila): manda UM update ao paciente, atualiza a opção no `summary`
+ * (o modelo enxerga o novo estado) e RE-ANCORA `presented_at` — assim um "sim"/"pode fechar"
+ * em resposta a este update fecha o pedido pelo backstop 11b (que exige adjacência à
+ * apresentação). Sem a re-âncora, o aceite genérico morria em "a Xarlote falou outra coisa".
+ */
+export async function atualizarOfertaAoPaciente(
+  orderId: string,
+  quoteId: string,
+  mensagem: string,
+  patch: { produto: ProdutoCotado | null; total: number | null; deliveryFee: number | null },
+  traceId: string,
+): Promise<void> {
+  const { data: order } = await db.from('orders').select('status, conversation_id, summary, selected_quote_id').eq('id', orderId).maybeSingle();
+  if (!order?.conversation_id) return;
+  if (!['quoted', 'quoting'].includes(String(order.status)) || order.selected_quote_id) {
+    await writeLog('info', 'order', `Update de oferta NÃO enviado — pedido já '${order.status}'${order.selected_quote_id ? ' (decidido)' : ''}`, { traceId, orderId, quoteId });
+    return;
+  }
+  const phone = await userPhoneForOrder(order.conversation_id as string);
+  if (!phone) return;
+  const sent = await sendOutbound(order.conversation_id as string, phone, mensagem, traceId, {}, { dedup: true, dedupWindowMs: 120_000 });
+  if (!sent) return;
+
+  // Atualiza a opção no summary (ou cria o summary se a apresentação ainda não tinha acontecido).
+  try {
+    const parsed = order.summary ? JSON.parse(order.summary as string) as { options?: Array<Record<string, unknown>> } : { options: [] };
+    const options = Array.isArray(parsed.options) ? parsed.options : [];
+    const idx = options.findIndex((o) => o['quote_id'] === quoteId);
+    const linha = {
+      total: patch.total, delivery_fee: patch.deliveryFee,
+      product: patch.produto?.cotado ?? null, is_substitute: patch.produto?.substituto ?? null, product_line: linhaDoProduto(patch.produto),
+    };
+    if (idx >= 0) options[idx] = { ...options[idx], ...linha };
+    else {
+      const { data: q } = await db.from('quotes').select('supplier_id, eta_minutes, payment_methods, suppliers(name)').eq('id', quoteId).maybeSingle();
+      const supName = (q?.suppliers as { name?: string } | null)?.name ?? 'Farmácia';
+      options.push({ option: options.length + 1, quote_id: quoteId, supplier_name: supName, eta_minutes: q?.eta_minutes ?? null, payment_methods: q?.payment_methods ?? [], ...linha });
+    }
+    const summary = { ...(parsed as Record<string, unknown>), order_id: orderId, status: 'quoted', options,
+      instructions: (parsed as { instructions?: string }).instructions ?? 'Quando o usuário escolher/aceitar uma opção, chame confirm_order_selection com order_id e quote_id. product/is_substitute dizem o que a farmácia tem — nunca afirme que é o remédio pedido se product for null ou is_substitute for true.' };
+    await db.from('orders').update({ summary: JSON.stringify(summary, null, 2) }).eq('id', orderId);
+  } catch (err) {
+    await writeLog('warn', 'order', `Update de oferta: falha ao atualizar summary: ${String(err).slice(0, 120)}`, { traceId, orderId, quoteId });
+  }
+
+  const { data: presMsg } = await db.from('messages').select('created_at').eq('conversation_id', order.conversation_id as string).eq('direction', 'out').order('created_at', { ascending: false }).limit(1).maybeSingle();
+  await db.from('orders').update({ status: 'quoted', presented_at: (presMsg?.created_at as string | undefined) ?? new Date().toISOString() }).eq('id', orderId).in('status', ['quoting', 'quoted']);
+  await writeLog('info', 'order', `📣 Oferta atualizada ao paciente (frete/produto) e apresentação re-ancorada`, { traceId, orderId, quoteId, total: patch.total, frete: patch.deliveryFee, substituto: patch.produto?.substituto ?? null });
 }

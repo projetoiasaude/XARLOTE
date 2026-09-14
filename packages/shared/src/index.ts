@@ -33,3 +33,8 @@ export * from './care-access.js';
 export * from './care-tools.js';
 export * from './laudo-recorte.js';
 export * from './cotacao-rede.js';
+export * from './produto-cotado.js';
+export * from './rota-farmacia.js';
+export * from './nome-remedio.js';
+export * from './pos-cotacao.js';
+export * from './endereco-entrega.js';

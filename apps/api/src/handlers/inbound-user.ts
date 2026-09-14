@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, afirmacaoDeProdutoSemProva, ehAncoraDeFechamento, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -1989,13 +1989,19 @@ ${decision.alreadyOffered
           if (presentedAt == null) {
             adjacencyOk = false; // pedido antigo, sem âncora de apresentação → não arrisca
           } else {
+            // A ÚLTIMA fala da Xarlote precisa ser a apresentação — OU outra âncora legítima de
+            // fechamento: o update de oferta ("Novidade da *X*…", que já re-ancora presented_at)
+            // ou a própria pergunta "quer fechar com a X?" (caso Ludmila: "Quer fechar com essa
+            // farmácia?" → "Sim" e nada fechou porque a última fala não era a apresentação).
             const { data: laterOut } = await db.from('messages')
-              .select('id')
+              .select('id, content')
               .eq('conversation_id', conversation.id)
               .eq('direction', 'out')
               .gt('created_at', activeOrder.presented_at as string)
+              .order('created_at', { ascending: false })
               .limit(1);
-            adjacencyOk = !(laterOut && laterOut.length > 0);
+            const ultima = laterOut?.[0];
+            adjacencyOk = !ultima || ehAncoraDeFechamento((ultima.content as string | null) ?? '');
           }
         }
 
@@ -2588,6 +2594,21 @@ ${decision.alreadyOffered
     // `suppressReply` já não é consultado daqui pra frente (o envio testa só `replyText`),
     // então atribuir a saudação basta pra ela sair — inclusive num turno que teria sido mudo.
     replyText = saudacaoDoServidor;
+  }
+
+  // 🧾 AFIRMAÇÃO DE PRODUTO SEM PROVA (caso Ludmila, 10/09/2026): "Sim, é o Daflon Flex 1000mg
+  // com 30 envelopes" sobre uma cotação de Venaflon 30 comprimidos. A cotação agora carrega o
+  // produto (items_available); se a fala afirma um produto que nenhuma cotação prova, a frase
+  // vira a versão honesta — mesma família do claim-guard (anúncio sem prova cai).
+  if (replyText && orderState && orderState.suppliers.length) {
+    const cotadas = orderState.suppliers.filter((s) => s.status === 'quoted').map((s) => ({ supplierName: s.supplierName, produto: s.produto }));
+    if (cotadas.length) {
+      const g = afirmacaoDeProdutoSemProva(replyText, cotadas);
+      if (g) {
+        await writeLog('warn', 'agent', `🛡️ Afirmação de produto sem prova barrada — ${g.motivo}; resposta substituída pela honesta`, { traceId, userId: user.id, orderId: orderState.orderId });
+        replyText = g.corrigido;
+      }
+    }
   }
 
   // ✍️ CONFUSÍVEIS (auditoria 10/09/2026): "Cansei os lembretes antigos" saiu duas vezes onde

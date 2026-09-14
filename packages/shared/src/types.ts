@@ -108,7 +108,12 @@ export interface OrderItem {
   name: string;
   dosage?: string;
   quantity?: string;
-  substitutes_ok: boolean;
+  /** true/false SÓ quando o paciente disse; null/undefined = não perguntado (caso Ludmila). */
+  substitutes_ok?: boolean | null;
+  /** De onde veio o nome: texto do paciente, foto (receita/caixa) ou áudio. */
+  source?: 'texto' | 'foto' | 'audio';
+  /** O nome foi encontrado num catálogo real? null = não deu pra checar. */
+  name_verified?: boolean | null;
 }
 
 export interface Order {

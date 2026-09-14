@@ -1,6 +1,6 @@
 import { db } from '@iasaude/db';
-import { AGENT_INSTANCE, sanitizeSupplierNote, noteSignalsConditionalOffer, resolveSupplierByHint, itemDisplayName, PLATFORM_HANDOFF_SUMMARY } from '@iasaude/shared';
-import type { OrderItem } from '@iasaude/shared';
+import { AGENT_INSTANCE, sanitizeSupplierNote, noteSignalsConditionalOffer, resolveSupplierByHint, itemDisplayName, PLATFORM_HANDOFF_SUMMARY, linhaDoProduto } from '@iasaude/shared';
+import type { OrderItem, ProdutoCotado } from '@iasaude/shared';
 import { providerFor } from '@iasaude/whatsapp';
 
 /**
@@ -34,6 +34,8 @@ export interface OrderSupplierState {
   total: number | null;
   deliveryFee: number | null;
   etaMinutes: number | null;
+  /** O que a farmácia disse que tem (produto-cotado.ts). null = não nomeou / não cotou. */
+  produto: ProdutoCotado | null;
   /** Deu resposta substantiva (cotou preço OU disse algo útil registrado em notes). */
   responded: boolean;
   /** Tem o item / ofereceu alternativa (entrega condicional, retirada, Uber, indicação). */
@@ -79,6 +81,7 @@ interface QuoteJoinRow {
   eta_minutes: number | null;
   supplier_id: string;
   conversation_id: string | null;
+  items_available: ProdutoCotado[] | null;
   suppliers: { name?: string | null; whatsapp_e164?: string | null; phone_e164?: string | null } | null;
 }
 
@@ -101,7 +104,7 @@ export async function loadLatestOrderState(userId: string): Promise<OrderState |
 
   const { data: quotesRaw } = await db
     .from('quotes')
-    .select('id, status, notes, total, delivery_fee, eta_minutes, supplier_id, conversation_id, suppliers(name, whatsapp_e164, phone_e164)')
+    .select('id, status, notes, total, delivery_fee, eta_minutes, supplier_id, conversation_id, items_available, suppliers(name, whatsapp_e164, phone_e164)')
     .eq('order_id', order.id)
     .order('created_at', { ascending: true });
   const quotes = (quotesRaw ?? []) as unknown as QuoteJoinRow[];
@@ -141,6 +144,7 @@ export async function loadLatestOrderState(userId: string): Promise<OrderState |
       total: q.total,
       deliveryFee: q.delivery_fee,
       etaMinutes: q.eta_minutes,
+      produto: (Array.isArray(q.items_available) ? q.items_available[0] : null) ?? null,
       responded,
       conditional,
       conversationId: q.conversation_id,
@@ -181,7 +185,10 @@ function supplierStateLabel(s: OrderSupplierState): string {
   switch (s.status) {
     case 'quoted': {
       const preco = s.total != null ? `cotou R$${Number(s.total).toFixed(2)}` : 'respondeu (sem preço claro)';
-      return preco;
+      const frete = s.deliveryFee == null ? 'frete a confirmar' : s.deliveryFee === 0 ? 'frete grátis' : `frete R$${Number(s.deliveryFee).toFixed(2)}`;
+      // Identidade do produto (caso Ludmila): "cotou R$64,90" sem dizer QUE produto levou o
+      // modelo a confirmar "sim, é o Daflon Flex" sobre um Venaflon.
+      return `${preco} (${frete}) — produto: ${linhaDoProduto(s.produto)}`;
     }
     case 'negotiating':
     case 'contacting':
@@ -296,6 +303,9 @@ export function buildOrderStateBlock(state: OrderState): string {
   }
   lines.push(
     `- 🔒 HONESTIDADE DE ESTADO: só diga que o pedido foi "confirmado/fechado" se a situação acima disser FECHADO. Se está buscando, diga que está buscando; se NÃO fechou, seja honesta — nunca invente uma confirmação.`,
+  );
+  lines.push(
+    `- 🧾 HONESTIDADE DE PRODUTO: o campo "produto:" de cada farmácia é O QUE ELA DISSE QUE TEM. Se o paciente perguntar "é o X mesmo?", responda pelo campo: substituto → diga que é um similar e qual; "(a farmácia não confirmou o produto)" → diga que ainda vai confirmar. NUNCA responda "sim, é o X" sem o campo dizer X. Frete "a confirmar" = você NÃO sabe o frete; frete com valor = já sabe, não pergunte de novo à farmácia.`,
   );
 
   return lines.join('\n');

@@ -40,6 +40,13 @@ const FORMS: [string, RegExp][] = [
 ];
 
 const KIT_RE = /\b(kit|combo)\b|\bleve\s*\d|\+/;
+// "+" ENTRE DUAS DOSAGENS é composição do MESMO remédio ("Daflon Flex 900mg + 100mg",
+// "Losartana 50mg + Hidroclorotiazida 12,5mg"), não kit/combo. O KIT_RE cru derrubava todo
+// medicamento de associação pra 0,3 e o Daflon Flex REAL do catálogo sumia (13/09).
+const COMPOSICAO_RE = /(\d+(?:[.,]\d+)?\s*(?:mg|mcg|g|ml|ui|%)?)\s*\+\s*(?=[a-z]*\s*\d+(?:[.,]\d+)?\s*(?:mg|mcg|g|ml|ui|%))/gi;
+function pareceKit(text: string): boolean {
+  return KIT_RE.test(text.replace(COMPOSICAO_RE, '$1 '));
+}
 
 export function normalize(s: string): string {
   return (s ?? '')
@@ -137,7 +144,7 @@ export function parseMedicationQuery(text: string): ParsedMedication {
   // Reconhece "+"/"leve N" além de kit/combo (review M5): se o USUÁRIO pediu explicitamente um combo
   // ("losartana + hidroclorotiazida"), `wantsKit` tem que ser true — senão a penalidade de kit (que
   // usa KIT_RE, com "+") derrubaria o próprio produto que ele quer. Alinhado ao KIT_RE.
-  const wantsKit = KIT_RE.test(norm);
+  const wantsKit = pareceKit(norm);
   // nameTokens = o que sobra depois de tirar dosagem/forma/qtd/stopwords/números soltos.
   const strengthWords = new Set(strengths.flatMap((s) => [s, s.replace(/[a-z%]+$/i, '')]));
   const nameTokens = norm
@@ -158,13 +165,24 @@ export function parseMedicationQuery(text: string): ParsedMedication {
 export function scoreProductMatch(q: ParsedMedication, product: PlatformProduct): number {
   const hay = normalize(`${product.productName} ${(product.activeIngredient ?? []).join(' ')}`);
 
-  // NOME — obrigatório: fração dos tokens de nome presentes no produto.
+  // NOME — obrigatório: fração dos tokens de nome presentes no produto, por PALAVRA INTEIRA.
+  //
+  // Caso Ludmila (10/09): "Aflor 1000 Flex" casava "Suplemento Fixare Flex" com 0,52 (metade
+  // do nome — "flex" — por substring) e o link de compra saiu pra paciente. E "Daflon Flex"
+  // dava a MESMA nota pra "Daflon 1000 comprimidos" (o não-Flex). Regras:
+  //   • o PRIMEIRO token (a marca/princípio) é obrigatório — sem "daflon", não é Daflon;
+  //   • com ≤2 tokens, TODOS precisam estar; com 3+, pelo menos ⅔ (tolera um qualificador);
+  //   • palavra inteira: "flex" não casa "flexive", "dipirona" não casa "dipironax".
   let nameFrac = 1;
   if (q.nameTokens.length > 0) {
-    const present = q.nameTokens.filter((t) => hay.includes(t)).length;
+    const hasWord = (t: string) => new RegExp(`(^|[^a-z0-9])${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`).test(hay);
+    const brand = q.nameTokens[0] as string;
+    if (!hasWord(brand)) return 0; // a marca/princípio não está no produto → não é candidato
+    const present = q.nameTokens.filter(hasWord).length;
     nameFrac = present / q.nameTokens.length;
+    const minimo = q.nameTokens.length <= 2 ? 1 : 2 / 3;
+    if (nameFrac + 1e-9 < minimo) return 0;
   }
-  if (nameFrac === 0) return 0; // nem o nome do remédio bate → não é candidato
 
   let score = 0.55 * nameFrac;
   let weight = 0.55;
@@ -200,7 +218,7 @@ export function scoreProductMatch(q: ParsedMedication, product: PlatformProduct)
   let normalized = weight > 0 ? score / weight : 0;
 
   // KIT/combo quando o usuário não pediu kit.
-  if (!q.wantsKit && KIT_RE.test(normalize(product.productName))) penalty *= 0.3;
+  if (!q.wantsKit && pareceKit(normalize(product.productName))) penalty *= 0.3;
 
   normalized *= penalty;
 

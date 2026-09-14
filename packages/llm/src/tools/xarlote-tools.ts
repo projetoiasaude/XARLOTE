@@ -140,12 +140,13 @@ export const xarloteTools: ToolDefinition[] = [
             items: {
               type: 'object',
               properties: {
-                name: { type: 'string' },
-                dosage: { type: 'string' },
-                quantity: { type: 'string' },
-                substitutes_ok: { type: 'boolean' },
+                name: { type: 'string', description: 'Nome do remédio EXATAMENTE como o paciente disse ou como está escrito na receita/caixa. Não "corrija" nem complete.' },
+                dosage: { type: 'string', description: 'Dose, só se o paciente/receita informou (ex.: "500mg"). Omita se não souber.' },
+                quantity: { type: 'string', description: 'Quantidade, só se o paciente disse (ex.: "1 caixa", "30 comprimidos"). NUNCA invente quantidade a partir da posologia ("1x ao dia" NÃO é "30 comprimidos"). Omita se não souber.' },
+                substitutes_ok: { type: 'boolean', description: 'SÓ preencha se o paciente DISSE: true = ele aceita genérico/similar; false = quer só a marca. Se ele não falou nada sobre isso, OMITA (a farmácia que oferecer similar terá a oferta registrada e o paciente decide depois).' },
+                source: { type: 'string', enum: ['texto', 'foto', 'audio'], description: 'De onde veio o NOME: "texto" (o paciente digitou), "foto" (você leu de receita/caixa numa imagem), "audio" (transcrição). Nome lido de foto/áudio é verificado num catálogo antes de acionar farmácias.' },
               },
-              required: ['name', 'substitutes_ok'],
+              required: ['name'],
             },
           },
           saved_address_label: {
@@ -321,7 +322,7 @@ export const xarloteTools: ToolDefinition[] = [
           professional: { type: 'string', description: 'Nome do MÉDICO específico que o paciente quer marcar, quando ele nomeou um (ex.: "Dr. Valdivino José Vieira Júnior"). kind=clinic. Eu peço pela agenda DELE na recepção. Omita se o paciente não citou um médico específico.' },
           items: {
             type: 'array', description: 'Medicamentos a cotar (kind=pharmacy).',
-            items: { type: 'object', properties: { name: { type: 'string' }, dosage: { type: 'string' }, quantity: { type: 'string' }, substitutes_ok: { type: 'boolean' } }, required: ['name', 'substitutes_ok'] },
+            items: { type: 'object', properties: { name: { type: 'string' }, dosage: { type: 'string' }, quantity: { type: 'string' }, substitutes_ok: { type: 'boolean', description: 'SÓ se o paciente disse (true aceita similar / false só a marca); senão omita.' }, source: { type: 'string', enum: ['texto', 'foto', 'audio'] } }, required: ['name'] },
           },
         },
       },
@@ -536,7 +537,7 @@ export const xarloteTools: ToolDefinition[] = [
     type: 'function',
     function: {
       name: 'save_address',
-      description: 'SALVA (ou atualiza) um endereço rotulado do paciente pra reusar nas próximas vezes. Use depois que o paciente confirmar um endereço novo e você perguntar de quem é ("é sua casa, trabalho ou outro?") + a quadra/lote (ou complemento). Assim, da próxima vez você só pergunta "casa, trabalho ou novo?" e reusa via start_pharmacy_order(saved_address_label). Se o paciente compartilhou localização 📍, o backend já tem a rua/setor — você só confirma a quadra/lote e o rótulo e salva.',
+      description: 'SALVA (ou atualiza) um endereço rotulado do paciente pra reusar nas próximas vezes. Use depois que o paciente confirmar um endereço novo e você perguntar de quem é ("é sua casa, trabalho ou outro?") + a quadra/lote (ou complemento). Assim, da próxima vez você só pergunta "casa, trabalho ou novo?" e reusa via start_pharmacy_order(saved_address_label). Se o paciente compartilhou localização 📍, o backend já tem a rua/setor — você só confirma a quadra/lote e o rótulo e salva. ⚠️ CORREÇÃO NO MEIO DE UM PEDIDO: se o paciente disser que o endereço do pedido está errado e passar o certo, chame ESTA tool (não message_supplier): ela atualiza o pedido em andamento e avisa a farmácia que já cotou, pedindo o frete pro endereço certo.',
       parameters: {
         type: 'object',
         properties: {
@@ -546,6 +547,7 @@ export const xarloteTools: ToolDefinition[] = [
           notes: { type: 'string', description: 'Instrução de entrega, se houver (ex.: "deixar com o porteiro"). Opcional.' },
           set_default: { type: 'boolean', description: 'true se esse deve virar o endereço padrão (ex.: é o primeiro, ou o paciente pediu). Opcional.' },
           confirmed_residential: { type: 'boolean', description: 'Passe true SOMENTE quando o endereço parecia de hospital/clínica, você perguntou, e o paciente CONFIRMOU que é a casa/trabalho dele mesmo — aí salva sob o rótulo residencial sem re-perguntar.' },
+          apply_to_active_order: { type: 'boolean', description: 'Default true: se há pedido de farmácia em andamento, o endereço salvo vira o endereço de entrega dele e as farmácias que já cotaram são avisadas. Passe false só se o paciente disser que é pra OUTRA ocasião.' },
         },
         required: ['label'],
       },
