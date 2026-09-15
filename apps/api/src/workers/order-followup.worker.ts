@@ -30,7 +30,11 @@ const SILENT_NUDGE_MS = 20 * 60 * 1000;      // 20min de silêncio da farmácia 
 const DEADLINE_MARGIN_MS = 10 * 60 * 1000;   // alerta a partir de 10min antes do prazo
 const WABA_SAFE_MS = 22 * 60 * 60 * 1000;    // margem antes da janela de 24h fechar
 const MAX_ACTIONS_PER_TICK = 5;
-const ABANDONED_QUOTE_MS = 7 * 24 * 60 * 60 * 1000; // 'quoted' sem escolha há 7+ dias = cotação vencida
+// 'quoted' sem escolha há 24h+ = cotação vencida. Era 7 dias: um pedido apresentado em 10/09
+// ainda era "PEDIDO ATIVO" pro modelo em 14/09 (e o roteador já o tratava como morto há 3 dias)
+// — foi assim que "Oi, tudo bem?" virou "endereço atualizado no pedido, já pedi o frete".
+// A janela é a MESMA do roteador (JANELA_PEDIDO_VIVO_MS) e do bloco de estado (24h).
+const ABANDONED_QUOTE_MS = 24 * 60 * 60 * 1000;
 
 // Cobrança à farmácia: humana e VARIADA (nunca a mesma frase sempre — tell de robô).
 const SUPPLIER_NUDGES = [
@@ -95,8 +99,9 @@ async function lastUserInboundAt(conversationId: string): Promise<number | null>
  * EXPIRA cotações abandonadas (auditoria 20/07). Um pedido 'quoted' é opções apresentadas
  * aguardando a ESCOLHA do paciente. O nudge-stalled-flows cutuca UMA vez entre 3–20h e depois
  * deixa quieto — então o pedido fica 'quoted' PARA SEMPRE quando a pessoa não responde (Marina
- * desde 10/06 = 40 dias; vários outros). Depois de 7 dias a cotação está VENCIDA de qualquer
- * forma (preço/estoque de farmácia mudam numa semana). Marca 'failed' com MOTIVO + evento.
+ * desde 10/06 = 40 dias; vários outros). Depois de 24h a cotação está VENCIDA de qualquer
+ * forma (preço/estoque de farmácia de bairro valem pro dia; o roteador de mensagens já trata
+ * >24h como pedido morto). Marca 'failed' com MOTIVO + evento.
  *
  * NÃO é destrutivo: 'failed' é revivível (inbound-supplier revive failed→quoting quando a
  * farmácia responde) e o paciente pode recomeçar com cotação FRESCA (melhor que uma de 1 semana).
@@ -107,20 +112,21 @@ export async function expireAbandonedQuotes(): Promise<void> {
     const cutoff = new Date(Date.now() - ABANDONED_QUOTE_MS).toISOString();
     // created_at (não updated_at): a migration 0022 bumpou updated_at de todos os antigos; e a
     // revivência (inbound-supplier) reseta created_at → ele reflete o ciclo de cotação atual.
+    // Conta a partir da APRESENTAÇÃO (presented_at); created_at só quando ela não existe.
     const { data: stale } = await db.from('orders')
-      .select('id, user_id, created_at')
+      .select('id, user_id, created_at, presented_at')
       .eq('status', 'quoted')
       .is('selected_quote_id', null)
-      .lt('created_at', cutoff)
+      .or(`presented_at.lt.${cutoff},and(presented_at.is.null,created_at.lt.${cutoff})`)
       .limit(20);
     if (!stale?.length) return;
     for (const o of stale) {
       // Claim atômico (.eq('status','quoted')) — se outro processo/fechamento mexeu, não pisa.
       const { data: claimed } = await db.from('orders')
-        .update({ status: 'failed', cancelled_reason: 'cotação expirada — 7+ dias sem escolha do paciente (preços/estoque desatualizados)' })
+        .update({ status: 'failed', cancelled_reason: 'cotação expirada — 24h sem escolha do paciente (preços/estoque desatualizados)' })
         .eq('id', o.id).eq('status', 'quoted').is('selected_quote_id', null).select('id');
       if (claimed?.length) {
-        await writeLog('info', 'order', `cotação abandonada expirada (>7d sem escolha) — pedido ${o.id.slice(0, 8)} → failed`, { orderId: o.id });
+        await writeLog('info', 'order', `cotação abandonada expirada (>24h sem escolha) — pedido ${o.id.slice(0, 8)} → failed`, { orderId: o.id });
         void writeEvent({ eventName: 'order.quote_expired', userId: (o.user_id as string | null) ?? undefined, payload: { order_id: o.id } });
       }
     }

@@ -10,6 +10,12 @@ interface XarloteContext {
   medications?: string[];
   memoryCards?: MemoryCard[];
   activeOrderSummary?: string | null;
+  /**
+   * Quando NÃO há pedido ativo: o que aconteceu com o último (pra o modelo não "continuar"
+   * um pedido morto que aparece no histórico). Ex.: { itens: 'Daflon Flex 1000', quando: '10/09',
+   * motivo: 'cotação expirada — 24h sem escolha' }.
+   */
+  ultimoPedidoEncerrado?: { itens: string; quando: string; motivo: string } | null;
   /** Método de pagamento mais usado pelo usuário (pedidos anteriores) — confirmar, não re-perguntar. */
   paymentPreference?: string | null;
   /**
@@ -93,7 +99,9 @@ export function buildXarloteSystemPrompt(ctx: XarloteContext = {}): string {
 
   const activeOrderSection = ctx.activeOrderSummary
     ? `## PEDIDO ATIVO\n${ctx.activeOrderSummary}\n\n⚠️ IMPORTANTE: Quando o usuário aceitar/escolher uma das opções de farmácia (ex.: "aceito", "pode ser", "quero a 1", "prefiro a X", "a mais barata"), chame IMEDIATAMENTE **confirm_order_selection** com o order_id e o quote_id correto da opção escolhida. Não peça confirmação adicional.\n\n🔒 REGRA DE PRECEDÊNCIA: se existe PEDIDO ATIVO com opções cotadas E o usuário aceita/escolhe uma delas, **confirm_order_selection VENCE relay_answer_to_establishment**, mesmo que haja uma PERGUNTA PENDENTE no contexto. Fechar o pedido já avisa a farmácia — não relaye um aceite. Só use relay_answer_to_establishment quando o usuário responde um DADO que a farmácia perguntou (plano/particular, receita, marca), NÃO quando ele fecha negócio.`
-    : '';
+    // Estado vazio FALA (regra 3): sem isto, o modelo lia no histórico um pedido de dias atrás
+    // como se estivesse vivo e "corrigia" o endereço dele num "oi" (Ludmila, 14/09).
+    : `## PEDIDO ATIVO\nNenhum pedido de farmácia em andamento agora.${ctx.ultimoPedidoEncerrado ? ` O último (${ctx.ultimoPedidoEncerrado.itens}, ${ctx.ultimoPedidoEncerrado.quando}) foi ENCERRADO: ${ctx.ultimoPedidoEncerrado.motivo}.` : ''} Nenhuma farmácia está esperando resposta sua e você NÃO está esperando frete, preço nem retorno de farmácia nenhuma — mesmo que a última mensagem do histórico diga que estava. Não diga "tô esperando a farmácia"/"vou cobrar o frete"; se ele quiser o remédio, é um pedido NOVO (start_pharmacy_order); se perguntar do antigo, diga que aquela cotação venceu e ofereça cotar de novo.`;
 
   /**
    * 🤝 QUEM ELE CUIDA.
@@ -468,7 +476,7 @@ Quando você chama uma ferramenta, o **resultado dela volta pra você** antes de
 
 ### Endereços rotulados (casa/trabalho/outro) — guarde uma vez, reuse sempre
 - **Reusar um salvo**: quando o paciente disser "manda pra casa"/"pro trabalho"/"o de sempre", passe **\`saved_address_label\`** direto no **start_pharmacy_order** (ex.: "casa"). Não precisa re-perguntar nem geocodificar — o backend usa a localização guardada. (Os endereços salvos estão no seu contexto em "Endereços salvos".)
-- **save_address**: guarda/atualiza um endereço rotulado. Use depois de um pedido num endereço NOVO, quando você confirmou de quem é (casa/trabalho/outro) e a quadra/lote — aí da próxima vez você só pergunta "casa, trabalho ou novo?". Passe \`label\`, \`complement\` (quadra/lote), e \`full_address\` se tiver o texto; \`set_default: true\` se for o primeiro. ⚠️ **Se o paciente CORRIGIR o endereço com um pedido em andamento** ("esse endereço não está certo, é Rua X, 201, Setor Y"): chame **save_address** com o endereço certo (label = o rótulo que ele usa, ou "casa") — ela atualiza o pedido E avisa a farmácia que já cotou. NÃO use message_supplier pra passar endereço, e NÃO mande a mesma coisa duas vezes.
+- **save_address**: guarda/atualiza um endereço rotulado. Use depois de um pedido num endereço NOVO, quando você confirmou de quem é (casa/trabalho/outro) e a quadra/lote — aí da próxima vez você só pergunta "casa, trabalho ou novo?". Passe \`label\`, \`complement\` (quadra/lote), e \`full_address\` se tiver o texto; \`set_default: true\` se for o primeiro. ⚠️ **Se o paciente CORRIGIR o endereço com um pedido em andamento** ("esse endereço não está certo, é Rua X, 201, Setor Y"): chame **save_address** com o endereço certo (label = o rótulo do endereço que o pedido estava usando; se você não souber de quem é o endereço novo, pergunte "é casa, trabalho ou outro?" — NUNCA invente "casa") — ela atualiza o pedido E avisa a farmácia que já cotou. NÃO use message_supplier pra passar endereço, e NÃO mande a mesma coisa duas vezes. Isso vale SÓ com PEDIDO ATIVO no contexto: sem PEDIDO ATIVO, o pedido anterior está encerrado — não retome endereço, frete ou farmácia de um pedido antigo do histórico por conta própria; responda ao que ele disse agora.
 - **set_default_address**: pra marcar um endereço JÁ salvo como padrão (quando o paciente pede, ou usa o mesmo 3+ vezes).
 
 ### Consultas médicas

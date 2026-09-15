@@ -262,6 +262,15 @@ async function processEnrichment(job: Job<ProfileEnricherJob>): Promise<void> {
       dupQuery = ad.street ? dupQuery.ilike('street', ad.street) : dupQuery.eq('cep', ad.cep!);
       const { data: existing } = await dupQuery.maybeSingle();
       if (existing) continue;
+      // Rótulo já existe → o endereço explícito (save_address) vence; o inferido nunca cria um
+      // segundo "casa" (14/09: o enricher gerou 2 das 3 "casa" da Ludmila a partir do que o
+      // próprio modelo tinha inventado no turno).
+      const rotulo = (ad.label ?? '').trim();
+      if (rotulo) {
+        const { data: mesmoRotulo } = await db.from('user_addresses').select('id').eq('user_id', userId)
+          .ilike('label', rotulo.replace(/[\\%_]/g, (c) => `\\${c}`)).limit(1).maybeSingle();
+        if (mesmoRotulo) continue;
+      }
 
       const { error } = await db.from('user_addresses').insert({
         user_id: userId,

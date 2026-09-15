@@ -541,7 +541,7 @@ export const xarloteTools: ToolDefinition[] = [
       parameters: {
         type: 'object',
         properties: {
-          label: { type: 'string', description: 'Rótulo do endereço: "casa", "trabalho", ou outro nome curto que o paciente deu ("casa da minha mãe").' },
+          label: { type: 'string', description: 'Rótulo do endereço: "casa", "trabalho", ou outro nome curto que o paciente deu ("casa da minha mãe"). SÓ o rótulo que o PACIENTE disse (ou o do endereço que o pedido já usava, numa correção) — nunca chute "casa".' },
           full_address: { type: 'string', description: 'Endereço COMPLETO como o paciente confirmou, incluindo quadra/lote/número/complemento se houver (ex.: "Rua Ema 5, Qd 19 Lt 28, Recanto das Emas, Goiânia"). Se o paciente compartilhou localização 📍 e não houver texto, deixe vazio — o backend usa a localização do último pedido/mensagem.' },
           complement: { type: 'string', description: 'Complemento/quadra/lote/ponto de referência, se o paciente informou separado (ex.: "Qd 19 Lt 28", "apto 302", "casa azul do portão branco"). Opcional.' },
           notes: { type: 'string', description: 'Instrução de entrega, se houver (ex.: "deixar com o porteiro"). Opcional.' },

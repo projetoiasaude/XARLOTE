@@ -51,6 +51,12 @@ export type DecisaoDeDose =
 export const JANELA_DISPARO_MS = 6 * 60 * 60_000;
 /** Duas confirmações do mesmo remédio dentro disto são a MESMA dose. */
 export const JANELA_DUPLICATA_MS = 30 * 60_000;
+/**
+ * Até quando um "tomei" ainda se refere ao ÚLTIMO disparo (e não a "agora"). A Vossa confirma a
+ * Venlafaxina das 21h às 06:12 do dia seguinte: a dose é a das 21h, não uma das 06:12 (14/09).
+ * Meio dia: além disso, o disparo é da rodada anterior e o "tomei" é uma dose nova.
+ */
+export const JANELA_OCORRENCIA_MS = 12 * 60 * 60_000;
 
 const TOKEN_DE_DOSE = /^\d+(?:[.,]\d+)?(?:mg|mcg|ml|g|ui|%)?$/;
 
@@ -148,6 +154,6 @@ export function decidirRegistroDeDose(input: {
 
   // Registra. A ocorrência confirmada é o disparo recente do alvo (quando houve).
   const runMs = ms(alvo?.last_run_at);
-  const ocorrenciaIso = alvo && runMs != null && agora - runMs <= JANELA_DISPARO_MS ? new Date(runMs).toISOString() : null;
+  const ocorrenciaIso = alvo && runMs != null && agora - runMs <= JANELA_OCORRENCIA_MS ? new Date(runMs).toISOString() : null;
   return { acao: 'registrar', lembrete: alvo, ocorrenciaIso, nota: null };
 }

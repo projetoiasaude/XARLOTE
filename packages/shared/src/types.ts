@@ -81,6 +81,8 @@ export interface Message {
   llm_tokens_out: number | null;
   llm_latency_ms: number | null;
   trace_id: string | null;
+  /** delivered | queued | window_blocked | suppressed | failed | null (legado). */
+  delivery_status?: string | null;
   created_at: string;
 }
 

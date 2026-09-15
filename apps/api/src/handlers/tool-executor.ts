@@ -4,7 +4,7 @@ import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem, CareLinkView } from '@iasaude/shared';
 import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, pediuCancelarTudo, ehRruleComListaDeMinutos, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool,
-  decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
+  decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, extractDeliverySector, parseEnderecoDigitado, montarEnderecoHumano, nomeJaConfirmadoPeloPaciente, quantidadeFoiMencionada, JANELA_PEDIDO_VIVO_MS, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
 import { verificarExistenciaDoRemedio } from './verificar-nome-remedio.js';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
@@ -31,44 +31,11 @@ import {
 import { handleRedFlagCheck, type RedFlagArgs } from './red-flag-handler.js';
 import { ToolFailure, resolveOrderForUser, resolveMediaMessageId } from './entity-resolve.js';
 
-/**
- * Extrai um identificador curto do endereço pra usar na cotação com a farmácia:
- * formato "Rua/Avenida X, Setor/Bairro Y" (sem número, sem CEP, sem cidade/UF).
- * Endereço completo + lat/lng só são repassados na confirmação do pedido.
- *
- * Nominatim típico: "Avenida Interligação, Setor Santa Rita VII, Goiânia, Região..., Goiás, 74999-999, Brasil"
- * ViaCEP típico:    "R. 14, 201, St. Oeste, Goiânia, Goiás"
- */
-function extractDeliverySector(fullAddress: string | null): string | null {
-  if (!fullAddress) return null;
-  // Strings sintéticas (sem reverse geocoding) não rendem extração — caller usa fallback.
-  if (/Localização compartilhada|^lat\s|coordenadas?\b/i.test(fullAddress)) return null;
-
-  const parts = fullAddress.split(',').map((s) => s.trim()).filter(Boolean);
-  const ignoreLow = /^(região|brasil|brazil|região centro-oeste|mesorregião|microrregião)/i;
-  const isStreet = /^(rua|r\.?|avenida|av\.?|alameda|al\.?|travessa|tv\.?|rodovia|rod\.?|praça|pç\.?|estrada|via|quadra|qd\.?)\b/i;
-  const isOnlyNumber = /^\d+[a-zA-Z]?$/;
-  const isCep = /^\d{5}-?\d{3}$/;
-  const isUf = /^([A-Z]{2}|Goiás|Goias|São Paulo|Rio de Janeiro|Minas Gerais|Bahia|Paraná|Pernambuco|Ceará|Pará|Distrito Federal|Mato Grosso|Mato Grosso do Sul|Espírito Santo|Santa Catarina|Rio Grande do Sul|Rio Grande do Norte|Alagoas|Sergipe|Paraíba|Piauí|Maranhão|Tocantins|Acre|Amapá|Amazonas|Rondônia|Roraima)$/i;
-
-  let street: string | null = null;
-  let sector: string | null = null;
-
-  for (const p of parts) {
-    if (ignoreLow.test(p) || isCep.test(p) || isOnlyNumber.test(p) || isUf.test(p)) continue;
-    if (isStreet.test(p)) {
-      if (!street) street = p;
-      continue;
-    }
-    if (!sector) {
-      sector = p;
-      if (street) break;
-    }
-  }
-
-  const result = [street, sector].filter(Boolean).join(', ');
-  return result || null;
-}
+// `extractDeliverySector` vem de @iasaude/shared (endereco-entrega.ts). Este arquivo tinha uma
+// CÓPIA local mais antiga — que tratava "Qd. B8" como rua e "Lt. 20" como setor — e foi ela que
+// abriu a cotação da Ludmila com "entregar Rua 14, Lt. 20" em 14/09/2026, um dia depois de a
+// versão certa ter sido testada e deployada só no inbound-supplier (regra 104: o endurecimento
+// aplicado num lugar e esquecido no outro é dívida silenciosa).
 
 /**
  * A mídia deste turno, já baixada UMA vez pelo inbound e classificada pelos BYTES.
@@ -483,11 +450,13 @@ async function handleSaveProfileFact(
       });
       break;
     case 'address': {
-      await db.from('user_addresses').insert({
-        user_id: ctx.userId,
-        label: String(args.payload['label'] ?? 'principal'),
-        ...pick(['street', 'number', 'complement', 'neighborhood', 'city', 'state', 'cep', 'is_default', 'latitude', 'longitude']),
-      });
+      // UPSERT por rótulo — o insert cru aqui era um dos três escritores que deixaram a
+      // Ludmila com 5 endereços e 3 "casa" (14/09). Um rótulo, uma linha.
+      const rotulo = String(args.payload['label'] ?? 'principal').trim() || 'principal';
+      const campos = pick(['street', 'number', 'complement', 'neighborhood', 'city', 'state', 'cep', 'is_default', 'latitude', 'longitude']);
+      const { data: jaExiste } = await db.from('user_addresses').select('id').eq('user_id', ctx.userId).ilike('label', escapeLike(rotulo)).limit(1).maybeSingle();
+      if (jaExiste?.id) await db.from('user_addresses').update({ ...campos }).eq('id', jaExiste.id);
+      else await db.from('user_addresses').insert({ user_id: ctx.userId, label: rotulo, ...campos });
       break;
     }
     case 'identity': {
@@ -839,11 +808,30 @@ async function handleSaveAddress(
   args: { label: string; full_address?: string; complement?: string; notes?: string; set_default?: boolean; confirmed_residential?: boolean; apply_to_active_order?: boolean },
   ctx: ToolContext,
 ): Promise<void> {
-  const label = (args.label ?? '').trim() || 'principal';
+  let label = (args.label ?? '').trim() || 'principal';
   let lat: number | null = null;
   let lng: number | null = null;
   let addrText: string | null = (args.full_address ?? '').trim() || null;
   const hadText = !!addrText;
+
+  // 🏷️ A CORREÇÃO CORRIGE O ENDEREÇO QUE O PEDIDO USAVA. Com pedido vivo (24h) apontando pra um
+  // endereço salvo, o rótulo é o DELE — não o que o modelo escolheu. Em 14/09 o trabalho da
+  // Ludmila foi regravado como "casa" porque o prompt dizia "label = o rótulo que ele usa, ou
+  // casa" (regra 98: o campo que você oferece é a pergunta que você faz).
+  const { data: pedidoVivo } = args.apply_to_active_order !== false
+    ? await db.from('orders').select('id, user_address_id').eq('user_id', ctx.userId)
+      .in('status', ['quoting', 'quoted'])
+      .gte('created_at', new Date(Date.now() - JANELA_PEDIDO_VIVO_MS).toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle()
+    : { data: null };
+  if (pedidoVivo?.user_address_id) {
+    const { data: usado } = await db.from('user_addresses').select('label').eq('id', pedidoVivo.user_address_id).maybeSingle();
+    const rotuloDoPedido = String(usado?.label ?? '').trim();
+    if (rotuloDoPedido && rotuloDoPedido.toLowerCase() !== label.toLowerCase()) {
+      await writeLog('info', 'address', `save_address: pedido vivo usa o endereço "${rotuloDoPedido}" — a correção vai pra ele (o modelo pediu "${label}")`, { traceId: ctx.traceId, orderId: pedidoVivo.id });
+      label = rotuloDoPedido;
+    }
+  }
 
   // 1. Texto PRECISO tem prioridade (salvar proativo "meu trabalho é Av X 100").
   if (addrText) {
@@ -877,19 +865,28 @@ async function handleSaveAddress(
     return;
   }
 
-  // 3. Componentes estruturados (best-effort) pra exibir bonitinho depois.
-  let street: string | null = null, number: string | null = null, neighborhood: string | null = null;
-  let city: string | null = null, state: string | null = null, cep: string | null = null;
+  // 3. Componentes estruturados. O QUE A PESSOA DIGITOU É O DADO (caso Ludmila, 10–14/09):
+  //    o reverse-geocode trocava "Rua 14, 201, Qd. B8, Lt. 20, Setor Oeste" por "Rua 14,
+  //    Setor Sul" sem número — o setor do mapa numa rua de divisa, e o número perdido. O mapa
+  //    só completa o que ela não disse (cidade/UF/CEP).
+  const digitado = parseEnderecoDigitado(hadText ? (args.full_address ?? '') : (addrText ?? ''));
+  let street: string | null = digitado.street, number: string | null = digitado.number, neighborhood: string | null = digitado.neighborhood;
+  let city: string | null = digitado.city, state: string | null = digitado.state, cep: string | null = digitado.cep;
   try {
     const nomi = await reverseGeocodeNominatim(lat, lng);
     if (nomi) {
-      street = nomi.road ?? null; number = nomi.houseNumber ?? null;
-      neighborhood = nomi.neighborhood ?? null; city = nomi.city ?? null;
-      state = nomi.state ?? null; cep = nomi.postcode ?? null;
+      street = street ?? nomi.road ?? null; number = number ?? nomi.houseNumber ?? null;
+      neighborhood = neighborhood ?? nomi.neighborhood ?? null; city = city ?? nomi.city ?? null;
+      state = state ?? nomi.state ?? null; cep = cep ?? nomi.postcode ?? null;
     }
   } catch { /* best-effort — coords bastam */ }
-  // Se o geocode não trouxe rua mas temos o texto do usuário, guarda o texto como rua.
+  // Se nem o texto nem o mapa deram rua, guarda o texto inteiro como rua.
   if (!street && addrText) street = addrText.slice(0, 180);
+  // Complemento: o que veio no argumento próprio + o que estava no texto (Qd./Lt./Apto), sem repetir.
+  const complementoArg = (args.complement ?? '').trim();
+  const complemento = [complementoArg, digitado.complement].filter((c): c is string => !!c && c.trim().length > 0)
+    .filter((c, i, arr) => arr.findIndex((x) => x.toLowerCase().replace(/\W/g, '') === c.toLowerCase().replace(/\W/g, '')) === i)
+    .join(', ') || null;
 
   // PONTO 10 (incidente Vadivino: hospital salvo como "casa" + virou endereço default):
   // endereço institucional (hospital/UPA/clínica) sob rótulo residencial → confirma antes
@@ -907,7 +904,7 @@ async function handleSaveAddress(
     .select('id').eq('user_id', ctx.userId).ilike('label', escapeLike(label)).limit(1).maybeSingle();
   const row: Record<string, unknown> = {
     user_id: ctx.userId, label,
-    street, number, complement: (args.complement ?? '').trim() || null,
+    street, number, complement: complemento,
     neighborhood, city, state, cep,
     latitude: lat, longitude: lng,
     notes: (args.notes ?? '').trim() || null,
@@ -942,15 +939,16 @@ async function handleSaveAddress(
   // cotação; a correção virou mensagem solta à farmácia e o pedido/perfil ficaram errados. Agora
   // o endereço salvo TAMBÉM vira o endereço do pedido vivo, e a farmácia que já cotou recebe UMA
   // mensagem com o endereço certo pedindo o frete pra lá (via fila do agente; janela respeitada).
+  // "Pedido em andamento" tem a MESMA janela do roteador (24h): em 14/09 um pedido cotado em
+  // 10/09 e nunca fechado recebeu o endereço novo e uma mensagem pra farmácia, num turno em que
+  // a paciente só disse "oi".
   if (args.apply_to_active_order !== false && addrId) {
     const { data: ativo } = await db.from('orders').select('id, delivery_address').eq('user_id', ctx.userId)
-      .in('status', ['quoting', 'quoted']).order('created_at', { ascending: false }).limit(1).maybeSingle();
+      .in('status', ['quoting', 'quoted'])
+      .gte('created_at', new Date(Date.now() - JANELA_PEDIDO_VIVO_MS).toISOString())
+      .order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (ativo?.id) {
-      const enderecoNovo = [
-        [street, number].filter(Boolean).join(', '),
-        (args.complement ?? '').trim() || null, neighborhood,
-        [city, state].filter(Boolean).join(' - '), cep,
-      ].filter((p) => p && String(p).trim()).join(', ') || addrText || null;
+      const enderecoNovo = montarEnderecoHumano({ street, number, complement: complemento, neighborhood, city, state, cep }) || addrText || null;
       await db.from('orders').update({ delivery_address: enderecoNovo, delivery_lat: lat, delivery_lng: lng, user_address_id: addrId }).eq('id', ativo.id);
       const { data: cotadas } = await db.from('quotes').select('id, conversation_id, suppliers(name, whatsapp_e164, phone_e164)').eq('order_id', ativo.id).eq('status', 'quoted');
       let avisadas = 0;
@@ -981,15 +979,37 @@ async function handleStartPharmacyOrder(
   // "não perguntado". `source` diz de onde o nome veio (texto/foto/áudio).
   // O booleano só é honrado se o PACIENTE falou de genérico/similar/marca (teste cego 13/09: o
   // modelo de visão preencheu `false` sozinho ao ler a receita). Consentimento pela fala.
-  const { data: falasRecentes } = await db.from('messages').select('content, transcript').eq('conversation_id', ctx.conversationId).eq('direction', 'in').order('created_at', { ascending: false }).limit(3);
-  const falas = [ctx.textoDoPaciente, ...((falasRecentes ?? []).map((m) => (m.content as string | null) ?? (m.transcript as string | null)))];
-  const falouDeSubstituto = pacienteFalouDeSubstituto(falas);
-  args.items = (args.items ?? []).map((i) => ({
-    ...i,
-    name: String(i.name ?? '').trim(),
-    substitutes_ok: typeof i.substitutes_ok === 'boolean' && falouDeSubstituto ? i.substitutes_ok : null,
-    source: (['texto', 'foto', 'audio'] as const).includes((i.source ?? 'texto') as OrigemDoNome) ? (i.source ?? 'texto') : 'texto',
-  }));
+  // As FALAS RECENTES do paciente (texto + o que foi lido de foto/áudio), nos últimos 30 min.
+  // Eram 3 mensagens contando a atual (14/09: "Pode ser pro trabalho" dita duas mensagens antes
+  // já tinha saído da janela). Uma conversa de pedido tem 6–10 falas curtas; olhamos 8.
+  const { data: falasRecentes } = await db.from('messages').select('content, transcript, direction, created_at')
+    .eq('conversation_id', ctx.conversationId)
+    .gte('created_at', new Date(Date.now() - 30 * 60_000).toISOString())
+    .order('created_at', { ascending: false }).limit(16);
+  const recentes = (falasRecentes ?? []) as Array<{ content: string | null; transcript: string | null; direction: 'in' | 'out'; created_at: string }>;
+  const falasIn = recentes.filter((m) => m.direction === 'in').slice(0, 8);
+  // O que o PACIENTE disse (texto/legenda) — é o que vale como consentimento (substituto, endereço).
+  const falasDoPaciente = [ctx.textoDoPaciente, ...falasIn.map((m) => m.content)];
+  // …e mais o que foi LIDO da foto/áudio (transcript) — vale só pra quantidade (a receita diz "30 comprimidos").
+  const falas = [...falasDoPaciente, ...falasIn.map((m) => m.transcript)];
+  const ultimaFalaDaXarlote = recentes.find((m) => m.direction === 'out')?.content ?? null;
+  const falouDeSubstituto = pacienteFalouDeSubstituto(falasDoPaciente);
+  args.items = (args.items ?? []).map((i) => {
+    // 📦 QUANTIDADE QUE NINGUÉM DISSE NÃO ENTRA (14/09): "30 cápsulas"/"90 cápsulas" inventados
+    // da posologia viraram forma de busca e "(90 cápsulas)" pra farmácia. Sem número dito pelo
+    // paciente ou lido da receita, a quantidade cai — 1 caixa é o padrão e a farmácia cota assim.
+    const quantidade = quantidadeFoiMencionada(falas, i.quantity) ? i.quantity : undefined;
+    if (i.quantity && !quantidade) {
+      void writeLog('info', 'order', `start_pharmacy_order: quantidade "${i.quantity}" de "${i.name}" não foi dita por ninguém — removida (1 caixa é o padrão)`, { traceId: ctx.traceId });
+    }
+    return {
+      ...i,
+      name: String(i.name ?? '').trim(),
+      quantity: quantidade,
+      substitutes_ok: typeof i.substitutes_ok === 'boolean' && falouDeSubstituto ? i.substitutes_ok : null,
+      source: (['texto', 'foto', 'audio'] as const).includes((i.source ?? 'texto') as OrigemDoNome) ? (i.source ?? 'texto') : 'texto',
+    };
+  });
   if (!args.items.length || !args.items[0]?.name) {
     throw new ToolFailure('NENHUM pedido foi criado: faltou o nome do medicamento. Pergunte ao paciente qual remédio ele quer.');
   }
@@ -1077,11 +1097,17 @@ async function handleStartPharmacyOrder(
     // mandou a foto e "consegue cotar?". Um endereço salvo só entra se o paciente o MENCIONOU
     // (rótulo, "mesmo endereço", a rua) neste turno ou no anterior. Senão, pergunta pra onde vai.
     if (saved) {
-      const { data: ultimas } = await db.from('messages').select('content, transcript').eq('conversation_id', ctx.conversationId).eq('direction', 'in').order('created_at', { ascending: false }).limit(2);
-      const falas = [ctx.textoDoPaciente, ...((ultimas ?? []).map((m) => (m.content as string | null) ?? (m.transcript as string | null)))];
-      if (!enderecoFoiMencionado(falas, { label: String(saved.label ?? ''), street: (saved.street as string | null) ?? null })) {
-        const { data: todos } = await db.from('user_addresses').select('label, street, number, neighborhood').eq('user_id', ctx.userId).order('is_default', { ascending: false }).limit(4);
-        const lista = (todos ?? []).map((a) => `*${a.label}* (${[a.street, a.number, a.neighborhood].filter(Boolean).join(', ') || 'endereço salvo'})`).join(', ');
+      // Olha as falas recentes de verdade (não só a atual + 1) e aceita a resposta à NOSSA
+      // proposta: "Confirmo o pedido pro trabalho?" → "Isso" é consentimento (14/09).
+      if (!enderecoFoiMencionado(falasDoPaciente, { label: String(saved.label ?? ''), street: (saved.street as string | null) ?? null }, { propostaDaXarlote: ultimaFalaDaXarlote, respostaAtual: ctx.textoDoPaciente })) {
+        const { data: todos } = await db.from('user_addresses').select('label, street, number, complement, neighborhood, is_default, created_at').eq('user_id', ctx.userId).order('is_default', { ascending: false }).order('created_at', { ascending: false }).limit(8);
+        // Um por rótulo (o default ou o mais novo) — a lista com "trabalho, trabalho, casa, casa" era ilegível.
+        const porRotulo = new Map<string, { label: string; street: string | null; number: string | null; complement: string | null; neighborhood: string | null }>();
+        for (const a of (todos ?? []) as Array<{ label: string; street: string | null; number: string | null; complement: string | null; neighborhood: string | null }>) {
+          const k = String(a.label ?? '').trim().toLowerCase();
+          if (k && !porRotulo.has(k)) porRotulo.set(k, a);
+        }
+        const lista = [...porRotulo.values()].map((a) => `*${a.label}* (${[[a.street, a.number].filter(Boolean).join(', '), a.complement, a.neighborhood].filter(Boolean).join(', ') || 'endereço salvo'})`).join(', ');
         await writeLog('warn', 'order', `start_pharmacy_order: endereço salvo "${saved.label}" NÃO foi mencionado pelo paciente — perguntando pra onde vai em vez de assumir`, { traceId: ctx.traceId });
         await sendOutbound(ctx.conversationId, ctx.phoneE164,
           `Pra onde eu mando? Tenho aqui ${lista || 'um endereço salvo'} — ou me passa um endereço novo (com o CEP) 💙`, ctx.traceId);
@@ -1122,7 +1148,12 @@ async function handleStartPharmacyOrder(
     if (geo && geo.confidence === 'precise') {
       lat = geo.lat;
       lng = geo.lng;
-      deliveryAddress = geo.formattedAddress || args.location.address;
+      // O endereço do pedido é o que o paciente DIGITOU (número, quadra, lote, setor); o mapa
+      // só empresta cidade/CEP quando faltam. O `formattedAddress` do geocoder trocava
+      // "Rua 14, 201, Qd. B8, Lt. 20, Setor Oeste" por "Rua 14, Setor Sul" (14/09).
+      const digitado = parseEnderecoDigitado(args.location.address);
+      const doMapa = parseEnderecoDigitado(geo.formattedAddress ?? '');
+      deliveryAddress = montarEnderecoHumano({ ...digitado, city: digitado.city ?? doMapa.city, state: digitado.state ?? doMapa.state, cep: digitado.cep ?? doMapa.cep }) || geo.formattedAddress || args.location.address;
       locationSource = `geocoded:${geo.formattedAddress}`;
       await writeLog('info', 'geocoding', `Endereço localizado (confiança: precise)`, { traceId: ctx.traceId, lat, lng, address: geo.formattedAddress });
     } else if (geo && geo.confidence === 'low') {
@@ -1209,8 +1240,20 @@ async function handleStartPharmacyOrder(
   // Catálogo real das grandes redes decide; a regra do que fazer é pura (nome-remedio.ts):
   // foto/áudio + inexistente → confirma com o paciente ANTES de acionar alguém; texto do
   // paciente + inexistente → segue (a palavra dele vence); redes fora → segue sem verificar.
+  // A CONVERSA É A MEMÓRIA da checagem: se a pergunta "Li *X* na receita…" já saiu e o
+  // paciente respondeu, X está confirmado — não se pergunta de novo (14/09: quatro vezes).
+  const { data: recentesMsgs } = await db.from('messages').select('direction, content')
+    .eq('conversation_id', ctx.conversationId)
+    .gte('created_at', new Date(Date.now() - 6 * 60 * 60_000).toISOString())
+    .order('created_at', { ascending: true }).limit(40);
+  const conversaRecente = [...((recentesMsgs ?? []) as Array<{ direction: 'in' | 'out'; content: string | null }>), { direction: 'in' as const, content: ctx.textoDoPaciente ?? '' }];
   for (const item of args.items) {
     const origem = (item.source ?? 'texto') as OrigemDoNome;
+    if (origem !== 'texto' && nomeJaConfirmadoPeloPaciente(conversaRecente, item.name)) {
+      item.name_verified = true;
+      await writeLog('info', 'pharmacy', `Nome "${item.name}" (${origem}): já confirmado pelo paciente nesta conversa → segue sem re-perguntar`, { traceId: ctx.traceId });
+      continue;
+    }
     const ver = await verificarExistenciaDoRemedio(item.name, ctx.traceId);
     item.name_verified = ver.existe;
     const decisao = decidirVerificacaoDeNome({ origem, existe: ver.existe });

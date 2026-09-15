@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, afirmacaoDeProdutoSemProva, ehAncoraDeFechamento, classificarAckDeDose, lembretesQueTocaramJuntos, anunciouRegistroDeDose, falaHonestaDeDose, tokenPrincipal, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, afirmacaoDeProdutoSemProva, ehAncoraDeFechamento, classificarAckDeDose, lembretesQueTocaramJuntos, lembretesEntregues, anunciouRegistroDeDose, falaHonestaDeDose, tokenPrincipal, FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA, JANELA_PEDIDO_VIVO_MS, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -795,10 +795,14 @@ async function processInboundUserInner(
     // condensa em memory cards `episode` (que, desde a migration 0031, não desbotam).
     getConversationMessages(conversation.id, 30),
     queryUser360(user.id),
+    // "PEDIDO ATIVO" tem a mesma janela do roteador e do bloco de estado (24h). Sem ela, o
+    // pedido cotado em 10/09 ainda era "ativo" pro modelo em 14/09 — e um "oi" virou
+    // save_address + mensagem à farmácia (Ludmila).
     db.from('orders')
       .select('id, status, items, summary, presented_at')
       .eq('user_id', user.id)
       .in('status', ['quoting', 'quoted', 'confirming'])
+      .gte('created_at', new Date(Date.now() - JANELA_PEDIDO_VIVO_MS).toISOString())
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle(),
@@ -866,6 +870,19 @@ async function processInboundUserInner(
   const ferramentas = ferramentasParaAtor({ temVinculos })
     .filter((t) => t.function.name !== 'fetch_lab_results' || labPronto === true);
   const activeOrderSummary = activeOrderRes.data?.summary ?? null;
+  // Sem pedido ativo, o estado vazio FALA o que houve com o último (regra 3): senão o modelo
+  // lê no histórico "vou pedir o frete pra Coimbra" de 4 dias atrás e segue esperando (14/09).
+  const ultimoPedidoEncerrado = activeOrderSummary ? null : await (async () => {
+    const { data: ult } = await db.from('orders').select('items, status, cancelled_reason, created_at, closed_at')
+      .eq('user_id', user.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (!ult) return null;
+    const itens = ((ult.items as Array<{ name?: string }> | null) ?? []).map((i) => i.name).filter(Boolean).join(', ') || 'medicamento';
+    const quando = new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit' }).format(new Date(ult.created_at as string));
+    const motivo = ult.status === 'handed_off' ? 'fechado com a farmácia (entrega combinada)'
+      : ult.status === 'delivered' ? 'entregue'
+      : (ult.cancelled_reason as string | null) || (ult.status === 'failed' ? 'sem cotação' : String(ult.status));
+    return { itens, quando, motivo };
+  })();
 
   // Preferência de pagamento aprendida: método mais usado nos pedidos recentes
   // (empate -> mais recente). Xarlote confirma ("no pix de novo?") em vez de perguntar.
@@ -925,6 +942,7 @@ async function processInboundUserInner(
     medications: medications?.map((m) => `${m.medication_name}${m.dosage ? ` ${m.dosage}` : ''}`) ?? [],
     memoryCards,
     activeOrderSummary,
+    ultimoPedidoEncerrado,
     paymentPreference,
     healthPlan: userHealthPlan,
   });
@@ -2242,8 +2260,14 @@ ${decision.alreadyOffered
         .gte('last_run_at', new Date(Date.now() - windowMs).toISOString())
         .order('last_run_at', { ascending: false })
         .limit(6);
+      // SÓ O QUE FOI ENTREGUE tocou: o espelho `window_blocked`/`suppressed` em `messages` diz
+      // que o paciente não recebeu aquele lembrete (Glauber/Ciro, 14–15/09).
+      const { data: saidasRaw } = await db.from('messages').select('created_at, delivery_status, content')
+        .eq('conversation_id', conversation.id).eq('direction', 'out')
+        .gte('created_at', new Date(Date.now() - windowMs - 120_000).toISOString());
+      const entregues = lembretesEntregues((recentesRaw ?? []) as Array<{ id: string; title: string; type: string; last_run_at: string | null; medication_id: string | null }>, (saidasRaw ?? []) as Array<{ created_at: string; delivery_status: string | null; content: string | null }>);
       // TODOS os que tocaram juntos com o mais recente (≤3 min), não só o primeiro.
-      const juntos = lembretesQueTocaramJuntos((recentesRaw ?? []) as Array<{ id: string; title: string; type: string; last_run_at: string | null; medication_id: string | null }>);
+      const juntos = lembretesQueTocaramJuntos(entregues);
       lembretesRecentesTitulos = juntos.map((r) => r.title);
       const maisRecente = juntos[0] ?? null;
       // Coerência verbo↔lembrete: "bebi" só confirma lembrete de hidratação; verbo genérico
@@ -2519,6 +2543,21 @@ ${decision.alreadyOffered
       });
       void writeEvent({ eventName: 'agent.claim_stripped', userId: user.id, conversationId: conversation.id, payload: { kind: teimosos[0]!.kind, removidas: limpo.removidas.length } });
       replyText = limpo.texto.trim() || 'Ainda não guardei nada no perfil, tá? Quer que eu guarde esse resultado aqui pra gente consultar depois?';
+    }
+  }
+
+  // 🧾 PROMESSA SEM FERRAMENTA (Ludmila, 14/09/2026): "Vou ajustar a cotação só com os
+  // remédios" — não existe ação que edite uma cotação de plataforma. Com pedido em jogo, a
+  // oração cai e entra a frase honesta (o que ELA pode fazer: desconsiderar o item ou refazer).
+  if (replyText && orderState) {
+    const okNames = executedToolCalls.filter((t) => t.ok).map((t) => t.name);
+    const promessas = verificarAnuncios(replyText, [], okNames).suspect
+      .filter((sus) => FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA.includes(sus.kind));
+    if (promessas.length) {
+      const limpo = semAnuncios(replyText, promessas.map((sus) => sus.kind));
+      await writeLog('warn', 'agent', `🧾 promessa de "${promessas[0]!.kind}" sem ferramenta que a cumpra → oração trocada pela fala honesta`, { traceId, evidence: promessas[0]!.evidence });
+      void writeEvent({ eventName: 'agent.claim_stripped', userId: user.id, conversationId: conversation.id, payload: { kind: promessas[0]!.kind, removidas: limpo.removidas.length } });
+      replyText = [limpo.texto.trim(), falaHonestaPara(promessas[0]!.kind)].filter(Boolean).join(' ');
     }
   }
 

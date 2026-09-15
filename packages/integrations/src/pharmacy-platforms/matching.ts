@@ -162,6 +162,31 @@ export function parseMedicationQuery(text: string): ParsedMedication {
  * casamento de dosagem, forma e quantidade; multiplica por penalidade se o produto é kit/combo
  * e o usuário não pediu. Disponibilidade dá um empurrãozinho no desempate.
  */
+const ORAL_SOLIDO = new Set(['comprimido', 'capsula']);
+function mesmaFamiliaDeForma(a: string, b: string): boolean {
+  return ORAL_SOLIDO.has(a) && ORAL_SOLIDO.has(b);
+}
+
+/** Prefixos de catálogo que vêm antes da marca: sal, categoria, embalagem. */
+const PREFIXOS_DE_CATALOGO = /^(?:(?:cloridrato|sulfato|maleato|succinato|besilato|bromidrato|fosfato|citrato|valerato|hemifumarato|fumarato|mesilato|dipropionato|acetato|nitrato|tartarato|dicloridrato|sodio|potassio|calcio|glicinato)\s+(?:de\s+|ferrico\s+|ferroso\s+)?|(?:suplemento|complemento)\s+(?:alimentar|nutricional|vitaminico)\s+|(?:antialergico|analgesico|antibiotico|anti-?inflamatorio|antitermico|antiacido|anticoncepcional|medicamento|remedio|kit|generico)\s+)+/;
+const STOP_DE_NOME = new Set(['de', 'da', 'do', 'com', 'e', 'a', 'o', 'em', 'para']);
+/** Até onde no nome do produto a marca pode estar (1-based). */
+export const POSICAO_MAXIMA_DA_MARCA = 3;
+
+/** A marca do pedido está na posição de marca do nome do produto, ou no princípio ativo? */
+export function brandInBrandPosition(brand: string, product: PlatformProduct): boolean {
+  const toks = normalize(product.productName)
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(PREFIXOS_DE_CATALOGO, '')
+    .split(' ')
+    .filter((t) => t && !STOP_DE_NOME.has(t));
+  const pos = toks.indexOf(brand);
+  if (pos >= 0 && pos < POSICAO_MAXIMA_DA_MARCA) return true;
+  const ingr = normalize((product.activeIngredient ?? []).join(' '));
+  return ingr.length > 0 && new RegExp(`(^|[^a-z0-9])${brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`).test(ingr);
+}
+
 export function scoreProductMatch(q: ParsedMedication, product: PlatformProduct): number {
   const hay = normalize(`${product.productName} ${(product.activeIngredient ?? []).join(' ')}`);
 
@@ -178,6 +203,11 @@ export function scoreProductMatch(q: ParsedMedication, product: PlatformProduct)
     const hasWord = (t: string) => new RegExp(`(^|[^a-z0-9])${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`).test(hay);
     const brand = q.nameTokens[0] as string;
     if (!hasWord(brand)) return 0; // a marca/princípio não está no produto → não é candidato
+    // 14/09 (Ludmila): "Alto D" casou "Colete Putti Elástico **Alto** | GG" — a marca estava no
+    // produto, só que como 4ª palavra de um colete ortopédico. Catálogo escreve marca PRIMEIRO
+    // ("Neutrofer 300mg…", "Cloridrato de Metformina…", "Suplemento Alimentar Neutrofer…"):
+    // a marca do pedido precisa estar nas primeiras posições do NOME, ou ser o princípio ativo.
+    if (!brandInBrandPosition(brand, product)) return 0;
     const present = q.nameTokens.filter(hasWord).length;
     nameFrac = present / q.nameTokens.length;
     const minimo = q.nameTokens.length <= 2 ? 1 : 2 / 3;
@@ -194,7 +224,11 @@ export function scoreProductMatch(q: ParsedMedication, product: PlatformProduct)
     weight += 0.25;
     const prodStrengths = extractStrengths(hay);
     if (strengthsCompatible(q.strengths, prodStrengths)) score += 0.25;
-    else if (prodStrengths.length === 0) score += 0.08; // produto não expõe dosagem = incerto
+    // Produto SEM dosagem no nome pra um pedido COM dosagem: era +0,08 ("incerto") e bastava
+    // pra "Neutrofer Colina DHA 60 Cápsulas" vencer o "Neutrofer 300mg 30 Comprimidos" quando a
+    // forma inventada punia o segundo (14/09). Sem a dose no nome, o produto não prova que é a
+    // apresentação pedida → cai abaixo do limiar sozinho; só sobe se nada mais o derrubar.
+    else if (prodStrengths.length === 0) penalty *= 0.6;
     else penalty *= 0.28; // dosagem explícita e divergente → cai abaixo do limiar
   }
 
@@ -204,6 +238,10 @@ export function scoreProductMatch(q: ParsedMedication, product: PlatformProduct)
     const prodForm = detectForm(hay);
     if (prodForm === q.form) score += 0.13;
     else if (!prodForm) score += 0.05;
+    // cápsula × comprimido é a MESMA família (oral sólido): paciente e modelo usam uma pela
+    // outra, e a punição de forma derrubava a Espironolactona 50mg "Comprimidos" pra um pedido
+    // "30 cápsulas" inventado (14/09). Gotas × comprimido continua grave.
+    else if (prodForm && mesmaFamiliaDeForma(prodForm, q.form)) score += 0.10;
     else penalty *= 0.45;
   }
 

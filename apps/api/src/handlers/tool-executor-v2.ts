@@ -16,7 +16,7 @@
  *   - Side-effects em transação quando possível
  */
 import { db, writeAudit, writeLog, writeEvent } from '@iasaude/db';
-import { nextOccurrence, isOfferStillValid, pickFutureBrDateTimes, sameSlot, isAmbiguousNegation, gravarEscolhaDoPaciente, decidirRegistroDeDose, JANELA_DUPLICATA_MS, type LembreteParaDose } from '@iasaude/shared';
+import { nextOccurrence, isOfferStillValid, pickFutureBrDateTimes, sameSlot, isAmbiguousNegation, gravarEscolhaDoPaciente, decidirRegistroDeDose, JANELA_DUPLICATA_MS, JANELA_OCORRENCIA_MS, lembreteFoiEntregue, type LembreteParaDose } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { discoverClinics } from './clinic-discovery.js';
 import { initiateClinicNegotiation } from './agent-clinic.js';
@@ -296,7 +296,16 @@ export async function handleLogMedicationTaken(args: LogMedicationTakenArgs, ctx
     .in('status', ['pending', 'sent'])
     .order('last_run_at', { ascending: false, nullsFirst: false })
     .limit(40);
-  const lembretes = (lembretesRaw ?? []) as LembreteParaDose[];
+  // SÓ O QUE FOI ENTREGUE tocou (Glauber 15/09 06:49): o lembrete das 20h ficou `window_blocked`,
+  // ele nunca o viu, e a "confirmação" virou Domperidona do jantar de manhã. O espelho em
+  // `messages` diz o que chegou; o disparo não entregue deixa de contar como disparo.
+  const { data: saidasRaw } = await db.from('messages').select('created_at, delivery_status, content')
+    .eq('conversation_id', ctx.conversationId).eq('direction', 'out')
+    .gte('created_at', new Date(Date.now() - JANELA_OCORRENCIA_MS - 120_000).toISOString());
+  const saidas = (saidasRaw ?? []) as Array<{ created_at: string; delivery_status: string | null; content: string | null }>;
+  const lembretes = ((lembretesRaw ?? []) as LembreteParaDose[]).map((l) =>
+    l.last_run_at && !lembreteFoiEntregue({ id: l.id, title: l.title, last_run_at: l.last_run_at }, saidas) ? { ...l, last_run_at: null } : l,
+  );
   const decisaoPrevia = decidirRegistroDeDose({
     nomeInformado: confirmName,
     status: args.status,
@@ -330,16 +339,26 @@ export async function handleLogMedicationTaken(args: LogMedicationTakenArgs, ctx
       .ilike('title', likeSafe(confirmName));
   }
 
-  // Acha a medicação por nome (fuzzy)
-  let { data: med } = await db
-    .from('user_medications')
-    .select('id, treatment_id, medication_name, daily_consumption')
-    .eq('user_id', ctx.userId)
-    .ilike('medication_name', `%${likeSafe(args.medication_name)}%`)
-    .eq('active', true)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  // O remédio é o DO LEMBRETE que a dose confirma, quando ele está ligado a um. A busca por
+  // nome ("%Domperidona 10mg%") devolvia o primeiro dos dois iguais — o do almoço pra um
+  // lembrete do jantar (15/09). Só cai pro nome quando o lembrete não aponta pra remédio nenhum.
+  let { data: med } = lembreteAlvo?.medication_id
+    ? await db.from('user_medications')
+      .select('id, treatment_id, medication_name, daily_consumption')
+      .eq('id', lembreteAlvo.medication_id)
+      .maybeSingle()
+    : { data: null };
+  if (!med?.id) {
+    ({ data: med } = await db
+      .from('user_medications')
+      .select('id, treatment_id, medication_name, daily_consumption')
+      .eq('user_id', ctx.userId)
+      .ilike('medication_name', `%${likeSafe(args.medication_name)}%`)
+      .eq('active', true)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle());
+  }
 
   if (!med?.id) {
     // HONESTIDADE (caso real: "água"/"loção da barba" só existiam como REMINDER,

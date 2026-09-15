@@ -43,7 +43,8 @@ export type ClaimKind =
   | 'agendamento'
   | 'pedido_fechado'
   | 'mensagem_a_terceiro'
-  | 'registro_salvo';
+  | 'registro_salvo'
+  | 'ajuste_de_cotacao';
 
 /** Quais ferramentas tornam cada anúncio verdadeiro. */
 const PROVAS: Record<ClaimKind, readonly string[]> = {
@@ -56,6 +57,9 @@ const PROVAS: Record<ClaimKind, readonly string[]> = {
     'relay_answer_to_establishment', 'forward_media_to_establishment',
   ],
   registro_salvo: ['save_exam_result', 'parse_prescription_image', 'log_medication_taken', 'log_symptom'],
+  // "Vou ajustar a cotação"/"tiro esse item" só vira verdade com uma busca NOVA (ou cancelando
+  // a atual): não existe ferramenta que edite uma cotação de plataforma já apresentada.
+  ajuste_de_cotacao: ['start_pharmacy_order', 'cancel_order'],
 };
 
 /**
@@ -82,6 +86,10 @@ const ANUNCIOS: Record<ClaimKind, RegExp> = {
   // ("já está salvo", "ficou registrado"). "Anotado, Glauber ✅" sozinho NÃO entra: é a
   // fórmula de confirmação de dose, coberta pelo backstop determinístico de adesão.
   registro_salvo: /\b(?:guardei|salvei|registrei|anotei)\b[^.!?]{0,30}\b(?:exame|resultado|laudo|receita|perfil|historico|prontuario|tudo)\b|\b(?:exame|resultado|laudo|receita)\b[^.!?]{0,30}\b(?:guardad[oa]|salv[oa]|registrad[oa]|anotad[oa])\b|\b(?:ja\s+)?(?:esta|estao|ta|tao|ficou|ficaram|foi|foram)\s+(?:tudo\s+)?(?:guardad[oa]s?|salv[oa]s?|registrad[oa]s?)\b/,
+  // ⚠️ PROMESSA sem ferramenta (Ludmila, 14/09/2026): "Vou ajustar a cotação só com os
+  // remédios, tá? Já te aviso." — um colete ortopédico tinha entrado na cotação de plataforma
+  // e não existe ação que o tire de lá. A promessa saiu, nada aconteceu, ela parou de responder.
+  ajuste_de_cotacao: /\b(?:vou|posso|deixa\s+eu|ja\s+vou)\s+(?:ajustar|tirar|remover|corrigir|refazer|arrumar)\b[^.!?]{0,40}\b(?:cotacao|cotacoes|pedido|item|itens|lista|opcao|opcoes)\b|\b(?:ajustei|tirei|removi|corrigi|refiz|arrumei)\b[^.!?]{0,30}\b(?:cotacao|cotacoes|pedido|item|itens|lista|opcao|opcoes|busca)\b|\b(?:tir[oa]|tirar|remov[oa]|remover)\b[^.!?]{0,20}\bda\s+(?:cotacao|lista|opcao)\b/,
 };
 
 /**
@@ -92,6 +100,13 @@ const ANUNCIOS: Record<ClaimKind, RegExp> = {
  * a ferramenta ou reescrever) e, se ele insistir, derruba a oração (`semAnuncios`).
  */
 export const FAMILIAS_COM_PROVA_NO_TURNO: readonly ClaimKind[] = ['registro_salvo'];
+
+/**
+ * Famílias de PROMESSA: o texto anuncia algo que vai fazer e nenhuma ferramenta existe pra
+ * isso. Com pedido de farmácia em jogo, a oração cai e entra a frase honesta — sem rodada de
+ * correção, porque não há ferramenta que o modelo pudesse chamar.
+ */
+export const FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA: readonly ClaimKind[] = ['ajuste_de_cotacao'];
 
 /**
  * Devolve o texto SEM as orações que anunciam qualquer das famílias em `kinds`.
@@ -195,5 +210,7 @@ export function falaHonestaPara(kind: ClaimKind): string {
       return 'Não consegui alcançar eles agora 😕 Vou continuar tentando e te aviso assim que conseguir falar.';
     case 'registro_salvo':
       return 'Não consegui guardar isso no seu perfil agora 😕 Pode me mandar de novo daqui a pouco?';
+    case 'ajuste_de_cotacao':
+      return 'Esse item entrou por engano na minha busca automática, pode desconsiderar 🙏 Se quiser, eu refaço a cotação só com os remédios da receita — é só me dizer.';
   }
 }

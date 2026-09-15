@@ -20,12 +20,81 @@ function fold(s: string): string {
   return (s ?? '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
 }
 
-/** O token existe como PALAVRA INTEIRA em algum nome de produto? (acento-insensível) */
-export function nomeExisteEm(token: string | null | undefined, nomesDeProdutos: string[]): boolean {
+/**
+ * Prefixos que vêm ANTES da marca/princípio no nome de catálogo e não são o nome:
+ * sal ("Cloridrato de Metformina"), categoria ("Suplemento Alimentar Neutrofer", "Antialérgico
+ * Allegra D"), embalagem ("Kit"). Removidos antes de olhar a posição do token.
+ */
+const PREFIXOS_DE_CATALOGO = /^(?:(?:cloridrato|sulfato|maleato|succinato|besilato|bromidrato|fosfato|citrato|valerato|hemifumarato|fumarato|mesilato|dipropionato|acetato|nitrato|tartarato|dicloridrato|sodio|potassio|calcio|glicinato)\s+(?:de\s+|ferrico\s+|ferroso\s+)?|(?:suplemento|complemento)\s+(?:alimentar|nutricional|vitaminico)\s+|(?:antialergico|analgesico|antibiotico|anti-?inflamatorio|antitermico|antiacido|anticoncepcional|medicamento|remedio|kit|generico)\s+)+/;
+
+/** Tokens de um nome de produto, sem stopwords, depois de tirar os prefixos de catálogo. */
+function tokensDeCatalogo(nome: string): string[] {
+  return fold(nome)
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(PREFIXOS_DE_CATALOGO, '')
+    .split(' ')
+    .filter((t) => t && !['de', 'da', 'do', 'com', 'e', 'a', 'o', 'em', 'para'].includes(t));
+}
+
+/** Em que posição (1-based) o token aparece no nome do produto, ou 0 se não aparece. */
+export function posicaoDoTokenNoProduto(token: string | null | undefined, nomeDoProduto: string): number {
   const t = fold(token ?? '').trim();
-  if (t.length < 3) return false;
-  const re = new RegExp(`(^|[^a-z0-9])${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`);
-  return nomesDeProdutos.some((n) => re.test(fold(n)));
+  if (t.length < 3) return 0;
+  const toks = tokensDeCatalogo(nomeDoProduto);
+  const i = toks.indexOf(t);
+  return i < 0 ? 0 : i + 1;
+}
+
+/** Até onde no nome do produto a marca/princípio pode estar. */
+export const POSICAO_MAXIMA_DA_MARCA = 3;
+
+/**
+ * O token existe como MARCA/PRINCÍPIO em algum nome de produto? Palavra inteira,
+ * acento-insensível, e nas primeiras posições do nome (catálogo escreve marca primeiro:
+ * "Neutrofer 300mg 30 Comprimidos", "Espironolactona 50mg…", "Cloridrato de Metformina…").
+ *
+ * 14/09: "Alto D" passou porque "alto" apareceu em "Colete Putti Elástico **Alto** | GG" —
+ * palavra em qualquer posição não prova que o remédio existe; só a posição de marca prova.
+ */
+export function nomeExisteEm(token: string | null | undefined, nomesDeProdutos: string[]): boolean {
+  return nomesDeProdutos.some((n) => {
+    const pos = posicaoDoTokenNoProduto(token, n);
+    return pos > 0 && pos <= POSICAO_MAXIMA_DA_MARCA;
+  });
+}
+
+/** Prefixo fixo da pergunta de confirmação — é por ele que a conversa "lembra" que perguntou. */
+export const MARCA_DA_PERGUNTA_DE_NOME = 'Li *';
+
+/**
+ * A XARLOTE JÁ PERGUNTOU esse nome e o paciente JÁ RESPONDEU? Então não pergunta de novo.
+ *
+ * 14/09 (Ludmila): "Oxandrolona" não está em rede nenhuma (é manipulado) → "não achei nenhum
+ * remédio com esse nome" saiu QUATRO vezes, depois de "é esse mesmo" três vezes. A checagem
+ * não tinha memória: cada `start_pharmacy_order` recomeçava do zero. A conversa é a memória:
+ * se existe uma pergunta nossa sobre ESTE token e QUALQUER fala do paciente depois dela, ele
+ * já respondeu — e, se tivesse corrigido o nome, o modelo teria trocado o item (o token não
+ * casaria mais). A palavra dele vence.
+ */
+export function nomeJaConfirmadoPeloPaciente(
+  mensagens: Array<{ direction: 'in' | 'out'; content: string | null | undefined }>,
+  nome: string,
+): boolean {
+  const token = tokenPrincipal(nome);
+  if (!token) return false;
+  let perguntou = false;
+  for (const m of mensagens) {
+    const c = m.content ?? '';
+    if (m.direction === 'out') {
+      if (c.startsWith(MARCA_DA_PERGUNTA_DE_NOME) && tokenPrincipal(c.slice(MARCA_DA_PERGUNTA_DE_NOME.length).split('*')[0] ?? '') === token) perguntou = true;
+      continue;
+    }
+    if (perguntou && c.trim()) return true;
+    // O paciente escreveu o próprio nome ("é oxandrolona mesmo") — vale como texto dele.
+    if (tokensDeNome(c).includes(token)) return true;
+  }
+  return false;
 }
 
 export type VerificacaoDeNome = 'segue' | 'confirmar' | 'segue_sem_verificar';
