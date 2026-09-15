@@ -128,3 +128,19 @@
 ## 5. Fora deste plano (registrado)
 - Clínica da Duda (bot de menu, dedupe por assunto, "3" bloqueado pela sanidade) — próxima leva.
 - Farmácias que não respondem (tipo de número) — `PLANO_FARMACIA_VIDA_REAL.md`.
+
+## 6. O primeiro caso real (Ludmila, 14/09/2026, 14:54–16:29) — o que o desenho não previu
+
+Duas receitas, nenhuma cotada. Nenhum dos seis defeitos de 10/09 voltou; apareceram outros
+quatro, todos rastreados à decisão que os permitiu e corrigidos em 15/09 (commit `c063389`):
+
+| Sintoma | Decisão que o permitiu | O que mudou |
+|---|---|---|
+| "Oi, tudo bem?" → *"Endereço salvo e atualizado no pedido! Já pedi o frete pra Coimbra"* | `quoted` expirava em 7 dias; "PEDIDO ATIVO" sem idade; histórico sem data; `apply_to_active_order` sem janela | Expira 24h após a apresentação (janela do roteador); PEDIDO ATIVO e a correção de endereço usam a mesma janela; **o estado vazio fala** o que houve com o último pedido; o histórico ganha `[10/09 12:12 — há 4 dias]` quando há vazio de 6h+. Teste cego 1/4 → 5/5. |
+| "Rua 14, 201, Qd. B8, Lt. 20, Setor Oeste" virou "Rua 14, Setor Sul" sem número; 5 linhas, 3 "casa" (e é o trabalho dela); "Pra onde eu mando?" ilegível; "Pode ser pro trabalho" ignorado; abertura "entregar Rua 14, Lt. 20" | reverse-geocode sobrescrevia o texto; três escritores de `user_addresses`; rótulo inventado pelo prompt ("ou casa"); consentimento olhava 1 fala; cópia local antiga do extrator no tool-executor | **O que a pessoa digitou é o dado** (`parseEnderecoDigitado`; o mapa só completa cidade/UF/CEP); a correção corrige o endereço que o pedido usava; upsert por rótulo nos três caminhos; 8 falas em 30 min + "Confirmo pro trabalho?"→"Isso"; um por rótulo na pergunta; `extractDeliverySector` só o do shared. |
+| "Oxandrolona" (manipulado, real) → *"não achei nenhum remédio com esse nome"* 4×, depois de "é esse mesmo" 3× | checagem sem memória; catálogo das redes como universo | **A conversa é a memória**: pergunta feita + resposta = confirmado (`nomeJaConfirmadoPeloPaciente`). A palavra dele vence. |
+| "Alto D" passou (*"Colete Putti Elástico Alto"*) e virou colete de R$ 246 na cotação | "existe" = palavra em qualquer posição; ranqueador idem | Marca só na **posição de marca** (≤3ª palavra, depois de sal/categoria) — existência e ranqueador. |
+| Espironolactona 50mg (que a Pague Menos tem) = "não achei"; Neutrofer 300mg = "Neutrofer Colina DHA 60 Cápsulas" | modelo inventou "30/90 cápsulas" → forma cápsula puniu "Comprimidos" ×0,45; produto sem dose ganhava +0,08 | Cápsula ≡ comprimido (oral sólido); produto sem dose pra pedido com dose cai (×0,6); **quantidade que ninguém disse não entra** (`quantidadeFoiMencionada`). |
+| *"Vou ajustar a cotação só com os remédios"* — sem ação que exista | promessa sem ferramenta não era família da guarda | `ajuste_de_cotacao` no claim-guard: a oração cai, entra a fala honesta. |
+
+Fora de novo, de propósito: as 3 farmácias mudas (Longevitá, Modelo ×2) — `PLANO_FARMACIA_VIDA_REAL.md`.

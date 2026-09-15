@@ -57,3 +57,17 @@
 - O rescue repetir a mesma pergunta de 26/08 ("outra região, telemedicina ou aguardar?") depois
   de ela já ter dito "telemedicina"/"Ipasgo": registrado; depende da busca respeitar a
   modalidade, que é a próxima leva.
+
+## 5. A mensagem que ninguém recebeu (Glauber 15/09, Ciro 14/09, Vossa 14/09)
+
+O despachante grava o espelho do lembrete em `messages` mesmo quando o WhatsApp o recusou
+(`window_blocked`) ou a rotina estava pausada (`suppressed`), e `last_run_at` avança. Para o
+modelo e para o backstop, "tocou"; para o paciente, nada chegou.
+
+| Sintoma | Decisão | O que mudou (15/09, `c063389`) |
+|---|---|---|
+| Glauber "Sim" às 06:49 → *Domperidona (jantar) "tomou antes do jantar"* às 6h49, `medication_id` do almoço, "Boa noite" | histórico do modelo incluía o lembrete das 20h bloqueado; o remédio vinha do `ilike` do nome | `messagesToHistory` não passa saída não entregue; o remédio é o **do lembrete** que a dose confirma |
+| Ciro "sim" pra *"tudo bem por aí?"* → creatina e whey "registrados" | idem (suprimidos no mesmo segundo do template entregue) | espelho identificado **pelo título** (perto no tempo não basta) — `lembreteFoiEntregue` |
+| Vossa "Tomei" 06:12 → ligado ao reforço 22h30 (bloqueado), horário 06:12 | ocorrência só em 6h | disparo não entregue não conta como disparo; a dose amarra no último entregue em até 12h |
+
+Reparo de dados (auditado) pendente da autorização do fundador: 3 doses falsas apagadas, a da Vossa re-amarrada.

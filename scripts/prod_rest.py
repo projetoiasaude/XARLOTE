@@ -47,3 +47,15 @@ def ts(s):
     s = s.replace('Z', '+00:00')
     s = re.sub(r'\.(\d{1,6})\d*', lambda m: '.' + m.group(1).ljust(6, '0'), s)
     return datetime.fromisoformat(s).astimezone(SP)
+
+def _write(method, table, params, data=None):
+    """PATCH/DELETE por filtro PostgREST. Devolve as linhas afetadas (Prefer: return=representation).
+    SÓ pra reparo auditado: chame rpc('write_audit', …) junto, com o motivo."""
+    q = urllib.parse.urlencode(params if isinstance(params, list) else list(params.items()), safe='*,().:+@ ')
+    req = urllib.request.Request(BASE + table + '?' + q, data=(json.dumps(data).encode() if data is not None else None), method=method,
+        headers={'apikey': KEY, 'Authorization': f'Bearer {KEY}', 'Content-Type': 'application/json', 'Prefer': 'return=representation'})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        body = r.read().decode()
+        return json.loads(body) if body else []
+def patch(table, params, data): return _write('PATCH', table, params, data)
+def delete(table, params): return _write('DELETE', table, params)
