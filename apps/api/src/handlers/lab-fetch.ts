@@ -23,6 +23,7 @@
  */
 import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
+import { readFileSync } from 'fs';
 import { chromium, type Browser, type Page } from 'playwright';
 import { db, writeLog, writeAudit } from '@iasaude/db';
 import {
@@ -50,7 +51,19 @@ const USER_AGENT = 'Xarlote/1.0 (+https://xarlote.ai) assistente de saude a pedi
  * manda isso pro /tmp; `--no-sandbox` porque o processo já roda como root no container;
  * `--disable-gpu` porque não há GPU. O e2e com portal falso nunca viu isso: página simples.
  */
-const LAUNCH_ARGS = ['--disable-dev-shm-usage', '--no-sandbox', '--disable-gpu', '--disable-extensions', '--no-first-run', '--no-zygote'];
+const LAUNCH_ARGS = ['--disable-dev-shm-usage', '--no-sandbox', '--disable-gpu', '--disable-extensions', '--no-first-run', '--disable-background-networking', '--disable-features=site-per-process,IsolateOrigins', '--renderer-process-limit=2'];
+/** Segunda tentativa quando a aba morre: tudo num processo só (menos memória, menos isolamento). */
+const LAUNCH_ARGS_FALLBACK = [...LAUNCH_ARGS, '--single-process', '--no-zygote'];
+/** O que o portal NÃO precisa carregar pra gente entrar e achar o PDF: imagem, fonte, mídia, analytics. */
+const RECURSOS_BLOQUEADOS = /\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|eot|mp4|webm|mp3)(\?|$)|googletagmanager|google-analytics|doubleclick|facebook\.net|hotjar|clarity\.ms/i;
+
+/** Limite de memória do cgroup (container) — pra diagnosticar "Target crashed" sem ssh. */
+function limiteDeMemoria(): string {
+  for (const f of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
+    try { return readFileSync(f, 'utf8').trim(); } catch { /* próximo */ }
+  }
+  return '?';
+}
 
 /**
  * Onde está o Chromium. No container do worker (Railway/nixpacks) ele vem do Nix e fica
@@ -79,7 +92,9 @@ export async function chromiumFunciona(): Promise<{ ok: true; executavel: string
   const executavel = resolverChromium();
   try {
     const b = await chromium.launch({ headless: true, executablePath: executavel, args: LAUNCH_ARGS });
+    const versao = b.version();
     await b.close();
+    console.log(`[lab] chromium ${versao} · memória do container: ${limiteDeMemoria()} · rss ${Math.round(process.memoryUsage().rss / 1048576)} MB`);
     return { ok: true, executavel: executavel ?? '(bundled do Playwright)' };
   } catch (err) {
     return { ok: false, erro: String(err).split('\n').slice(0, 3).join(' | ').slice(0, 300) };
@@ -195,13 +210,45 @@ async function abrirPortal(linha: LinhaDeBusca): Promise<{ ok: true; portal: Por
   const entrada = urlDeEntrada(alvo, adapter);
   if (!entrada) return { ok: false, motivo: 'portal_desconhecido', adapter: adapter.id, detalhe: 'sem url de entrada' };
 
-  const browser = await chromium.launch({ headless: true, executablePath: resolverChromium(), args: LAUNCH_ARGS });
+  // Duas tentativas: a normal e, se a ABA morrer ("Target crashed" — o Chromium do Nix no
+  // container fez isso na SPA do CDI em 21/09), a de processo único. O stderr do Chromium vai
+  // pro log (5 linhas) — é a única janela pro que acontece lá dentro sem ssh.
+  let browser: Browser | null = null;
+  let ultimoErro: unknown = null;
+  for (const args of [LAUNCH_ARGS, LAUNCH_ARGS_FALLBACK]) {
+    browser = await chromium.launch({ headless: true, executablePath: resolverChromium(), args });
+    // `process()` existe no BrowserServer/launch do Chromium (não está no tipo público).
+    const proc = (browser as unknown as { process?: () => { stderr?: NodeJS.ReadableStream | null } | null }).process?.();
+    let linhasErr = 0;
+    proc?.stderr?.on('data', (d: Buffer) => {
+      if (linhasErr++ < 5) console.warn(`[lab][chromium] ${String(d).slice(0, 200).replace(/\n/g, ' ')}`);
+    });
+    try {
+      const ctx = await browser.newContext({ userAgent: USER_AGENT, acceptDownloads: true, viewport: { width: 1024, height: 768 } });
+      await ctx.route('**/*', (route) => (RECURSOS_BLOQUEADOS.test(route.request().url()) || ['image', 'font', 'media'].includes(route.request().resourceType())) ? route.abort() : route.continue());
+      const page = await ctx.newPage();
+      let crashou = false;
+      page.on('crash', () => { crashou = true; });
+      const p = embrulhar(page);
+      await p.goto(entrada);
+      await p.waitForLoadState?.('networkidle', { timeout: 8_000 }).catch(() => undefined);
+      if (crashou) throw new Error('page crashed');
+      return await depoisDeAbrir(browser, p, adapter);
+    } catch (err) {
+      ultimoErro = err;
+      await browser.close().catch(() => undefined);
+      browser = null;
+      const msg = String(err);
+      if (!/crash/i.test(msg)) break; // outro erro: não adianta insistir
+      await writeLog('warn', 'lab', `aba do navegador morreu ao abrir o portal — tentando em processo único`, { adapter: adapter.id });
+    }
+  }
+  return { ok: false, motivo: 'erro_interno', adapter: adapter.id, detalhe: String(ultimoErro).slice(0, 160) };
+}
+
+async function depoisDeAbrir(browser: Browser, p: PaginaDoPortal, adapterInicial: LabAdapter): Promise<{ ok: true; portal: PortalAberto } | { ok: false; motivo: MotivoParada; adapter: string | null; detalhe?: string }> {
+  let adapter = adapterInicial;
   try {
-    const ctx = await browser.newContext({ userAgent: USER_AGENT, acceptDownloads: true, viewport: { width: 1280, height: 900 } });
-    const page = await ctx.newPage();
-    const p = embrulhar(page);
-    await p.goto(entrada);
-    await p.waitForLoadState?.('networkidle', { timeout: 8_000 }).catch(() => undefined);
     adapter = escolherAdapterPelaPagina(await p.content(), adapter);
     // Se a URL do protocolo era a home e o adapter conhece a tela de entrada, vai pra ela.
     if (adapter.urlPadrao && !adapter.detecta?.(await p.content()) && adapter.id !== 'generico') {
@@ -212,6 +259,7 @@ async function abrirPortal(linha: LinhaDeBusca): Promise<{ ok: true; portal: Por
     return { ok: true, portal: { browser, page: p, adapter } };
   } catch (err) {
     await browser.close().catch(() => undefined);
+    if (/crash/i.test(String(err))) throw err; // deixa a tentativa em processo único acontecer
     return { ok: false, motivo: 'erro_interno', adapter: adapter.id, detalhe: String(err).slice(0, 160) };
   }
 }
