@@ -4,9 +4,9 @@ import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem, CareLinkView } from '@iasaude/shared';
 import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, pediuCancelarTudo, ehRruleComListaDeMinutos, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool,
-  decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, extractDeliverySector, parseEnderecoDigitado, montarEnderecoHumano, nomeJaConfirmadoPeloPaciente, quantidadeFoiMencionada, JANELA_PEDIDO_VIVO_MS, pareceProtocoloDeRetirada, RECUSA_DE_PROTOCOLO, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
+  decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, extractDeliverySector, parseEnderecoDigitado, montarEnderecoHumano, nomeJaConfirmadoPeloPaciente, quantidadeFoiMencionada, JANELA_PEDIDO_VIVO_MS, pareceProtocoloDeRetirada, RECUSA_DE_PROTOCOLO, interpretarQuando, autorizouBuscaNoPortal, dataDeNascimentoDaFala, quandoPorExtenso, mensagemVouTentarAgora, mensagemVouConferirOSite, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
 import { verificarExistenciaDoRemedio } from './verificar-nome-remedio.js';
-import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, type PlaceResult } from '@iasaude/integrations';
+import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, escolherAdapter, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { markSupplierVerifiedById } from './supplier-directory.js';
@@ -113,7 +113,7 @@ interface ToolContext {
    * ponto de envio de verdade a uma farmácia — é o que o guard anti-mentira consulta, no
    * lugar de "o nome da tool apareceu na lista" (que dava true mesmo em 10 dead-ends).
    */
-  turnFlags?: { suppressLlmText: boolean; supplierMessaged?: boolean };
+  turnFlags?: { suppressLlmText: boolean; supplierMessaged?: boolean; exameGuardadoNoTurno?: string | null };
   /**
    * OBSERVAÇÃO PRO MODELO (loop ReAct, 26/07). O handler escreve aqui o que o MODELO
    * precisa saber pra decidir o próximo passo — não é texto pro paciente. Ex.:
@@ -205,6 +205,12 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
         break;
       case 'fetch_lab_results':
         await handleFetchLabResults(tc.args as FetchLabArgs, ctxAlvo);
+        break;
+      case 'cancel_lab_fetch':
+        await handleCancelLabFetch(tc.args as { laboratorio?: string }, ctxAlvo);
+        break;
+      case 'get_exam_result':
+        await handleGetExamResult(tc.args as { exam_id?: string; title_query?: string }, ctxAlvo);
         break;
       case 'cancel_reminders':
         await handleCancelReminders(tc.args as { title_query?: string; all?: boolean }, ctxAlvo);
@@ -610,6 +616,10 @@ async function handleSaveExamResult(args: SaveExamArgs, ctx: ToolContext) {
   const findings = Array.isArray(args.findings) ? args.findings : [];
   const examDate = parseExamDate(args.exam_date);
 
+  // A ingestão já gravou o documento deste turno: gravar de novo é duplicata.
+  if (ctx.turnFlags?.exameGuardadoNoTurno) {
+    throw new ToolFailure(`NÃO gravei de novo: o exame deste documento JÁ está guardado no prontuário (id ${ctx.turnFlags.exameGuardadoNoTurno.slice(0, 8)}) — a ingestão automática fez isso antes de você. Diga só que está guardado e interprete.`);
+  }
   // 🧾 PROTOCOLO DE RETIRADA NÃO É RESULTADO (caso Ciro, 18/09/2026): "Código do procedimento
   // 1474509" + "prazo de entrega… acesso pelo site" virou "resultado de RM Crânio" no
   // prontuário, duas vezes, e "Guardei seu resultado" saiu sem laudo nenhum.
@@ -3042,22 +3052,20 @@ interface FetchLabArgs {
   login?: string;
   senha?: string;
   protocolo?: string;
+  /** Data de nascimento dita pela pessoa ou impressa (dd/mm/aaaa ou ISO). O servidor também olha o perfil. */
+  data_nascimento?: string;
+  /** Omitido/"agora" = busca agora; ISO com fuso = busca AGENDADA (a previsão do protocolo). */
+  quando?: string;
 }
 
-const LAB_FETCH_POLICY = 'lab-fetch-1.0';
+const LAB_FETCH_POLICY_AGORA = 'lab-fetch-1.0';
+/** Busca AGENDADA: o acesso fica cifrado até a data — a política tem que dizer isso. */
+const LAB_FETCH_POLICY_AGENDADA = 'lab-fetch-agendada-1.1';
 const LAB_FETCH_MAX_POR_DIA = 3;
+const LAB_FETCH_MAX_PENDENTES = 3;
 
-/** A pessoa disse SIM, com as palavras dela, nesta mensagem? Determinístico, sem modelo. */
-export function autorizouBuscaNoPortal(texto: string | null | undefined): boolean {
-  const t = (texto ?? '').trim().toLowerCase();
-  if (!t) return false;
-  // Negação em qualquer lugar vence: "não, pode deixar" / "sim, mas não agora".
-  // Fronteira só ANTES da palavra e por `(^|\s)`: "deixa" precisa casar "deixar", e o `\b`
-  // do JavaScript não conhece acento (regra da casa — 3 alternativas do regex de emergência
-  // ficaram mortas meses por isso).
-  if (/(^|\s)(n[ãa]o|nunca|deix|depois|espera)/.test(t)) return false;
-  return /^(sim|pode|autorizo|autorizado|ok|okay|claro|vai|bora|isso|quero|confirmo|beleza|manda|busca)(\s|$|[!.,])/.test(t);
-}
+/** Re-export (a decisão pura mora em @iasaude/shared; call-sites antigos importam daqui). */
+export { autorizouBuscaNoPortal };
 
 async function handleFetchLabResults(args: FetchLabArgs, ctx: ToolContext): Promise<void> {
   if (!labFetchDisponivel()) {
@@ -3066,68 +3074,135 @@ async function handleFetchLabResults(args: FetchLabArgs, ctx: ToolContext): Prom
   const login = (args.login ?? '').trim();
   const senha = (args.senha ?? '').trim();
   const laboratorio = (args.laboratorio ?? '').trim() || null;
+  const portalUrl = (args.portal_url ?? '').trim() || null;
   if (!login || !senha) {
     throw new ToolFailure('NADA FOI FEITO: faltou login ou senha. Se a foto não deixou claro, PERGUNTE à pessoa — não invente.');
   }
 
-  // 🔐 GATE DE CONSENTIMENTO — a prova é a fala da pessoa, não a sua afirmação de que ela
-  // concordou. A mensagem de entrada DESTE turno precisa ser um "sim" inequívoco.
-  const textoDaPessoa = ctx.inboundMsg?.content ?? '';
-  if (!autorizouBuscaNoPortal(textoDaPessoa)) {
-    throw new ToolFailure(
-      'NADA FOI FEITO: a pessoa ainda NÃO autorizou explicitamente nesta mensagem. Pergunte: '
-      + '"Quer que eu entre no site do laboratório com esse acesso e busque seus resultados? Uso o login uma vez e não guardo a senha. Responde sim pra autorizar." '
-      + 'Só chame de novo quando ela responder sim.',
-    );
+  // ⏱️ QUANDO é decisão de servidor (caso Ciro): a data lida no protocolo vira agora/agendada.
+  const quando = interpretarQuando(args.quando, new Date());
+  if (quando.tipo === 'invalida') {
+    throw new ToolFailure(quando.motivo === 'longe_demais'
+      ? 'NADA FOI FEITO: essa data está a mais de 60 dias. Diga que perto da data ele te lembra (ou manda o PDF) e você busca.'
+      : quando.motivo === 'passado'
+        ? 'NADA FOI FEITO: essa data já passou há mais de 12h. Se o resultado já saiu, chame de novo SEM `quando` (busca agora).'
+        : 'NADA FOI FEITO: `quando` precisa ser ISO com fuso (ex.: 2026-09-21T17:30:00-03:00) ou omitido (agora).');
   }
 
-  // Rate limit por pessoa: 3/dia. Cada busca abre um navegador e digita uma senha em site
-  // de terceiro — não é coisa de repetir em loop.
+  // 🔐 GATE DE CONSENTIMENTO — a prova é a fala da pessoa NESTA mensagem ("sim", "pode",
+  // "15/03/1990, sim"). A pergunta certa muda com o `quando`.
+  const textoDaPessoa = ctx.inboundMsg?.content ?? '';
+  const perguntaDeAutorizacao = quando.tipo === 'agendada'
+    ? `"Quer que eu entre no site do ${laboratorio ?? 'laboratório'} ${quandoPorExtenso(quando.em)} e busque seu resultado? Guardo esse acesso cifrado só até lá e apago depois. Responde sim pra autorizar."`
+    : `"Quer que eu entre no site do ${laboratorio ?? 'laboratório'} com esse acesso e busque seus resultados? Uso o login uma vez e não guardo a senha. Responde sim pra autorizar."`;
+  if (!autorizouBuscaNoPortal(textoDaPessoa)) {
+    throw new ToolFailure(`NADA FOI FEITO: a pessoa ainda NÃO autorizou explicitamente nesta mensagem. Pergunte: ${perguntaDeAutorizacao} Só chame de novo quando ela responder sim.`);
+  }
+
+  // 🗂️ O que o portal EXIGE e o que temos. Adapter específico conhece os campos de antemão
+  // (Synapse/CDI: protocolo + senha + nascimento); o genérico descobre no reconhecimento.
+  const adapter = escolherAdapter({ url: portalUrl, nome: laboratorio });
+  const exigidos = adapter.camposObrigatorios ?? [];
+  const { data: perfil } = await db.from('users').select('birth_date, document_cpf').eq('id', ctx.userId).maybeSingle();
+  const nascimento = dataDeNascimentoDaFala(args.data_nascimento) ?? dataDeNascimentoDaFala(ctx.textoDoPaciente) ?? ((perfil?.birth_date as string | null) ?? null);
+  const cpf = ((perfil?.document_cpf as string | null) ?? '').replace(/\D/g, '') || null;
+  if (exigidos.includes('nascimento') && !nascimento) {
+    throw new ToolFailure(`NADA FOI FEITO: o site do ${laboratorio ?? 'laboratório'} pede a DATA DE NASCIMENTO junto com o protocolo e a senha, e ela não está no perfil. Pergunte: "O site do ${laboratorio ?? 'laboratório'} pede sua data de nascimento junto com o protocolo. Me manda ela (dd/mm/aaaa) e confirma com 'sim' que eu ${quando.tipo === 'agendada' ? 'agendo' : 'busco'}." Quando ela responder, chame de novo com data_nascimento.`);
+  }
+  // Dado dito uma vez fica no perfil (auditado) — a próxima clínica não pergunta de novo.
+  if (nascimento && !perfil?.birth_date) {
+    await db.from('users').update({ birth_date: nascimento }).eq('id', ctx.userId);
+    await writeAudit({ actorType: 'user', actorId: ctx.userId, action: 'user.birth_date.set', userId: ctx.userId, conversationId: ctx.conversationId, traceId: ctx.traceId, messageId: ctx.inboundMsg?.id ?? null, metadata: { origem: 'fetch_lab_results' } });
+  }
+
+  // 🚦 Limites por pessoa: 3 buscas/dia e 3 pendentes. Cada busca abre um navegador e digita
+  // uma senha em site de terceiro — não é coisa de repetir em loop.
   const desde = new Date(Date.now() - 24 * 3600_000).toISOString();
   const { count } = await db.from('lab_fetches').select('id', { count: 'exact', head: true })
-    .eq('user_id', ctx.userId).gte('created_at', desde).in('status', ['na_fila', 'rodando', 'concluida']);
-  if ((count ?? 0) >= LAB_FETCH_MAX_POR_DIA) {
+    .eq('user_id', ctx.userId).gte('created_at', desde).in('status', ['na_fila', 'rodando', 'concluida', 'reconhecendo']);
+  if (quando.tipo === 'agora' && (count ?? 0) >= LAB_FETCH_MAX_POR_DIA) {
     throw new ToolFailure('NADA FOI FEITO: já foram 3 buscas hoje para esta pessoa. Diga que amanhã dá pra tentar de novo, ou que ela pode mandar o PDF.');
   }
+  const { data: pendentes } = await db.from('lab_fetches').select('id, laboratorio, scheduled_for, status')
+    .eq('user_id', ctx.userId).in('status', ['reconhecendo', 'agendada', 'na_fila', 'rodando']);
+  if (quando.tipo === 'agendada') {
+    const mesma = (pendentes ?? []).find((p) => (p.status === 'agendada' || p.status === 'reconhecendo') && p.scheduled_for && Math.abs(new Date(p.scheduled_for as string).getTime() - quando.em.getTime()) < 3600_000 && (p.laboratorio ?? '') === (laboratorio ?? ''));
+    if (mesma) {
+      throw new ToolFailure(`NADA FOI FEITO (não precisa): já existe uma busca ${mesma.status === 'agendada' ? 'agendada' : 'sendo conferida'} no ${laboratorio ?? 'laboratório'} para ${quandoPorExtenso(new Date(mesma.scheduled_for as string))}. Diga isso a ela; não agende outra.`);
+    }
+    if ((pendentes ?? []).length >= LAB_FETCH_MAX_PENDENTES) {
+      throw new ToolFailure('NADA FOI FEITO: já há 3 buscas pendentes para esta pessoa. Diga que quando uma delas terminar dá pra agendar outra, ou que ela pode mandar o PDF.');
+    }
+  } else if ((pendentes ?? []).some((p) => p.status === 'na_fila' || p.status === 'rodando')) {
+    throw new ToolFailure('NADA FOI FEITO (não precisa): já tem uma busca rodando agora para esta pessoa. Diga que já está buscando e que avisa quando terminar.');
+  }
 
-  // Consentimento registrado ANTES de enfileirar, apontando para a mensagem dela.
+  // Consentimento registrado ANTES de gravar qualquer coisa, apontando para a mensagem dela.
   const { data: consent } = await db.from('consent_events').insert({
-    user_id: ctx.userId, event_type: 'accept', policy_version: LAB_FETCH_POLICY, channel: 'whatsapp',
+    user_id: ctx.userId, event_type: 'accept', policy_version: quando.tipo === 'agendada' ? LAB_FETCH_POLICY_AGENDADA : LAB_FETCH_POLICY_AGORA, channel: 'whatsapp',
     evidence_message_id: ctx.inboundMsg?.id ?? null, evidence_text: textoDaPessoa.slice(0, 300),
   }).select('id').single();
 
+  const chave = chaveDoCofre();
+  if (!chave) throw new ToolFailure('NADA FOI FEITO: cofre indisponível.');
+  const credenciaisCifradas = cifrar(JSON.stringify({ login, senha, protocolo: (args.protocolo ?? '').trim() || null, nascimento, cpf }), chave);
+
   const { data: fetch, error } = await db.from('lab_fetches').insert({
-    user_id: ctx.userId, conversation_id: ctx.conversationId, laboratorio,
-    status: 'na_fila', consent_event_id: (consent?.id as string | undefined) ?? null,
+    user_id: ctx.userId, conversation_id: ctx.conversationId, laboratorio, portal_url: portalUrl,
+    status: quando.tipo === 'agendada' ? 'reconhecendo' : 'na_fila',
+    scheduled_for: quando.tipo === 'agendada' ? quando.em.toISOString() : null,
+    credenciais_cifradas: credenciaisCifradas, trace_id: ctx.traceId,
+    consent_event_id: (consent?.id as string | undefined) ?? null,
   }).select('id').single();
   if (error || !fetch?.id) {
     throw new ToolFailure('NADA FOI FEITO: não consegui registrar a busca. Diga que houve um problema do seu lado e que ela pode mandar o PDF.');
   }
 
-  const chave = chaveDoCofre();
-  if (!chave) throw new ToolFailure('NADA FOI FEITO: cofre indisponível.');
-  const credenciaisCifradas = cifrar(JSON.stringify({ login, senha, protocolo: (args.protocolo ?? '').trim() || null }), chave);
-
-  await enqueueLabFetch({
-    fetchId: fetch.id as string, userId: ctx.userId, conversationId: ctx.conversationId, phoneE164: ctx.phoneE164,
-    traceId: ctx.traceId, laboratorio, portalUrl: (args.portal_url ?? '').trim() || null, credenciaisCifradas,
-  });
+  await enqueueLabFetch({ kind: quando.tipo === 'agendada' ? 'reconhecer' : 'buscar', fetchId: fetch.id as string, traceId: ctx.traceId });
 
   await writeAudit({
-    actorType: 'user', actorId: ctx.userId, action: 'lab_fetch.requested', userId: ctx.userId,
+    actorType: 'user', actorId: ctx.userId, action: quando.tipo === 'agendada' ? 'lab_fetch.schedule_requested' : 'lab_fetch.requested', userId: ctx.userId,
     conversationId: ctx.conversationId, targetTable: 'lab_fetches', targetId: fetch.id as string,
     messageId: ctx.inboundMsg?.id ?? null, traceId: ctx.traceId,
-    metadata: { laboratorio, consentEventId: consent?.id ?? null },
+    metadata: { laboratorio, adapter: adapter.id, consentEventId: consent?.id ?? null, scheduledFor: quando.tipo === 'agendada' ? quando.em.toISOString() : null },
   });
-  await writeLog('info', 'lab', 'busca de exames enfileirada (consentimento registrado)', { traceId: ctx.traceId, userId: ctx.userId });
+  await writeLog('info', 'lab', quando.tipo === 'agendada' ? `busca AGENDADA para ${quando.em.toISOString()} — reconhecimento do portal enfileirado (${adapter.id})` : 'busca de exames enfileirada (consentimento registrado)', { traceId: ctx.traceId, userId: ctx.userId });
 
-  // 🗣️ VOZ ÚNICA (caso Ciro, 16/09/2026): a busca é assíncrona e o worker responde sozinho
-  // ("achei N exames" / "ainda não conheço o site do CDI"). O modelo, sem saber o desfecho,
-  // escreveu "Estou entrando no site do CDI no dia 21/09 pra buscar seu resultado" no MESMO
-  // segundo em que o worker dizia que não conhecia o site. Aqui o handler fala o único
-  // fato que existe agora — que vai tentar — e o texto do modelo é suprimido pelo contador
-  // de mensagens do turno. Nada de data, nada de promessa.
-  await sendOutbound(ctx.conversationId, ctx.phoneE164,
-    `Tô tentando entrar no site${laboratorio ? ` do ${laboratorio}` : ' do laboratório'} agora com esse acesso. Já te digo o que deu 💙`, ctx.traceId);
-  if (ctx.observation) ctx.observation.note = 'A busca foi enfileirada e o paciente JÁ foi avisado de que você está tentando. O resultado (achou / não conhece o site / erro) chega em OUTRA mensagem automática. NÃO prometa data, NÃO diga que vai entrar em tal dia, NÃO crie lembrete pra "buscar depois". Não escreva mais nada sobre isso neste turno.';
+  // 🗣️ VOZ ÚNICA (caso Ciro, 16/09): o desfecho é assíncrono e o worker responde sozinho.
+  // O handler fala o único fato de agora; o texto do modelo é suprimido pelo contador do turno.
+  await sendOutbound(ctx.conversationId, ctx.phoneE164, quando.tipo === 'agendada' ? mensagemVouConferirOSite(laboratorio, quando.em) : mensagemVouTentarAgora(laboratorio), ctx.traceId);
+  if (ctx.observation) ctx.observation.note = quando.tipo === 'agendada'
+    ? 'O pedido de busca agendada foi registrado e o paciente JÁ foi avisado de que você vai conferir o site. A confirmação da data (ou a impossibilidade) chega em OUTRA mensagem automática, depois que o servidor reconhecer o portal. NÃO diga que agendou, NÃO prometa data, NÃO crie lembrete. Não escreva mais nada sobre isso neste turno.'
+    : 'A busca foi enfileirada e o paciente JÁ foi avisado de que você está tentando. O resultado (achou / não conhece o site / erro) chega em OUTRA mensagem automática. NÃO prometa data, NÃO diga que vai entrar em tal dia, NÃO crie lembrete pra "buscar depois". Não escreva mais nada sobre isso neste turno.';
+}
+
+/** A pessoa desistiu: cancela o que está pendente (e o lembrete de fallback, se houver). */
+async function handleCancelLabFetch(args: { laboratorio?: string }, ctx: ToolContext): Promise<void> {
+  const { data: pendentes } = await db.from('lab_fetches').select('id, laboratorio, status, scheduled_for, reminder_id')
+    .eq('user_id', ctx.userId).in('status', ['reconhecendo', 'agendada', 'na_fila']);
+  const alvo = (pendentes ?? []).filter((p) => !args.laboratorio?.trim() || (p.laboratorio ?? '').toLowerCase().includes(args.laboratorio.trim().toLowerCase()));
+  if (!alvo.length) throw new ToolFailure('NADA FOI CANCELADO: não há busca de exame pendente pra esta pessoa. Diga isso — não afirme que cancelou.');
+  for (const p of alvo) {
+    await db.from('lab_fetches').update({ status: 'cancelada', credenciais_cifradas: null, finished_at: new Date().toISOString() }).eq('id', p.id).in('status', ['reconhecendo', 'agendada', 'na_fila']);
+    if (p.reminder_id) await db.from('reminders').update({ status: 'cancelled' }).eq('id', p.reminder_id);
+    await writeAudit({ actorType: 'user', actorId: ctx.userId, action: 'lab_fetch.cancelled', userId: ctx.userId, conversationId: ctx.conversationId, targetTable: 'lab_fetches', targetId: p.id as string, traceId: ctx.traceId, metadata: { laboratorio: p.laboratorio } });
+  }
+  await writeLog('info', 'lab', `${alvo.length} busca(s) pendente(s) cancelada(s) a pedido`, { traceId: ctx.traceId, userId: ctx.userId });
+  if (ctx.observation) ctx.observation.note = `Cancelei ${alvo.length} busca(s) pendente(s)${args.laboratorio ? ` (${args.laboratorio})` : ''} e apaguei o acesso guardado. Confirme isso a ela em uma linha.`;
+}
+
+/** O exame inteiro (todos os marcadores) quando a conversa é sobre um resultado antigo. */
+async function handleGetExamResult(args: { exam_id?: string; title_query?: string }, ctx: ToolContext): Promise<void> {
+  // O contexto mostra o id ENCURTADO (8 chars): resolve por prefixo entre os últimos exames.
+  const { data: ultimos } = await db.from('user_exam_results').select('id, title, exam_type, exam_date, laboratorio, summary, findings, source, created_at')
+    .eq('user_id', ctx.userId).order('created_at', { ascending: false }).limit(30);
+  const id = (args.exam_id ?? '').trim().toLowerCase();
+  const q = (args.title_query ?? '').trim().toLowerCase();
+  const data = (ultimos ?? []).find((e) => id && String(e.id).toLowerCase().startsWith(id))
+    ?? (q ? (ultimos ?? []).find((e) => String(e.title ?? '').toLowerCase().includes(q)) : undefined)
+    ?? null;
+  if (!data) throw new ToolFailure('Não achei esse exame no prontuário dela. Diga isso; não invente valores.');
+  const achados = ((data.findings as Array<{ marker: string; value: string; unit?: string; reference?: string }> | null) ?? []);
+  const lista = achados.map((a) => `${a.marker}: ${a.value}${a.unit ? ` ${a.unit}` : ''}${a.reference ? ` (ref. ${a.reference})` : ''}`).join('; ');
+  if (ctx.observation) ctx.observation.note = `EXAME "${data.title}"${data.exam_date ? ` de ${data.exam_date}` : ''}${data.laboratorio ? ` (${data.laboratorio})` : ''}, ${achados.length} marcador(es), lido de ${data.source}. Resumo: ${data.summary ?? '—'}. Marcadores: ${lista || '—'}. Responda com base NISTO; não invente marcador que não está aqui.`;
 }

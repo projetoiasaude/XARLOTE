@@ -9,14 +9,25 @@
  */
 import type { LabAdapter, AlvoDoPortal } from './types.js';
 import { adapterGenerico } from './generico.js';
+import { adapterSynapse } from './synapse.js';
 
 export const ADAPTERS: readonly LabAdapter[] = [
-  // específicos primeiro (nenhum ainda)
+  // específicos primeiro — cada um escrito OLHANDO o portal real
+  adapterSynapse, // CDI Goiânia e outros Synapse EIS/RIS (21/09/2026, caso Ciro)
   adapterGenerico,
 ];
 
 export function escolherAdapter(alvo: AlvoDoPortal): LabAdapter {
   return ADAPTERS.find((a) => a.casa(alvo)) ?? adapterGenerico;
+}
+
+/**
+ * Depois de abrir a página: algum adapter específico se reconhece nela? O protocolo do CDI
+ * diz "cdig.com.br" (a home, sem login); a página de resultados se apresenta como Synapse.
+ * A detecção pela página vence a escolha pela URL.
+ */
+export function escolherAdapterPelaPagina(html: string, atual: LabAdapter): LabAdapter {
+  return ADAPTERS.find((a) => a.detecta?.(html)) ?? atual;
 }
 
 /**

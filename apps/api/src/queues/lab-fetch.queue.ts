@@ -1,29 +1,22 @@
 /**
  * Fila de busca de exames no portal do laboratório.
  *
- * O que a diferencia das outras filas: **o payload carrega credencial** (cifrada — ver
- * `lib/lab-vault.ts`). Por isso:
- *   • `removeOnComplete: true` e `removeOnFail: true` — nada de guardar o job por 30 dias
- *     como o apagamento LGPD faz. Terminou, sumiu.
- *   • `attempts: 1` — retry aqui é tentar a senha de novo num portal que já recusou, e isso
- *     é caminho de bloqueio de conta. Se falhou, a pessoa é avisada e decide.
- *   • um único job por (pessoa) por vez: `jobId` determinístico com a linha de `lab_fetches`.
+ * v2 (21/09/2026): o job NÃO carrega credencial. O acesso fica cifrado na linha de
+ * `lab_fetches` (lib/lab-vault.ts) enquanto a busca está pendente; o worker lê, usa uma vez e
+ * apaga. O job é só "qual linha" e "o que fazer" — reconhecer o portal ou buscar.
+ *   • `attempts: 1` — retry aqui é tentar a senha de novo num portal que já recusou.
+ *   • `jobId` determinístico por (linha, kind): a fila deduplica.
  */
 import { Queue } from 'bullmq';
 import { QUEUE_NAMES } from '@iasaude/shared';
 import { getRedisConnection } from '../queue-config.js';
 
 export interface LabFetchJob {
-  /** A linha de `lab_fetches` que o worker vai preencher. */
+  /** 'reconhecer' = provar que dá pra entrar (sem digitar) antes de prometer a data; 'buscar' = a busca. */
+  kind: 'reconhecer' | 'buscar';
+  /** A linha de `lab_fetches`. */
   fetchId: string;
-  userId: string;
-  conversationId: string;
-  phoneE164: string;
   traceId: string;
-  laboratorio: string | null;
-  portalUrl: string | null;
-  /** `cifrar(JSON.stringify(CredenciaisLab))` — só o worker abre. */
-  credenciaisCifradas: string;
 }
 
 let fila: Queue<LabFetchJob> | null = null;
@@ -32,18 +25,14 @@ function getFila(): Queue<LabFetchJob> {
   if (!fila) {
     fila = new Queue<LabFetchJob>(QUEUE_NAMES.LAB_FETCH, {
       connection: getRedisConnection(),
-      defaultJobOptions: {
-        attempts: 1,
-        removeOnComplete: true,
-        removeOnFail: true,
-      },
+      defaultJobOptions: { attempts: 1, removeOnComplete: true, removeOnFail: true },
     });
   }
   return fila;
 }
 
 export async function enqueueLabFetch(job: LabFetchJob): Promise<void> {
-  await getFila().add('lab-fetch', job, { jobId: `lab-fetch-${job.fetchId}` });
+  await getFila().add(job.kind, job, { jobId: `lab-${job.kind}-${job.fetchId}` });
 }
 
 export async function closeLabFetchQueue(): Promise<void> {

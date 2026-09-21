@@ -22,12 +22,13 @@ import { Worker } from 'bullmq';
 import { QUEUE_NAMES } from '@iasaude/shared';
 import { writeLog } from '@iasaude/db';
 import { getRedisConnection, getRedisClient } from '../queue-config.js';
-import { executarLabFetch, chromiumFunciona } from '../handlers/lab-fetch.js';
+import { executarLabFetch, executarReconhecimento, chromiumFunciona, despacharBuscasAgendadas } from '../handlers/lab-fetch.js';
 import { labFetchDisponivel, LAB_FETCH_READY_KEY, LAB_FETCH_READY_TTL_S } from '../lib/lab-vault.js';
 import type { LabFetchJob } from '../queues/lab-fetch.queue.js';
 
 let worker: Worker<LabFetchJob> | null = null;
 let heartbeat: NodeJS.Timeout | null = null;
+let agendadas: NodeJS.Timeout | null = null;
 
 async function marcarPronto(): Promise<void> {
   try {
@@ -66,13 +67,21 @@ export async function startLabFetchWorker(): Promise<void> {
 
   worker = new Worker<LabFetchJob>(
     QUEUE_NAMES.LAB_FETCH,
-    async (job) => { await executarLabFetch(job.data); },
+    async (job) => {
+      if (job.data.kind === 'reconhecer') await executarReconhecimento(job.data);
+      else await executarLabFetch(job.data);
+    },
     { connection: getRedisConnection(), concurrency: 1, lockDuration: 90_000 },
   );
 
+  // 🗓️ Buscas AGENDADAS: a cada minuto, o que venceu vira job (o estado vive no banco).
+  agendadas = setInterval(() => {
+    despacharBuscasAgendadas().catch((err) => writeLog('warn', 'lab', `despacho das agendadas falhou: ${String(err).slice(0, 120)}`, {}));
+  }, 60_000);
+
   worker.on('failed', (job, err) => {
     void writeLog('error', 'lab', `job de busca falhou fora do orquestrador: ${String(err).slice(0, 200)}`, {
-      traceId: job?.data.traceId, userId: job?.data.userId,
+      traceId: job?.data.traceId, fetchId: job?.data.fetchId,
     });
   });
 
@@ -82,6 +91,7 @@ export async function startLabFetchWorker(): Promise<void> {
 
 export async function stopLabFetchWorker(): Promise<void> {
   if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+  if (agendadas) { clearInterval(agendadas); agendadas = null; }
   try { await getRedisClient().del(LAB_FETCH_READY_KEY); } catch { /* best-effort */ }
   if (worker) { await worker.close(); worker = null; }
 }

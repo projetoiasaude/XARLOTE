@@ -16,6 +16,10 @@ interface XarloteContext {
    * motivo: 'cotação expirada — 24h sem escolha' }.
    */
   ultimoPedidoEncerrado?: { itens: string; quando: string; motivo: string } | null;
+  /** Buscas de exame no portal pendentes (agendadas / sendo conferidas / rodando). */
+  buscasDeExame?: Array<{ laboratorio: string | null; status: string; quando: string | null }>;
+  /** Os últimos exames do prontuário, com id e uns marcadores — pra conversar sobre eles. */
+  examesNoProntuario?: Array<{ id: string; titulo: string; data: string | null; laboratorio: string | null; marcadores: number; resumo: string | null; amostra: string }>;
   /** Método de pagamento mais usado pelo usuário (pedidos anteriores) — confirmar, não re-perguntar. */
   paymentPreference?: string | null;
   /**
@@ -96,6 +100,18 @@ export function buildXarloteSystemPrompt(ctx: XarloteContext = {}): string {
         return parts.join('\n\n');
       })()
     : 'Nenhum histórico relevante ainda.';
+
+  // 🔬 O prontuário FALA (regra 3): os exames guardados e as buscas pendentes são fatos do
+  // banco — o modelo conversa sobre eles em vez de "lembrar" pelo histórico.
+  const buscas = ctx.buscasDeExame ?? [];
+  const exames = ctx.examesNoProntuario ?? [];
+  const examesSection = (buscas.length || exames.length)
+    ? `\n\n## 🔬 BUSCAS DE EXAME AGENDADAS (${buscas.length})\n${buscas.length
+      ? buscas.map((b) => `- ${b.laboratorio ?? 'laboratório'}: ${b.status === 'agendada' ? `COMBINADA para ${b.quando}` : b.status === 'reconhecendo' ? 'conferindo o site agora' : 'rodando agora'}`).join('\n') + '\nEstas JÁ existem — não agende de novo, não prometa nada além disso; pra desistir, cancel_lab_fetch.'
+      : 'nenhuma.'}\n\n## 🔬 EXAMES NO PRONTUÁRIO (${exames.length} mais recentes)\n${exames.length
+      ? exames.map((e) => `- [${e.id}] ${e.titulo}${e.data ? ` (${e.data})` : ''}${e.laboratorio ? `, ${e.laboratorio}` : ''} — ${e.marcadores} marcador(es)${e.resumo ? `. ${e.resumo}` : ''}${e.amostra ? ` [${e.amostra}]` : ''}`).join('\n') + '\nPra explicar ou comparar números de um destes, chame get_exam_result com o id — não cite valor de memória.'
+      : 'nenhum ainda.'}`
+    : '';
 
   const activeOrderSection = ctx.activeOrderSummary
     ? `## PEDIDO ATIVO\n${ctx.activeOrderSummary}\n\n⚠️ IMPORTANTE: Quando o usuário aceitar/escolher uma das opções de farmácia (ex.: "aceito", "pode ser", "quero a 1", "prefiro a X", "a mais barata"), chame IMEDIATAMENTE **confirm_order_selection** com o order_id e o quote_id correto da opção escolhida. Não peça confirmação adicional.\n\n🔒 REGRA DE PRECEDÊNCIA: se existe PEDIDO ATIVO com opções cotadas E o usuário aceita/escolhe uma delas, **confirm_order_selection VENCE relay_answer_to_establishment**, mesmo que haja uma PERGUNTA PENDENTE no contexto. Fechar o pedido já avisa a farmácia — não relaye um aceite. Só use relay_answer_to_establishment quando o usuário responde um DADO que a farmácia perguntou (plano/particular, receita, marca), NÃO quando ele fecha negócio.`
@@ -341,7 +357,8 @@ Pode pedir proativamente: *"Já que estamos cadastrando, quem você quer que eu 
   2. Fazer a próxima ação que faz sentido pelo conteúdo:
      - **Receita médica** → leia os itens (medicamento, dose, quantidade, posologia, validade) e ofereça cotar imediatamente, perguntando forma de pagamento e endereço.
      - **Caixa/embalagem de remédio** → ofereça cadastrar no perfil (medicamentos em uso) ou cotar reposição.
-     - **Exame/resultado** (hemograma, raio-x, ultrassom, doppler, teste de covid, laudo) → leia e **INTERPRETE** conforme a seção EXAMES, LAUDOS E SEGUNDA OPINIÃO: o que está dentro e fora da referência, o que isso costuma significar, a sua opinião honesta e a ressalva de uma linha no fim. **Depois OFEREÇA guardar:** *"Quer que eu guarde esse resultado aqui no seu perfil pra gente consultar depois?"*. Se o paciente confirmar, chame \`save_exam_result\` com o tipo, título, um resumo NEUTRO (só o que está escrito no laudo) e os marcadores que você leu. Se ele não quiser, tudo bem — não guarde. E **nunca diga que guardou sem a ferramenta ter rodado neste turno**.
+     - **Exame/resultado** (hemograma, raio-x, ultrassom, doppler, teste de covid, laudo) → leia e **INTERPRETE** conforme a seção EXAMES, LAUDOS E SEGUNDA OPINIÃO: o que está dentro e fora da referência, o que isso costuma significar, a sua opinião honesta e a ressalva de uma linha no fim. **Guardar é automático**: quando a foto/PDF é um laudo, o servidor JÁ guardou o arquivo e os marcadores antes de você falar, e te avisa num bloco *[SISTEMA — … GUARDADO no prontuário como …]*. Aí você diz em uma linha que ficou guardado e interpreta. **Sem esse bloco, NÃO diga que guardou** (e não pergunte "quer que eu guarde?" — se não guardou, é porque não era laudo).
+     - **Protocolo de retirada de exame** (comprovante com protocolo/senha/previsão de entrega, SEM resultado) → NÃO é resultado: nada foi guardado como exame, e você NÃO diz que guardou. O bloco *[SISTEMA — isto é um PROTOCOLO…]* traz a previsão de liberação. Ofereça, perguntando antes: buscar o resultado no site do laboratório com aquele acesso — **na data prevista, com \`fetch_lab_results\` e \`quando\`** — ou ele te mandar o PDF/foto quando sair.
      - **Ferida, lesão, manchas, partes do corpo** → acolha sem diagnosticar. Se aparenta algo grave (sangramento intenso, queimadura grande, mancha rapidamente alastrante), oriente PA/SAMU. Sem julgar a foto.
      - **Qualquer outra coisa** (printscreen, doc, foto aleatória) → comente o que viu e pergunte como você pode ajudar com aquilo.
 - Você NÃO precisa chamar tool nenhuma especificamente pra "ler" a imagem, ela já chegou no seu contexto multimodal. A tool \`parse_prescription_image\` ainda existe pra casos especiais, mas o normal é apenas olhar e responder direto.
@@ -363,8 +380,9 @@ Regras duras:
 - **RESPONDA SOBRE O EXAME QUE ESTÁ NA SUA FRENTE.** Se a pergunta é sobre a foto de agora, olhe a foto de agora. Exames antigos do perfil só entram se você deixar claro que são de outra data (*"no exame de maio ela tinha…"*). Misturar o de hoje com o de maio é erro grave.
 - Interpretar, contextualizar e opinar — SIM. Fechar diagnóstico (*"você tem X"*) e mudar dose — NÃO.
 - Vale igual pra **consulta** (*"o que acha do que o médico disse?"*) e pra **saúde em geral**: dê a sua posição, com o mesmo cuidado.
-- Guardar no perfil continua sendo com autorização: OFEREÇA e só chame \`save_exam_result\` depois do "sim". No registro (\`summary\`, \`findings\`) vai o que está ESCRITO no exame, neutro; a sua leitura fica na conversa.
-- **Nunca diga que guardou sem ter chamado a ferramenta neste turno.** "Já guardei tudo aqui" sem \`save_exam_result\` é mentira, e o sistema derruba a frase.
+- **Guardar é do servidor, não seu.** Todo PDF/foto de laudo passa pela ingestão ANTES de você: arquivo no prontuário + marcadores conferidos contra o texto. O bloco *[SISTEMA — … GUARDADO …]* é a única prova; com ele, diga em uma linha que está guardado. Sem ele, NÃO diga que guardou — e o sistema derruba a frase. \`save_exam_result\` fica só pra quando a pessoa te DITA um resultado por texto (aí passe exatamente o que ela disse).
+- **Exame antigo do prontuário**: o contexto EXAMES NO PRONTUÁRIO lista os últimos com o id; pra explicar ou comparar os números, chame \`get_exam_result\` e responda com o que voltou. Não cite valor de memória.
+- **Buscar no site do laboratório**: só com \`fetch_lab_results\`, só depois do "sim" dela, e o servidor é quem fala o desfecho. Você NUNCA escreve "entrei no site", "vou entrar dia X" nem cria lembrete pra buscar: a data vai em \`quando\`, e o servidor confere o site e confirma sozinho. Se existe busca em BUSCAS DE EXAME AGENDADAS, ela JÁ está combinada — não repita, não recrie; pra desistir, \`cancel_lab_fetch\`.
 
 ## FLUXO DE FARMÁCIA (siga RIGOROSAMENTE essa árvore de decisão)
 
@@ -537,5 +555,5 @@ Forma de pagamento usual: ${ctx.paymentPreference ?? 'não registrada'}
 Convênio (pra consulta/exame): ${ctx.healthPlan ?? 'não registrado'}
 
 ### Memória recuperada (por relevância semântica)
-${memorySection}${activeOrderSection ? `\n\n${activeOrderSection}` : ''}${careSection}`;
+${memorySection}${activeOrderSection ? `\n\n${activeOrderSection}` : ''}${careSection}${examesSection}`;
 }

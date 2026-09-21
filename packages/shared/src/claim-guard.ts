@@ -44,7 +44,8 @@ export type ClaimKind =
   | 'pedido_fechado'
   | 'mensagem_a_terceiro'
   | 'registro_salvo'
-  | 'ajuste_de_cotacao';
+  | 'ajuste_de_cotacao'
+  | 'busca_no_portal';
 
 /** Quais ferramentas tornam cada anúncio verdadeiro. */
 const PROVAS: Record<ClaimKind, readonly string[]> = {
@@ -60,6 +61,9 @@ const PROVAS: Record<ClaimKind, readonly string[]> = {
   // "Vou ajustar a cotação"/"tiro esse item" só vira verdade com uma busca NOVA (ou cancelando
   // a atual): não existe ferramenta que edite uma cotação de plataforma já apresentada.
   ajuste_de_cotacao: ['start_pharmacy_order', 'cancel_order'],
+  // "Estou entrando no site do CDI" / "vou entrar dia 21" só é verdade com a busca registrada
+  // — e mesmo aí quem fala é o servidor (voz única). Sem a tool no turno, é promessa vazia.
+  busca_no_portal: ['fetch_lab_results'],
 };
 
 /**
@@ -90,6 +94,9 @@ const ANUNCIOS: Record<ClaimKind, RegExp> = {
   // remédios, tá? Já te aviso." — um colete ortopédico tinha entrado na cotação de plataforma
   // e não existe ação que o tire de lá. A promessa saiu, nada aconteceu, ela parou de responder.
   ajuste_de_cotacao: /\b(?:vou|posso|deixa\s+eu|ja\s+vou)\s+(?:ajustar|tirar|remover|corrigir|refazer|arrumar)\b[^.!?]{0,40}\b(?:cotacao|cotacoes|pedido|item|itens|lista|opcao|opcoes)\b|\b(?:ajustei|tirei|removi|corrigi|refiz|arrumei)\b[^.!?]{0,30}\b(?:cotacao|cotacoes|pedido|item|itens|lista|opcao|opcoes|busca)\b|\b(?:tir[oa]|tirar|remov[oa]|remover)\b[^.!?]{0,20}\bda\s+(?:cotacao|lista|opcao)\b/,
+  // ⚠️ Caso Ciro (16–17/09/2026): "Estou entrando no site do CDI no dia 21/09 pra buscar seu
+  // resultado" e "vou entrar no site do CDI com seu protocolo" saíram sem busca nenhuma.
+  busca_no_portal: /\b(?:estou|to|tou|vou|irei)\s+(?:entrar|entrando|acessar|acessando)\s+(?:no|o)\s+(?:site|portal|sistema)\b|\b(?:entrei|acessei)\s+(?:no|o)\s+(?:site|portal|sistema)\b|\b(?:vou|irei)\s+(?:buscar|pegar|baixar)\b[^.!?]{0,30}\b(?:resultado|laudo|exame)s?\b[^.!?]{0,30}\b(?:site|portal|sistema)\b/,
 };
 
 /**
@@ -106,7 +113,7 @@ export const FAMILIAS_COM_PROVA_NO_TURNO: readonly ClaimKind[] = ['registro_salv
  * isso. Com pedido de farmácia em jogo, a oração cai e entra a frase honesta — sem rodada de
  * correção, porque não há ferramenta que o modelo pudesse chamar.
  */
-export const FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA: readonly ClaimKind[] = ['ajuste_de_cotacao'];
+export const FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA: readonly ClaimKind[] = ['ajuste_de_cotacao', 'busca_no_portal'];
 
 /**
  * Devolve o texto SEM as orações que anunciam qualquer das famílias em `kinds`.
@@ -212,5 +219,7 @@ export function falaHonestaPara(kind: ClaimKind): string {
       return 'Não consegui guardar isso no seu perfil agora 😕 Pode me mandar de novo daqui a pouco?';
     case 'ajuste_de_cotacao':
       return 'Esse item entrou por engano na minha busca automática, pode desconsiderar 🙏 Se quiser, eu refaço a cotação só com os remédios da receita — é só me dizer.';
+    case 'busca_no_portal':
+      return 'Sobre buscar o resultado no site do laboratório: eu só faço isso depois que você autoriza e o sistema confere o site — e aí eu te confirmo por aqui. Quer que eu tente? Responde sim que eu registro.';
   }
 }

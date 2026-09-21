@@ -189,3 +189,58 @@ porque `writeLog` grava só no banco.
 | Senha do portal em claro em `assistant_tasks.tool_output` | Só a entrada era redigida | Saída redigida também. Linha de 16/09 precisa de reparo manual. |
 
 Continua verdade: só existe o adapter genérico; CDI e IGR (Dasa) devolvem `portal_desconhecido`. O que o paciente mandar em PDF agora é lido de verdade.
+
+## v2 — 21/09/2026: tarefa futura, prova antes da promessa, ingestão única (caso Ciro)
+
+O pedido do fundador depois do caso Ciro: *"não era pra executar, era pra AGENDAR a execução;
+no dia, ela entra sozinha, traz os exames e guarda no perfil; e se ele mandar o exame, ela
+extrai tudo e guarda, documento e dados, formando o histórico"*. Sem remendo. O desenho:
+
+### 1. Tarefa futura é entidade (`lab_fetches` + `scheduled_for`)
+- `fetch_lab_results` ganha `quando` (ISO com fuso). O servidor decide (`interpretarQuando`):
+  ≤10 min / passou há <12h → agora; futuro até 60 dias → **agendada**; senão recusa com instrução.
+- Linha `lab_fetches` com status `reconhecendo` → `agendada` → (despachante, 60 s) `na_fila`
+  → `rodando` → `concluida | parada | falhou`; `cancelada` a pedido (`cancel_lab_fetch`).
+- **O acesso fica cifrado NA LINHA** (`credenciais_cifradas`, AES-256-GCM, chave só no
+  ambiente) só enquanto pendente, e é **apagado em todo desfecho**. A 0032 dizia "sem
+  credencial no Postgres" porque só existia busca imediata; a promessa que fica de pé é
+  "nunca em claro, nunca depois da busca" — e a pergunta de autorização diz isso à pessoa.
+- Campos que o portal exige (`camposObrigatorios` do adapter, ou descobertos no
+  reconhecimento) contra o que temos (perfil `birth_date`, `document_cpf`, o que ela disse):
+  falta → o servidor manda perguntar ANTES de agendar (`faltou_dado`); dado dito uma vez vai
+  pro perfil (auditado).
+
+### 2. Prova antes da promessa (reconhecimento)
+Ao agendar, o worker abre o portal SEM digitar nada: aceita cookies, reconhece o formulário e
+os campos. Só então a pessoa ouve *"Combinado: 21/09 a partir das 17h30 eu entro no site do
+CDI…"*. Se o portal não é reconhecido: *"ainda não conheço o site… no dia eu te lembro e você
+me manda o PDF"* + um lembrete honesto criado pelo servidor (nunca "vou entrar"). O modelo do
+turno diz UMA coisa ("deixa eu conferir se consigo") e o handler fala com voz única; a
+família `busca_no_portal` do claim-guard derruba "estou entrando no site" sem a tool.
+
+### 3. Adapter de verdade: Synapse EIS/RIS (CDI Goiânia)
+Olhado ao vivo em 21/09: `novo.cdig.com.br/resultado/` (Nuxt), banner de cookies, Protocolo +
+Senha + **Data de Nascimento** (`input[type=date]`), sem CAPTCHA. `casa()` pela URL/nome,
+`detecta()` pelo título da página (a URL do protocolo era a home). A listagem pós-login usa a
+heurística do genérico + download por clique (SPA); o que vier de diferente para com a frase
+honesta de sempre. O genérico ganhou `reconhecer` e o campo de nascimento.
+
+### 4. Ingestão única (`apps/api/src/handlers/ingestao-de-exame.ts`)
+Todo documento — PDF do portal, PDF do WhatsApp, foto — passa por AQUI antes do modelo:
+arquivo no bucket privado + `app_media`; texto (pdf.js) ou leitura estruturada da foto (UMA
+chamada de visão: classificação + descrição objetiva + marcadores); classificação
+determinística (`classificarTextoDeDocumento`: laudo · protocolo · receita · pedido · outro);
+extração com temperatura 0 e **verificação de cada valor contra o texto**
+(`verificarAchadosNoTexto` — o que não está no laudo não entra); `user_exam_results` ligado ao
+arquivo (`media_id`). O modelo recebe o FATO (`blocoDeIngestaoParaModelo`) e comenta; a guarda
+anti-mentira vê a ingestão como `save_exam_result` executado. Protocolo nunca vira resultado.
+
+### 5. Discutir depois
+O prompt lista os últimos 6 exames (id, título, data, marcadores, amostra) e as buscas
+pendentes; `get_exam_result` devolve um exame inteiro. Teste cego (glm-5.2 e gpt-4.1-mini):
+A protocolo→pede agendar 3/3 · B "sim"→`quando`=21/09 3/3 · C laudo guardado→interpreta sem
+re-gravar 3/3 · D protocolo+"me envia"→não diz "guardei" 3/3 — nos dois modelos.
+
+### Dependência
+Migration `0033_lab_fetch_agendada.sql` (colunas + status + índices + `media_id`). Sem ela o
+código novo não sobe: o insert da busca falha (graciosamente) e o exame ingerido não grava.

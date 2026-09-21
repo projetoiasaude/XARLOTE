@@ -11,7 +11,7 @@
  * O que ele NÃO faz, por desenho (docs/PLANO_EXAMES_LAB.md §2): não tenta contornar CAPTCHA,
  * não passa por 2FA, não tenta o login uma segunda vez.
  */
-import type { LabAdapter, PaginaDoPortal, CredenciaisLab, LoginResultado, ResultadoRemoto } from './types.js';
+import type { LabAdapter, PaginaDoPortal, CredenciaisLab, LoginResultado, ResultadoRemoto, ReconhecimentoDoPortal } from './types.js';
 import { pareceCaptcha, parece2FA, pareceLoginFalhou, pareceLinkDeResultado, ehPdf, resolverHref } from './deteccao.js';
 
 const NAV_TIMEOUT_MS = 20_000;
@@ -56,11 +56,32 @@ async function primeiroQueExiste(page: PaginaDoPortal, seletores: readonly strin
   return null;
 }
 
+const SEL_NASCIMENTO = 'input[type="date"], input[name*="nascimento" i], input[id*="nascimento" i], input[placeholder*="nascimento" i]';
+const SELETORES_COOKIES = ['button:has-text("Aceitar")', 'button:has-text("Aceito")', 'button:has-text("Concordo")', 'button:has-text("OK")', '#onetrust-accept-btn-handler'];
+
 export const adapterGenerico: LabAdapter = {
   id: 'generico',
   nome: 'genérico',
   // É o último da lista: só é escolhido quando nenhum específico casa.
   casa: () => true,
+
+  async preparar(page) {
+    for (const s of SELETORES_COOKIES) {
+      if (await page.existe(s)) { await page.click(s).catch(() => undefined); await page.esperar?.(400); break; }
+    }
+  },
+
+  /** A mesma régua do login, sem digitar: exatamente um campo de senha e um de usuário. */
+  async reconhecer(page): Promise<ReconhecimentoDoPortal> {
+    const html = await page.content();
+    if (pareceCaptcha(html)) return { ok: false, motivo: 'bloqueado_captcha' };
+    const senhas = await page.coletar(SELETOR_SENHA, ['name', 'id']);
+    if (senhas.length !== 1) return { ok: false, motivo: 'portal_desconhecido' };
+    const campoUsuario = await primeiroQueExiste(page, SELETORES_USUARIO);
+    if (!campoUsuario) return { ok: false, motivo: 'portal_desconhecido' };
+    const pedeNascimento = await page.existe(SEL_NASCIMENTO);
+    return { ok: true, campos: pedeNascimento ? ['login', 'senha', 'nascimento'] : ['login', 'senha'] };
+  },
 
   async login(page, creds: CredenciaisLab): Promise<LoginResultado> {
     // 1. Antes de digitar QUALQUER coisa: a página já é um CAPTCHA?
@@ -84,6 +105,10 @@ export const adapterGenerico: LabAdapter = {
         'input[name*="protocolo" i]', 'input[id*="protocolo" i]', 'input[placeholder*="protocolo" i]',
       ]);
       if (campoProtocolo && campoProtocolo !== campoUsuario) await page.fill(campoProtocolo, creds.protocolo);
+    }
+    // Data de nascimento, quando o portal tem o campo e a gente tem o dado (ISO pra `type=date`).
+    if (creds.nascimento && await page.existe(SEL_NASCIMENTO)) {
+      await page.fill(SEL_NASCIMENTO, creds.nascimento).catch(() => undefined);
     }
 
     // 4. Submete UMA vez.

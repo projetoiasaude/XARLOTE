@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
 import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, afirmacaoDeProdutoSemProva, ehAncoraDeFechamento, classificarAckDeDose, lembretesQueTocaramJuntos, lembretesEntregues, anunciouRegistroDeDose, falaHonestaDeDose, tokenPrincipal, FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA, JANELA_PEDIDO_VIVO_MS, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, afirmacaoDeProdutoSemProva, ehAncoraDeFechamento, classificarAckDeDose, lembretesQueTocaramJuntos, lembretesEntregues, anunciouRegistroDeDose, falaHonestaDeDose, tokenPrincipal, FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA, JANELA_PEDIDO_VIVO_MS, blocoDeIngestaoParaModelo, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -38,7 +38,8 @@ function agentLoopEnabled(): boolean {
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard, QuoteOption } from '@iasaude/shared';
 import { chat, buildXarloteSystemPrompt, ferramentasParaAtor, messagesToHistory, embed, userContentWithImage, dataUrl, type ChatContent, type ChatMessage, type ToolCall } from '@iasaude/llm';
 import { sendMenu, isSimulatorMode, fetchInboundMedia, nomeArquivoDeInbound } from '@iasaude/whatsapp';
-import { transcribeAudio, lerPdfCompleto, mensagemDePdfIlegivel, type LeituraDePdf } from '@iasaude/integrations';
+import { transcribeAudio, mensagemDePdfIlegivel, type LeituraDePdf, type MotivoIlegivel } from '@iasaude/integrations';
+import { ingerirDocumentoDeExame } from './ingestao-de-exame.js';
 import { sniffMidia, mensagemDeRecusa } from '../lib/media-sniff.js';
 import { Queue } from 'bullmq';
 import { loadPrompts } from '../config/prompts.js';
@@ -261,22 +262,6 @@ export function trechoDeTranscript(d: {
   return texto.length > max ? `${cabecalho} ${texto.slice(0, max)}…` : `${cabecalho} ${texto}`;
 }
 
-/**
- * Lê o PDF sem NUNCA lançar.
- *
- * O extrator não lança por contrato, e reserva o motivo `falha_ao_ler` justamente pra o
- * chamador ter um rótulo honesto quando algo inesperado explodir. Dizer "escaneado" pra um
- * erro de programação mandaria o paciente fotografar um PDF perfeitamente legível.
- */
-async function lerPdf(buf: Buffer, traceId: string): Promise<LeituraDePdf> {
-  try {
-    // pdf.js primeiro (fontes compostas/CMaps — caso Ciro 18/09); o leitor antigo é o fallback dele.
-    return await lerPdfCompleto(buf, { maxCaracteres: MAX_CHARS_TEXTO_PDF });
-  } catch (err) {
-    await writeLog('error', 'media', `extração de texto do PDF explodiu: ${String(err).slice(0, 200)}`, { traceId });
-    return { ok: false, motivo: 'falha_ao_ler', paginas: 0 };
-  }
-}
 
 /**
  * Descrição OBJETIVA de uma foto do paciente, pra ficar em `messages.transcript` e voltar ao
@@ -870,6 +855,27 @@ async function processInboundUserInner(
   // não faz — o paciente nunca ouve "tô entrando" de um sistema sem Chromium.
   const ferramentas = ferramentasParaAtor({ temVinculos })
     .filter((t) => t.function.name !== 'fetch_lab_results' || labPronto === true);
+  // 🔬 O prontuário fala: buscas de exame pendentes e os últimos exames (2 queries baratas,
+  // índices parciais). Sem isto o modelo "lembrava" exames pelo histórico e por cards.
+  const [buscasDeExame, examesNoProntuario] = await Promise.all([
+    db.from('lab_fetches').select('laboratorio, status, scheduled_for').eq('user_id', user.id)
+      .in('status', ['reconhecendo', 'agendada', 'na_fila', 'rodando']).order('created_at', { ascending: false }).limit(3)
+      .then(({ data }) => (data ?? []).map((b) => ({
+        laboratorio: (b.laboratorio as string | null) ?? null, status: String(b.status),
+        quando: b.scheduled_for ? new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).format(new Date(b.scheduled_for as string)) : null,
+      }))),
+    db.from('user_exam_results').select('id, title, exam_date, laboratorio, summary, findings').eq('user_id', user.id)
+      .order('created_at', { ascending: false }).limit(6)
+      .then(({ data }) => (data ?? []).map((e) => {
+        const f = (e.findings as Array<{ marker?: string; value?: string; unit?: string }> | null) ?? [];
+        return {
+          id: String(e.id).slice(0, 8), titulo: (e.title as string | null) ?? 'exame', data: (e.exam_date as string | null) ?? null,
+          laboratorio: (e.laboratorio as string | null) ?? null, marcadores: f.length,
+          resumo: e.summary ? String(e.summary).slice(0, 160) : null,
+          amostra: f.slice(0, 4).map((a) => `${a.marker} ${a.value}${a.unit ? ` ${a.unit}` : ''}`).join('; '),
+        };
+      })),
+  ]);
   const activeOrderSummary = activeOrderRes.data?.summary ?? null;
   // Sem pedido ativo, o estado vazio FALA o que houve com o último (regra 3): senão o modelo
   // lê no histórico "vou pedir o frete pra Coimbra" de 4 dias atrás e segue esperando (14/09).
@@ -946,6 +952,8 @@ async function processInboundUserInner(
     ultimoPedidoEncerrado,
     paymentPreference,
     healthPlan: userHealthPlan,
+    buscasDeExame,
+    examesNoProntuario,
   });
 
   // 🤝 CONHECER O PACIENTE — 3 perguntas de baixa fricção, só pra quem acabou de entrar.
@@ -1198,6 +1206,9 @@ ${decision.alreadyOffered
    * `parse_prescription_image` responder "não consegui processar, manda de novo" para sempre.
    */
   let midiaDoTurno: MidiaDoTurno | null = null;
+  // 🧾 O que a INGESTÃO decidiu sobre o documento/foto deste turno (exame guardado? protocolo?).
+  // Quem grava é o servidor, antes do modelo; o modelo só recebe o fato (caso Ciro, 18/09).
+  let ingestaoDoTurno: Awaited<ReturnType<typeof ingerirDocumentoDeExame>> | null = null;
   /** Fotos de turnos anteriores re-anexadas a este (ver foto-recente.ts). */
   let fotosReanexadas = 0;
 
@@ -1352,9 +1363,19 @@ ${decision.alreadyOffered
     if (tipoReal === 'image' && midia) {
       // ─── FOTO (inclusive a que veio "como arquivo") → canal multimodal (visão) ───────
       await writeLog('info', 'vision', `Imagem pronta pra visão (${midia.buffer.length} bytes, ${mimeReal})`, { traceId });
-      const promptText = legenda
+      // 🧾 INGESTÃO ANTES DO TURNO: uma leitura estruturada da foto classifica (laudo,
+      // protocolo, receita…), guarda o arquivo no prontuário e, se é laudo, grava os
+      // marcadores conferidos. O modelo recebe o FATO junto com a imagem.
+      ingestaoDoTurno = await ingerirDocumentoDeExame({
+        userId: user.id, conversationId: conversation.id, traceId, origem: 'whatsapp',
+        buffer: midia.buffer, mime: mimeReal, messageId: inboundMsg.id, rotulo: null,
+      });
+      const fatoDaIngestao = ingestaoDoTurno && (ingestaoDoTurno.tipo === 'laudo' || ingestaoDoTurno.tipo === 'protocolo')
+        ? `\n${blocoDeIngestaoParaModelo(ingestaoDoTurno, 'foto')}`
+        : '';
+      const promptText = (legenda
         ? `[O usuário enviou uma imagem com a legenda: "${legenda}". Olhe a imagem e responda naturalmente.]`
-        : `[O usuário enviou uma imagem. Olhe e responda naturalmente — descreva brevemente o que vê e siga a conversa.]`;
+        : `[O usuário enviou uma imagem. Olhe e responda naturalmente — descreva brevemente o que vê e siga a conversa.]`) + fatoDaIngestao;
       userMsgContent = userContentWithImage(promptText, [dataUrl(midia.buffer.toString('base64'), mimeReal)]);
       userMsgPreview = `[imagem${legenda ? ` + "${legenda.slice(0, 40)}"` : ''}]`;
       // `textoDoPaciente` já é a legenda. Antes desta correção o ramo de foto escapava dos
@@ -1377,11 +1398,15 @@ ${decision.alreadyOffered
       // existiu); depois, fora do caminho crítico, a descrição objetiva do que ela mostra —
       // o mesmo papel do `trechoDeTranscript` no PDF.
       const legendaTx = legenda ? ` (legenda: "${legenda.slice(0, 120)}")` : '';
-      await db.from('messages').update({ transcript: `[foto enviada pelo paciente${legendaTx}]` }).eq('id', inboundMsg.id).then(() => undefined, () => undefined);
-      void descreverImagemParaHistorico(midia.buffer, mimeReal, promptsConfig, traceId).then(async (desc) => {
-        if (!desc) return;
-        await db.from('messages').update({ transcript: `[foto enviada pelo paciente${legendaTx}: ${desc}]` }).eq('id', inboundMsg.id);
-      }).catch(() => { /* best-effort */ });
+      const descDaIngestao = ingestaoDoTurno?.descricao?.trim() || null;
+      await db.from('messages').update({ transcript: descDaIngestao ? `[foto enviada pelo paciente${legendaTx}: ${descDaIngestao}]` : `[foto enviada pelo paciente${legendaTx}]` }).eq('id', inboundMsg.id).then(() => undefined, () => undefined);
+      // A descrição objetiva já veio da leitura estruturada; só cai na chamada antiga se ela faltou.
+      if (!descDaIngestao) {
+        void descreverImagemParaHistorico(midia.buffer, mimeReal, promptsConfig, traceId).then(async (desc) => {
+          if (!desc) return;
+          await db.from('messages').update({ transcript: `[foto enviada pelo paciente${legendaTx}: ${desc}]` }).eq('id', inboundMsg.id);
+        }).catch(() => { /* best-effort */ });
+      }
     } else if (tipoReal === 'document' && midia) {
       // ─── PDF (laudo do laboratório, receita digital, pedido médico) ─────────────────
       // Aqui a hospedagem é AWAIT, ao contrário da foto: o bloco que o modelo lê AFIRMA que o
@@ -1399,7 +1424,16 @@ ${decision.alreadyOffered
         await writeLog('warn', 'media', `falha ao guardar documento: ${String(err).slice(0, 140)}`, { traceId });
       }
 
-      const leitura: LeituraDePdf = await lerPdf(midia.buffer, traceId);
+      // 🧾 INGESTÃO ANTES DO TURNO (caso Ciro, 18/09): guarda o arquivo no prontuário, lê,
+      // classifica e — se é laudo — grava os marcadores conferidos. O modelo recebe o fato.
+      ingestaoDoTurno = await ingerirDocumentoDeExame({
+        userId: user.id, conversationId: conversation.id, traceId, origem: 'whatsapp',
+        buffer: midia.buffer, mime: mimeReal, messageId: inboundMsg.id, rotulo: nomeArq,
+      });
+      // A leitura já aconteceu na ingestão — o bloco de documento reaproveita.
+      const leitura: LeituraDePdf = ingestaoDoTurno.texto
+        ? { ok: true, texto: ingestaoDoTurno.texto, paginas: ingestaoDoTurno.paginas ?? 0, caracteres: ingestaoDoTurno.caracteres ?? ingestaoDoTurno.texto.length, truncado: !!ingestaoDoTurno.truncado }
+        : { ok: false, motivo: (ingestaoDoTurno.motivoIlegivel ?? 'falha_ao_ler') as MotivoIlegivel, paginas: ingestaoDoTurno.paginas ?? 0 };
       const texto = leitura.ok ? leitura.texto : '';
       // Log SEM nome de arquivo e SEM uma linha do conteúdo: só tamanho e desfecho. O motivo
       // (senha, escaneado, fonte sem mapa) é o que a gente precisa medir pra saber se vale
@@ -1408,16 +1442,21 @@ ${decision.alreadyOffered
         traceId, pdfOk: leitura.ok, ...(leitura.ok ? {} : { pdfMotivo: leitura.motivo }),
       });
 
-      userMsgContent = blocoDeDocumentoParaModelo({
+      const blocoDoc = blocoDeDocumentoParaModelo({
         nomeArquivo: nomeArq,
         legenda,
         texto,
         paginas: leitura.paginas,
         caracteres: leitura.ok ? leitura.caracteres : null,
-        guardado: hospedado,
+        guardado: hospedado || !!ingestaoDoTurno?.arquivoGuardado,
         mime: mimeReal,
         motivoIlegivel: leitura.ok ? null : mensagemDePdfIlegivel(leitura.motivo),
       });
+      // Laudo/protocolo: o fato da ingestão vem PRIMEIRO; o texto do documento segue (é o que
+      // a seção EXAMES manda interpretar). Receita/pedido/outro: o bloco de sempre.
+      userMsgContent = ingestaoDoTurno && (ingestaoDoTurno.tipo === 'laudo' || ingestaoDoTurno.tipo === 'protocolo')
+        ? `${blocoDeIngestaoParaModelo(ingestaoDoTurno, 'pdf')}\n\n${blocoDoc}`
+        : blocoDoc;
       userMsgPreview = `[documento pdf, ${leitura.paginas || '?'} pág, ${leitura.ok ? `${texto.length} chars` : leitura.motivo}]`;
       midiaDoTurno = { tipo: 'document', mime: mimeReal, buffer: midia.buffer, texto };
       // O TRECHO (não o laudo inteiro) fica na mensagem: é o que faz o documento aparecer no
@@ -1591,7 +1630,7 @@ ${decision.alreadyOffered
     ordersCreatedThisTurn: new Set<string>(),
     // UMA VOZ: handlers auto-contidos (message_supplier) setam suppressLlmText — o texto
     // do LLM não sai junto contradizendo a resposta real da tool (incidente 07/07 17:34).
-    turnFlags: { suppressLlmText: false, supplierMessaged: false },
+    turnFlags: { suppressLlmText: false, supplierMessaged: false, exameGuardadoNoTurno: ingestaoDoTurno?.tipo === 'laudo' ? (ingestaoDoTurno.examId ?? null) : null },
     // Os bytes que ESTE turno já baixou: quem precisar da mídia (receita, exame) usa estes,
     // em vez de pedir um base64 que só existe no simulador ou baixar o arquivo de novo.
     midiaDoTurno,
@@ -1675,6 +1714,11 @@ ${decision.alreadyOffered
   // não só se foi TENTADA — senão um create_reminder que falhou marca "já chamou a tool" e
   // o backstop deixa passar a promessa falsa (paciente fica sem o lembrete).
   const executedToolCalls: Array<ToolCall & { ok: boolean }> = [];
+  // A ingestão gravou o exame ANTES do modelo falar: pra guarda anti-mentira, "guardei" é
+  // verdade neste turno (family `registro_salvo`), sem o modelo precisar chamar a tool.
+  if (ingestaoDoTurno?.tipo === 'laudo' && ingestaoDoTurno.examId) {
+    executedToolCalls.push({ id: `ingestao-${ingestaoDoTurno.examId.slice(0, 8)}`, name: 'save_exam_result', args: { exam_id: ingestaoDoTurno.examId }, ok: true } as ToolCall & { ok: boolean });
+  }
   // Tools de efeito IRREVERSÍVEL que não podem repetir entre rodadas do loop (o modelo, ao
   // ver o resultado, tende a "reforçar" a ação). Emergência escalonada 2× liga 2 vezes pro
   // contato do paciente; message_supplier 2× manda 2 WhatsApps reais pra farmácia.
@@ -2550,7 +2594,9 @@ ${decision.alreadyOffered
   // 🧾 PROMESSA SEM FERRAMENTA (Ludmila, 14/09/2026): "Vou ajustar a cotação só com os
   // remédios" — não existe ação que edite uma cotação de plataforma. Com pedido em jogo, a
   // oração cai e entra a frase honesta (o que ELA pode fazer: desconsiderar o item ou refazer).
-  if (replyText && orderState) {
+  // (vale pra qualquer turno: as frases são específicas — "vou ajustar a cotação", "estou
+  // entrando no site" — e fora do contexto delas não aparecem.)
+  if (replyText) {
     const okNames = executedToolCalls.filter((t) => t.ok).map((t) => t.name);
     const promessas = verificarAnuncios(replyText, [], okNames).suspect
       .filter((sus) => FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA.includes(sus.kind));

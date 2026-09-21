@@ -112,6 +112,8 @@ export function mensagemDeParada(motivo: import('./types.js').MotivoParada, labo
       return `O site${lab} não aceitou esse login. Confere no papel se o usuário e a senha estão certinhos? Não vou tentar de novo por conta própria pra não bloquear seu acesso.${fallback}`;
     case 'portal_desconhecido':
       return `Ainda não conheço o site${lab} bem o suficiente pra navegar nele sozinha.${fallback}`;
+    case 'faltou_dado':
+      return `Pra entrar no site${lab} falta um dado que ele pede junto com o protocolo (normalmente a data de nascimento). Me manda que eu tento de novo.${fallback}`;
     case 'sem_resultados':
       return `Consegui entrar no site${lab}, mas ainda não tem nenhum resultado liberado. Quer que eu tente de novo amanhã?`;
     case 'download_falhou':

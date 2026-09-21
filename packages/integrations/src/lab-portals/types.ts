@@ -16,7 +16,22 @@ export interface CredenciaisLab {
   senha: string;
   /** Número do protocolo/atendimento, quando o portal pede além do login. */
   protocolo?: string | null;
+  /** Data de nascimento (ISO aaaa-mm-dd) — o Synapse (CDI) pede junto com protocolo e senha. */
+  nascimento?: string | null;
+  /** CPF só-dígitos, quando o portal pede. */
+  cpf?: string | null;
 }
+
+/** Os campos que um portal pode exigir na tela de entrada. */
+export type CampoDoPortal = 'login' | 'senha' | 'protocolo' | 'nascimento' | 'cpf';
+
+/**
+ * RECONHECIMENTO: o adapter olha a página SEM digitar nada e diz se sabe entrar nela e o
+ * que ela pede. É a prova que precede a promessa ("dia 21 eu entro lá") — caso Ciro, 16/09.
+ */
+export type ReconhecimentoDoPortal =
+  | { ok: true; campos: CampoDoPortal[] }
+  | { ok: false; motivo: Extract<MotivoParada, 'bloqueado_captcha' | 'portal_desconhecido' | 'timeout' | 'erro_interno'> };
 
 /** Como o adapter foi escolhido — a URL impressa no protocolo ou o nome do laboratório. */
 export interface AlvoDoPortal {
@@ -36,6 +51,7 @@ export type MotivoParada =
   | 'bloqueado_2fa'
   | 'credenciais_invalidas'
   | 'portal_desconhecido'
+  | 'faltou_dado'
   | 'sem_resultados'
   | 'download_falhou'
   | 'timeout'
@@ -51,6 +67,8 @@ export interface ResultadoRemoto {
   rotulo: string;
   /** URL absoluta do PDF, ou `null` quando o download é por clique (o adapter resolve). */
   href: string | null;
+  /** Seletor do botão que dispara o download, quando não há href (SPA). */
+  seletor?: string | null;
   /** Data impressa ao lado, se houver — string crua; quem interpreta é o orquestrador. */
   dataTexto?: string | null;
 }
@@ -84,16 +102,28 @@ export interface PaginaDoPortal {
   coletar(selector: string, attrs: readonly string[]): Promise<Array<Record<string, string | null>>>;
   /** Existe pelo menos um elemento visível que casa? */
   existe(selector: string): Promise<boolean>;
+  /** Clica e captura o arquivo que o clique baixa (SPA sem href). `null` se nada veio. */
+  clicarEBaixar?(selector: string, opts?: { timeout?: number }): Promise<{ contentType: string; body: Buffer } | null>;
+  /** Espera um pouco (renderização de SPA). */
+  esperar?(ms: number): Promise<void>;
 }
 
 export interface LabAdapter {
   id: string;
   /** Como o laboratório se chama no papel — usado para casar com o que a visão leu. */
   nome: string;
-  /** Este adapter atende este alvo? */
+  /** Este adapter atende este alvo? (pela URL/nome, antes de abrir a página) */
   casa(alvo: AlvoDoPortal): boolean;
+  /** Este adapter reconhece a PÁGINA aberta? (o Synapse do CDI se apresenta no título) */
+  detecta?(html: string): boolean;
+  /** Campos que este portal exige, quando o adapter os conhece de antemão. */
+  camposObrigatorios?: CampoDoPortal[];
   /** URL de entrada quando o protocolo não traz uma. */
   urlPadrao?: string;
+  /** Aceita cookies / fecha o que cobre o formulário. Sem digitar nada. */
+  preparar?(page: PaginaDoPortal): Promise<void>;
+  /** Olha a tela de entrada sem digitar: dá pra entrar aqui? o que ela pede? */
+  reconhecer(page: PaginaDoPortal): Promise<ReconhecimentoDoPortal>;
   login(page: PaginaDoPortal, creds: CredenciaisLab): Promise<LoginResultado>;
   listarResultados(page: PaginaDoPortal): Promise<ResultadoRemoto[]>;
   baixar(page: PaginaDoPortal, item: ResultadoRemoto): Promise<Buffer | null>;

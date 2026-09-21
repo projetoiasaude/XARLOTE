@@ -705,10 +705,11 @@ export const xarloteTools: ToolDefinition[] = [
     function: {
       name: 'fetch_lab_results',
       description:
-        'Entra no site do LABORATÓRIO com o login e a senha que a pessoa mandou (normalmente na foto do protocolo do exame), baixa os PDFs dos resultados e guarda no prontuário dela. '
-        + '⚠️ SÓ chame DEPOIS que a pessoa autorizou EXPLICITAMENTE, na mensagem dela, NESTE turno (ex.: "sim", "pode", "autorizo"). Antes disso, PERGUNTE: '
-        + '"Quer que eu entre no site do [laboratório] com esse acesso e busque seus resultados? Uso o login uma vez e não guardo a senha. Responde sim pra autorizar." '
-        + 'Se ela não autorizou, NÃO chame — o servidor recusa e você terá anunciado algo que não aconteceu. A busca é assíncrona: diga que está entrando e que avisa quando terminar. Nunca prometa que vai dar certo.',
+        'Entra no site do LABORATÓRIO com o login e a senha que a pessoa mandou (normalmente na foto do protocolo do exame), baixa os PDFs dos resultados e guarda no prontuário dela — AGORA ou numa DATA FUTURA (a previsão de liberação impressa no protocolo). '
+        + '⚠️ SÓ chame DEPOIS que a pessoa autorizou EXPLICITAMENTE, na mensagem dela, NESTE turno (ex.: "sim", "pode", "autorizo"; a data de nascimento pode vir junto: "15/03/1990, sim"). Antes disso, PERGUNTE — pra busca agora: '
+        + '"Quer que eu entre no site do [laboratório] com esse acesso e busque seus resultados? Uso o login uma vez e não guardo a senha. Responde sim pra autorizar." — pra busca em data futura: '
+        + '"Quer que eu entre no site do [laboratório] dia [dd/mm a partir das HHhMM] e busque seu resultado? Guardo esse acesso cifrado só até lá e apago depois. Responde sim pra autorizar." '
+        + 'Se ela não autorizou, NÃO chame — o servidor recusa. O desfecho é ASSÍNCRONO e o servidor fala com ela sozinho (que está tentando; depois: achou / não conhece o site / faltou um dado / a data ficou combinada). VOCÊ NÃO diz que entrou, NÃO promete data, NÃO diz que vai dar certo e NÃO cria lembrete pra "buscar depois" — quem agenda é esta ferramenta, com `quando`.',
       parameters: {
         type: 'object',
         properties: {
@@ -717,8 +718,37 @@ export const xarloteTools: ToolDefinition[] = [
           login: { type: 'string', description: 'Usuário/login/protocolo de acesso, exatamente como impresso.' },
           senha: { type: 'string', description: 'Senha, exatamente como impressa.' },
           protocolo: { type: 'string', description: 'Número de protocolo/atendimento, se for um campo separado do login.' },
+          data_nascimento: { type: 'string', description: 'Data de nascimento da pessoa (dd/mm/aaaa), SÓ se ela disse nesta conversa ou está impressa no protocolo. Alguns portais pedem junto com o protocolo; o servidor também olha o perfil dela.' },
+          quando: { type: 'string', description: 'Omita (ou "agora") pra buscar agora. Pra buscar numa DATA FUTURA (ex.: "previsão de entrega 21/09/2026 a partir das 17:30", ou a pessoa disse "no dia que sair"), passe a data/hora em ISO com fuso: "2026-09-21T17:30:00-03:00". O servidor confere o site ANTES de confirmar a data com ela.' },
         },
         required: ['laboratorio', 'login', 'senha'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cancel_lab_fetch',
+      description: 'Cancela uma busca de exame no site do laboratório que está AGENDADA/pendente (o contexto "BUSCAS DE EXAME AGENDADAS" mostra quais existem). Use quando a pessoa disser que não precisa mais, que já pegou o resultado, ou que quer desistir. Apaga o acesso guardado. Nunca diga que cancelou sem a ferramenta voltar ok:true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          laboratorio: { type: 'string', description: 'Nome do laboratório da busca a cancelar, se houver mais de uma pendente. Omita pra cancelar todas.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_exam_result',
+      description: 'Devolve um exame do prontuário INTEIRO (todos os marcadores com valor, unidade e referência) pra você explicar ou comparar. Use quando a conversa é sobre um exame ANTIGO (o contexto "EXAMES NO PRONTUÁRIO" lista os últimos, com o id) e você precisa dos números. Não devolve nada pro paciente por si — você lê e responde.',
+      parameters: {
+        type: 'object',
+        properties: {
+          exam_id: { type: 'string', description: 'O id do exame, como está no contexto EXAMES NO PRONTUÁRIO.' },
+          title_query: { type: 'string', description: 'Ou uma palavra do título (ex.: "hemograma", "ressonância"), quando não tem o id.' },
+        },
       },
     },
   },
