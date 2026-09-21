@@ -525,6 +525,19 @@ export async function despacharBuscasAgendadas(): Promise<number> {
     await enqueueLabFetch({ kind: 'buscar', fetchId: l.id as string, traceId: (l.trace_id as string | null) ?? `lab-fetch-${String(l.id).slice(0, 8)}` });
     n++;
   }
-  if (n) await writeLog('info', 'lab', `${n} busca(s) agendada(s) enfileirada(s)`, {});
+  // Reconhecimento ÓRFÃO: a API enfileirou e o job sumiu (Redis reiniciou, worker caiu no
+  // meio). A linha fica 'reconhecendo' pra sempre e a pessoa nunca ouve nada. Reenfileira
+  // depois de 2 min — o reconhecimento não digita nada, então repetir é seguro; e o `jobId`
+  // deduplica enquanto o job original ainda existir.
+  const { data: orfas } = await db.from('lab_fetches')
+    .select('id, trace_id')
+    .eq('status', 'reconhecendo')
+    .lt('created_at', new Date(Date.now() - 2 * 60_000).toISOString())
+    .limit(10);
+  for (const l of orfas ?? []) {
+    await enqueueLabFetch({ kind: 'reconhecer', fetchId: l.id as string, traceId: (l.trace_id as string | null) ?? `lab-recon-${String(l.id).slice(0, 8)}` });
+    n++;
+  }
+  if (n) await writeLog('info', 'lab', `${n} busca(s) agendada(s)/reconhecimento(s) enfileirado(s)`, {});
   return n;
 }
