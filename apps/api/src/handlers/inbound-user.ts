@@ -38,7 +38,7 @@ function agentLoopEnabled(): boolean {
 import type { NormalizedInbound, ProfileEnricherJob, MemoryCard, QuoteOption } from '@iasaude/shared';
 import { chat, buildXarloteSystemPrompt, ferramentasParaAtor, messagesToHistory, embed, userContentWithImage, dataUrl, type ChatContent, type ChatMessage, type ToolCall } from '@iasaude/llm';
 import { sendMenu, isSimulatorMode, fetchInboundMedia, nomeArquivoDeInbound } from '@iasaude/whatsapp';
-import { transcribeAudio, extrairTextoDePdf, mensagemDePdfIlegivel, type LeituraDePdf } from '@iasaude/integrations';
+import { transcribeAudio, lerPdfCompleto, mensagemDePdfIlegivel, type LeituraDePdf } from '@iasaude/integrations';
 import { sniffMidia, mensagemDeRecusa } from '../lib/media-sniff.js';
 import { Queue } from 'bullmq';
 import { loadPrompts } from '../config/prompts.js';
@@ -270,7 +270,8 @@ export function trechoDeTranscript(d: {
  */
 async function lerPdf(buf: Buffer, traceId: string): Promise<LeituraDePdf> {
   try {
-    return extrairTextoDePdf(buf, { maxCaracteres: MAX_CHARS_TEXTO_PDF });
+    // pdf.js primeiro (fontes compostas/CMaps — caso Ciro 18/09); o leitor antigo é o fallback dele.
+    return await lerPdfCompleto(buf, { maxCaracteres: MAX_CHARS_TEXTO_PDF });
   } catch (err) {
     await writeLog('error', 'media', `extração de texto do PDF explodiu: ${String(err).slice(0, 200)}`, { traceId });
     return { ok: false, motivo: 'falha_ao_ler', paginas: 0 };

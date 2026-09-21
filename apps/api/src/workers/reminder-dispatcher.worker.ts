@@ -579,6 +579,10 @@ export async function dispatchReminders(): Promise<void> {
         sender_role: 'assistant',
         content_type: 'text',
         content: msg,
+        // Marca de ORIGEM: é espelho de lembrete, não fala da Xarlote. O nudge-stalled-flows
+        // tratava "Já tomou?" como pergunta de triagem parada e mandava "ficou faltando uma
+        // respostinha sua" 3h depois (Glauber, 17/09/2026).
+        raw_payload: { kind: 'reminder', reminder_id: reminder.id },
       }).select('id').single();
       mirroredMessageId = (mirrored?.id as string | undefined) ?? null;
       await db.from('conversations').update({ last_message_at: now.toISOString() }).eq('id', conv.id);

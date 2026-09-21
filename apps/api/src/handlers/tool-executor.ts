@@ -4,7 +4,7 @@ import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem, CareLinkView } from '@iasaude/shared';
 import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, pediuCancelarTudo, ehRruleComListaDeMinutos, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool,
-  decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, extractDeliverySector, parseEnderecoDigitado, montarEnderecoHumano, nomeJaConfirmadoPeloPaciente, quantidadeFoiMencionada, JANELA_PEDIDO_VIVO_MS, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
+  decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, extractDeliverySector, parseEnderecoDigitado, montarEnderecoHumano, nomeJaConfirmadoPeloPaciente, quantidadeFoiMencionada, JANELA_PEDIDO_VIVO_MS, pareceProtocoloDeRetirada, RECUSA_DE_PROTOCOLO, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
 import { verificarExistenciaDoRemedio } from './verificar-nome-remedio.js';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
@@ -303,7 +303,9 @@ export async function handleToolCall(tc: ToolCall, ctx: ToolContext): Promise<To
       default:
         break;
     }
-    if (taskId) await db.from('assistant_tasks').update({ status: 'success', tool_output: tc.args, completed_at: new Date().toISOString() }).eq('id', taskId);
+    // `redigirCredenciais` também aqui: a ENTRADA era redigida e a SAÍDA não — a senha do portal
+    // do CDI do Ciro ficou em texto puro no `tool_output` de 16/09/2026 (regra 3).
+    if (taskId) await db.from('assistant_tasks').update({ status: 'success', tool_output: redigirCredenciais(tc.args), completed_at: new Date().toISOString() }).eq('id', taskId);
     await auditToolCall({
       toolName: tc.name,
       // O REGISTRO afetado — que numa ação de cuidador é o do sujeito, não o de quem falou.
@@ -607,6 +609,14 @@ async function handleSaveExamResult(args: SaveExamArgs, ctx: ToolContext) {
   }
   const findings = Array.isArray(args.findings) ? args.findings : [];
   const examDate = parseExamDate(args.exam_date);
+
+  // 🧾 PROTOCOLO DE RETIRADA NÃO É RESULTADO (caso Ciro, 18/09/2026): "Código do procedimento
+  // 1474509" + "prazo de entrega… acesso pelo site" virou "resultado de RM Crânio" no
+  // prontuário, duas vezes, e "Guardei seu resultado" saiu sem laudo nenhum.
+  if (pareceProtocoloDeRetirada({ summary: args.summary, findings, title: args.title })) {
+    await writeLog('warn', 'exam', `save_exam_result recusado: é protocolo de retirada, não resultado ("${args.title}")`, { traceId: ctx.traceId, userId: ctx.userId });
+    throw new ToolFailure(RECUSA_DE_PROTOCOLO);
+  }
 
   // 🔴 INCIDENTE 30/07 (Glauber, 12 falhas em 4 minutos): o `message_id` vinha do MODELO e
   // chegou como "message_id", "message_0", "1", "chatcmpl-…" — texto numa coluna uuid, então
@@ -2469,7 +2479,7 @@ async function handleCreateReminder(
   const saneado = sanitizarCorpoDeLembrete(body);
   const placeholdersRemovidos = saneado.removidas.length;
   if (placeholdersRemovidos) {
-    await writeLog('warn', 'tool', `create_reminder: ${placeholdersRemovidos} oração(ões) com placeholder removida(s) do body — "${title}"`, {
+    await writeLog('warn', 'tool', `create_reminder: ${placeholdersRemovidos} oração(ões) com placeholder/promessa removida(s) do body — "${title}"`, {
       traceId: ctx.traceId, userId: ctx.userId,
     });
     body = saneado.body;
@@ -2509,7 +2519,7 @@ async function handleCreateReminder(
     if (ctx.observation) {
       const fimTxt = describeReminderEnd(rruleFinal, firstRun, userTz);
       const aviso = placeholdersRemovidos
-        ? ` ⚠️ Removi do body ${placeholdersRemovidos} frase(s) com placeholder não preenchido (ex.: "X dias") — NUNCA escreva contagens que você não sabe; o fim da série está acima, use ele se quiser falar em dias.`
+        ? ` ⚠️ Removi do body ${placeholdersRemovidos} frase(s) com placeholder não preenchido (ex.: "X dias") ou com PROMESSA de ação sua ("vou entrar no site e buscar", "já volto com novidades") — o lembrete é só texto que toca na hora; ele não faz nada. NUNCA escreva contagens que você não sabe nem prometa ação no body.`
         : '';
       ctx.observation.note = `Lembrete criado: "${title}" — ${describeReminder(rruleFinal, firstRun)}${fimTxt}. Já está ativo; não crie de novo.${aviso}${avisoHomonimo}`;
     }
@@ -3110,4 +3120,14 @@ async function handleFetchLabResults(args: FetchLabArgs, ctx: ToolContext): Prom
     metadata: { laboratorio, consentEventId: consent?.id ?? null },
   });
   await writeLog('info', 'lab', 'busca de exames enfileirada (consentimento registrado)', { traceId: ctx.traceId, userId: ctx.userId });
+
+  // 🗣️ VOZ ÚNICA (caso Ciro, 16/09/2026): a busca é assíncrona e o worker responde sozinho
+  // ("achei N exames" / "ainda não conheço o site do CDI"). O modelo, sem saber o desfecho,
+  // escreveu "Estou entrando no site do CDI no dia 21/09 pra buscar seu resultado" no MESMO
+  // segundo em que o worker dizia que não conhecia o site. Aqui o handler fala o único
+  // fato que existe agora — que vai tentar — e o texto do modelo é suprimido pelo contador
+  // de mensagens do turno. Nada de data, nada de promessa.
+  await sendOutbound(ctx.conversationId, ctx.phoneE164,
+    `Tô tentando entrar no site${laboratorio ? ` do ${laboratorio}` : ' do laboratório'} agora com esse acesso. Já te digo o que deu 💙`, ctx.traceId);
+  if (ctx.observation) ctx.observation.note = 'A busca foi enfileirada e o paciente JÁ foi avisado de que você está tentando. O resultado (achou / não conhece o site / erro) chega em OUTRA mensagem automática. NÃO prometa data, NÃO diga que vai entrar em tal dia, NÃO crie lembrete pra "buscar depois". Não escreva mais nada sobre isso neste turno.';
 }

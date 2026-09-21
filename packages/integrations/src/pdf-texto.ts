@@ -783,7 +783,7 @@ function utf16be(bytes: number[]): string {
  * Repetição não-consecutiva fica: "Resultado: 13,2" pode aparecer legitimamente duas
  * vezes, e apagar o segundo seria apagar exame.
  */
-function compactar(bruto: string): string {
+export function compactar(bruto: string): string {
   const linhas = bruto
     .split('\n')
     .map((l) =>
@@ -829,7 +829,7 @@ const CONTROLE_SUSPEITO = /[\u0000-\u0008\u000e-\u001f\u007f]/;
  * TEXTO dele pra você" e pede pra ela chamar `save_exam_result` com o que leu. Lixo
  * aprovado aqui vira exame gravado no prontuário de alguém.
  */
-function temTextoDeVerdade(bruto: string, t: string): boolean {
+export function temTextoDeVerdade(bruto: string, t: string): boolean {
   if (t.length === 0) return false;
 
   if (bruto.length > 0) {

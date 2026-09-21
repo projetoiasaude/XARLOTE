@@ -22,7 +22,7 @@ import { chromium, type Browser, type Page } from 'playwright';
 import { db, writeLog, writeAudit } from '@iasaude/db';
 import { chat } from '@iasaude/llm';
 import {
-  extrairTextoDePdf,
+  lerPdfCompleto,
   escolherAdapter, urlDeEntrada, mensagemDeParada,
   type CredenciaisLab, type MotivoParada, type PaginaDoPortal, type DesfechoDaBusca, type PdfBaixado,
 } from '@iasaude/integrations';
@@ -191,7 +191,7 @@ function extrairJson(texto: string): ExameExtraido | null {
 }
 
 async function guardarPdf(job: LabFetchJob, pdf: PdfBaixado): Promise<{ examId: string | null; mediaId: string | null }> {
-  const leitura = extrairTextoDePdf(pdf.buffer, { maxCaracteres: MAX_CHARS_PDF });
+  const leitura = await lerPdfCompleto(pdf.buffer, { maxCaracteres: MAX_CHARS_PDF });
   if (!leitura.ok) {
     await writeLog('warn', 'lab', `PDF baixado mas ilegível (${leitura.motivo}) — guardado só o arquivo`, { traceId: job.traceId, userId: job.userId });
   }

@@ -161,17 +161,27 @@ async function collectTargets(): Promise<NudgeTarget[]> {
   for (const c of convs ?? []) {
     const { data: last } = await db
       .from('messages')
-      .select('direction, content, created_at')
+      .select('direction, content, created_at, raw_payload')
       .eq('conversation_id', c.id)
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
-    if (last?.direction === 'out' && (last.content ?? '').trim().endsWith('?')) {
+    // Lembrete de remédio termina em "Já tomou?" e NÃO é triagem parada: quem cobra a resposta
+    // dele é o próprio dispatcher (reforço condicional). Espelho de lembrete tem a marca
+    // `raw_payload.kind = 'reminder'` (desde 21/09); os antigos se reconhecem pela fórmula.
+    if (last?.direction === 'out' && (last.content ?? '').trim().endsWith('?') && !ehEspelhoDeLembrete(last)) {
       targets.push({ kind: 'clarification', entityId: c.id, conversationId: c.id, entityTs: last.created_at });
     }
   }
 
   return targets;
+}
+
+function ehEspelhoDeLembrete(m: { content: string | null; raw_payload?: unknown }): boolean {
+  const rp = m.raw_payload as { kind?: string } | null | undefined;
+  if (rp && typeof rp === 'object' && rp.kind === 'reminder') return true;
+  const c = (m.content ?? '').toLowerCase();
+  return /\bj[aá] tomou\?|responde "tomei"|hora d[oa] |passei pra te lembrar|lembrete:|lembrando de novo|[uú]ltimo lembrete/.test(c);
 }
 
 export async function nudgeStalledFlows(): Promise<void> {

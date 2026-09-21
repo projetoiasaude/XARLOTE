@@ -10,7 +10,8 @@
  *
  * ─── A REGRA ─────────────────────────────────────────────────────────────────────
  * O body é texto FINAL. Se uma oração contém marca de preenchimento ("X dias", "{nome}",
- * "[remédio]", "N doses", "___"), a oração inteira sai. Texto com um buraco a menos é
+ * "[remédio]", "N doses", "___") — ou uma PROMESSA de ação da Xarlote ("vou entrar no site
+ * e buscar", "já volto com novidades"; ver `prometeAcaoDaXarlote`) — a oração inteira sai. Texto com um buraco a menos é
  * sempre melhor que texto com um buraco à mostra — e o modelo recebe, na observação da
  * ferramenta, o que foi cortado e o motivo, pra aprender no mesmo turno.
  *
@@ -36,6 +37,30 @@ const MARCAS_DE_PLACEHOLDER: RegExp[] = [
   /\b(?:nome do paciente|nome do remedio|nome do medicamento|inserir aqui|preencher|a definir)\b/,
   /\b(?:tbd|todo|placeholder)\b/,
 ];
+
+/**
+ * PROMESSA DE AÇÃO DA XARLOTE dentro do lembrete (caso Ciro, 17→21/09/2026).
+ *
+ * O modelo criou um lembrete pra 21/09 17:30 com o body: "Vou entrar no site do CDI com seu
+ * protocolo pra buscar o resultado. Já volto com novidades!" Um lembrete não entra em site
+ * nenhum — é texto que toca na hora marcada. A promessa sairia pro paciente como se fosse
+ * verdade, e nada no sistema a cumpriria. Oração em que a Xarlote diz o que ELA vai fazer
+ * ("vou entrar/buscar/ligar/mandar/cotar", "já volto", "te aviso assim que", "estou
+ * entrando") cai. O que o PACIENTE faz ("toma 1 comprimido", "leva o exame") fica.
+ */
+const MARCAS_DE_PROMESSA: RegExp[] = [
+  /\b(?:eu\s+)?(?:vou|irei)\s+(?:entrar|buscar|pegar|ligar|mandar|enviar|cotar|procurar|falar|verificar|checar|conferir|olhar|consultar|acessar|baixar|pesquisar|tentar)\b/,
+  /\b(?:ja|logo)\s+volto\b/,
+  /\bte\s+aviso\s+(?:assim|quando|se)\b/,
+  /\b(?:estou|to|tou)\s+(?:entrando|buscando|pegando|ligando|cotando|procurando|verificando|acessando|baixando)\b/,
+  /\bvolto\s+com\s+novidades?\b/,
+];
+
+/** `true` quando a oração promete uma ação da Xarlote (não do paciente). */
+export function prometeAcaoDaXarlote(oracao: string): boolean {
+  const f = foldPt(oracao);
+  return MARCAS_DE_PROMESSA.some((re) => re.test(f));
+}
 
 export interface CorpoSaneado {
   /** O que sobrou. `null` quando nada aproveitável restou (o chamador usa o título). */
@@ -68,7 +93,7 @@ export function sanitizarCorpoDeLembrete(body: string | null | undefined): Corpo
   const removidas: string[] = [];
   const mantidas: string[] = [];
   for (const o of partes) {
-    if (temPlaceholder(o)) removidas.push(o);
+    if (temPlaceholder(o) || prometeAcaoDaXarlote(o)) removidas.push(o);
     else mantidas.push(o);
   }
   if (!removidas.length) return { body: t, removidas };

@@ -51,7 +51,7 @@
 import type { FastifyInstance } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import { db, writeEvent } from '@iasaude/db';
-import { extrairTextoDePdf, mensagemDePdfIlegivel, type LeituraDePdf } from '@iasaude/integrations';
+import { lerPdfCompleto, mensagemDePdfIlegivel, type LeituraDePdf } from '@iasaude/integrations';
 import { requirePatient } from '../../middleware/patient-auth.js';
 import { MAX_BYTES, mensagemDeRecusa, sniffMidia } from '../../lib/media-sniff.js';
 
@@ -72,9 +72,9 @@ type RespostaDocumento =
  * previu, o arquivo TEM que continuar guardado e a resposta tem que dizer o que houve.
  * Perder o upload por causa da leitura seria trocar um problema pequeno por um grande.
  */
-function lerPdf(buf: Buffer, log: { error: (o: object, m: string) => void }): LeituraDePdf {
+async function lerPdf(buf: Buffer, log: { error: (o: object, m: string) => void }): Promise<LeituraDePdf> {
   try {
-    return extrairTextoDePdf(buf);
+    return await lerPdfCompleto(buf);
   } catch (err) {
     // Sem o texto no log: é dado clínico. Só o tamanho e a mensagem do erro.
     log.error(
@@ -195,7 +195,7 @@ export async function appMediaRoutes(app: FastifyInstance): Promise<void> {
      */
     let documento: RespostaDocumento | undefined;
     if (v.tipo === 'document') {
-      const leitura = lerPdf(buf, req.log);
+      const leitura = await lerPdf(buf, req.log);
       documento = leitura.ok
         ? {
             texto: leitura.texto,
