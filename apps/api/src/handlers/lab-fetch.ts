@@ -43,6 +43,14 @@ const RECON_TIMEOUT_MS = 30_000;
 const NAV_TIMEOUT_MS = 20_000;
 const MAX_PDFS = 10;
 const USER_AGENT = 'Xarlote/1.0 (+https://xarlote.ai) assistente de saude a pedido do paciente';
+/**
+ * Flags de container (21/09/2026, primeiro portal real): o Chromium do Nix no Railway
+ * derrubou a aba ("Target crashed") ao renderizar a SPA do CDI — o /dev/shm do container é
+ * minúsculo e o Chromium usa ele como memória compartilhada por padrão. `--disable-dev-shm-usage`
+ * manda isso pro /tmp; `--no-sandbox` porque o processo já roda como root no container;
+ * `--disable-gpu` porque não há GPU. O e2e com portal falso nunca viu isso: página simples.
+ */
+const LAUNCH_ARGS = ['--disable-dev-shm-usage', '--no-sandbox', '--disable-gpu', '--disable-extensions', '--no-first-run', '--no-zygote'];
 
 /**
  * Onde está o Chromium. No container do worker (Railway/nixpacks) ele vem do Nix e fica
@@ -70,7 +78,7 @@ export function resolverChromium(env: NodeJS.ProcessEnv = process.env): string |
 export async function chromiumFunciona(): Promise<{ ok: true; executavel: string } | { ok: false; erro: string }> {
   const executavel = resolverChromium();
   try {
-    const b = await chromium.launch({ headless: true, executablePath: executavel });
+    const b = await chromium.launch({ headless: true, executablePath: executavel, args: LAUNCH_ARGS });
     await b.close();
     return { ok: true, executavel: executavel ?? '(bundled do Playwright)' };
   } catch (err) {
@@ -187,7 +195,7 @@ async function abrirPortal(linha: LinhaDeBusca): Promise<{ ok: true; portal: Por
   const entrada = urlDeEntrada(alvo, adapter);
   if (!entrada) return { ok: false, motivo: 'portal_desconhecido', adapter: adapter.id, detalhe: 'sem url de entrada' };
 
-  const browser = await chromium.launch({ headless: true, executablePath: resolverChromium() });
+  const browser = await chromium.launch({ headless: true, executablePath: resolverChromium(), args: LAUNCH_ARGS });
   try {
     const ctx = await browser.newContext({ userAgent: USER_AGENT, acceptDownloads: true, viewport: { width: 1280, height: 900 } });
     const page = await ctx.newPage();
