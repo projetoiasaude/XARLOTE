@@ -177,3 +177,15 @@ porque `writeLog` grava só no banco.
 
 **Ligada em produção em 03/09/2026** (migration 0032 aplicada; flag nas duas services;
 `/health` → `lab_fetch_ready: true`). Nenhum paciente real passou por ela ainda.
+
+## O primeiro paciente real (Ciro, 16–18/09/2026) — o que a frente não previu
+
+| Sintoma | Decisão que o permitiu | O que mudou (21/09, `7d8d6db`) |
+|---|---|---|
+| Laudo da Dasa (12 pág) e da RM do IGR (1 pág) → "não consegui ler o texto", duas vezes | Leitor de PDF escrito à mão, sem biblioteca, cobrindo "fonte de 1 byte"; laudo moderno é Type0/Identity-H + /ToUnicode | `pdf-leitor.ts`: pdf.js lê; as recusas honestas (protegido/escaneado/ilegível) continuam com a mesma régua; o leitor antigo é fallback. Provado nos dois PDFs reais. |
+| "Estou entrando no site do CDI no dia 21/09" e "Ainda não conheço o site do CDI" no mesmo segundo | A busca é assíncrona; o modelo escreveu o desfecho antes de existir | O handler fala o único fato ("tô tentando agora, já te digo"), voz única; observação proíbe data/promessa/lembrete de "buscar depois". |
+| Lembrete criado pra 21/09 17:30 com "vou entrar no site… já volto com novidades" | Sanitizador do body só conhecia placeholder | Oração que promete ação da Xarlote cai (criação e disparo) — `prometeAcaoDaXarlote`. |
+| Protocolo de retirada gravado 2× como "resultado de RM Crânio" | `save_exam_result` aceitava qualquer coisa com título | `pareceProtocoloDeRetirada`: zero achado clínico + fala de retirada/prazo/site → recusa com instrução honesta. |
+| Senha do portal em claro em `assistant_tasks.tool_output` | Só a entrada era redigida | Saída redigida também. Linha de 16/09 precisa de reparo manual. |
+
+Continua verdade: só existe o adapter genérico; CDI e IGR (Dasa) devolvem `portal_desconhecido`. O que o paciente mandar em PDF agora é lido de verdade.
