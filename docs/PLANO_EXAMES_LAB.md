@@ -244,3 +244,20 @@ re-gravar 3/3 · D protocolo+"me envia"→não diz "guardei" 3/3 — nos dois mo
 ### Dependência
 Migration `0033_lab_fetch_agendada.sql` (colunas + status + índices + `media_id`). Sem ela o
 código novo não sobe: o insert da busca falha (graciosamente) e o exame ingerido não grava.
+
+### Provas em produção (21/09/2026, 11:00–11:20 BRT, no usuário do fundador)
+1. **Busca agendada, ponta a ponta**: linha `agendada` (protocolo falso 0000000) → despachante
+   enfileirou em ≤60 s → worker abriu `cdig.com.br`, detectou Synapse pela página, foi pra
+   `novo.cdig.com.br/resultado/`, aceitou cookies, preencheu protocolo/senha/nascimento,
+   submeteu UMA vez → `credenciais_invalidas` → acesso apagado → duas mensagens no WhatsApp
+   ("Como combinado, tô entrando…" / "O site do CDI G não aceitou esse login…").
+2. **Reconhecimento antes da promessa**: linha `reconhecendo` (agendada pra +2 dias) →
+   `agendada`, adapter `synapse-eis`, campos `login+senha+nascimento`, mensagem "Combinado:
+   23/09 a partir das 11h13 eu entro no site do CDI G…" — sem digitar nada. Cancelada depois.
+3. **Ingestão de PDF real** (laudo Dasa de 12 páginas): 25.130 chars lidos, `laudo`, 29
+   marcadores extraídos e **29 conferidos no texto**, `user_exam_results` + `app_media` +
+   card + audit. Linhas de teste apagadas.
+4. **O que quebrou no caminho e foi consertado**: o Chromium do Nix no container **não tinha
+   nenhuma fonte** (`TextRunHarfBuzz … glyph_count: 0`) e a aba morria em qualquer página com
+   texto de verdade — `NIXPACKS_PKGS=chromium liberation_ttf dejavu_fonts` + `~/.fonts`
+   ligado na subida + prontidão exige fonte. O e2e com portal falso nunca viu isso.
