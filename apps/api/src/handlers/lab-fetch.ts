@@ -23,7 +23,7 @@
  */
 import { randomUUID } from 'crypto';
 import { execFileSync } from 'child_process';
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync, existsSync, symlinkSync } from 'fs';
 import { chromium, type Browser, type Page } from 'playwright';
 import { db, writeLog, writeAudit } from '@iasaude/db';
 import {
@@ -56,6 +56,44 @@ const LAUNCH_ARGS = ['--disable-dev-shm-usage', '--no-sandbox', '--disable-gpu',
 const LAUNCH_ARGS_FALLBACK = [...LAUNCH_ARGS, '--single-process', '--no-zygote'];
 /** O que o portal NÃO precisa carregar pra gente entrar e achar o PDF: imagem, fonte, mídia, analytics. */
 const RECURSOS_BLOQUEADOS = /\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|eot|mp4|webm|mp3)(\?|$)|googletagmanager|google-analytics|doubleclick|facebook\.net|hotjar|clarity\.ms/i;
+
+/**
+ * FONTES NO CONTAINER (21/09/2026, primeiro portal real): o Chromium do Nix subia, mas o
+ * container não tinha NENHUMA fonte — `TextRunHarfBuzz error … font: '' glyph_count: 0` e a
+ * aba morria ("Target crashed") ao desenhar o texto da SPA do CDI. O e2e com portal falso
+ * nunca viu porque a página era mínima. As fontes vêm pelo Nix (`NIXPACKS_PKGS` do serviço:
+ * chromium + liberation_ttf + dejavu_fonts) em `~/.nix-profile/share/fonts`, que o fontconfig
+ * do Chromium NÃO varre. Aqui: `~/.fonts` → esse diretório (fontconfig varre `~/.fonts`).
+ * Idempotente; falha vira log, não exceção. Devolve quantas fontes existem, pra prova.
+ */
+export function prepararFontes(env: NodeJS.ProcessEnv = process.env): { fontes: number; origem: string | null } {
+  const home = env['HOME'] || '/root';
+  const candidatos = [`${home}/.nix-profile/share/fonts`, '/usr/share/fonts', '/nix/var/nix/profiles/default/share/fonts'];
+  for (const dir of candidatos) {
+    let n = 0;
+    const contar = (d: string, prof = 0): void => {
+      if (prof > 4) return;
+      let itens: import('fs').Dirent[] = [];
+      try { itens = readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const it of itens) {
+        if (it.isDirectory()) contar(`${d}/${it.name}`, prof + 1);
+        else if (/\.(ttf|otf|ttc)$/i.test(it.name)) n++;
+      }
+    };
+    contar(dir);
+    if (!n) continue;
+    if (dir !== '/usr/share/fonts') {
+      const alvo = `${home}/.fonts`;
+      try {
+        if (!existsSync(alvo)) symlinkSync(dir, alvo);
+      } catch (err) {
+        console.warn(`[lab] não consegui ligar ${alvo} → ${dir}: ${String(err).slice(0, 100)}`);
+      }
+    }
+    return { fontes: n, origem: dir };
+  }
+  return { fontes: 0, origem: null };
+}
 
 /** Limite de memória do cgroup (container) — pra diagnosticar "Target crashed" sem ssh. */
 function limiteDeMemoria(): string {
@@ -90,11 +128,13 @@ export function resolverChromium(env: NodeJS.ProcessEnv = process.env): string |
  */
 export async function chromiumFunciona(): Promise<{ ok: true; executavel: string } | { ok: false; erro: string }> {
   const executavel = resolverChromium();
+  const fontes = prepararFontes();
   try {
     const b = await chromium.launch({ headless: true, executablePath: executavel, args: LAUNCH_ARGS });
     const versao = b.version();
     await b.close();
-    console.log(`[lab] chromium ${versao} · memória do container: ${limiteDeMemoria()} · rss ${Math.round(process.memoryUsage().rss / 1048576)} MB`);
+    console.log(`[lab] chromium ${versao} · fontes: ${fontes.fontes}${fontes.origem ? ` (${fontes.origem})` : ' — NENHUMA: página com texto vai derrubar a aba'} · memória do container: ${limiteDeMemoria()} · rss ${Math.round(process.memoryUsage().rss / 1048576)} MB`);
+    if (!fontes.fontes) return { ok: false, erro: 'nenhuma fonte no container (NIXPACKS_PKGS precisa de liberation_ttf/dejavu_fonts) — a aba morre ao desenhar texto' };
     return { ok: true, executavel: executavel ?? '(bundled do Playwright)' };
   } catch (err) {
     return { ok: false, erro: String(err).split('\n').slice(0, 3).join(' | ').slice(0, 300) };
