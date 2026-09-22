@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   classifyApiError,
   classifyTransportError,
+  reacaoAFalha,
 } from '../apps/mobile/src/lib/api/errors.js';
 
 /**
@@ -83,6 +84,64 @@ describe('o que vale retentar', () => {
     expect(classifyApiError(400, { error: 'invalid_code' }).retryable).toBe(false);
     expect(classifyApiError(429, { error: 'rate_limited' }).retryable).toBe(false);
     expect(classifyApiError(401, { error: 'token_expired' }).retryable).toBe(false);
+  });
+});
+
+describe('403 é autorização, não autenticação', () => {
+  /**
+   * O defeito que estes casos fecham (auditoria de 22/09, P0 #1 e #3):
+   *
+   * 401 e 403 eram o MESMO `kind`. Um cuidador tocava "já tomei" no lembrete da mãe, a
+   * chamada ia sem `?subject=`, o servidor respondia 403, o cliente gastava uma rotação
+   * de refresh, repetia, tomava 403 de novo e chamava `onSignedOut()`: sessão limpa,
+   * cache do prontuário limpo, tela de login — e nenhuma frase explicando. Nenhum token
+   * novo resolveria: o problema nunca foi quem ele é.
+   */
+  it('403 vira `forbidden`, não `unauthenticated`', () => {
+    expect(classifyApiError(403, { error: 'forbidden' }).kind).toBe('forbidden');
+    expect(classifyApiError(403, null).kind).toBe('forbidden');
+  });
+
+  it('`sem_acesso` (o 404 de quem não tem vínculo) também é `forbidden`', () => {
+    // A rota não é oráculo de ids: sem vínculo ela responde 404, e o app entende que é
+    // falta de acesso — sem deslogar e sem dizer "não encontrei" sobre algo que existe.
+    const f = classifyApiError(404, { error: 'sem_acesso' });
+    expect(f.kind).toBe('forbidden');
+    expect(f.message).toMatch(/acesso/i);
+  });
+
+  it('401 continua `unauthenticated`, inclusive o `unauthorized` do contrato', () => {
+    expect(classifyApiError(401, { error: 'unauthorized' }).kind).toBe('unauthenticated');
+    expect(classifyApiError(401, { error: 'token_expired' }).kind).toBe('unauthenticated');
+    expect(classifyApiError(401, null).kind).toBe('unauthenticated');
+  });
+
+  it('`forbidden` NÃO é retentável — o React Query não pode insistir nisso', () => {
+    // `query.ts` decide por `retryable`: repetir um 403 só gasta a rede do paciente.
+    expect(classifyApiError(403, { error: 'forbidden' }).retryable).toBe(false);
+    expect(classifyApiError(404, { error: 'sem_acesso' }).retryable).toBe(false);
+  });
+});
+
+describe('reacaoAFalha — o que o cliente HTTP faz com a falha', () => {
+  it('401 na primeira tentativa renova; 401 depois de renovar encerra', () => {
+    expect(reacaoAFalha('unauthenticated', 'primeira')).toBe('renovar');
+    expect(reacaoAFalha('unauthenticated', 'apos-renovar')).toBe('encerrar');
+  });
+
+  it('403 não renova e NÃO desloga, nas duas tentativas', () => {
+    // Este é o teste que impede o P0 de voltar: nenhum caminho de um 403 leva a
+    // `onSignedOut()`.
+    expect(reacaoAFalha('forbidden', 'primeira')).toBe('nada');
+    expect(reacaoAFalha('forbidden', 'apos-renovar')).toBe('nada');
+  });
+
+  it('nenhum outro kind mexe na sessão', () => {
+    const outros = ['network', 'timeout', 'rate_limited', 'not_found', 'unavailable', 'unknown'] as const;
+    for (const kind of outros) {
+      expect(reacaoAFalha(kind, 'primeira')).toBe('nada');
+      expect(reacaoAFalha(kind, 'apos-renovar')).toBe('nada');
+    }
   });
 });
 

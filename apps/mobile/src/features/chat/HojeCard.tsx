@@ -68,8 +68,19 @@ interface Props {
 }
 
 export const HojeCard = memo(function HojeCard({ agoraMs }: Props) {
-  const { data, isError } = useReminders();
-  const { agir, emAndamento, idEmAndamento } = useReminderAction();
+  /**
+   * 🤝 `doProprio` — este card é SEMPRE de quem está logado, nunca de quem ele cuida.
+   *
+   * Duas razões, e as duas são de leitura errada: (1) a conversa embaixo é a do titular
+   * do JWT, então um "Já tomei" da mãe no topo de um chat que é da filha é a dose no
+   * prontuário errado por um toque; (2) esta tela não usa a moldura `Screen`, então aqui
+   * NÃO existe o chip "Você está no registro de X" — a única pista da troca não chega.
+   *
+   * Os lembretes de quem se cuida continuam na aba de Lembretes, que tem o chip e manda
+   * `?subject=` em toda ação.
+   */
+  const { data, isError } = useReminders({ doProprio: true });
+  const { agir, emAndamento, idEmAndamento } = useReminderAction({ doProprio: true });
 
   const feito = useCallback((id: string) => agir(id, 'done'), [agir]);
   const adiar = useCallback((id: string) => agir(id, 'snooze', 30), [agir]);

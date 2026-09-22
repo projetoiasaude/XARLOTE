@@ -57,6 +57,7 @@ import type { MemoryCard } from '@/features/health/overview';
  * ÚNICO. Ele mora em `features/health` por ter nascido lá; o que ele faz não é de saúde.
  */
 import { useFalarComXarlote } from '@/features/health/use-falar-com-xarlote';
+import { AvisoCuidador } from '@/features/care/AvisoCuidador';
 import { CardMemoria } from './CardMemoria';
 import {
   APAGAR_CARD_DISPONIVEL,
@@ -83,7 +84,7 @@ export function BlocoMemoria({ cards, resumo, agoraMs }: Props) {
   const [abertoId, setAbertoId] = useState<string | null>(null);
   const [tudoAberto, setTudoAberto] = useState<Record<string, boolean>>({});
   const [contestados, setContestados] = useState<ReadonlySet<string>>(() => new Set<string>());
-  const { falar, emVoo } = useFalarComXarlote();
+  const { falar, emVoo, bloqueado } = useFalarComXarlote();
   const { esquecer, disponivel } = useEsquecerCard();
 
   const buscando = busca.trim().length > 0;
@@ -147,6 +148,10 @@ export function BlocoMemoria({ cards, resumo, agoraMs }: Props) {
       }
       style={styles.bloco}
     >
+      {/* 🤝 A memória mostrada é a de quem está sendo cuidado; a conversa que o app
+          abriria é a de quem está logado. Dito uma vez, antes dos cartões. */}
+      <AvisoCuidador />
+
       {/* Só a procedência: o total já está dito no contador do cabeçalho, uma linha
           acima, e um dado é dito uma vez por tela. */}
       {resumo.origens.length > 0 ? (
@@ -211,6 +216,7 @@ export function BlocoMemoria({ cards, resumo, agoraMs }: Props) {
                 contestado={contestados.has(c.id)}
                 podeApagar={disponivel}
                 {...(disponivel ? { onApagar: esquecer } : {})}
+                bloqueado={bloqueado}
                 agoraMs={agoraMs}
               />
             ))}

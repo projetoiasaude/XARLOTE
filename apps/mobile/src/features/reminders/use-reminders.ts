@@ -37,7 +37,7 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 import type { ReminderAppAction } from '@iasaude/shared';
 import { apiFetch } from '@/lib/api/client';
 import { useSession } from '@/lib/auth/session';
-import { useChaveDoSujeito, useSubjectQuery } from '@/lib/care/sujeito';
+import { useChaveDoSujeito, useComSujeito } from '@/lib/care/sujeito';
 import { OVERVIEW_KEY } from '@/features/health/use-overview';
 import type { ReminderRow } from '@/features/health/overview';
 import { lembreteOtimista, type CorpoNovoLembrete } from './format';
@@ -81,14 +81,23 @@ interface CriarResposta {
   reminder: ReminderRow | null;
 }
 
-export function useReminders() {
+/**
+ * 🤝 De quem são os lembretes desta chamada.
+ *
+ * `doProprio` só é usado pelo `HojeCard`, que vive DENTRO do chat — e a conversa é sempre
+ * a de quem está logado. Ver `lib/care/sujeito.tsx`.
+ */
+export interface AlvoDosLembretes {
+  doProprio?: boolean;
+}
+
+export function useReminders({ doProprio = false }: AlvoDosLembretes = {}) {
   const { user } = useSession();
-  const chaveDoSujeito = useChaveDoSujeito();
-  const subject = useSubjectQuery();
-  const subjectExtra = subject ? subject.replace('?', '&') : '';
+  const chaveDoSujeito = useChaveDoSujeito(doProprio);
+  const comSujeito = useComSujeito(doProprio);
   return useQuery<ListaAtivos>({
     queryKey: [REMINDERS_KEY, chaveDoSujeito],
-    queryFn: () => apiFetch<ListaAtivos>(`/app/reminders?scope=active${subjectExtra}`),
+    queryFn: () => apiFetch<ListaAtivos>(comSujeito('/app/reminders?scope=active')),
     enabled: user !== null,
     staleTime: 60_000,
   });
@@ -103,16 +112,17 @@ export function useReminders() {
 export function useHistoricoLembretes(aberta: boolean) {
   const { user } = useSession();
   const chaveDoSujeito = useChaveDoSujeito();
-  const subject = useSubjectQuery();
-  const subjectExtra = subject ? subject.replace('?', '&') : '';
+  const comSujeito = useComSujeito();
   return useInfiniteQuery({
     queryKey: [REMINDERS_HISTORY_KEY, chaveDoSujeito],
     enabled: user !== null && aberta,
     initialPageParam: null as string | null,
     queryFn: ({ pageParam }) =>
       apiFetch<PaginaHistorico>(
-        `/app/reminders?scope=history&limit=${HISTORICO_PAGINA}${subjectExtra}` +
-          (pageParam ? `&cursor=${encodeURIComponent(pageParam)}` : ''),
+        comSujeito(
+          `/app/reminders?scope=history&limit=${HISTORICO_PAGINA}` +
+            (pageParam ? `&cursor=${encodeURIComponent(pageParam)}` : ''),
+        ),
       ),
     getNextPageParam: (ultima) => ultima.nextCursor,
     staleTime: 60_000,
@@ -128,18 +138,29 @@ export interface AcaoLembrete {
   minutos?: number;
 }
 
-export function useReminderAction() {
-  const { user } = useSession();
-  const chaveDoSujeito = useChaveDoSujeito();
-  const subject = useSubjectQuery();
-  const subjectExtra = subject ? subject.replace('?', '&') : '';
+export function useReminderAction({ doProprio = false }: AlvoDosLembretes = {}) {
+  // Sem `useSession()` aqui: mutação não tem `enabled`, e o `user` que ficava nesta linha
+  // era lixo que o lint apontava — o mesmo ruído que escondeu o `subjectExtra` nunca
+  // usado logo abaixo por uma sprint inteira.
+  const chaveDoSujeito = useChaveDoSujeito(doProprio);
+  const comSujeito = useComSujeito(doProprio);
   const qc = useQueryClient();
   const chave = [REMINDERS_KEY, chaveDoSujeito];
   const chaveHistorico = [REMINDERS_HISTORY_KEY, chaveDoSujeito];
 
   const mutation = useMutation<AcaoResposta, Error, AcaoLembrete, { anterior: ListaAtivos | undefined }>({
+    /**
+     * 🤝 O `?subject=` aqui é o conserto de um P0.
+     *
+     * Ele era calculado na linha de cima e NUNCA usado (o lint avisava). A ação saía
+     * como se fosse do próprio, o servidor respondia 403, o cliente gastava uma rotação
+     * de refresh, repetia, tomava 403 de novo e derrubava a sessão: quem tocava "já
+     * tomei" no lembrete da mãe voltava pra tela de login, com o cache limpo e sem uma
+     * frase explicando nada. O servidor resolve o sujeito por `care_links` exigindo a
+     * capacidade `agir`, e sem vínculo válido responde 404 `sem_acesso`.
+     */
     mutationFn: ({ id, acao, minutos }) =>
-      apiFetch<AcaoResposta>(`/app/reminders/${id}/action`, {
+      apiFetch<AcaoResposta>(comSujeito(`/app/reminders/${id}/action`), {
         method: 'POST',
         body: { action: acao, ...(minutos !== undefined ? { minutes: minutos } : {}) },
       }),
@@ -206,8 +227,13 @@ export function useReminderAction() {
      * é o defeito mais caro possível num app que a pessoa consulta pra saber se já tomou
      * o remédio. Vai como argumento, e não como dependência, pra não dar identidade nova
      * a `agir` em todo render.
+     *
+     * Ele recebe o ERRO porque desfazer não é explicar: um vínculo de cuidado revogado
+     * responde 404 `sem_acesso`, e desde que 403/404 pararam de deslogar (ver
+     * `lib/api/errors.ts`) essa resposta chega até a tela — se ela só fizesse rollback, o
+     * cartão voltaria pra "passou da hora" sem uma palavra sobre o que houve.
      */
-    (id: string, acao: ReminderAppAction, minutos?: number, aoFalhar?: () => void) => {
+    (id: string, acao: ReminderAppAction, minutos?: number, aoFalhar?: (erro: unknown) => void) => {
       mutation.mutate(
         { id, acao, ...(minutos !== undefined ? { minutos } : {}) },
         aoFalhar ? { onError: aoFalhar } : undefined,
@@ -232,14 +258,13 @@ export function useReminderAction() {
  * saúde, "criei seu lembrete" tem que significar que ele existe no banco.
  */
 export function useCriarLembrete() {
-  const { user } = useSession();
   const chaveDoSujeito = useChaveDoSujeito();
-  const subject = useSubjectQuery();
-  const subjectExtra = subject ? subject.replace('?', '&') : '';
+  const comSujeito = useComSujeito();
   const qc = useQueryClient();
 
   return useMutation<CriarResposta, Error, CorpoNovoLembrete>({
-    mutationFn: (corpo) => apiFetch<CriarResposta>(`/app/reminders${subject}`, { method: 'POST', body: corpo }),
+    mutationFn: (corpo) =>
+      apiFetch<CriarResposta>(comSujeito('/app/reminders'), { method: 'POST', body: corpo }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: [REMINDERS_KEY, chaveDoSujeito] });
       void qc.invalidateQueries({ queryKey: [OVERVIEW_KEY, chaveDoSujeito] });

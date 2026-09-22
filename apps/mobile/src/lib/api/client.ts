@@ -18,7 +18,7 @@
  * tokens e recebe de volta a rotação e o "caiu a sessão".
  */
 import Constants from 'expo-constants';
-import { ApiError, classifyApiError, classifyTransportError } from './errors';
+import { ApiError, classifyApiError, classifyTransportError, reacaoAFalha } from './errors';
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 
@@ -172,7 +172,11 @@ export async function apiFetch<T>(path: string, opts: RequestOptions = {}): Prom
   try {
     return await once<T>(path, opts, bridge?.getAccessToken() ?? null);
   } catch (err) {
-    if (!(err instanceof ApiError) || err.failure.kind !== 'unauthenticated') throw err;
+    // Quem decide é `reacaoAFalha` (ver ./errors.ts): 403 sai por aqui sem gastar
+    // rotação e sem derrubar sessão nenhuma — é autorização, não identidade.
+    if (!(err instanceof ApiError) || reacaoAFalha(err.failure.kind, 'primeira') !== 'renovar') {
+      throw err;
+    }
 
     // Uma única segunda chance: rotaciona (ou espera quem já está rotacionando) e
     // repete. Se o retry falhar de novo com 401, a sessão morreu de verdade.
@@ -181,7 +185,13 @@ export async function apiFetch<T>(path: string, opts: RequestOptions = {}): Prom
     try {
       return await once<T>(path, opts, fresh);
     } catch (retryErr) {
-      if (retryErr instanceof ApiError && retryErr.failure.kind === 'unauthenticated') {
+      // Só 'encerrar' desloga. Um 403 no retry (token novo, registro alheio) cai em
+      // 'nada' e vira mensagem na tela — era exatamente aqui que o cuidador perdia a
+      // sessão inteira por tocar "já tomei" no lembrete da mãe.
+      if (
+        retryErr instanceof ApiError &&
+        reacaoAFalha(retryErr.failure.kind, 'apos-renovar') === 'encerrar'
+      ) {
         bridge?.onSignedOut();
       }
       throw retryErr;

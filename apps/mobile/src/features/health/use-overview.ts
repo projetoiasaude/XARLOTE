@@ -12,7 +12,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { apiFetch } from '@/lib/api/client';
 import { useSession } from '@/lib/auth/session';
-import { useChaveDoSujeito, useSubjectQuery } from '@/lib/care/sujeito';
+import { useChaveDoSujeito, useComSujeito } from '@/lib/care/sujeito';
 import type { Overview } from './overview';
 
 export const OVERVIEW_KEY = 'overview';
@@ -24,10 +24,10 @@ export const OVERVIEW_KEY = 'overview';
 export function useOverview() {
   const { user } = useSession();
   const chave = useChaveDoSujeito();
-  const subject = useSubjectQuery();
+  const comSujeito = useComSujeito();
   return useQuery<Overview>({
     queryKey: [OVERVIEW_KEY, chave],
-    queryFn: () => apiFetch<Overview>(`/app/overview${subject}`),
+    queryFn: () => apiFetch<Overview>(comSujeito('/app/overview')),
     enabled: user !== null,
     // Prontuário não muda de segundo em segundo, e a resposta é grande (até 180 linhas
     // de log de dose). 2 minutos evita refetch a cada troca de aba sem deixar a tela

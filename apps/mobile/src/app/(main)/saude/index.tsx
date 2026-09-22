@@ -64,6 +64,7 @@ import {
 import { GlassBadge, GlassButton, GlassCard, LoadFailure, Skeleton } from '@/components/ui';
 import { CollapsibleSection } from '@/components/ui/collapsible-section';
 import { Screen } from '@/components/xarlote/Screen';
+import { AvisoCuidador } from '@/features/care/AvisoCuidador';
 import { AdherenceChart } from '@/features/health/AdherenceChart';
 import { CardAviso } from '@/features/health/CardAviso';
 import { ListaComTeto, LinhaNavegacao } from '@/features/health/Secoes';
@@ -107,6 +108,12 @@ interface AcaoProps {
   chave: string;
   acessivel: string;
   emVoo: string | null;
+  /**
+   * 🤝 A bolsa aberta é de outra pessoa: o pedido iria pra conversa de quem está logado,
+   * e o registro é dela. O botão fica à vista e desabilitado; o porquê é dito uma vez, no
+   * `AvisoCuidador` do topo da tela.
+   */
+  bloqueado: boolean;
   onFalar: (mensagem: string, chave: string) => void;
 }
 
@@ -123,12 +130,13 @@ interface AcaoProps {
  * sem abrir a seção, e o toque no cabeçalho continua sendo só recolher. O alvo de 44pt
  * vem do `hitSlop` que o próprio `GlassButton` calcula pro tamanho `sm`.
  */
-function AcaoDaSecao({ rotulo, mensagem, chave, acessivel, emVoo, onFalar }: AcaoProps) {
+function AcaoDaSecao({ rotulo, mensagem, chave, acessivel, emVoo, bloqueado, onFalar }: AcaoProps) {
   return (
     <GlassButton
       size="sm"
       variant="secondary"
       loading={emVoo === chave}
+      disabled={bloqueado}
       onPress={() => onFalar(mensagem, chave)}
       accessibilityLabel={acessivel}
     >
@@ -143,7 +151,7 @@ export default function SaudeScreen() {
   // Congelado por render (duas funções puras da mesma tela não podem discordar na
   // virada do dia) mas NÃO por sessão: `useAgora` reacerta ao voltar do segundo plano.
   const agora = useAgora();
-  const { falar, emVoo } = useFalarComXarlote();
+  const { falar, emVoo, bloqueado } = useFalarComXarlote();
 
   const adesao = useMemo(
     () => (data ? resumoAdesao(data.medicationLog, 30, agora) : null),
@@ -226,6 +234,10 @@ export default function SaudeScreen() {
         <RefreshControl refreshing={isRefetching} onRefresh={aoAtualizar} tintColor={colors.accentHi} />
       }
     >
+      {/* 🤝 Dito UMA vez, antes de qualquer botão: o que este modo não faz e por quê.
+          Some por completo quando a bolsa aberta é a de quem está logado. */}
+      <AvisoCuidador />
+
       {/* ── Herói: a resposta da tela em zero toque ────────────────────────── */}
       <GlassCard style={styles.cardAdesao}>
         <View style={styles.adesaoTopo}>
@@ -266,6 +278,10 @@ export default function SaudeScreen() {
               <CardAviso
                 aviso={a}
                 ocupado={emVoo === a.chave}
+                // 🤝 Só a ação de PERGUNTAR é travada — `abrirExame` é navegação, e
+                // travar a leitura do exame de quem se cuida seria tirar o que o
+                // vínculo justamente concede.
+                bloqueado={bloqueado}
                 onPerguntar={falar}
                 onAbrirExame={abrirExame}
               />
@@ -288,6 +304,7 @@ export default function SaudeScreen() {
             chave="nova-alergia"
             acessivel="Contar uma alergia pra Xarlote"
             emVoo={emVoo}
+            bloqueado={bloqueado}
             onFalar={falar}
           />
         }
@@ -344,6 +361,7 @@ export default function SaudeScreen() {
             chave="novo-medicamento"
             acessivel="Registrar um medicamento com a Xarlote"
             emVoo={emVoo}
+            bloqueado={bloqueado}
             onFalar={falar}
           />
         }
@@ -395,6 +413,7 @@ export default function SaudeScreen() {
             chave="novo-exame"
             acessivel="Enviar a foto de um exame pra Xarlote"
             emVoo={emVoo}
+            bloqueado={bloqueado}
             onFalar={falar}
           />
         }
@@ -450,6 +469,7 @@ export default function SaudeScreen() {
             chave="nova-condicao"
             acessivel="Contar uma condição de saúde pra Xarlote"
             emVoo={emVoo}
+            bloqueado={bloqueado}
             onFalar={falar}
           />
         }
@@ -495,6 +515,7 @@ export default function SaudeScreen() {
             chave="novo-medico"
             acessivel="Cadastrar um médico com a Xarlote"
             emVoo={emVoo}
+            bloqueado={bloqueado}
             onFalar={falar}
           />
         }
@@ -529,6 +550,7 @@ export default function SaudeScreen() {
             chave="novo-sintoma"
             acessivel="Contar um sintoma pra Xarlote"
             emVoo={emVoo}
+            bloqueado={bloqueado}
             onFalar={falar}
           />
         }

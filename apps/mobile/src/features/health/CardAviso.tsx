@@ -21,12 +21,25 @@ interface Props {
   aviso: Aviso;
   /** Este aviso tem um envio em voo — o botão vira spinner e não aceita dois toques. */
   ocupado: boolean;
+  /**
+   * 🤝 A bolsa aberta é de outra pessoa. Vale só pra ação `perguntar`, que escreveria na
+   * conversa de quem está logado; `abrirExame` é leitura e continua valendo. O porquê é
+   * dito uma vez no topo da tela (`AvisoCuidador`).
+   */
+  bloqueado?: boolean;
   onPerguntar: (mensagem: string, chave: string) => void;
   onAbrirExame: (exameId: string) => void;
 }
 
-export const CardAviso = memo(function CardAviso({ aviso, ocupado, onPerguntar, onAbrirExame }: Props) {
+export const CardAviso = memo(function CardAviso({
+  aviso,
+  ocupado,
+  bloqueado = false,
+  onPerguntar,
+  onAbrirExame,
+}: Props) {
   const cor = aviso.tom === 'warn' ? colors.warn : colors.info;
+  const travado = bloqueado && aviso.acao.tipo === 'perguntar';
 
   return (
     <GlassCard style={styles.card}>
@@ -49,6 +62,7 @@ export const CardAviso = memo(function CardAviso({ aviso, ocupado, onPerguntar, 
         size="md"
         style={styles.botao}
         loading={ocupado}
+        disabled={travado}
         onPress={() => {
           if (aviso.acao.tipo === 'perguntar') onPerguntar(aviso.acao.mensagem, aviso.chave);
           else onAbrirExame(aviso.acao.exameId);

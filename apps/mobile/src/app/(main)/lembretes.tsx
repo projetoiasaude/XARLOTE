@@ -41,7 +41,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AppState, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import * as Haptics from 'expo-haptics';
-import { AlarmClock, ChevronDown, Plus, TriangleAlert } from 'lucide-react-native';
+import { AlarmClock, ChevronDown, Plus, TriangleAlert, X } from 'lucide-react-native';
 import type { ReminderAppAction } from '@iasaude/shared';
 import {
   CollapsibleSection,
@@ -70,7 +70,7 @@ import {
   useReminders,
 } from '@/features/reminders/use-reminders';
 import { ApiError } from '@/lib/api/errors';
-import { colors, FONTE_CLINICA, FONTE_MINIMA } from '@/theme';
+import { colors, FONTE_CLINICA, FONTE_MINIMA, radii } from '@/theme';
 
 /** Teto de segurança do despertador: nenhum timer de horas pendurado. */
 const ESPERA_MAX_MS = 30 * 60_000;
@@ -82,9 +82,9 @@ const ESPERA_MAX_MS = 30 * 60_000;
  * já tem 40 lembretes ativos…"). Trocar isso por um genérico apagaria a única orientação
  * útil que a resposta trazia.
  */
-function textoDoErro(erro: unknown): string {
+function textoDoErro(erro: unknown, padrao = 'Não consegui salvar agora. Tenta de novo?'): string {
   if (erro instanceof ApiError) return erro.failure.message;
-  return 'Não consegui salvar agora. Tenta de novo?';
+  return padrao;
 }
 
 export default function LembretesScreen() {
@@ -118,6 +118,17 @@ export default function LembretesScreen() {
    */
   const [agiuAgora, setAgiuAgora] = useState<Record<string, string>>({});
 
+  /**
+   * O que deu errado no último "já tomei"/"+30 min"/"cancelar", pronto pra ler.
+   *
+   * O rollback sozinho é mudo — e ele ficou MAIS importante desde que 403/404 pararam de
+   * derrubar a sessão: antes, agir no lembrete de quem se cuida com o vínculo revogado
+   * jogava a pessoa na tela de login (errado, mas visível); agora a linha só voltaria ao
+   * lugar. Dispensável pelo toque, porque erro velho sobre uma ação que depois deu certo
+   * mente.
+   */
+  const [erroDaAcao, setErroDaAcao] = useState<string | null>(null);
+
   const historico = useHistoricoLembretes(historicoAberto);
 
   const lista = data?.reminders ?? [];
@@ -145,14 +156,20 @@ export default function LembretesScreen() {
       // o horário já é o de amanhã, e a frase de recorrente é justamente a que não pode
       // dizer "concluído".
       if (alvo) setAgiuAgora((atual) => ({ ...atual, [id]: fraseDaAcao(alvo, acao, minutos) }));
+      setErroDaAcao(null);
 
-      agir(id, acao, minutos, () =>
+      agir(id, acao, minutos, (erro) => {
+        // Desfazer NÃO é explicar: sem esta linha o cartão volta pra "passou da hora" em
+        // silêncio, e a pessoa não sabe se o registro entrou. A mensagem do servidor
+        // ganha — é ela que sabe dizer "esse lembrete não é seu" quando o vínculo de
+        // cuidado foi revogado.
+        setErroDaAcao(textoDoErro(erro, 'Não consegui registrar agora. Tenta de novo?'));
         setAgiuAgora((atual) => {
           if (!(id in atual)) return atual;
           const { [id]: _saiu, ...resto } = atual;
           return resto;
-        }),
-      );
+        });
+      });
     },
     [agir],
   );
@@ -281,6 +298,18 @@ export default function LembretesScreen() {
         <RefreshControl refreshing={isRefetching} onRefresh={aoAtualizar} tintColor={colors.accentHi} />
       }
     >
+      {erroDaAcao ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Fechar o aviso de erro"
+          onPress={() => setErroDaAcao(null)}
+          style={styles.erroBarra}
+        >
+          <Text style={styles.erroTexto}>{erroDaAcao}</Text>
+          <X size={15} color={colors.dangerSoft} />
+        </Pressable>
+      ) : null}
+
       {agenda.atrasados > 0 && (
         <GlassCard style={styles.aviso}>
           <TriangleAlert size={18} color={colors.warn} />
@@ -488,6 +517,20 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(251,191,36,0.06)',
   },
   avisoTexto: { flex: 1, color: colors.text, fontSize: FONTE_CLINICA, lineHeight: 19 },
+  /** A mesma barra dispensável do chat — uma falha, uma forma de dizê-la. */
+  erroBarra: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: radii.lg,
+    borderWidth: 1,
+    borderColor: 'rgba(248,113,113,0.35)',
+    backgroundColor: 'rgba(248,113,113,0.12)',
+  },
+  erroTexto: { flex: 1, color: colors.dangerSoft, fontSize: FONTE_CLINICA, lineHeight: 19 },
   novo: { width: '100%' },
   truncado: { color: colors.textDim, fontSize: FONTE_MINIMA, lineHeight: 17, marginTop: 10 },
   vazio: { marginTop: 14 },

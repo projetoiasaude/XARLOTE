@@ -20,6 +20,7 @@
  */
 import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react';
 import { useSession } from '@/lib/auth/session';
+import { comSujeito } from './rotas';
 
 export interface PessoaCuidada {
   id: string;
@@ -68,20 +69,35 @@ export function useSujeito(): SujeitoCtx {
 }
 
 /**
- * O sufixo de query pras chamadas de dados. Vazio quando é o próprio registro — assim o
- * caminho de sempre continua idêntico, byte a byte, pra quem não cuida de ninguém.
+ * 🤝 `doProprio` — "esta chamada é MINHA, mesmo com a bolsa de outra pessoa aberta".
+ *
+ * Existe por causa do chat. A conversa é sempre a de quem está logado (o `POST
+ * /app/messages` não tem sujeito, e o histórico é o do JWT), e o `HojeCard` mora dentro
+ * dela: sem esta saída, ele mostrava a dose da mãe numa tela SEM o chip da moldura
+ * (`app/(main)/index.tsx` não usa `Screen`), e o "Já tomei" dali parecia do próprio.
+ *
+ * Fora esse caso, todo dado de tela segue o sujeito escolhido.
  */
-export function useSubjectQuery(): string {
+function sujeitoEfetivo(subjectId: string | null, doProprio: boolean): string | null {
+  return doProprio ? null : subjectId;
+}
+
+/**
+ * A rota com o sujeito dentro, quando houver. Uma função só, que decide entre `?` e `&`
+ * olhando a rota — ver `./rotas.ts` pra saber qual logout isso evita.
+ */
+export function useComSujeito(doProprio = false): (rota: string) => string {
   const { subjectId } = useSujeito();
-  return subjectId ? `?subject=${encodeURIComponent(subjectId)}` : '';
+  const alvo = sujeitoEfetivo(subjectId, doProprio);
+  return useCallback((rota: string) => comSujeito(rota, alvo), [alvo]);
 }
 
 /**
  * A chave de cache. Duas pessoas nunca compartilham cache — é o que impede a tela de
  * mostrar o exame de uma enquanto o cabeçalho diz o nome da outra.
  */
-export function useChaveDoSujeito(): string {
+export function useChaveDoSujeito(doProprio = false): string {
   const { subjectId } = useSujeito();
   const { user } = useSession();
-  return `${user?.id ?? 'anon'}:${subjectId ?? 'eu'}`;
+  return `${user?.id ?? 'anon'}:${sujeitoEfetivo(subjectId, doProprio) ?? 'eu'}`;
 }

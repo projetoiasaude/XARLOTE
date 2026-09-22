@@ -52,7 +52,9 @@ interface Props {
 export function CartaoIdentidade({ nome, telefone, xarloteLigada }: Props) {
   const [editando, setEditando] = useState(false);
   const [rascunho, setRascunho] = useState('');
-  const { falar, emVoo } = useFalarComXarlote();
+  // 🤝 `sobreOProprio`: o apelido vem do `GET /app/me`, ou seja, é de quem está logado —
+  // mesmo com a bolsa de outra pessoa aberta, esta frase vai pro prontuário certo.
+  const { falar, emVoo } = useFalarComXarlote({ sobreOProprio: true });
   const enviando = emVoo === CHAVE_PEDIDO;
 
   // Fecha o editor quando o envio COMEÇA. Cancelar o alerta de confirmação não passa por

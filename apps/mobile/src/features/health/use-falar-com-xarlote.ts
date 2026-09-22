@@ -26,6 +26,14 @@
  * pendentes: aqui não há bolha otimista, o envio ou dá certo e o chat mostra a linha do
  * servidor, ou falha e diz que falhou.
  *
+ * ## 🤝 E ele RECUSA quando a bolsa aberta é de outra pessoa
+ *
+ * `POST /app/messages` não tem noção de sujeito: a conversa é sempre a de quem está
+ * logado. Como as frases são montadas em primeira pessoa a partir do dado da TELA
+ * ("Minha Losartana está acabando"), um toque na Saúde da mãe cotava o remédio dela no
+ * chat da filha — e o profile-enricher podia anotar que a filha toma Losartana. A decisão
+ * mora em `features/care/escrita.ts` e é aplicada aqui, no funil, além dos botões.
+ *
  * ## Este hook NÃO mexe no cache da conversa, e isso é o conserto
  *
  * A primeira versão fazia `await qc.invalidateQueries({predicate: 'chat'})` ANTES de
@@ -53,17 +61,58 @@ import * as Haptics from 'expo-haptics';
 import { useRouter } from 'expo-router';
 import { apiFetch } from '@/lib/api/client';
 import { ApiError } from '@/lib/api/errors';
+import { useSujeito } from '@/lib/care/sujeito';
+import { decidirFalarComXarlote, TITULO_SO_NO_PROPRIO } from '@/features/care/escrita';
 
 export interface FalarComXarlote {
   /** Pede confirmação, envia, e leva pra conversa. `chave` é só pra tela saber quem está em voo. */
   falar: (mensagem: string, chave: string) => void;
   /** A `chave` do pedido em voo, ou null. */
   emVoo: string | null;
+  /**
+   * 🤝 A bolsa aberta não é a de quem está logado — nada daqui pode ser enviado.
+   *
+   * As telas usam isto pra DESABILITAR o botão e dizer por quê (`aviso`), em vez de
+   * mostrar um botão que some do jeito errado ou escreve no prontuário errado.
+   */
+  bloqueado: boolean;
+  /** A frase honesta, pronta pra tela. `null` quando dá pra mandar. */
+  aviso: string | null;
 }
 
-export function useFalarComXarlote(): FalarComXarlote {
+export interface OpcoesDeFalar {
+  /**
+   * 🤝 A frase desta tela é montada com o dado de QUEM ESTÁ LOGADO, não com o da bolsa
+   * aberta — então ela vai pro prontuário certo mesmo em modo cuidador.
+   *
+   * Hoje existe um único caso: o apelido no `CartaoIdentidade`, que sai do `GET /app/me`
+   * (o titular do JWT) e não do overview do sujeito. Sem esta saída, quem cuida da mãe
+   * não conseguiria trocar o próprio nome sem sair do registro dela — e, pior, leria
+   * "isso eu registro no WhatsApp de Maria" sobre uma ação que é dele. Frase honesta
+   * também vale pra recusa: recusar pelo motivo errado é mentir.
+   *
+   * O padrão é `false` (recusar) de propósito: quem escrever a próxima tela precisa
+   * PARAR e afirmar de quem é o dado, em vez de herdar permissão por descuido.
+   */
+  sobreOProprio?: boolean;
+}
+
+export function useFalarComXarlote({ sobreOProprio = false }: OpcoesDeFalar = {}): FalarComXarlote {
   const router = useRouter();
   const [emVoo, setEmVoo] = useState<string | null>(null);
+  const { pessoa, cuidandoDeOutro } = useSujeito();
+  /**
+   * A trava fica no FUNIL, não só nos botões.
+   *
+   * Sete telas chamam este hook hoje e a oitava é escrita amanhã. Confiar só no `disabled`
+   * de cada uma significa que a próxima nasce escrevendo no prontuário do cuidador — e o
+   * defeito é invisível: a mensagem some da tela onde foi disparada e reaparece num chat
+   * que a pessoa não está olhando. Ver `features/care/escrita.ts`.
+   */
+  const decisao = decidirFalarComXarlote({
+    cuidandoDeOutro: cuidandoDeOutro && !sobreOProprio,
+    nome: pessoa?.nome ?? null,
+  });
 
   const despachar = useCallback(
     async (mensagem: string, chave: string) => {
@@ -106,14 +155,19 @@ export function useFalarComXarlote(): FalarComXarlote {
     (mensagem: string, chave: string) => {
       const texto = mensagem.trim();
       if (!texto) return;
+      // Bloqueado NUNCA cai em silêncio nem em envio: a tela diz de quem é a conversa.
+      if (!decisao.pode) {
+        Alert.alert(TITULO_SO_NO_PROPRIO, decisao.aviso ?? '');
+        return;
+      }
       void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       Alert.alert('Mandar pra Xarlote?', `"${texto}"`, [
         { text: 'Cancelar', style: 'cancel' },
         { text: 'Mandar', onPress: () => void despachar(texto, chave) },
       ]);
     },
-    [despachar],
+    [despachar, decisao.pode, decisao.aviso],
   );
 
-  return { falar, emVoo };
+  return { falar, emVoo, bloqueado: !decisao.pode, aviso: decisao.aviso };
 }

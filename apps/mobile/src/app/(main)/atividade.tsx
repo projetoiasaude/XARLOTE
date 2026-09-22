@@ -35,6 +35,7 @@ import { History, MessageCircle, Zap } from 'lucide-react-native';
 import { EmptyState, GlassButton, GlassCard, LoadFailure, Skeleton } from '@/components/ui';
 import { CollapsibleSection } from '@/components/ui/collapsible-section';
 import { Screen } from '@/components/xarlote/Screen';
+import { AvisoCuidador } from '@/features/care/AvisoCuidador';
 import { ActivityCard } from '@/features/activity/ActivityCard';
 import { ActivityLine } from '@/features/activity/ActivityLine';
 import { montarAtividades, resumoDaAtividade, type Atividade } from '@/features/activity/timeline';
@@ -75,7 +76,7 @@ export default function AtividadeScreen() {
   // Reacerta ao voltar do segundo plano: "atualizado há 2 min" congelado na montagem
   // continua dizendo 2 min meia hora depois.
   const agora = useAgora();
-  const { falar, emVoo } = useFalarComXarlote();
+  const { falar, emVoo, bloqueado } = useFalarComXarlote();
 
   const atividades = useMemo(
     () => (data ? montarAtividades(data.orders, data.consultations, agora) : []),
@@ -136,6 +137,10 @@ export default function AtividadeScreen() {
         <RefreshControl refreshing={isRefetching} onRefresh={aoAtualizar} tintColor={colors.accentHi} />
       }
     >
+      {/* 🤝 Dito UMA vez, antes dos cartões: "Ainda preciso" escreveria na conversa de
+          quem está logado, e o pedido é de quem tem o registro aberto. */}
+      <AvisoCuidador />
+
       {isError && !data ? (
         <LoadFailure
           erro={error}
@@ -174,6 +179,7 @@ export default function AtividadeScreen() {
                   agoraMs={agora}
                   onAcao={aoAgir}
                   ocupado={emVoo === `${a.tipo}:${a.id}`}
+                  bloqueado={bloqueado}
                 />
               ))}
             </View>

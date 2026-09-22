@@ -87,6 +87,12 @@ interface Props {
   /** Ligado só quando `DELETE /app/memory/:id` existir (ver memoria.ts). */
   podeApagar: boolean;
   onApagar?: (id: string) => void;
+  /**
+   * 🤝 A memória na tela é de quem está sendo cuidado — corrigir manda uma mensagem em
+   * primeira pessoa pra conversa de QUEM ESTÁ LOGADO, que é outro prontuário. O botão
+   * fica à vista e desabilitado; o porquê é dito uma vez no topo do bloco.
+   */
+  bloqueado?: boolean;
   /** O "agora" da tela, congelado por render (ver features/health/use-agora.ts). */
   agoraMs: number;
 }
@@ -100,6 +106,7 @@ function CardMemoriaBase({
   contestado,
   podeApagar,
   onApagar,
+  bloqueado = false,
   agoraMs,
 }: Props) {
   const [corrigindo, setCorrigindo] = useState(false);
@@ -270,12 +277,16 @@ function CardMemoriaBase({
               <GlassButton
                 variant="secondary"
                 size="sm"
+                disabled={bloqueado}
                 onPress={abrirCorrecao}
                 icon={<MessageSquareX size={14} color={colors.text} />}
               >
                 Não é isso
               </GlassButton>
-              {podeApagar && onApagar ? (
+              {/* Apagar também não é oferecido no modo cuidador: `DELETE /app/memory/:id`
+                  não aceita `?subject=`, então o id da outra pessoa só renderia um
+                  "sem acesso" — botão que falha é pior que botão ausente. */}
+              {podeApagar && onApagar && !bloqueado ? (
                 <GlassButton
                   variant="ghost"
                   size="sm"

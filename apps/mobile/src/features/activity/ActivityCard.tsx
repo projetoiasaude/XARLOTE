@@ -33,6 +33,12 @@ interface Props {
   onAcao: (atividade: Atividade) => void;
   /** Este cartão tem um envio em voo. */
   ocupado?: boolean;
+  /**
+   * 🤝 A bolsa aberta é de outra pessoa. Trava só a ação `retomar`, que manda uma
+   * mensagem em primeira pessoa pra conversa de quem está logado; `responder` é
+   * navegação pro chat e continua valendo.
+   */
+  bloqueado?: boolean;
 }
 
 function Marcador({ estado }: { estado: Etapa['estado'] }) {
@@ -52,7 +58,13 @@ function Marcador({ estado }: { estado: Etapa['estado'] }) {
   return <View style={[styles.marcador, styles.marcadorEsperando]} />;
 }
 
-export const ActivityCard = memo(function ActivityCard({ atividade, agoraMs, onAcao, ocupado }: Props) {
+export const ActivityCard = memo(function ActivityCard({
+  atividade,
+  agoraMs,
+  onAcao,
+  ocupado,
+  bloqueado = false,
+}: Props) {
   // `desdeNoPassado`, não `brDesde` cru: carimbo no futuro não pode virar "agora".
   const desde = desdeNoPassado(atividade.atualizadoEm ?? atividade.criadoEm, agoraMs);
 
@@ -107,6 +119,7 @@ export const ActivityCard = memo(function ActivityCard({ atividade, agoraMs, onA
           size="md"
           style={styles.botao}
           loading={ocupado ?? false}
+          disabled={bloqueado && atividade.acao.tipo === 'retomar'}
           onPress={() => onAcao(atividade)}
           accessibilityLabel={`${atividade.acao.rotulo}: ${atividade.titulo}`}
         >
