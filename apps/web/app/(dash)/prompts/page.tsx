@@ -1,15 +1,15 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Bot, Pill, Save, RotateCcw, CheckCircle, AlertCircle, Key,
+  Bot, Pill, Save, RotateCcw, CheckCircle, AlertCircle, AlertTriangle, Key,
   Cpu, Eye, EyeOff, Copy, Power, Image as ImageIcon, Mic, SlidersHorizontal,
   Volume2, RefreshCw, Play,
 } from 'lucide-react';
 import {
   GlassCard, GlassButton, GlassInput, GlassTextarea, GlassBadge,
-  SectionHeader, StatusPing,
+  SectionHeader, StatusPing, Drawer,
 } from '@/components/ui';
 import { cn } from '@/lib/utils';
 
@@ -109,58 +109,286 @@ const FLOW_SWITCHES: { key: keyof PromptsConfig; label: string; desc: string }[]
   { key: 'clinic_outbound_enabled', label: 'Disparo a clínicas', desc: 'Contatar clínicas pra buscar consultas.' },
 ];
 
+type ConfigPatch = Partial<PromptsConfig>;
+
+/**
+ * As ÚNICAS chaves que o botão "Salvar" pode mandar — e só as que mudaram.
+ *
+ * Os interruptores (mestre + os 4 de fluxo) ficam de fora de propósito: eles já salvam
+ * sozinhos no clique. Reenviá-los era o defeito de 22/09 — o "Salvar" montava
+ * `{...config}` com o estado de quando a aba abriu, então ajustar um prompt às 15h
+ * religava, em silêncio, o que outra aba (ou o celular) tinha desligado às 14h: disparo
+ * a farmácias, lembretes e até o interruptor mestre da Xarlote.
+ *
+ * `tts_enabled` CONTINUA aqui porque ele não salva sozinho — o clique dele só mexe no
+ * formulário, e quem grava é o Salvar.
+ */
+const SAVE_KEYS: readonly (keyof PromptsConfig)[] = [
+  'sara_suffix', 'agent_override', 'llm_api_key', 'llm_model', 'vision_model',
+  'audio_model', 'tts_enabled', 'tts_api_key', 'tts_voice_id', 'tts_model', 'tts_speed',
+];
+
+/** Nome de gente pra cada chave — usado pra dizer O QUE mudou em outra aba. */
+const KEY_LABELS: Record<keyof PromptsConfig, string> = {
+  sara_suffix: 'Instruções adicionais da Xarlote',
+  agent_override: 'Override do Agente Farmácia',
+  llm_api_key: 'Chave da OpenRouter',
+  llm_model: 'Modelo de chat',
+  vision_model: 'Modelo de visão',
+  audio_model: 'Modelo de áudio',
+  xarlote_enabled: 'Interruptor da Xarlote',
+  reminders_enabled: 'Lembretes',
+  nudges_enabled: 'Follow-ups',
+  pharmacy_outbound_enabled: 'Disparo a farmácias',
+  clinic_outbound_enabled: 'Disparo a clínicas',
+  tts_enabled: 'Voz da Xarlote',
+  tts_api_key: 'Chave da ElevenLabs',
+  tts_voice_id: 'Voz escolhida',
+  tts_model: 'Modelo TTS',
+  tts_speed: 'Velocidade da fala',
+};
+
+const CHAVES_DE_API: readonly (keyof PromptsConfig)[] = ['llm_api_key', 'tts_api_key'];
+
+/** A API devolve as chaves mascaradas (`sk-or-…ab12`). Reenviar a máscara gravaria lixo. */
+function pareceMascara(valor: string): boolean {
+  return /[•…]/.test(valor);
+}
+
+/** Mostra a chave sem mostrar a chave — serve pra máscara da API e pra chave crua. */
+function mascarar(valor: string): string {
+  if (!valor) return '';
+  if (pareceMascara(valor)) return valor;
+  return valor.length <= 10 ? '••••••' : `${valor.slice(0, 6)}••••${valor.slice(-4)}`;
+}
+
+/** Copia UMA chave preservando o tipo dela — é o que evita `any` no diff genérico. */
+function copiarChave<K extends keyof PromptsConfig>(
+  destino: ConfigPatch,
+  origem: PromptsConfig,
+  chave: K,
+): void {
+  destino[chave] = origem[chave];
+}
+
+/**
+ * Resposta do `/admin/prompts` com os defaults por baixo: campo que o servidor não
+ * mandou não pode virar `undefined` no meio de um `.toFixed()`, e um JSON que não é
+ * config (um `{error:…}`, um 502 em HTML) precisa falhar alto, não pintar a tela de lixo.
+ */
+function comDefaults(data: unknown): PromptsConfig {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('Resposta inesperada de /admin/prompts');
+  }
+  const parcial = data as Partial<PromptsConfig>;
+  if (typeof parcial.llm_model !== 'string') {
+    throw new Error('Resposta inesperada de /admin/prompts (sem llm_model)');
+  }
+  return { ...DEFAULT_CFG, ...parcial };
+}
+
+/** Só o que mudou desde o último estado conhecido do servidor. */
+function montarPatch(atual: PromptsConfig, servidor: PromptsConfig): ConfigPatch {
+  const patch: ConfigPatch = {};
+  for (const chave of SAVE_KEYS) {
+    const valor = atual[chave];
+    if (valor === servidor[chave]) continue;
+    if (CHAVES_DE_API.includes(chave) && typeof valor === 'string') {
+      // Máscara não é chave; e campo em branco é "não mexi", nunca "apague a chave".
+      if (valor.trim() === '' || pareceMascara(valor)) continue;
+    }
+    copiarChave(patch, atual, chave);
+  }
+  return patch;
+}
+
+interface CampoChaveProps {
+  label: string;
+  /** O que o servidor tem hoje — já pode vir mascarado pela API. '' = nada configurado. */
+  valorServidor: string;
+  /** Rascunho local; só existe enquanto `editando`. */
+  rascunho: string;
+  editando: boolean;
+  placeholder: string;
+  /** Onde pegar a chave + de onde ela pode estar vindo. */
+  ajuda: ReactNode;
+  onEditar: () => void;
+  onCancelar: () => void;
+  onChange: (valor: string) => void;
+}
+
+/**
+ * Campo de chave de API que NUNCA reenvia o que ele mostra.
+ *
+ * Com a API mascarando (`sk-or-…ab12`), um input pré-preenchido mandaria a máscara de
+ * volta no primeiro Salvar e gravaria a máscara no lugar da chave. Então o estado normal
+ * aqui é leitura: "Chave configurada ••••ab12". Só quem clica em "Trocar chave" digita —
+ * e só o que for digitado sai daqui.
+ */
+function CampoChave({
+  label, valorServidor, rascunho, editando, placeholder, ajuda,
+  onEditar, onCancelar, onChange,
+}: CampoChaveProps) {
+  const [mostrando, setMostrando] = useState(false);
+  const configurada = valorServidor.trim() !== '';
+
+  return (
+    <div>
+      <span className="flex items-center gap-1.5 text-xs font-medium text-white/70 mb-1.5">
+        <Key size={12} />
+        {label}
+      </span>
+
+      {editando ? (
+        <>
+          <div className="flex gap-2">
+            <GlassInput
+              type={mostrando ? 'text' : 'password'}
+              placeholder={placeholder}
+              value={rascunho}
+              autoComplete="off"
+              spellCheck={false}
+              aria-label={`Nova ${label.toLowerCase()}`}
+              onChange={(e) => onChange(e.target.value)}
+              className="flex-1 font-mono"
+            />
+            <GlassButton variant="secondary" size="md" onClick={() => setMostrando((v) => !v)}>
+              {mostrando ? <EyeOff size={14} /> : <Eye size={14} />}
+              {mostrando ? 'Ocultar' : 'Mostrar'}
+            </GlassButton>
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+            <GlassButton variant="ghost" size="sm" onClick={onCancelar}>
+              <RotateCcw size={12} /> Cancelar
+            </GlassButton>
+            <span className="text-xs text-white/40">
+              {configurada && 'Em branco = mantém a chave de hoje. '}
+              A nova chave só vai pro servidor quando você salvar.
+            </span>
+          </div>
+        </>
+      ) : (
+        <div className="flex flex-wrap items-center gap-2">
+          {configurada ? (
+            <>
+              <GlassBadge tone="success" dot>Chave configurada</GlassBadge>
+              <code className="font-mono text-xs text-white/55">{mascarar(valorServidor)}</code>
+            </>
+          ) : (
+            <GlassBadge tone="warn">Nenhuma chave configurada</GlassBadge>
+          )}
+          <GlassButton variant="secondary" size="sm" onClick={onEditar}>
+            {configurada ? 'Trocar chave' : 'Definir chave'}
+          </GlassButton>
+        </div>
+      )}
+
+      <p className="text-xs text-white/40 mt-1.5">{ajuda}</p>
+    </div>
+  );
+}
+
 export default function PromptsPage() {
   const [config, setConfig] = useState<PromptsConfig>(DEFAULT_CFG);
   const [original, setOriginal] = useState<PromptsConfig>(DEFAULT_CFG);
   const [status, setStatus] = useState<Status>('idle');
   const [errorMsg, setErrorMsg] = useState('');
   const [customModel, setCustomModel] = useState('');
-  const [showKey, setShowKey] = useState(false);
   const [base, setBase] = useState<BasePrompts | null>(null);
   const [showSaraBase, setShowSaraBase] = useState(false);
   const [showAgentBase, setShowAgentBase] = useState(false);
   const [agentBaseTab, setAgentBaseTab] = useState<'quoting' | 'confirmation'>('quoting');
-  const [showTtsKey, setShowTtsKey] = useState(false);
   const [voices, setVoices] = useState<ElVoice[]>([]);
   const [loadingVoices, setLoadingVoices] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const [baseError, setBaseError] = useState('');
+  const [editandoLlmKey, setEditandoLlmKey] = useState(false);
+  const [editandoTtsKey, setEditandoTtsKey] = useState(false);
+  const [confirmarDesligar, setConfirmarDesligar] = useState(false);
+  /** Config vista no servidor depois que esta aba carregou — só pra AVISAR, nunca aplicar. */
+  const [remoto, setRemoto] = useState<PromptsConfig | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const manterLigadaRef = useRef<HTMLButtonElement | null>(null);
+  /** Quando ESTA aba escreveu pela última vez — descarta poll mais velho que a escrita. */
+  const ultimaEscrita = useRef(0);
+
+  /** O `customModel` só existe pra modelo fora da lista; derivar evita estado zumbi. */
+  const modeloForaDaLista = useCallback(
+    (modelo: string) => (MODELS.find((m) => m.value === modelo) ? '' : modelo),
+    [],
+  );
 
   useEffect(() => {
-    fetch(`${API}/admin/prompts`)
-      .then((r) => r.json())
-      .then((data: PromptsConfig) => {
+    let vivo = true;
+    (async () => {
+      try {
+        const res = await fetch(`${API}/admin/prompts`, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = comDefaults(await res.json());
+        if (!vivo) return;
         setConfig(data);
         setOriginal(data);
-        if (data.llm_model && !MODELS.find((m) => m.value === data.llm_model)) {
-          setCustomModel(data.llm_model);
-        }
-      })
-      .catch(() => {});
-    fetch(`${API}/admin/prompts/base`)
-      .then((r) => r.json())
-      .then((data: BasePrompts) => setBase(data))
-      .catch(() => {});
+        setCustomModel(modeloForaDaLista(data.llm_model));
+      } catch (err) {
+        // Carregou errado e a tela mostra os padrões: dizer isso é obrigatório — sem o
+        // aviso, o fundador leria "GPT-4.1 Mini" achando que é o que está em produção.
+        if (vivo) setLoadError(String(err));
+      }
+    })();
+    (async () => {
+      try {
+        const res = await fetch(`${API}/admin/prompts/base`, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as BasePrompts;
+        if (vivo) setBase(data);
+      } catch (err) {
+        if (vivo) setBaseError(`Não consegui carregar o prompt base (${String(err)}).`);
+      }
+    })();
+    return () => { vivo = false; };
+  }, [modeloForaDaLista]);
+
+  // Poll de 30 s só pra SABER que outra aba (ou o celular) mexeu na config. Nunca
+  // sobrescreve o que está sendo digitado aqui: quem decide adotar é o fundador, no
+  // banner. Resposta que começou antes da nossa última escrita é descartada — senão o
+  // aviso acusaria a mudança que nós mesmos acabamos de fazer.
+  useEffect(() => {
+    let vivo = true;
+    const id = setInterval(async () => {
+      const iniciadoEm = Date.now();
+      try {
+        const res = await fetch(`${API}/admin/prompts`, { cache: 'no-store' });
+        if (!res.ok) return;
+        const fresh = comDefaults(await res.json());
+        if (!vivo || iniciadoEm < ultimaEscrita.current) return;
+        setRemoto(fresh);
+      } catch {
+        // Sinal secundário: uma falha aqui não some com nada da tela, e os caminhos que
+        // importam (carregar e salvar) já falam quando quebram.
+      }
+    }, 30_000);
+    return () => { vivo = false; clearInterval(id); };
   }, []);
+
+  // Abriu a confirmação de desligar: o foco vai pro botão que NÃO faz nada. Quem
+  // chegou aqui por engano sai apertando Enter ou Esc.
+  useEffect(() => {
+    if (confirmarDesligar) manterLigadaRef.current?.focus();
+  }, [confirmarDesligar]);
 
   function copyBase(text: string) {
     navigator.clipboard?.writeText(text).catch(() => {});
   }
 
   const effectiveModel = customModel || config.llm_model;
-  const isDirty =
-    config.sara_suffix !== original.sara_suffix ||
-    config.agent_override !== original.agent_override ||
-    config.llm_api_key !== original.llm_api_key ||
-    effectiveModel !== original.llm_model ||
-    config.vision_model !== original.vision_model ||
-    config.audio_model !== original.audio_model ||
-    config.xarlote_enabled !== original.xarlote_enabled ||
-    config.tts_enabled !== original.tts_enabled ||
-    config.tts_api_key !== original.tts_api_key ||
-    config.tts_voice_id !== original.tts_voice_id ||
-    config.tts_model !== original.tts_model ||
-    config.tts_speed !== original.tts_speed;
+  const candidato: PromptsConfig = { ...config, llm_model: effectiveModel };
+  const patch = montarPatch(candidato, original);
+  const isDirty = Object.keys(patch).length > 0;
+
+  const divergentes = remoto
+    ? (Object.keys(KEY_LABELS) as (keyof PromptsConfig)[]).filter((k) => remoto[k] !== original[k])
+    : [];
 
   async function loadVoices() {
     setLoadingVoices(true);
@@ -226,10 +454,22 @@ export default function PromptsPage() {
   }
 
   const [toggleBusy, setToggleBusy] = useState(false);
-  async function handleToggleEnabled() {
+
+  /**
+   * Clique no interruptor mestre. Ligar é imediato; DESLIGAR passa por confirmação —
+   * é o clique que faz a Xarlote descartar mensagem de todo paciente, e até hoje um
+   * esbarrão no trackpad bastava.
+   */
+  function onClickMestre() {
     if (toggleBusy) return;
-    const next = !config.xarlote_enabled;
+    if (config.xarlote_enabled) setConfirmarDesligar(true);
+    else void handleToggleEnabled(true);
+  }
+
+  async function handleToggleEnabled(next: boolean) {
+    if (toggleBusy) return;
     setToggleBusy(true);
+    setConfirmarDesligar(false);
     setConfig((c) => ({ ...c, xarlote_enabled: next }));
     try {
       const res = await fetch(`${API}/admin/prompts`, {
@@ -237,10 +477,12 @@ export default function PromptsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ xarlote_enabled: next }),
       });
+      ultimaEscrita.current = Date.now();
       if (!res.ok) throw new Error(await res.text());
-      const saved: PromptsConfig = await res.json();
+      const saved = comDefaults(await res.json());
       setOriginal((o) => ({ ...o, xarlote_enabled: saved.xarlote_enabled }));
       setConfig((c) => ({ ...c, xarlote_enabled: saved.xarlote_enabled }));
+      setRemoto(null);
     } catch (err) {
       setConfig((c) => ({ ...c, xarlote_enabled: !next }));
       setErrorMsg(`Falha ao alternar interruptor: ${String(err)}`);
@@ -262,10 +504,12 @@ export default function PromptsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ [key]: next }),
       });
+      ultimaEscrita.current = Date.now();
       if (!res.ok) throw new Error(await res.text());
-      const saved: PromptsConfig = await res.json();
+      const saved = comDefaults(await res.json());
       setOriginal((o) => ({ ...o, [key]: saved[key] }));
       setConfig((c) => ({ ...c, [key]: saved[key] }));
+      setRemoto(null);
     } catch (err) {
       setConfig((c) => ({ ...c, [key]: !next })); // rollback
       setErrorMsg(`Falha ao alternar ${key}: ${String(err)}`);
@@ -276,30 +520,28 @@ export default function PromptsPage() {
   }
 
   async function handleSave() {
+    // Só o que mudou. O que não está no corpo o servidor não toca — é assim que um
+    // Salvar às 15h para de religar o que outra aba desligou às 14h.
+    if (Object.keys(patch).length === 0) return;
     setStatus('saving');
     setErrorMsg('');
     try {
-      const payload = {
-        ...config,
-        llm_model: effectiveModel,
-        vision_model: config.vision_model,
-        audio_model: config.audio_model,
-        tts_enabled: config.tts_enabled,
-        tts_api_key: config.tts_api_key,
-        tts_voice_id: config.tts_voice_id,
-        tts_model: config.tts_model,
-        tts_speed: config.tts_speed,
-      };
       const res = await fetch(`${API}/admin/prompts`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(patch),
       });
+      ultimaEscrita.current = Date.now();
       if (!res.ok) throw new Error(await res.text());
-      const saved: PromptsConfig = await res.json();
+      // A resposta vira a nova base do diff — sem isso o próximo Salvar reenviaria o
+      // que acabou de ser gravado (e a máscara da chave voltaria como se fosse edição).
+      const saved = comDefaults(await res.json());
       setConfig(saved);
       setOriginal(saved);
-      setCustomModel('');
+      setRemoto(null);
+      setCustomModel(modeloForaDaLista(saved.llm_model));
+      setEditandoLlmKey(false);
+      setEditandoTtsKey(false);
       setStatus('saved');
       if (savedTimer.current) clearTimeout(savedTimer.current);
       savedTimer.current = setTimeout(() => setStatus('idle'), 3000);
@@ -311,9 +553,36 @@ export default function PromptsPage() {
 
   function handleReset() {
     setConfig(original);
-    setCustomModel('');
+    setCustomModel(modeloForaDaLista(original.llm_model));
+    setEditandoLlmKey(false);
+    setEditandoTtsKey(false);
     setStatus('idle');
     setErrorMsg('');
+  }
+
+  /** Adota o que o servidor tem agora, PRESERVANDO o que já foi mexido nesta aba. */
+  function adotarDoServidor() {
+    if (!remoto) return;
+    // `patch` é exatamente o que esta aba mexeu e ainda não salvou.
+    const mesclado: PromptsConfig = { ...remoto, ...patch };
+    setConfig(mesclado);
+    setOriginal(remoto);
+    setCustomModel(modeloForaDaLista(mesclado.llm_model));
+    setRemoto(null);
+  }
+
+  function editarChave(campo: 'llm_api_key' | 'tts_api_key') {
+    // Abre o campo VAZIO: o que está no servidor pode já ser uma máscara, e máscara
+    // digitada de volta viraria a "chave" gravada.
+    setConfig((c) => ({ ...c, [campo]: '' }));
+    if (campo === 'llm_api_key') setEditandoLlmKey(true);
+    else setEditandoTtsKey(true);
+  }
+
+  function cancelarChave(campo: 'llm_api_key' | 'tts_api_key') {
+    setConfig((c) => ({ ...c, [campo]: original[campo] }));
+    if (campo === 'llm_api_key') setEditandoLlmKey(false);
+    else setEditandoTtsKey(false);
   }
 
   return (
@@ -324,6 +593,54 @@ export default function PromptsPage() {
         subtitle="Tudo entra em vigor na próxima mensagem, sem reiniciar"
         size="lg"
       />
+
+      {loadError && (
+        <GlassCard className="border-rose-400/30 p-4">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle size={16} className="mt-0.5 shrink-0 text-rose-300" />
+            <p className="text-sm text-rose-200/90">
+              Não consegui carregar a configuração ({loadError}). O que está na tela são os
+              valores padrão, <strong>não</strong> os de produção — recarregue a página antes
+              de mexer em qualquer coisa.
+            </p>
+          </div>
+        </GlassCard>
+      )}
+
+      {/* Mudou em outro lugar — avisa, mostra o quê, e só troca se o fundador mandar. */}
+      <AnimatePresence>
+        {divergentes.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+          >
+            <GlassCard className="border-amber-400/30 p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <AlertTriangle size={16} className="mt-0.5 shrink-0 text-amber-300" />
+                  <div className="min-w-0">
+                    <p className="text-sm text-amber-100/90">
+                      A configuração mudou em outro lugar (outra aba, o celular ou uma env).
+                    </p>
+                    <p className="mt-1 text-xs text-white/55">
+                      {divergentes.map((k) => KEY_LABELS[k]).join(' · ')}
+                    </p>
+                  </div>
+                </div>
+                <GlassButton variant="secondary" size="sm" onClick={adotarDoServidor}>
+                  <RefreshCw size={12} /> Trazer o que está no servidor
+                </GlassButton>
+              </div>
+              {isDirty && (
+                <p className="mt-2 text-xs text-white/45">
+                  O que você já mexeu nesta aba fica como está — só o resto é atualizado.
+                </p>
+              )}
+            </GlassCard>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Master switch — hero card */}
       <motion.div
@@ -377,8 +694,9 @@ export default function PromptsPage() {
               type="button"
               role="switch"
               aria-checked={config.xarlote_enabled}
+              aria-label="Ligar ou desligar a Xarlote"
               disabled={toggleBusy}
-              onClick={handleToggleEnabled}
+              onClick={onClickMestre}
               className={cn(
                 'relative inline-flex h-8 w-14 shrink-0 cursor-pointer rounded-full transition-colors',
                 'focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-ink-base',
@@ -460,36 +778,33 @@ export default function PromptsPage() {
         />
 
         <div className="mt-5 grid gap-4">
-          <div>
-            <label className="flex items-center gap-1.5 text-xs font-medium text-white/70 mb-1.5">
-              <Key size={12} />
-              API Key (OpenRouter)
-            </label>
-            <div className="flex gap-2">
-              <GlassInput
-                type={showKey ? 'text' : 'password'}
-                placeholder="sk-or-v1-…"
-                value={config.llm_api_key}
-                onChange={(e) => setConfig((c) => ({ ...c, llm_api_key: e.target.value }))}
-                className="flex-1 font-mono"
-              />
-              <GlassButton variant="secondary" size="md" onClick={() => setShowKey((v) => !v)}>
-                {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
-                {showKey ? 'Ocultar' : 'Mostrar'}
-              </GlassButton>
-            </div>
-            <p className="text-xs text-white/40 mt-1.5">
-              Pegue em{' '}
-              <a
-                href="https://openrouter.ai/keys"
-                target="_blank"
-                rel="noreferrer"
-                className="text-accent-hi hover:underline"
-              >
-                openrouter.ai/keys
-              </a>
-            </p>
-          </div>
+          <CampoChave
+            label="API Key (OpenRouter)"
+            valorServidor={original.llm_api_key}
+            rascunho={config.llm_api_key}
+            editando={editandoLlmKey}
+            placeholder="sk-or-v1-…"
+            onEditar={() => editarChave('llm_api_key')}
+            onCancelar={() => cancelarChave('llm_api_key')}
+            onChange={(v) => setConfig((c) => ({ ...c, llm_api_key: v }))}
+            ajuda={
+              <>
+                Pegue em{' '}
+                <a
+                  href="https://openrouter.ai/keys"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-accent-hi hover:underline"
+                >
+                  openrouter.ai/keys
+                </a>
+                {'. '}
+                {original.llm_api_key.trim() === ''
+                  ? 'Sem chave aqui, a Xarlote usa a OPENROUTER_API_KEY do servidor, se existir.'
+                  : 'A API não diz se ela veio daqui ou da OPENROUTER_API_KEY do servidor — o valor mostrado é o que está valendo.'}
+              </>
+            }
+          />
 
           <div>
             <label className="block text-xs font-medium text-white/70 mb-1.5">Modelo</label>
@@ -617,6 +932,7 @@ export default function PromptsPage() {
             type="button"
             role="switch"
             aria-checked={config.tts_enabled}
+            aria-label="Ativar a voz da Xarlote"
             onClick={() => setConfig((c) => ({ ...c, tts_enabled: !c.tts_enabled }))}
             className={cn(
               'relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full transition-colors mt-1',
@@ -636,36 +952,33 @@ export default function PromptsPage() {
         </div>
 
         <div className="mt-5 grid gap-4">
-          <div>
-            <label className="flex items-center gap-1.5 text-xs font-medium text-white/70 mb-1.5">
-              <Key size={12} />
-              API Key (ElevenLabs)
-            </label>
-            <div className="flex gap-2">
-              <GlassInput
-                type={showTtsKey ? 'text' : 'password'}
-                placeholder="sk_…"
-                value={config.tts_api_key}
-                onChange={(e) => setConfig((c) => ({ ...c, tts_api_key: e.target.value }))}
-                className="flex-1 font-mono"
-              />
-              <GlassButton variant="secondary" size="md" onClick={() => setShowTtsKey((v) => !v)}>
-                {showTtsKey ? <EyeOff size={14} /> : <Eye size={14} />}
-                {showTtsKey ? 'Ocultar' : 'Mostrar'}
-              </GlassButton>
-            </div>
-            <p className="text-xs text-white/40 mt-1.5">
-              Pegue em{' '}
-              <a
-                href="https://elevenlabs.io/app/settings/api-keys"
-                target="_blank"
-                rel="noreferrer"
-                className="text-accent-hi hover:underline"
-              >
-                elevenlabs.io/settings/api-keys
-              </a>
-            </p>
-          </div>
+          <CampoChave
+            label="API Key (ElevenLabs)"
+            valorServidor={original.tts_api_key}
+            rascunho={config.tts_api_key}
+            editando={editandoTtsKey}
+            placeholder="sk_…"
+            onEditar={() => editarChave('tts_api_key')}
+            onCancelar={() => cancelarChave('tts_api_key')}
+            onChange={(v) => setConfig((c) => ({ ...c, tts_api_key: v }))}
+            ajuda={
+              <>
+                Pegue em{' '}
+                <a
+                  href="https://elevenlabs.io/app/settings/api-keys"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-accent-hi hover:underline"
+                >
+                  elevenlabs.io/settings/api-keys
+                </a>
+                {'. '}
+                {original.tts_api_key.trim() === ''
+                  ? 'Sem chave aqui, a Xarlote usa a ELEVENLABS_API_KEY do servidor, se existir.'
+                  : 'A API não diz se ela veio daqui ou da ELEVENLABS_API_KEY do servidor — o valor mostrado é o que está valendo.'}
+              </>
+            }
+          />
 
           <div>
             <div className="flex items-center justify-between mb-1.5">
@@ -852,7 +1165,7 @@ export default function PromptsPage() {
                 transition={{ duration: 0.25 }}
                 className="text-xs text-white/55 p-3 max-h-80 overflow-auto whitespace-pre-wrap font-mono"
               >
-                {base?.sara ?? 'Carregando…'}
+                {base?.sara ?? (baseError || 'Carregando…')}
               </motion.pre>
             )}
           </AnimatePresence>
@@ -935,7 +1248,9 @@ export default function PromptsPage() {
                 transition={{ duration: 0.25 }}
                 className="text-xs text-white/55 p-3 max-h-80 overflow-auto whitespace-pre-wrap font-mono"
               >
-                {base ? (agentBaseTab === 'quoting' ? base.agent_quoting : base.agent_confirmation) : 'Carregando…'}
+                {base
+                  ? (agentBaseTab === 'quoting' ? base.agent_quoting : base.agent_confirmation)
+                  : (baseError || 'Carregando…')}
               </motion.pre>
             )}
           </AnimatePresence>
@@ -1004,6 +1319,56 @@ export default function PromptsPage() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Confirmação — só no sentido perigoso (ligado → desligado). */}
+      <Drawer
+        open={confirmarDesligar}
+        onClose={() => setConfirmarDesligar(false)}
+        width="w-full max-w-sm"
+      >
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="confirmar-desligar-titulo"
+          className="flex h-full flex-col p-6"
+        >
+          <div className="flex h-11 w-11 items-center justify-center rounded-2xl border border-rose-400/30 bg-rose-400/15 text-rose-300">
+            <Power size={18} />
+          </div>
+          <h2 id="confirmar-desligar-titulo" className="mt-4 text-lg font-semibold text-white">
+            Desligar a Xarlote?
+          </h2>
+          <p className="mt-2 text-sm leading-relaxed text-white/65">
+            Enquanto ela estiver desligada, as mensagens que os pacientes mandarem no WhatsApp
+            são <strong className="text-white">descartadas</strong> — ninguém recebe resposta até
+            o interruptor voltar.
+          </p>
+          <p className="mt-2 text-xs leading-relaxed text-white/45">
+            Pra pausar só uma parte (lembretes, farmácias, clínicas), use os interruptores de
+            fluxo em vez deste.
+          </p>
+
+          <div className="mt-auto flex flex-col gap-2 pt-6">
+            <GlassButton
+              ref={manterLigadaRef}
+              variant="secondary"
+              size="lg"
+              onClick={() => setConfirmarDesligar(false)}
+            >
+              Manter ligada
+            </GlassButton>
+            <GlassButton
+              variant="danger"
+              size="lg"
+              disabled={toggleBusy}
+              onClick={() => void handleToggleEnabled(false)}
+            >
+              <Power size={15} />
+              {toggleBusy ? 'Desligando…' : 'Desligar mesmo assim'}
+            </GlassButton>
+          </div>
+        </div>
+      </Drawer>
     </div>
   );
 }

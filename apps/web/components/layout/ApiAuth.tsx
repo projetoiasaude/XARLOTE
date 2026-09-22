@@ -2,10 +2,15 @@
 import { useEffect } from 'react';
 
 const API = process.env['NEXT_PUBLIC_API_URL'] ?? 'http://localhost:3001';
-// Em deploy público (app do cliente) usa-se o APP token (escopo só /app).
-// Em dev/local usa-se o ADMIN token (abre /admin do dashboard também).
-const TOKEN =
-  process.env['NEXT_PUBLIC_APP_API_TOKEN'] ?? process.env['NEXT_PUBLIC_ADMIN_API_TOKEN'] ?? '';
+// SÓ o token de APP (escopo /app), nunca o de admin.
+//
+// O fallback pro `NEXT_PUBLIC_ADMIN_API_TOKEN` saiu em 22/09/2026: qualquer
+// `NEXT_PUBLIC_*` citado num componente de cliente é embutido no bundle que vai pro
+// navegador de qualquer visitante — bastava um build sem o token de app pra publicar o
+// token de ADMIN (que abre `/admin/*` inteiro) em JS público. Um deploy com a env errada
+// não pode ter esse preço. Em dev, defina `NEXT_PUBLIC_APP_API_TOKEN` no
+// `apps/web/.env.local` se for reabrir o `/app` (ver `NEXT_PUBLIC_APP_WEB_ENABLED`).
+const TOKEN = process.env['NEXT_PUBLIC_APP_API_TOKEN'] ?? '';
 
 /**
  * Injeta o header `x-admin-token` em TODA chamada fetch destinada à API
@@ -13,9 +18,10 @@ const TOKEN =
  * passam intactas). Cobre as dezenas de `fetch` espalhados pelo dashboard sem
  * precisar reescrever cada call site.
  *
- * O token vem de NEXT_PUBLIC_ADMIN_API_TOKEN (embutido no bundle). Como o
- * dashboard é uma ferramenta local/interna, isso é aceitável pra F0 — a defesa
- * real é o servidor exigir o token. F1 troca por Supabase Auth + RBAC.
+ * Só é montado pelo layout do `/app` (hoje fechado pelo middleware). O token vem de
+ * NEXT_PUBLIC_APP_API_TOKEN, que é público por natureza — a defesa real é o servidor
+ * exigir o token e o escopo dele ser só `/app`. O cutover pra API autenticada (OTP +
+ * JWT, como no app nativo) aposenta este arquivo.
  */
 export function ApiAuth() {
   useEffect(() => {
