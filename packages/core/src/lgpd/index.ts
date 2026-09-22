@@ -1,4 +1,4 @@
-import { CONSENT_ACCEPTED_PATTERNS, FORGET_ME_PATTERNS, LGPD_POLICY_VERSION } from '@iasaude/shared';
+import { CONSENT_ACCEPTED_PATTERNS, LGPD_POLICY_VERSION, pediuEsquecimento } from '@iasaude/shared';
 
 export function isConsentAccepted(text: string): boolean {
   const raw = text.trim();
@@ -10,8 +10,13 @@ export function isConsentAccepted(text: string): boolean {
   return CONSENT_ACCEPTED_PATTERNS.some((p) => candidates.some((c) => p.test(c)));
 }
 
+/**
+ * @deprecated Use `decidirEsquecimento` (@iasaude/shared) — ela também sabe CONFIRMAR,
+ * que é a metade perigosa. Esta função só responde "a pessoa pediu?" e sobrevive pelos
+ * chamadores antigos.
+ */
 export function isForgetMeRequest(text: string): boolean {
-  return FORGET_ME_PATTERNS.some((p) => p.test(text));
+  return pediuEsquecimento(text);
 }
 
 export function buildConsentEvent(userId: string, messageId: string, evidenceText: string) {

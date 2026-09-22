@@ -19,8 +19,16 @@ import { Queue, Worker, type Job } from 'bullmq';
 import { sendText, sendAudio, sendMenu, sendTemplate, sendImage } from '@iasaude/whatsapp';
 import { writeLog, db } from '@iasaude/db';
 import { AGENT_INSTANCE, QUEUE_NAMES, isPlaceholderPhone } from '@iasaude/shared';
-import { getRedisConnection, getRedisClient } from '../queue-config.js';
+import { getRedisConnection, getProducerConnection, getRedisClient } from '../queue-config.js';
 import { quemFicouSemReceber } from '../config/template-registry.js';
+
+/**
+ * Prioridades da fila de saída. BullMQ trata MENOR como mais urgente, e faz FIFO
+ * dentro da mesma prioridade — então todo job leva uma prioridade EXPLÍCITA: misturar
+ * jobs com e sem prioridade deixa a ordem dependendo de detalhe interno do BullMQ.
+ */
+export const PRIORIDADE_EMERGENCIA = 1;
+export const PRIORIDADE_NORMAL = 5;
 
 export interface OutboundJob {
   kind: 'text' | 'audio' | 'menu' | 'template' | 'image';
@@ -47,6 +55,15 @@ export interface OutboundJob {
    */
   templateCopyCode?: string;
   /**
+   * Prioridade na fila (BullMQ: MENOR sai primeiro). Ver PRIORIDADE_*.
+   *
+   * Existe por um motivo concreto: a fila é FIFO com 1 msg/1,2s por número. Às 8h, a
+   * resposta a quem escreveu entra atrás de TODOS os lembretes do tick — e um aviso de
+   * emergência esperava a mesma fila. Emergência passa na frente; o resto mantém a
+   * ordem de chegada.
+   */
+  priority?: number;
+  /**
    * Token único do ENFILEIRAMENTO (idempotência de envio — ver sendDedupKey). Preenchido
    * automaticamente pelo `dispatchOutbound`; os callers não passam.
    */
@@ -57,6 +74,12 @@ export interface OutboundJob {
 }
 
 const connection = getRedisConnection();
+/**
+ * O PRODUTOR tem conexão própria, sem offline-queue (ver `getProducerConnection`): é o
+ * que impede o `add` fantasma — aquele que estourava o timeout de 2s, o fallback mandava
+ * direto, e minutos depois ele criava o job que saía DE NOVO pelo worker.
+ */
+const producerConnection = getProducerConnection();
 
 function queueNameFor(instance: string): string {
   return instance === AGENT_INSTANCE ? QUEUE_NAMES.OUTBOUND_AGENT : QUEUE_NAMES.OUTBOUND_SARA;
@@ -69,7 +92,7 @@ function queueFor(instance: string): Queue {
   let q = queues.get(name);
   if (!q) {
     q = new Queue(name, {
-      connection,
+      connection: producerConnection,
       defaultJobOptions: {
         attempts: 5,
         backoff: { type: 'exponential', delay: 2000 },
@@ -240,9 +263,17 @@ async function rawSend(job: OutboundJob): Promise<SendOutcome> {
   } catch (err) {
     // Só devolve a reivindicação quando o erro PROVA que nada saiu (ver provesNothingWasSent).
     // Um timeout NÃO prova: é o clássico "entregou e a resposta HTTP não voltou" — soltar a
-    // trava ali faria o BullMQ (attempts:5) reenviar e o paciente receber 2×, reabrindo
-    // justamente o incidente de 27/07 que a trava existe pra impedir.
-    if (provesNothingWasSent(err)) await releaseSend(job);
+    // trava SEMPRE faria o BullMQ (attempts:5) reenviar e o paciente receber 2×, reabrindo
+    // justamente o incidente de 27/07 que a trava existe pra impedir. Mas nunca soltar é
+    // perda garantida: no ambíguo vale UM resgate (ver `podeTentarDeNovo`).
+    if (provesNothingWasSent(err)) {
+      await releaseSend(job);
+    } else if (await podeTentarDeNovo(job)) {
+      await releaseSend(job);
+      await writeLog('warn', 'outbound', `Envio ambíguo (${String(err).slice(0, 80)}) — liberando UM resgate; se falhar de novo vira falha visível`, {
+        traceId: job.traceId, instance: job.instance, kind: job.kind, messageId: job.messageId,
+      });
+    }
     throw err;
   }
 }
@@ -256,14 +287,55 @@ async function rawSend(job: OutboundJob): Promise<SendOutcome> {
  * trava livre. 5xx e ausência de resposta ficam ambíguos e mantêm a trava (não duplicar
  * vale mais que retentar, e o job vai pra 'failed' com carimbo — falha visível, não silenciosa).
  */
-function provesNothingWasSent(err: unknown): boolean {
+export function provesNothingWasSent(err: unknown): boolean {
   const m = String((err as Error)?.message ?? err);
+  // O código vem do FORMATO, não de qualquer 4xx no texto: o corpo do erro costuma ecoar
+  // o payload e um `HTTP 500: {"detail":"status code 400 …"}` seria lido como recusa —
+  // ou seja, um erro ambíguo (que pode ter entregue) viraria "nada saiu" e reenviaria.
   // zpro: "zpro /url HTTP 400: …" · uazapi (axios cru): "Request failed with status code 400"
-  if (/\bHTTP 4\d\d\b/.test(m) || /status code 4\d\d/i.test(m)) return true;
+  const status =
+    /\bHTTP (\d{3})\b/.exec(m)?.[1] ?? /Request failed with status code (\d{3})/i.exec(m)?.[1];
+  if (status) return status.startsWith('4');
   // zpro responde 200 com {success:false} quando RECUSA (ex.: ERR_CHANNEL_NOT_SUPPORTED no
   // /voice). É recusa explícita do provedor: nada saiu, e a retentativa precisa da trava livre.
   if (/success=false/.test(m)) return true;
+  // Falha de CONEXÃO: o request não chegou a ser feito. Isto também é prova (22/09) — e
+  // ficava de fora, então uma queda de rede de 2s consumia a trava e a retentativa era
+  // barrada como "duplicada", perdendo a mensagem em silêncio.
+  if (/\b(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|ECONNRESET)\b/.test(m)) return true;
+  if (/getaddrinfo|Client network socket disconnected/i.test(m)) return true;
   return false;
+}
+
+/**
+ * O envio AMBÍGUO (5xx, timeout) merece UMA segunda chance — e só uma.
+ *
+ * Trade-off escrito para não se perder: `claimSend` mantém a trava quando o erro não
+ * prova nada, e a retentativa do BullMQ era barrada como "duplicada", o job COMPLETAVA
+ * sem carimbo e a mensagem sumia em silêncio (lembrete de remédio inclusive). Soltar a
+ * trava sempre reabriria a duplicação de 27/07; nunca soltar é perda garantida.
+ *
+ * Um resgate por mensagem limita o pior caso a 2 envios (caso raro em que o zpro
+ * entregou E respondeu 5xx) e elimina a perda no caso comum (5xx = não entregou).
+ * Redis fora → `false`: sem contador não há limite, e aí não se arrisca.
+ *
+ * Quando o zpro confirmar que deduplica por `externalKey`, isto vira desnecessário:
+ * a retentativa passa a ser segura por construção.
+ */
+async function podeTentarDeNovo(job: OutboundJob): Promise<boolean> {
+  const alvo = job.messageId ?? job.sendToken;
+  if (!alvo) return false;
+  const key = `outbound:resgate:${alvo}`;
+  try {
+    const redis = getRedisClient();
+    // SET NX antes do INCR: garante o TTL uma única vez (INCR sozinho pode deixar
+    // chave eterna se o EXPIRE falhar no meio).
+    await redis.set(key, '0', 'EX', SEND_DEDUP_TTL_S, 'NX');
+    const n = await redis.incr(key);
+    return n === 1;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -485,7 +557,15 @@ export async function dispatchOutbound(job: OutboundJob): Promise<void> {
     // que não tem rate-limit. Mas as 3 piscadas foram TRANSITÓRIAS (segundos) — uma
     // 2ª tentativa cobre a maioria delas e mantém o envio dentro da fila, que é onde
     // mora a proteção anti-ban. Só o que falha DUAS vezes vira envio direto.
-    await withQueueRetry(() => queueFor(job.instance).add('send', job));
+    await withQueueRetry(() =>
+      queueFor(job.instance).add('send', job, {
+        priority: job.priority ?? PRIORIDADE_NORMAL,
+        // `jobId` pelo token de envio: as DUAS tentativas do withQueueRetry viram UM job.
+        // Sem isto, um `add` que "estourou o timeout" mas chegou no Redis depois gerava um
+        // segundo job — e o segundo saía por um worker onde a trava local não existe.
+        jobId: job.sendToken,
+      }),
+    );
   } catch (err) {
     await writeLog('warn', 'outbound', `Fila indisponível — enviando direto (fallback): ${String(err).slice(0, 160)}`, {
       traceId: job.traceId, instance: job.instance, kind: job.kind,
@@ -500,6 +580,10 @@ export async function dispatchOutbound(job: OutboundJob): Promise<void> {
       const outcome = await rawSend(job);
       if (outcome === 'sent') await stampDelivery(job.messageId, 'delivered');
       else if (outcome === 'not-sent') await stampDelivery(job.messageId, 'failed');
+      // Mesmo buraco do worker, no caminho do fallback: 'duplicate' sem prova de entrega
+      // não pode terminar em silêncio. Aqui não há retry do BullMQ, então o throw vira
+      // o `catch` abaixo — que carimba `failed` e loga como erro.
+      else await conferirDuplicado(job);
     } catch (e2) {
       await stampDelivery(job.messageId, 'failed');
       await writeLog('error', 'outbound', `Envio direto (fallback) falhou: ${String(e2).slice(0, 200)}`, {
@@ -527,6 +611,7 @@ export function startOutboundWorkers(): void {
         const outcome = await rawSend(job.data);
         if (outcome === 'sent') await stampDelivery(job.data.messageId, 'delivered');
         else if (outcome === 'not-sent') await stampDelivery(job.data.messageId, 'failed');
+        else await conferirDuplicado(job.data);
       },
       { connection, concurrency: 1, limiter: { max, duration } },
     );
@@ -542,6 +627,44 @@ export function startOutboundWorkers(): void {
     });
     outboundWorkers.push(worker);
   }
+}
+
+/**
+ * `duplicate` SÓ é desfecho bom quando existe prova de que o envio original saiu.
+ *
+ * Era aqui que a mensagem sumia (auditoria 22/09): o job completava calado, o
+ * `delivery_status` ficava `queued` para sempre e o detector de falhas — que só conta
+ * `level=error` — não via nada. Dez minutos de zpro instável perdiam tudo, com o
+ * dashboard dizendo "entregue" nos lembretes (que carimbavam otimista).
+ *
+ * Com prova de entrega: silêncio, que é o certo. Sem prova: LANÇA, e a retentativa do
+ * BullMQ vira uma verificação barata (o envio original pode terminar no meio-tempo). Se
+ * nenhuma delas encontrar prova, o job termina em `failed` pelo caminho terminal que já
+ * existe — carimbando `failed` e logando `error`, que é o que acorda o alerta.
+ */
+async function conferirDuplicado(job: OutboundJob): Promise<void> {
+  if (!job.messageId) {
+    await writeLog('warn', 'outbound', 'envio barrado como duplicado, sem espelho pra conferir', {
+      traceId: job.traceId, instance: job.instance, kind: job.kind,
+    });
+    return;
+  }
+  const { data, error } = await db
+    .from('messages')
+    .select('delivery_status')
+    .eq('id', job.messageId)
+    .maybeSingle();
+
+  // Sem conseguir ler o espelho não dá pra afirmar perda: relança pra tentar de novo.
+  if (error) throw new Error(`não consegui conferir a entrega do duplicado: ${error.message}`);
+
+  const status = (data?.delivery_status as string | null) ?? null;
+  if (status === 'delivered') return; // o envio original entregou — duplicata de verdade
+
+  throw new Error(
+    `envio reivindicado mas SEM prova de entrega (delivery_status=${status ?? 'null'}) — ` +
+    'tratando como não entregue em vez de completar em silêncio',
+  );
 }
 
 /** Fecha workers e filas outbound graciosamente (graceful shutdown F1.A5). */

@@ -85,8 +85,25 @@ export async function getConversationMessages(
 
 export async function insertMessage(msg: Omit<Message, 'id' | 'created_at'>): Promise<Message> {
   const { data, error } = await db.from('messages').insert(msg).select().single();
-  if (error) throw error;
-  return data;
+  if (!error) return data;
+
+  /**
+   * 23505 = a mensagem JÁ ESTÁ gravada (índice único por `external_id`).
+   *
+   * Isso não é falha: é a idempotência funcionando. Lançar aqui fazia o RETRY nascer
+   * morto — o job `app-inbound` tem `attempts: 3`, e as tentativas 2 e 3 morriam SEMPRE
+   * no insert, sem nunca chegar a responder ao paciente (auditoria 22/09). Devolver a
+   * linha existente deixa a retentativa RETOMAR o turno, que é o ponto de ter retry.
+   */
+  if (error.code === '23505' && msg.external_id) {
+    const { data: existente } = await db
+      .from('messages')
+      .select('*')
+      .eq('external_id', msg.external_id)
+      .maybeSingle();
+    if (existente) return existente as Message;
+  }
+  throw error;
 }
 
 // ─── Orders ─────────────────────────────────────────────────────────────────

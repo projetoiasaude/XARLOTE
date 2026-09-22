@@ -35,6 +35,7 @@ export function startAccountForgetWorker(): void {
       const relatorio = await executeForgetMe(job.data.userId, {
         traceId: job.data.traceId,
         canal: job.data.canal,
+        ...(job.data.phoneE164 ? { telefoneOriginal: job.data.phoneE164 } : {}),
         ...(job.data.conversationId ? { conversationId: job.data.conversationId } : {}),
       });
       // Sem PII: contagens. O relatório completo já foi ao audit_log pelo executor.

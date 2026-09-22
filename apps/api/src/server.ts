@@ -10,12 +10,14 @@ import { webhookZproRoute } from './routes/webhook.zpro.js';
 import { adminRoute } from './routes/admin.js';
 import { appRoute } from './routes/app.js';
 import { appPatientRoutes } from './routes/app/index.js';
+import { encerrarStreamsAbertos } from './routes/app/stream.js';
 import { sharePublicRoutes } from './routes/share-public.js';
 import { startAllWorkers } from './workers/start-all.js';
 import { closeOutbound } from './queues/outbound.queue.js';
 import { flushSupplierTurnBuffer } from './handlers/inbound-supplier.js';
-import { installShutdownHandlers, onShutdown } from './lifecycle.js';
+import { installShutdownHandlers, instalarRedeDeSegurancaDoProcesso, onShutdown, drenarEmVoo, quantosEmVoo } from './lifecycle.js';
 import { closeRedisClient } from './queue-config.js';
+import { iniciarSincronizacaoDeConfig, pararSincronizacaoDeConfig } from './config/prompts.js';
 import { initSentry, captureError, closeSentry } from './observability/sentry.js';
 
 /**
@@ -133,8 +135,28 @@ async function main() {
     app.register(webhookRoute, { prefix: '/webhook' });
     app.register(webhookZproRoute, { prefix: '/webhook' });
     app.register(adminRoute, { prefix: '/admin' });
-    // Rotas do Xarlote App (cliente final) — ativas também em produção.
-    app.register(appRoute, { prefix: '/app' });
+    /**
+     * ⚠️ ROTAS LEGADAS DO APP — DESLIGADAS EM PRODUÇÃO desde 22/09/2026.
+     *
+     * Elas identificam a pessoa pelo TELEFONE DO BODY, protegidas só por um token que
+     * vive no bundle público do web. Quem soubesse um número lia o prontuário inteiro
+     * (`POST /app/overview`) e ainda fazia a Xarlote responder no WhatsApp do titular
+     * (`POST /app/inbound`) — digitar um número nunca foi prova de posse dele.
+     *
+     * O app nativo (OTP + JWT, `routes/app/*`) cobre o mesmo caso de uso, e o `/app` do
+     * web foi fechado no mesmo dia. Em dev seguem ligadas; em produção, só com
+     * `LEGACY_APP_ROUTES=on` — o mesmo minuto de reversão que o web tem.
+     */
+    const legadoDoApp =
+      process.env['LEGACY_APP_ROUTES'] === 'on' || process.env['NODE_ENV'] !== 'production';
+    if (legadoDoApp) {
+      app.register(appRoute, { prefix: '/app' });
+      if (process.env['NODE_ENV'] === 'production') {
+        app.log.warn('⚠️  Rotas LEGADAS do app ativas em produção (LEGACY_APP_ROUTES=on) — auth por telefone no body.');
+      }
+    } else {
+      app.log.info('Rotas legadas do app: OFF (auth por telefone). App nativo usa /app/* com JWT.');
+    }
     // Rotas NOVAS do app (auth OTP + JWT de paciente) — convivem com as legadas
     // até o cutover do web (F5); depois o legado morre junto com as anon_read_*.
     app.register(appPatientRoutes, { prefix: '/app' });
@@ -154,7 +176,12 @@ async function main() {
     // Graceful shutdown (F1.A5): Railway manda SIGTERM em todo redeploy.
     // Ordem: HTTP primeiro (para de aceitar + drena in-flight) → workers (crons +
     // enricher, registrados dentro de startAllWorkers) → outbound → Redis → Sentry.
+    // SSE (`GET /app/stream`) é conexão ATIVA, não ociosa: sem fechá-la antes, o
+    // `app.close()` esperava o timeout duro, saía com exit(1) e os disposers seguintes
+    // (flush de fornecedor, filas) NUNCA rodavam.
+    onShutdown('conexões SSE do app', () => encerrarStreamsAbertos());
     onShutdown('http server (drena in-flight)', () => app.close());
+
 
     // Flush do debounce de fornecedor: processa rajadas na janela de 8s que morreriam com o
     // SIGTERM (msg persistida mas turno nunca rodado). Depois do http (sem webhook novo) e
@@ -164,6 +191,21 @@ async function main() {
       onShutdown('flush debounce de fornecedor', () => flushSupplierTurnBuffer());
     }
 
+    // Turnos (paciente e fornecedor) que rodam FORA do request: o webhook já respondeu
+    // 200, então o `app.close()` não os esperava e todo deploy matava turno no meio.
+    //
+    // ⚠️ DEPOIS do flush de fornecedor de propósito: o flush DISPARA turnos novos (a
+    // rajada que estava em debounce). Drenar antes dele deixaria justamente esses
+    // morrendo. Orçamento: 8s aqui + o resto cabe folgado nos 25s do teto duro — estourar
+    // o teto faz `exit(1)` e pula os disposers seguintes, inclusive o fechamento das filas.
+    onShutdown('turnos em voo', async () => {
+      const pendentes = quantosEmVoo();
+      if (pendentes > 0) app.log.info(`aguardando ${pendentes} turno(s) em voo…`);
+      const sobraram = await drenarEmVoo(Number(process.env['TURN_DRAIN_MS'] ?? 8_000));
+      if (sobraram > 0) app.log.error(`${sobraram} turno(s) NÃO terminaram a tempo — pode haver paciente sem resposta`);
+    });
+
+
     // Workers: só neste processo se ROLE incluir worker. Registram seus próprios
     // disposers (cron intervals, enricher) via onShutdown, na ordem certa.
     if (runWorkers) {
@@ -172,10 +214,16 @@ async function main() {
       console.log('   Workers: OFF (rodando em service dedicado — ROLE=worker)');
     }
 
+    // Config compartilhada api↔worker (P0-8): sem isto, o kill-switch de lembretes
+    // gravado no dashboard nunca chegava ao processo que dispara os lembretes.
+    iniciarSincronizacaoDeConfig((err) => app.log.warn({ err }, 'sync de config falhou (seguindo com a config em memória)'));
+    onShutdown('sync de config', () => pararSincronizacaoDeConfig());
+
     onShutdown('outbound workers + filas', () => closeOutbound());
     onShutdown('redis client', () => closeRedisClient());
     onShutdown('sentry flush', () => closeSentry());
     installShutdownHandlers(app);
+    instalarRedeDeSegurancaDoProcesso(app, (err, ctx) => captureError(err, ctx));
   } catch (err) {
     captureError(err, { phase: 'boot' });
     app.log.error(err);

@@ -72,7 +72,20 @@ async function apagarPorUsuario(tabela: string, userId: string): Promise<number>
 
 export async function executeForgetMe(
   userId: string,
-  ctx: { traceId: string; canal: 'whatsapp' | 'app'; conversationId?: string },
+  ctx: {
+    traceId: string;
+    canal: 'whatsapp' | 'app';
+    conversationId?: string;
+    /**
+     * Telefone lido ANTES de qualquer escrita, carregado pelo job.
+     *
+     * O passo 8 anonimiza `users.phone_e164` para `deleted-<id>`. Se a verificação do
+     * passo 9 lançar (é o desenho: sobra ⇒ retry), a tentativa seguinte lê a linha já
+     * anonimizada e perde as variantes do número — e a purga de `webhook_events`, que
+     * SÓ se alcança pelo número, nunca mais acontece. O job carrega o original.
+     */
+    telefoneOriginal?: string;
+  },
 ): Promise<RelatorioApagamento> {
   const nowIso = new Date().toISOString();
   /**
@@ -115,9 +128,15 @@ export async function executeForgetMe(
    * corrompe o registro de OUTROS pacientes. Telefone (forte) e nome completo (2+
    * palavras) bastam.
    */
+  // `deleted-<uuid>` é o carimbo de `patchAnonimizacaoUser`: se ele já está aí, esta é uma
+  // RETENTATIVA e o número real só existe no job.
+  const telefoneDaLinha = userRow?.phone_e164 as string | undefined;
+  const telefone =
+    telefoneDaLinha && !telefoneDaLinha.startsWith('deleted-') ? telefoneDaLinha : ctx.telefoneOriginal;
+
   const identificadores = [
-    ...(userRow?.phone_e164 ? brPhoneVariants(userRow.phone_e164) : []),
-    ...(userRow?.phone_e164 ? [userRow.phone_e164.replace(/\D/g, '')] : []),
+    ...(telefone ? brPhoneVariants(telefone) : []),
+    ...(telefone ? [telefone.replace(/\D/g, '')] : []),
     userRow?.full_name ?? '',
   ].filter((s): s is string => typeof s === 'string' && s.trim().length > 0);
 
@@ -162,6 +181,32 @@ export async function executeForgetMe(
     for (const r of data ?? []) if (r.storage_path) caminhos.push(r.storage_path as string);
   }
 
+  // ── 1b. ARQUIVOS, antes de qualquer linha sumir ────────────────────────────
+  //
+  // Isto ficava no passo 7, depois de `messages`, `app_media` e `app_exports` já terem
+  // sido apagadas — e `caminhos` só se descobre a partir DELAS. Funcionava na primeira
+  // passada; numa RETENTATIVA (o passo 9 lança de propósito quando sobra linha) a lista
+  // vinha vazia, o bloco era pulado e o apagamento se declarava COMPLETO com o laudo do
+  // paciente ainda no bucket. Apagar o arquivo enquanto a linha que o aponta existe é o
+  // que torna esta etapa idempotente: se morrer antes, a próxima tentativa reencontra
+  // tudo; se morrer depois, não há mais o que apagar.
+  let arquivosApagados = 0;
+  if (caminhos.length) {
+    let algumBucketRespondeu = false;
+    for (const bucket of BUCKETS) {
+      const { data, error } = await db.storage.from(bucket).remove(caminhos);
+      // Caminho que não existe naquele bucket devolve erro/vazio — normal, já que a
+      // mesma lista é tentada nos três. O que importa é o total removido.
+      if (!error) {
+        algumBucketRespondeu = true;
+        arquivosApagados += data?.length ?? 0;
+      }
+    }
+    // Os três recusarem não é "nenhum arquivo lá": é o Storage fora. Vira sobra, e a
+    // retentativa ainda vai encontrar as linhas (elas só somem depois daqui).
+    if (!algumBucketRespondeu) sobrasExtra.push(`storage(${caminhos.length}_arquivos)`);
+  }
+
   // ── 2. FECHAR A PORTA ──────────────────────────────────────────────────────
   // `tabelasParaApagar()` já devolve sessão/aparelho/link do médico primeiro.
   const tabelas: Record<string, number> = {};
@@ -204,6 +249,27 @@ export async function executeForgetMe(
   }
 
   // ── 3. Mensagens das conversas DELE ────────────────────────────────────────
+  //
+  // ⚠️ SOLTAR A PROVA ANTES DE APAGAR A MENSAGEM.
+  //
+  // `consent_events.evidence_message_id` aponta pra mensagem em que a pessoa autorizou
+  // algo (o consentimento da busca de exame, por exemplo) e a FK é `ON DELETE NO ACTION`.
+  // Como `consent_events` é PRESERVADO de propósito (é a prova de conformidade), o DELETE
+  // abaixo violava a FK e derrubava o apagamento no meio: passos 4 a 8 nunca rodavam e o
+  // paciente ficava meio-apagado, com telefone e mensagens intactos. Acontecia com
+  // QUALQUER paciente que já tivesse usado a frente de exames.
+  //
+  // A prova não se perde: `evidence_text` e `policy_version` continuam na linha. A
+  // migration 0034 troca a FK por `on delete set null` — isto aqui não depende dela.
+  {
+    const { error } = await db
+      .from('consent_events')
+      .update({ evidence_message_id: null })
+      .eq('user_id', userId)
+      .not('evidence_message_id', 'is', null);
+    if (error) throw new Error(`forget-me: falha ao soltar evidence_message_id: ${error.message}`);
+  }
+
   let mensagensApagadas = 0;
   if (idsConvPaciente.length) {
     const { count } = await db
@@ -226,16 +292,38 @@ export async function executeForgetMe(
     // Quantos pacientes DIFERENTES este fio atende? A pergunta que decide o destino.
     // As cotações deste paciente já foram apagadas no passo 2, então o que sobrar aqui
     // é exatamente "os outros" — e é isso que a gente não pode destruir.
+    const donosRestantes = new Set<string>();
+
     const { data: restantes } = await db
       .from('quotes')
       .select('order_id')
       .eq('conversation_id', fio);
     const outrosPedidos = (restantes ?? []).map((q) => q.order_id as string).filter(Boolean);
-    let outrosPacientes = 0;
     if (outrosPedidos.length) {
       const { data: donos } = await db.from('orders').select('user_id').in('id', outrosPedidos);
-      outrosPacientes = new Set((donos ?? []).map((o) => o.user_id as string).filter(Boolean)).size;
+      for (const o of donos ?? []) if (o.user_id) donosRestantes.add(o.user_id as string);
     }
+
+    // ⚠️ FIO DE CLÍNICA SE ALCANÇA POR `consultation_quotes`, NÃO POR `quotes`.
+    //
+    // A contagem olhava só as cotações de FARMÁCIA. Num fio de clínica — que chega aqui
+    // justamente por `consultation_quotes` — ela dava 0, o destino virava "apagar
+    // mensagens", e o histórico da clínica com OUTROS pacientes ia junto. Bastava uma
+    // clínica ter atendido duas pessoas pelo mesmo número.
+    const { data: consRestantes } = await db
+      .from('consultation_quotes')
+      .select('consultation_id')
+      .eq('conversation_id', fio);
+    const outrasConsultas = (consRestantes ?? []).map((q) => q.consultation_id as string).filter(Boolean);
+    if (outrasConsultas.length) {
+      const { data: donos } = await db.from('consultations').select('user_id').in('id', outrasConsultas);
+      for (const c of donos ?? []) if (c.user_id) donosRestantes.add(c.user_id as string);
+    }
+
+    // O próprio titular não conta: as linhas dele já caíram no passo 2. Descontar é
+    // barato e protege contra cascade que não tenha rodado ainda.
+    donosRestantes.delete(userId);
+    const outrosPacientes = donosRestantes.size;
 
     // `outrosPacientes` conta quem NÃO é este paciente: as cotações dele já caíram por
     // cascade quando `orders` foi apagada no passo 2. Só zero autoriza a exclusão.
@@ -285,7 +373,7 @@ export async function executeForgetMe(
   // `purge_webhook_events_for_phone` (migration 0028) recebe TODAS as variantes de uma
   // vez: cada ida ao banco é uma janela em que a exclusão pode falhar pela metade.
   let webhookEventsApagados = 0;
-  const digitosDoTelefone = (userRow?.phone_e164 ? brPhoneVariants(userRow.phone_e164) : [])
+  const digitosDoTelefone = (telefone ? brPhoneVariants(telefone) : [])
     .map((v) => v.replace(/\D/g, ''))
     .filter((d) => d.length >= 10);
 
@@ -307,16 +395,7 @@ export async function executeForgetMe(
     }
   }
 
-  // ── 7. Arquivos ────────────────────────────────────────────────────────────
-  let arquivosApagados = 0;
-  if (caminhos.length) {
-    for (const bucket of BUCKETS) {
-      const { data, error } = await db.storage.from(bucket).remove(caminhos);
-      // Caminho que não existe naquele bucket devolve erro/vazio — normal, já que a
-      // mesma lista é tentada nos três. O que importa é o total removido.
-      if (!error) arquivosApagados += data?.length ?? 0;
-    }
-  }
+  // (os arquivos saíram no passo 1b, antes das linhas que guardam o caminho deles)
 
   // ── 8. Anonimizar a linha do usuário ───────────────────────────────────────
   const { error: errUser } = await db

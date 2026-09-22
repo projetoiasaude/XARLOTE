@@ -940,9 +940,25 @@ export async function dispatchReminders(): Promise<void> {
     // delivery_status='window_blocked' = a linha existe no dashboard mas o paciente NUNCA
     // recebeu — a diferença que faltava pra enxergar o Arthur sem o remédio de pressão.
     if (mirroredMessageId) {
+      /**
+       * ⚠️ `delivered` AQUI SERIA OTIMISMO, e otimismo aqui cega a fila.
+       *
+       * Este ponto roda logo depois do `dispatchOutbound`, que só ENFILEIROU. Quem sabe o
+       * desfecho real é o worker da fila (`stampDelivery`). Carimbar `delivered` agora
+       * fazia duas coisas ruins: (1) o dashboard afirmava entrega de mensagem que podia
+       * falhar segundos depois; (2) — pior — a conferência de duplicata da fila
+       * (`conferirDuplicado`) usa EXATAMENTE esta coluna como prova de entrega, então um
+       * envio ambíguo era lido como "duplicata de verdade" e completava em silêncio.
+       * O buraco que a correção de 22/09 fechou ficava aberto justo pra lembrete.
+       *
+       * `queued` = "saiu daqui, a fila responde". Os outros vereditos (`window_blocked`,
+       * `suppressed`) continuam sendo deste código: são decisões tomadas AQUI, e a fila
+       * nunca chega a ver esses casos.
+       */
+      const carimbo = deliveryStatus === 'delivered' ? 'queued' : deliveryStatus;
       await db.from('messages').update({
-        delivered_at: whatsappDelivered ? new Date().toISOString() : null,
-        delivery_status: isSimulatorMode() ? 'suppressed' : deliveryStatus,
+        delivered_at: null,
+        delivery_status: isSimulatorMode() ? 'suppressed' : carimbo,
       }).eq('id', mirroredMessageId);
     }
 

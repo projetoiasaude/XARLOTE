@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { normalizeZproWebhook, zproEventId, isZproStatusEcho, extractZproDeliverySignal, describeShape } from '@iasaude/whatsapp';
 import { db, writeLog, redactPII } from '@iasaude/db';
 import { processInboundUser } from '../handlers/inbound-user.js';
+import { isShuttingDown, acompanharEmVoo } from '../lifecycle.js';
 import { processInboundSupplierFromWebhook } from '../handlers/inbound-supplier.js';
 import { recordSupplierWaDelivery } from '../handlers/supplier-directory.js';
 import { AGENT_INSTANCE, SARA_INSTANCE, whatsappJidVariants } from '@iasaude/shared';
@@ -85,6 +86,14 @@ export async function webhookZproRoute(app: FastifyInstance) {
       const incomingTrace = req.headers['x-trace-id'];
       const traceId = (typeof incomingTrace === 'string' && incomingTrace.trim()) || randomUUID();
       reply.header('x-trace-id', traceId);
+
+      // 🛑 SHUTDOWN: recusa ANTES de registrar em `webhook_events`. Se aceitássemos, o
+      // insert de idempotência gravaria o evento, o processo morreria com o turno pela
+      // metade, e a reentrega do provedor cairia em `skipped: duplicate` — mensagem do
+      // paciente no banco, sem nunca ter sido respondida.
+      if (isShuttingDown()) {
+        return reply.code(503).header('retry-after', '5').send({ error: 'shutting_down' });
+      }
 
       // Auth: segredo na URL (?key=) ou header x-zpro-secret. O painel do zpro
       // costuma só deixar colar uma URL, então a query é o caminho confiável.
@@ -187,10 +196,10 @@ export async function webhookZproRoute(app: FastifyInstance) {
       }
       if (isAgentInstance) {
         setImmediate(() =>
-          processInboundSupplierFromWebhook(normalized, traceId).catch((err) => {
+          acompanharEmVoo(processInboundSupplierFromWebhook(normalized, traceId).catch((err) => {
             req.log.error({ traceId, err }, 'inbound-supplier (zpro) failed');
             captureError(err, { traceId, phase: 'inbound-supplier-zpro' });
-          }),
+          }))
         );
         return reply.send({ ok: true });
       }

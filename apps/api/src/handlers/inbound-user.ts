@@ -1,8 +1,10 @@
 import { randomUUID } from 'crypto';
 import { db, findUserByPhone, upsertUser, findOrCreateConversation, insertMessage, getConversationMessages, writeLog, retrieveRelevantCards, deleteUserMemory, writeAudit, writeEvent, auditUserStateChange, queryUser360, formatUser360ForPrompt, loadUserSkills, formatSkillsForPrompt } from '@iasaude/db';
-import { isForgetMeRequest, isConsentAccepted, buildConsentEvent } from '@iasaude/core';
+import { isConsentAccepted, buildConsentEvent } from '@iasaude/core';
+import { marcarPedidoDeEsquecimento, consumirPedidoDeEsquecimento } from '../lib/esquecimento-pendente.js';
+import { acompanharEmVoo } from '../lifecycle.js';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, afirmacaoDeProdutoSemProva, ehAncoraDeFechamento, classificarAckDeDose, lembretesQueTocaramJuntos, lembretesEntregues, anunciouRegistroDeDose, falaHonestaDeDose, tokenPrincipal, FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA, JANELA_PEDIDO_VIVO_MS, blocoDeIngestaoParaModelo, type OnboardingTopic } from '@iasaude/shared';
+import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, afirmacaoDeProdutoSemProva, ehAncoraDeFechamento, classificarAckDeDose, lembretesQueTocaramJuntos, lembretesEntregues, anunciouRegistroDeDose, falaHonestaDeDose, tokenPrincipal, FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA, JANELA_PEDIDO_VIVO_MS, blocoDeIngestaoParaModelo, categoriaDeEmergenciaNaFala, decidirEsquecimento, confirmouEsquecimento, mensagemDeConfirmacaoDeEsquecimento, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -393,21 +395,76 @@ const enricherQueue = new Queue(QUEUE_NAMES.PROFILE_ENRICHER, {
   connection: { url: process.env['REDIS_URL'] ?? 'redis://localhost:6379' },
 });
 
+/**
+ * A FRASE DE ÚLTIMO RECURSO.
+ *
+ * O turno inteiro rodava sem `try/catch` externo: um `writeLog` que lançasse DEPOIS da
+ * LLM (são ~150 no caminho quente, todos `await`) deixava o paciente sem nenhuma
+ * resposta — as tools já tinham agido, e ele não sabia de nada. Aqui a regra da casa
+ * vale até no pior caminho: falha nunca vira silêncio.
+ *
+ * Só fala se NADA saiu neste turno (conta por `trace_id`), pra não dar duas respostas
+ * quando a exceção acontece depois de a Xarlote já ter respondido.
+ */
+async function avisarQueOTurnoFalhou(inbound: NormalizedInbound, traceId: string): Promise<void> {
+  try {
+    const { data: conv } = await db
+      .from('conversations')
+      .select('id')
+      .eq('whatsapp_instance', SARA_INSTANCE)
+      .eq('whatsapp_jid', inbound.from.jid)
+      .maybeSingle();
+    if (!conv?.id) return; // quebrou antes de existir conversa — não há onde falar
+
+    const { count } = await db
+      .from('messages')
+      .select('*', { count: 'exact', head: true })
+      .eq('conversation_id', conv.id as string)
+      .eq('direction', 'out')
+      .eq('trace_id', traceId);
+    if ((count ?? 0) > 0) return;
+
+    await sendOutbound(
+      conv.id as string,
+      inbound.from.phoneE164,
+      'Opa, deu um problema aqui do meu lado e eu não consegui terminar de te responder 😕 Manda de novo, por favor?',
+      traceId,
+    );
+  } catch {
+    // Esta rede de segurança nunca pode virar a causa da falha que ela existe pra cobrir.
+  }
+}
+
 export async function processInboundUser(
   inbound: NormalizedInbound,
   // F1.B2: o traceId nasce no webhook (ingresso) e desce até aqui pra correlacionar
   // todo o pipeline. Default randomUUID() mantém compat com callers diretos (simulate/testes).
   traceId: string = randomUUID(),
 ): Promise<{ traceId: string; conversationId: string }> {
-  // Serializa por telefone (H3). `withUserLock` é fail-open (Redis fora → roda sem lock) e devolve
-  // null só se o lock não liberou em waitMs — nesse caso processa mesmo assim pra NUNCA dropar a
-  // mensagem (degradado; os CAS/guards de cada tool cobrem a corrida remanescente).
-  const done = await withUserLock(inbound.from.phoneE164, () => processInboundUserInner(inbound, traceId), {
-    scope: 'turn', waitMs: TURN_LOCK_WAIT_MS, ttlMs: TURN_LOCK_TTL_MS,
-  });
-  if (done !== null) return done;
-  await writeLog('warn', 'lock', `turn-lock não liberou em ${TURN_LOCK_WAIT_MS}ms — processando sem serialização (degradado)`, { traceId });
-  return processInboundUserInner(inbound, traceId);
+  // `acompanharEmVoo`: o turno roda FORA do request (o webhook já respondeu 200), então
+  // o `app.close()` não o esperava e todo deploy matava turno no meio — sem reentrega,
+  // porque o zpro já tinha recebido 200. Agora o shutdown espera (com teto).
+  return acompanharEmVoo(processInboundUserComRede(inbound, traceId));
+}
+
+async function processInboundUserComRede(
+  inbound: NormalizedInbound,
+  traceId: string,
+): Promise<{ traceId: string; conversationId: string }> {
+  try {
+    // Serializa por telefone (H3). `withUserLock` é fail-open (Redis fora → roda sem lock) e devolve
+    // null só se o lock não liberou em waitMs — nesse caso processa mesmo assim pra NUNCA dropar a
+    // mensagem (degradado; os CAS/guards de cada tool cobrem a corrida remanescente).
+    const done = await withUserLock(inbound.from.phoneE164, () => processInboundUserInner(inbound, traceId), {
+      scope: 'turn', waitMs: TURN_LOCK_WAIT_MS, ttlMs: TURN_LOCK_TTL_MS,
+    });
+    if (done !== null) return done;
+    await writeLog('warn', 'lock', `turn-lock não liberou em ${TURN_LOCK_WAIT_MS}ms — processando sem serialização (degradado)`, { traceId });
+    return await processInboundUserInner(inbound, traceId);
+  } catch (err) {
+    await avisarQueOTurnoFalhou(inbound, traceId);
+    throw err; // o webhook loga e manda pro Sentry — a rede de segurança não esconde a falha
+  }
 }
 
 async function processInboundUserInner(
@@ -666,24 +723,56 @@ async function processInboundUserInner(
     return { traceId, conversationId: conversation.id };
   }
 
-  // 6. Check forget-me
-  if (inbound.text && isForgetMeRequest(inbound.text)) {
-    const confirmMsg = `Entendido. Pra confirmar que você quer apagar todos os seus dados, responde com *CONFIRMO APAGAR*. Isso é irreversível.`;
-    await sendOutbound(conversation.id, phoneE164, confirmMsg, traceId);
-    return { traceId, conversationId: conversation.id };
-  }
-  if (inbound.text?.toLowerCase().includes('confirmo apagar')) {
-    await writeAudit({
-      actorType: 'user',
-      action: 'user.forget_me.requested',
-      userId: user.id,
-      conversationId: conversation.id,
-      messageId: inboundMsg.id,
-      traceId,
-      reason: 'user_typed_confirmo_apagar',
-    });
-    await handleForgetMe(user.id, conversation.id, phoneE164, traceId);
-    return { traceId, conversationId: conversation.id };
+  // 6. Esquecimento (LGPD art. 18) — decisão em `packages/shared/src/esquecimento.ts`.
+  //
+  // O que havia aqui era `texto.includes('confirmo apagar')` sem estado e sem âncora:
+  // "não! eu não confirmo apagar nada" APAGAVA o prontuário, e `/quero sair/` fazia
+  // "quero sair de casa às 8h, me lembra?" virar pedido de esquecimento — engolindo o
+  // turno (o lembrete nunca era criado). Agora são dois passos com prazo, e o Redis
+  // guarda só a marca de "pediu" (15 min, some sozinha).
+  //
+  // O Redis só é tocado quando a frase JÁ é uma tentativa de confirmação — turno normal
+  // não paga nada por esta guarda.
+  if (inbound.text) {
+    const tentouConfirmar = confirmouEsquecimento(inbound.text);
+    const pedidoPendenteEm = tentouConfirmar ? await consumirPedidoDeEsquecimento(user.id) : null;
+    const decisao = decidirEsquecimento(inbound.text, pedidoPendenteEm);
+
+    if (decisao.acao === 'apagar') {
+      await writeAudit({
+        actorType: 'user',
+        action: 'user.forget_me.requested',
+        userId: user.id,
+        conversationId: conversation.id,
+        messageId: inboundMsg.id,
+        traceId,
+        reason: 'confirmacao_ancorada_com_pedido_pendente',
+      });
+      await handleForgetMe(user.id, conversation.id, phoneE164, traceId);
+      return { traceId, conversationId: conversation.id };
+    }
+
+    if (decisao.acao === 'perguntar') {
+      const marcou = await marcarPedidoDeEsquecimento(user.id);
+      if (!marcou) {
+        // Sem a marca, a confirmação que vier não vai apagar — e a pessoa ficaria num
+        // laço sem entender. É ERRO (o titular não consegue exercer o direito), não warn.
+        await writeLog('error', 'lgpd', 'pedido de esquecimento NÃO registrado (Redis fora) — a confirmação vai pedir de novo', {
+          traceId, userId: user.id,
+        });
+      }
+      await writeAudit({
+        actorType: 'user',
+        action: 'user.forget_me.asked',
+        userId: user.id,
+        conversationId: conversation.id,
+        messageId: inboundMsg.id,
+        traceId,
+        reason: decisao.motivo,
+      });
+      await sendOutbound(conversation.id, phoneE164, mensagemDeConfirmacaoDeEsquecimento(decisao.motivo), traceId);
+      return { traceId, conversationId: conversation.id };
+    }
   }
 
   // 7. Mark active if still profiling.
@@ -1646,7 +1735,12 @@ ${decision.alreadyOffered
   // ⚠️ `textoDoPaciente`, NUNCA `userMsgContent`: rodar esta regex sobre o bloco do documento
   // faz um pedido de exame com "Indicação clínica: dor no peito" disparar os botões do SAMU.
   const distressText = textoDoPaciente;
-  const EMERGENCY_RE = /(dor no peito|aperto no peito|falta de ar|n[aã]o consigo respirar|desmai|convuls|derrame\b|\bavc\b|rosto torto|fala arrastada|sangrando muito|dor de cabe[çc]a (muito|t[aã]o|super|bem) forte)/i;
+  // A régua mora em `packages/shared/src/emergencia-determinista.ts`, testada nos dois
+  // sentidos. Até 22/09 ela cobria só sinal FÍSICO: ideação suicida, automutilação e
+  // overdose dependiam inteiramente de o modelo chamar `red_flag_check` — e o modelo de
+  // fallback perde chamada de ferramenta. A categoria sai daqui porque muda a frase de
+  // abertura e o registro clínico ('other_critical' para tudo era mentira conveniente).
+  const categoriaDaEmergencia = categoriaDeEmergenciaNaFala(distressText);
 
   // 🤝 OS DOIS MOTIVOS DE NÃO ESCALAR ERAM UM REGEX SÓ — e precisavam deixar de ser.
   //
@@ -1671,18 +1765,21 @@ ${decision.alreadyOffered
 
   const alreadyRedFlag = llmResponse.toolCalls.some((t) => t.name === 'red_flag_check');
   let distressPreempted = false;
-  if (!alreadyRedFlag && EMERGENCY_RE.test(distressText) && !suprimePreempcao) {
-    const sobreQuem = sujeitoDaEmergencia
-      ? ` sobre ${sujeitoDaEmergencia.subjectName ?? 'quem ele cuida'}`
-      : '';
-    await writeLog('warn', 'red_flag', `🚑 Emergência determinística${sobreQuem} ("${distressText.slice(0, 40)}") → forçando red_flag_check`, { traceId });
+  if (!alreadyRedFlag && categoriaDaEmergencia && !suprimePreempcao) {
+    // Sem o NOME: log de nível warn não leva identificação de ninguém (regra 3) — e aqui
+    // ela vinha junto da categoria clínica, que é o pior par possível. O vínculo continua
+    // rastreável pelo `userId` + `audit_log`.
+    const sobreQuem = sujeitoDaEmergencia ? ' (sobre quem ele cuida)' : '';
+    await writeLog('warn', 'red_flag', `🚑 Emergência determinística [${categoriaDaEmergencia}]${sobreQuem} → forçando red_flag_check`, { traceId });
     await handleToolCall(
       {
         id: randomUUID(),
         name: 'red_flag_check',
         args: {
-          category: 'other_critical',
-          severity: 'high',
+          category: categoriaDaEmergencia,
+          // Ideação, automutilação e overdose são 'critical'; sinal físico segue 'high'
+          // (a régua física inclui coisas que podem não ser agudas, como "dor no peito").
+          severity: categoriaDaEmergencia === 'other_critical' ? 'high' : 'critical',
           evidence: distressText.slice(0, 200),
           // Registra no prontuário de quem está passando mal. A ORIENTAÇÃO do SAMU vai
           // pra conversa de quem escreveu de qualquer forma — `conversationId` e
@@ -2872,7 +2969,7 @@ async function handleForgetMe(userId: string, conversationId: string, phoneE164:
     .eq('user_id', userId).is('revoked_at', null);
 
   // 3. A limpeza, com retry.
-  const enfileirou = await enqueueAccountForget({ userId, canal: 'whatsapp', traceId, conversationId });
+  const enfileirou = await enqueueAccountForget({ userId, canal: 'whatsapp', traceId, conversationId, phoneE164 });
   if (!enfileirou) {
     // Redis fora. O paciente JÁ foi avisado — não apagar é inaceitável. Executa inline
     // (sem retry, que é o melhor disponível) e registra que foi por este caminho.
@@ -2880,6 +2977,6 @@ async function handleForgetMe(userId: string, conversationId: string, phoneE164:
       traceId,
       userId,
     });
-    await executeForgetMe(userId, { traceId, canal: 'whatsapp', conversationId });
+    await executeForgetMe(userId, { traceId, canal: 'whatsapp', conversationId, telefoneOriginal: phoneE164 });
   }
 }

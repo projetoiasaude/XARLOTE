@@ -4,6 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { normalizeWebhookPayload } from '@iasaude/whatsapp';
 import { db, writeLog, redactPII } from '@iasaude/db';
 import { processInboundUser } from '../handlers/inbound-user.js';
+import { isShuttingDown, acompanharEmVoo } from '../lifecycle.js';
 import { processInboundSupplierFromWebhook } from '../handlers/inbound-supplier.js';
 import type { UazapiWebhookPayload } from '@iasaude/whatsapp';
 import { AGENT_INSTANCE, SARA_INSTANCE } from '@iasaude/shared';
@@ -23,6 +24,14 @@ export async function webhookRoute(app: FastifyInstance) {
     const incomingTrace = req.headers['x-trace-id'];
     const traceId = (typeof incomingTrace === 'string' && incomingTrace.trim()) || randomUUID();
     reply.header('x-trace-id', traceId);
+
+    // 🛑 SHUTDOWN: recusa ANTES de registrar em `webhook_events`. Se aceitássemos, o
+    // insert de idempotência gravaria o evento, o processo morreria com o turno pela
+    // metade, e a reentrega do provedor cairia em `skipped: duplicate` — mensagem do
+    // paciente no banco, sem nunca ter sido respondida.
+    if (isShuttingDown()) {
+      return reply.code(503).header('retry-after', '5').send({ error: 'shutting_down' });
+    }
 
     // Verify secret when configured
     const expectedSecret = process.env['UAZAPI_WEBHOOK_SECRET'];
@@ -71,10 +80,10 @@ export async function webhookRoute(app: FastifyInstance) {
       instanceName === AGENT_INSTANCE || instanceName === process.env['UAZAPI_AGENT_INSTANCE'];
     if (isAgentInstance) {
       setImmediate(() =>
-        processInboundSupplierFromWebhook(normalized, traceId).catch((err) => {
+        acompanharEmVoo(processInboundSupplierFromWebhook(normalized, traceId).catch((err) => {
           req.log.error({ traceId, err }, 'inbound-supplier failed');
           captureError(err, { traceId, phase: 'inbound-supplier' });
-        }),
+        }))
       );
     } else {
       // Interruptor mestre: se a Xarlote estiver desligada no painel, ignora a mensagem do usuário.

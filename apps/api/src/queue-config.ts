@@ -9,6 +9,25 @@ export function getRedisConnection(): ConnectionOptions {
   return { url: redisUrl() };
 }
 
+/**
+ * Conexão para PRODUTOR de fila (`Queue.add`), com a offline-queue DESLIGADA.
+ *
+ * ⚠️ O ioredis, por padrão, ENFILEIRA em memória o comando enviado enquanto a conexão
+ * está caída e o executa quando o Redis volta. Com isso, o `add` que "estourou o
+ * timeout" de 2s do `withQueueRetry` não era cancelado (Promise.race não cancela o
+ * perdedor): o fallback mandava a mensagem direto e, minutos depois, o `add` fantasma
+ * criava o job — que saía de novo pelo worker, num processo onde a trava local não
+ * existe e a chave do Redis nunca foi gravada. É o mecanismo mais plausível das
+ * duplicatas de 27/07 e 30/07.
+ *
+ * Com `enableOfflineQueue: false` o `add` REJEITA na hora: o fallback direto acontece
+ * uma vez e não há fantasma. Só vale para produtor — Worker precisa da fila offline
+ * para os comandos bloqueantes.
+ */
+export function getProducerConnection(): ConnectionOptions {
+  return { url: redisUrl(), enableOfflineQueue: false };
+}
+
 let sharedClient: Redis | null = null;
 
 /**

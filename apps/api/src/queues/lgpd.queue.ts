@@ -30,6 +30,12 @@ export interface AccountForgetJob {
   canal: 'whatsapp' | 'app';
   traceId: string;
   conversationId?: string;
+  /**
+   * O telefone COMO ERA antes de qualquer escrita. O executor anonimiza `users` no
+   * passo 8; sem isto, a retentativa lê `deleted-<id>` e perde a única chave que
+   * alcança `webhook_events` (payload cru com o número dentro do JSON).
+   */
+  phoneE164?: string;
 }
 
 export interface DataExportJob {
@@ -88,7 +94,34 @@ function getFilaExportar(): Queue<DataExportJob> {
  */
 export async function enqueueAccountForget(job: AccountForgetJob): Promise<boolean> {
   try {
-    await getFilaApagar().add('account-forget', job, { jobId: `forget-${job.userId}` });
+    const fila = getFilaApagar();
+    const jobId = `forget-${job.userId}`;
+
+    /**
+     * ⚠️ `jobId` FIXO + `removeOnFail: false` = PORTA TRANCADA (auditoria 22/09).
+     *
+     * O BullMQ devolve o job existente em QUALQUER estado — inclusive `failed`. Como o
+     * apagamento guarda os falhos para sempre (de propósito: é incidente de compliance),
+     * um apagamento que falhou cinco vezes fazia todo pedido novo do mesmo paciente
+     * virar no-op silencioso, com a rota respondendo 202 "vai ser apagado". O direito do
+     * titular ficava preso num job morto que ninguém olhava.
+     *
+     * Um pedido novo em cima de um job falho é exatamente o caso de RETOMAR.
+     */
+    const existente = await fila.getJob(jobId);
+    if (existente && (await existente.isFailed())) {
+      await writeLog('warn', 'lgpd', 'pedido de apagamento reabriu um job que havia FALHADO — retomando', {
+        userId: job.userId,
+        traceId: job.traceId,
+      });
+      // `retry()` reaproveita a linha do job; os dados novos (traceId/telefone) só
+      // importam se o job antigo não os tinha — por isso o update antes.
+      await existente.updateData({ ...existente.data, ...job });
+      await existente.retry();
+      return true;
+    }
+
+    await fila.add('account-forget', job, { jobId });
     return true;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

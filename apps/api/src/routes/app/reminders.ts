@@ -792,8 +792,31 @@ export async function appRemindersRoutes(app: FastifyInstance): Promise<void> {
     const parsed = ActionSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
 
-    const userId = await resolveOwner(req, reply, parsed.data.phone);
-    if (userId === null) return reply; // resolveOwner já respondeu
+    const ator = await resolveOwner(req, reply, parsed.data.phone);
+    if (ator === null) return reply; // resolveOwner já respondeu
+
+    /**
+     * 🤝 MODO CUIDADOR — a metade que faltava (auditoria 22/09, P0-7).
+     *
+     * `GET /reminders` e `POST /reminders` já resolviam `?subject=`; a AÇÃO não. O app
+     * calculava o parâmetro e não mandava, e a filha que tocava "Já tomei" no lembrete
+     * da mãe levava 403 — que o app lia como sessão morta e a DESLOGAVA.
+     *
+     * Capacidade `agir` (não `ver`): confirmar dose é escrita no prontuário de outra
+     * pessoa. Sem vínculo válido, `resolverSujeitoDaRequisicao` responde 404 `sem_acesso`
+     * (e não 403) de propósito — rota autenticada não é oráculo de ids alheios.
+     *
+     * Só pelo JWT: o token legado (compartilhado, sem identidade) não pode escolher
+     * sujeito — seria trocar um id na query e escrever no prontuário de quem quisesse.
+     */
+    let userId = ator;
+    if (req.patient) {
+      const sujeito = await resolverSujeitoDaRequisicao(req, reply, 'agir');
+      if (!sujeito) return reply; // já respondeu 404
+      userId = sujeito.userId;
+    } else if ((req.query as { subject?: string } | undefined)?.subject) {
+      return reply.code(403).send({ error: 'forbidden', message: 'Ação em nome de outra pessoa exige o app com login.' });
+    }
 
     const { data: reminder } = await db
       .from('reminders')
@@ -830,6 +853,9 @@ export async function appRemindersRoutes(app: FastifyInstance): Promise<void> {
         // Qual credencial agiu: quando o web migrar (F5), este campo é o que prova que
         // ninguém mais chega por telefone antes de a rota legada ser removida.
         via: req.patient ? 'jwt' : 'legacy_token',
+        // Cuidador agindo pela pessoa cuidada: sem isto, a auditoria diria que a própria
+        // pessoa confirmou a dose.
+        ...(userId !== ator ? { por_cuidador: ator } : {}),
       },
     });
 

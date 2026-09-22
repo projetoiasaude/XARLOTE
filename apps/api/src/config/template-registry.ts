@@ -524,6 +524,99 @@ export function buildReengageTemplate(
   };
 }
 
+// ─── AVISO AO CONTATO DE EMERGÊNCIA (fora da janela de 24h) ──────────────────
+//
+// O contato de emergência é, por definição, alguém que NUNCA escreveu pra Xarlote —
+// então a janela de 24h está fechada e texto livre é REJEITADO pela Meta. Era assim que
+// o aviso morria: o paciente clicava "avisar meu contato", a Xarlote dizia "✅ avisei",
+// e ninguém do outro lado recebia nada (auditoria 22/09, P0-4).
+//
+// CORPO A APROVAR NA META (categoria UTILIDADE, pt_BR, 2 variáveis) — o texto abaixo é
+// o que `humanizar` monta, e precisa ser submetido BYTE-A-BYTE assim:
+//
+//   Oi, {{1}}! Aqui é a Xarlote, assistente de saúde.
+//
+//   {{2}} pode estar precisando de ajuda agora e colocou você como contato de emergência.
+//   Por favor, fale com ele(a) o quanto antes. Se houver risco imediato, ligue 192 (SAMU).
+//
+// ⚠️ Sem categoria clínica de propósito: o contato precisa AGIR, não diagnosticar — e o
+// que a pessoa relatou (ideação suicida, overdose) é dado sensível que não se manda pra
+// terceiro num template fixo. Na janela ABERTA, o texto livre pode ser mais específico.
+//
+// Enquanto `ZPRO_TEMPLATE_EMERGENCIA` não existir, devolve `null` e quem chama diz a
+// verdade ao paciente em vez de fingir que avisou.
+export interface TemplateDeEmergencia {
+  name: string;
+  language: string;
+  variables: string[];
+  text: string;
+  /** Qual caminho foi usado — vai pro log e pro audit, nunca pro paciente. */
+  via: 'dedicado' | 'reengajamento';
+}
+
+/**
+ * O MOTIVO, em uma frase. É o que entra no {{2}} do reengajamento e no {{2}} do
+ * dedicado — mesma frase nos dois, pra não existir "a versão boa" e "a versão ponte".
+ *
+ * Sem categoria clínica de propósito: o contato precisa AGIR, não diagnosticar, e o que
+ * a pessoa relatou (ideação suicida, overdose) é dado sensível que não se manda pra
+ * terceiro. Na janela ABERTA o texto livre pode ser mais específico.
+ */
+function motivoDaEmergencia(patientName: string): string {
+  return (
+    `${patientName} pode estar precisando de ajuda agora e colocou você como contato de ` +
+    `emergência. Por favor, fale com ele(a) o quanto antes. Se houver risco imediato, ligue 192 (SAMU).`
+  );
+}
+
+export function buildEmergencyContactTemplate(
+  contactName: string,
+  patientName: string,
+): TemplateDeEmergencia | null {
+  const contato = templateVar(contactName || 'tudo bem', 60) || 'tudo bem';
+  const paciente = templateVar(patientName || 'Uma pessoa', 60) || 'Uma pessoa';
+  const motivo = motivoDaEmergencia(paciente);
+
+  // 1º: o dedicado, quando existir.
+  const dedicado = process.env['ZPRO_TEMPLATE_EMERGENCIA']?.trim();
+  if (dedicado) {
+    return {
+      name: dedicado,
+      language: templateLanguage(),
+      variables: [contato, paciente],
+      text: `Oi, ${contato}! Aqui é a Xarlote, assistente de saúde.\n\n${motivo}`,
+      via: 'dedicado',
+    };
+  }
+
+  /**
+   * 2º: PONTE — o HSM de reengajamento (`lembrete_compromisso`).
+   *
+   * Decisão do fundador em 22/09, e ela tem fundamento técnico: esse template já está
+   * aprovado **no próprio número da Xarlote** (o mesmo de onde o aviso sai), o corpo é
+   * humano e não comercial, e os dois slots são exatamente "nome" + "motivo em uma
+   * frase" — o formato que este aviso precisa.
+   *
+   * O coringa `contato_geral` foi DESCARTADO para este caso: está aprovado na perna do
+   * AGENTE (outro número) e o corpo é B2B — "preciso falar com vocês… fico no aguardo,
+   * obrigada". Um filho lendo isso às 2h sobre a mãe arquiva como mensagem comercial, e
+   * aviso de emergência mal enquadrado queima a única chance que existe.
+   *
+   * Renderiza: "Oii, João! Aqui é a Xarlote,\n\n<motivo>\n\nTô por aqui com você pro
+   * que precisar, é só me responder nesta conversa. 💜" — e esse fecho ajuda: se o
+   * contato responder, a janela de 24h abre e a Xarlote passa a falar com ele direto.
+   *
+   * Some sozinho no dia em que `ZPRO_TEMPLATE_EMERGENCIA` existir.
+   */
+  if (reengageTemplateEnabled()) {
+    const tpl = buildReengageTemplate(contato, motivo);
+    return { ...tpl, via: 'reengajamento' };
+  }
+
+  // 3º: não há caminho. Quem chama diz a verdade ao paciente e põe o 192 na frente.
+  return null;
+}
+
 /** cotacao_medicamento já foi aprovado na Meta? (até lá, farmácia usa o coringa). */
 export function pharmacyTemplateApproved(): boolean {
   return process.env['ZPRO_TEMPLATE_COTACAO_APPROVED'] === 'true';

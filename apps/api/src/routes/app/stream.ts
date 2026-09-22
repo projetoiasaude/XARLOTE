@@ -41,6 +41,28 @@ import {
   sseFrame,
 } from '../../lib/app-events.js';
 
+/**
+ * Conexões SSE abertas — para o graceful shutdown poder fechá-las.
+ *
+ * SSE é conexão ATIVA e nunca fica ociosa: com `forceCloseConnections: 'idle'` (o padrão
+ * do Fastify), UM app aberto fazia o `app.close()` esperar o timeout duro de 25s, o
+ * processo sair com `exit(1)` e os disposers seguintes — flush do debounce de fornecedor
+ * e fechamento das filas — NUNCA rodarem (auditoria 22/09).
+ */
+const streamsAbertos = new Set<() => void>();
+
+/** Encerra todas as conexões SSE. Chamado no shutdown, ANTES do `app.close()`. */
+export function encerrarStreamsAbertos(): void {
+  for (const encerrar of [...streamsAbertos]) {
+    try {
+      encerrar();
+    } catch {
+      /* uma conexão problemática não pode impedir o fechamento das outras */
+    }
+  }
+  streamsAbertos.clear();
+}
+
 export async function appStreamRoutes(app: FastifyInstance): Promise<void> {
   app.get('/stream', { preHandler: requirePatient }, async (req, reply) => {
     const userId = req.patient!.userId;
@@ -92,11 +114,13 @@ export async function appStreamRoutes(app: FastifyInstance): Promise<void> {
     const encerrar = () => {
       if (encerrado) return;
       encerrado = true;
+      streamsAbertos.delete(encerrar);
       clearInterval(heartbeat);
       void sub.unsubscribe().catch(() => undefined);
       void sub.quit().catch(() => undefined);
       if (reply.raw.writable) reply.raw.end();
     };
+    streamsAbertos.add(encerrar);
 
     await sub.subscribe(appConversationChannel(conversationId));
     sub.on('message', (_canal, payload) => {

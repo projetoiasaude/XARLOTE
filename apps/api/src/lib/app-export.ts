@@ -144,11 +144,15 @@ export async function buildExport(userId: string, agoraIso: string): Promise<Res
     // A PROVA do consentimento — direito do titular saber o que aceitou e quando.
     safe(db.from('consent_events').select('*').eq('user_id', userId)),
     // Quem acessou o prontuário dele. É o que a LGPD chama de transparência.
-    safe(db.from('audit_log').select('id, actor_type, action, reason, created_at').eq('user_id', userId).order('created_at', { ascending: false }).limit(5_000)),
+    // ⚠️ `occurred_at`, não `created_at`: a coluna não existe em `audit_log` e o
+    // PostgREST devolvia erro que o `safe()` transformava em `[]` — o "registro de
+    // acessos" do titular vinha VAZIO desde sempre (auditoria 22/09).
+    safe(db.from('audit_log').select('id, actor_type, action, reason, occurred_at').eq('user_id', userId).order('occurred_at', { ascending: false }).limit(5_000)),
     safe(db.from('device_tokens').select('id, platform, app_version, created_at').eq('user_id', userId)),
     safe(db.from('app_media').select('id, mime, bytes, kind, created_at').eq('user_id', userId)),
     safe(db.from('share_grants').select('id, expires_at, revoked_at, access_count, last_accessed_at, created_at').eq('user_id', userId)),
-    safe(db.from('assistant_tasks').select('id, tool_name, status, created_at').eq('user_id', userId)),
+    // Mesma classe de erro: `assistant_tasks` tem `started_at`/`completed_at`.
+    safe(db.from('assistant_tasks').select('id, tool_name, status, started_at, completed_at').eq('user_id', userId)),
     // 🤝 AS DUAS DIREÇÕES DO CUIDADO. Quem enxerga o prontuário desta pessoa é dado dela
     // (art. 9º: ela tem direito de saber com quem ele é compartilhado). E de quem ela
     // cuida também é: são vínculos que ela criou e pode revogar.

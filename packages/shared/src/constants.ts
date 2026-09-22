@@ -66,14 +66,11 @@ export const CONSENT_ACCEPTED_PATTERNS = [
   /^✅\s*$/u,
 ];
 
-export const FORGET_ME_PATTERNS = [
-  /esquecer?\s+meus?\s+dados/i,
-  /apagar?\s+meus?\s+dados/i,
-  /revogar?\s+consentimento/i,
-  /cancelar?\s+cadastro/i,
-  /deletar?\s+minha\s+conta/i,
-  /quero\s+sair/i,
-];
+// FORGET_ME_PATTERNS foi REMOVIDO em 22/09/2026. Era uma lista solta de regex sem
+// negação e sem objeto: `/quero sair/` transformava "quero sair de casa às 8h, me
+// lembra?" em pedido de apagamento (e engolia o lembrete). A decisão inteira — pedir,
+// confirmar com âncora, janela de 15 min — vive agora em `esquecimento.ts`, com teste.
+// Um dado, um escritor (regra 150).
 
 export const QUEUE_NAMES = {
   INBOUND_USER: 'inbound-user',
@@ -115,8 +112,8 @@ export const QUOTE_CONSOLIDATE_MIN_COMPLETED = 2;
 export const QUOTE_CONSOLIDATE_MIN_ELAPSED_MS = 60 * 1000; // 1 min after 2 quotes
 export const PHARMACY_MAX_TURNS = 12;
 
-export const EMERGENCY_KEYWORDS = [
-  'infarto', 'acidente', 'overdose', 'tentativa de suicídio', 'suicídio',
-  'desmaiou', 'inconsciente', 'parou de respirar', 'convulsão',
-  'hemorragia', 'sangramento intenso', 'engasgou', 'não respira',
-];
+// EMERGENCY_KEYWORDS foi REMOVIDO em 22/09/2026. Era uma lista de palavras de emergência
+// SEM NENHUM CHAMADOR — código morto que parecia proteção (e o único teste sobre ela só
+// conferia que a lista continha as palavras da própria lista). Quem decide hoje é
+// `categoriaDeEmergenciaNaFala` em `emergencia-determinista.ts`, testada nos dois
+// sentidos e ligada na preempção do turno.

@@ -93,7 +93,16 @@ export async function appAccountRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // ── 2. Enfileirar a limpeza ───────────────────────────────────────────
-    const enfileirou = await enqueueAccountForget({ userId, canal: 'app', traceId });
+    // O telefone vai NO JOB: o executor anonimiza `users.phone_e164` no passo 8, e uma
+    // retentativa depois disso perderia a única chave que alcança `webhook_events`.
+    const { data: dono } = await db.from('users').select('phone_e164').eq('id', userId).maybeSingle();
+    const telefone = dono?.phone_e164 as string | undefined;
+    const enfileirou = await enqueueAccountForget({
+      userId,
+      canal: 'app',
+      traceId,
+      ...(telefone && !telefone.startsWith('deleted-') ? { phoneE164: telefone } : {}),
+    });
     if (!enfileirou) {
       return reply.code(503).send({
         error: 'unavailable',

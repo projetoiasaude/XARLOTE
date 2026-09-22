@@ -1,9 +1,9 @@
 import { randomUUID } from 'crypto';
 import type { FastifyInstance } from 'fastify';
-import { db, writeAudit, findOrCreateConversation } from '@iasaude/db';
+import { db, writeAudit, writeLog, findOrCreateConversation } from '@iasaude/db';
 import { SARA_INSTANCE, AGENT_INSTANCE, isWabaWindowOpen, comPausaDeOutreach, CHAVE_PAUSA } from '@iasaude/shared';
 import type { OrderItem } from '@iasaude/shared';
-import { loadPrompts, savePrompts } from '../config/prompts.js';
+import { loadPrompts, savePrompts, mascararSegredos, fontesDosSegredos, estadoDaConfig } from '../config/prompts.js';
 import { buildXarloteSystemPrompt, buildAgentPharmacySystemPrompt } from '@iasaude/llm';
 import { initiatePharmacyNegotiation } from '../handlers/inbound-supplier.js';
 import { initiateClinicNegotiation } from '../handlers/agent-clinic.js';
@@ -288,9 +288,17 @@ export async function adminRoute(app: FastifyInstance) {
     return reply.send(data);
   });
 
-  // Get prompts config
+  // Config do dashboard. As CHAVES DE API saem MASCARADAS (`••••ab12`): esta rota é
+  // consultada a cada 30s por toda página do dashboard, e a chave da OpenRouter/ElevenLabs
+  // viajava em claro pro navegador em cada uma delas (auditoria 22/09). O PUT ignora
+  // valor mascarado, então a tela pode reenviar o que recebeu sem apagar a chave.
+  // `_meta` diz de onde veio cada segredo (dashboard/env) e se ESTE processo está
+  // sincronizado com o Redis — é o que distingue "não tem chave" de "vem do env".
   app.get('/prompts', async (_req, reply) => {
-    return reply.send(loadPrompts());
+    return reply.send({
+      ...mascararSegredos(loadPrompts()),
+      _meta: { fontes: fontesDosSegredos(), config: estadoDaConfig() },
+    });
   });
 
   // Get the BASE prompts (read-only preview) — used by the dashboard so admins can
@@ -321,7 +329,7 @@ export async function adminRoute(app: FastifyInstance) {
   app.put('/prompts', async (req, reply) => {
     const body = req.body as Record<string, unknown>;
     const before = loadPrompts();
-    const updated = savePrompts({
+    const { config: updated, propagado } = await savePrompts({
       sara_suffix: typeof body['sara_suffix'] === 'string' ? (body['sara_suffix'] as string) : undefined,
       agent_override: typeof body['agent_override'] === 'string' ? (body['agent_override'] as string) : undefined,
       llm_api_key: typeof body['llm_api_key'] === 'string' ? (body['llm_api_key'] as string) : undefined,
@@ -349,9 +357,16 @@ export async function adminRoute(app: FastifyInstance) {
       reason: 'dashboard_save',
       before: Object.fromEntries(changedKeys.map((k) => [k, beforeRedacted[k]])),
       after: Object.fromEntries(changedKeys.map((k) => [k, afterRedacted[k]])),
-      metadata: { changed_keys: changedKeys },
+      metadata: { changed_keys: changedKeys, propagado },
     });
-    return reply.send(updated);
+    // `propagado:false` = o Redis recusou, então a mudança vale só neste processo e o
+    // WORKER não vai ver (era exatamente assim, em silêncio, antes da correção de 22/09).
+    if (!propagado) {
+      await writeLog('error', 'config', 'Config salva SEM propagar (Redis fora) — o worker segue com a config antiga', {
+        changedKeys: changedKeys.join(','),
+      });
+    }
+    return reply.send({ ...mascararSegredos(updated), _propagado: propagado });
   });
 
   // List voices disponíveis na conta ElevenLabs (usa key do prompts.json ou .env)

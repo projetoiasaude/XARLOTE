@@ -44,3 +44,5 @@ export * from './busca-agendada.js';
 export * from './documento-de-exame.js';
 export * from './robo-de-atendimento.js';
 export * from './adesao-ack.js';
+export * from './esquecimento.js';
+export * from './emergencia-determinista.js';

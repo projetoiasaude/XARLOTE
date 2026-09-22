@@ -1,10 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import {
-  CONSENT_ACCEPTED_PATTERNS,
-  FORGET_ME_PATTERNS,
-  EMERGENCY_KEYWORDS,
-} from '../packages/shared/src/constants';
-import { isConsentAccepted } from '../packages/core/src/lgpd/index.js';
+import { CONSENT_ACCEPTED_PATTERNS } from '../packages/shared/src/constants';
+import { categoriaDeEmergenciaNaFala } from '../packages/shared/src/emergencia-determinista.js';
+import { isConsentAccepted, isForgetMeRequest } from '../packages/core/src/lgpd/index.js';
 
 const matchesAny = (patterns: RegExp[], s: string): boolean =>
   patterns.some((re) => re.test(s.trim()));
@@ -39,22 +36,31 @@ describe('esquece-me (LGPD) — detecção de revogação', () => {
     'esquecer meus dados',
     'revogar consentimento',
     'deletar minha conta',
-    'quero sair',
+    // 22/09: era só "quero sair", e essa linha FOSSILIZAVA o defeito — sair sem objeto
+    // casava com "quero sair de casa às 8h". O objeto passou a ser obrigatório.
+    'quero sair do app',
   ])('reconhece "%s" como forget-me', (msg) => {
-    expect(matchesAny(FORGET_ME_PATTERNS, msg)).toBe(true);
+    expect(isForgetMeRequest(msg)).toBe(true);
   });
   it('não dispara em conversa normal', () => {
-    expect(matchesAny(FORGET_ME_PATTERNS, 'quero ver meus dados de novo na tela')).toBe(false);
+    expect(isForgetMeRequest('quero ver meus dados de novo na tela')).toBe(false);
+    expect(isForgetMeRequest('quero sair de casa às 8h, me lembra?')).toBe(false);
   });
 });
 
-describe('red-flag — keywords de emergência presentes', () => {
-  it.each(['infarto', 'convulsão', 'hemorragia', 'inconsciente', 'overdose'])(
-    'contém "%s"',
-    (kw) => {
-      expect(EMERGENCY_KEYWORDS).toContain(kw);
-    },
-  );
+describe('red-flag — a fala vira emergência (antes o teste só conferia a lista em si)', () => {
+  // A versão anterior fazia `expect(EMERGENCY_KEYWORDS).toContain('infarto')`: uma
+  // constante afirmando conter o que ela mesma declara. Passava sempre, inclusive quando
+  // NADA no código usava a lista — que era exatamente o caso. Agora testa COMPORTAMENTO.
+  it.each([
+    ['acho que meu pai teve um infarto agora', 'other_critical'],
+    ['ele está tendo uma convulsão', 'other_critical'],
+    ['começou uma hemorragia', 'other_critical'],
+    ['ela está inconsciente', 'other_critical'],
+    ['tomei a cartela inteira', 'overdose'],
+  ])('"%s" → %s', (fala, categoria) => {
+    expect(categoriaDeEmergenciaNaFala(fala)).toBe(categoria);
+  });
 });
 
 describe('isConsentAccepted — tolerância a pontuação (review 10/07 #24)', () => {
