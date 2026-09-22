@@ -1,10 +1,12 @@
 name: CI
 
 on:
+  # Todo branch, não só `main`. Em 22/09/2026 a auditoria achou 84 commits de PRODUÇÃO
+  # vivendo só no Mac do fundador, em `fix/auditoria-set` — um branch que o CI nunca viu,
+  # porque o gatilho era só `main`. Gate que não roda no branch que deploya não é gate.
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
-    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
