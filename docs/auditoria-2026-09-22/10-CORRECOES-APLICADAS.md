@@ -1,6 +1,8 @@
 # Correções dos 8 P0 — o que mudou, como publicar, como reverter
 
-> **Estado:** implementado e testado localmente, **nada publicado**. Nenhum commit, nenhum push, nenhum deploy, nenhuma migration aplicada, nenhuma mensagem enviada.
+> **Estado (24/09, 16:10 BRT):** ✅ **push** (`origin/fix/auditoria-set`, 90 commits) · ✅ **web** na Vercel (`/app` → página de encerramento; `/s/`, `/login`, `/privacidade`, `/suporte` públicos; dashboard exige login) · ✅ **API** no Railway (19:06Z — rota legada `POST /app/overview` 404, antes 401; log "Rotas legadas do app: OFF") · ✅ **worker** (19:09Z, 17 workers ON, boot limpo) · ⏳ **migration 0034 NÃO aplicada**: o conector do Supabase desta sessão está logado na organização da Criate e não enxerga o projeto da Xarlote — o fundador aplica pelo SQL Editor (ou reconecta o conector) · ✅ **OTA do app** (P0-7 no celular) publicado por volta das 23:40Z no canal `preview` (grupo `24e9a09d`, confirmado no `eas update:list`) — runtime `c36997c9…` conferido igual ao do APK antes de publicar (Android update `01a0d5ca`; o ritual: abrir, esperar ~20 s, fechar pela lista de recentes, abrir de novo; o rodapé do Perfil mostra `01a0d5ca`).
+> Junto foi publicado o **modo "entrega na hora"** da farmácia (`a5e1c95` + `6a84ed2` + `2498f63`) — fora do escopo dos P0; ver o log de 24/09 em `PROJECT_STATE.md`.
+> Obs. de deploy: a CLI v60 da Vercel respondeu "Not authorized" no `--prod`; a v59.25.4 (`npx vercel@59.25.4 --prod --yes`) publicou normalmente. O `railway.toml` está com aviso de depreciação (funciona até 01/12/2026 — migrar pra `.railway/railway.ts`).
 > **Verificação:** `pnpm -r typecheck` limpo em 9/9 workspaces · `CI=true pnpm test` **2.356 testes em 129 arquivos** (antes: 2.191 em 122) · teste de fumaça do processo isolado (sem `.env`, sem Redis, sem Supabase) com boot, rota legada 404 e shutdown limpo na ordem certa.
 > Diagnóstico de cada defeito: [`00-CONSOLIDADO.md`](00-CONSOLIDADO.md) §3.
 
