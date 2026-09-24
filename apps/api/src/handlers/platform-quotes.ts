@@ -167,7 +167,14 @@ export async function presentPlatformQuotes(params: {
   await sendOutbound(conversationId, phoneE164, texto, traceId);
 
   const itemsCovered = new Set(top.flatMap((q) => q.lines.map((l) => l.requested))).size;
-  await writeLog('info', 'platform', `Cotação de plataformas (cesta): ${top.length} rede(s), ${itemsCovered}/${basket.length} item(ns) coberto(s)${soNaHora ? ` — só as que resolvem na hora (${descartadas} lenta(s) fora)` : ' — nenhuma resolve na hora'}`, {
+  // Três casos, não dois: com rápidas E a exceção de cobertura (uma lenta que tem mais itens),
+  // `soNaHora` é false — e o log dizia "nenhuma resolve na hora" com a rápida na mensagem.
+  const modo = soNaHora
+    ? ` — só as que resolvem na hora (${descartadas} lenta(s) fora)`
+    : temOpcaoImediata(top)
+      ? ` — resolvem na hora + 1 lenta que cobre mais itens (${descartadas} fora)`
+      : ' — nenhuma resolve na hora';
+  await writeLog('info', 'platform', `Cotação de plataformas (cesta): ${top.length} rede(s), ${itemsCovered}/${basket.length} item(ns) coberto(s)${modo}`, {
     traceId, orderId,
     redes: top.map((q) => `${q.networkLabel} ${formatBRL(custoDaManchete(q))}/${faixaDePrazo(q)} (${q.lines.length}/${basket.length}${q.missing.length ? `, falta ${q.missing.join('+')}` : ''})`),
   });
