@@ -55,6 +55,27 @@ export interface FulfillmentOption {
    * dois é a diferença entre comparar e adivinhar.
    */
   etaMinutes: number;
+  /** Nome do SLA na rede ("SUPER EXPRESSA", "ENTREGA COM RECEITA") — pra log e diagnóstico. */
+  slaName?: string;
+  /**
+   * RETIRADA: a loja escolhida (a mais rápida e, no empate, a mais PERTO).
+   *
+   * A simulação sempre devolveu o endereço e a distância de cada loja, e o parser jogava
+   * fora. "Retira em 30 min" sem dizer ONDE não é uma promessa que a pessoa possa cumprir;
+   * "retira em 30 min na loja da Av. República do Líbano, a 1,6 km" é.
+   */
+  store?: PickupStore | null;
+}
+
+export interface PickupStore {
+  /** Marca/filial como a rede chama a loja ("Drogarias Pacheco - Filial Republica Do Libano 2"). */
+  name: string;
+  /** Rua + bairro, pronto pra ler ("Avenida República do Líbano, Setor Oeste"). */
+  address: string | null;
+  /** Distância do CEP até a loja, em km (null quando a rede não informa). */
+  distanceKm: number | null;
+  /** Label da rede IRMÃ (mesmo grupo no registro) cuja marca está na fachada — ver `marcarLojaDoGrupo`. */
+  marcaDoGrupo?: string | null;
 }
 
 // ─── Cesta (pedido com N medicamentos numa MESMA rede → 1 carrinho) ───────────
@@ -92,6 +113,11 @@ export interface PlatformBasketQuote {
   /** UM link de carrinho com TODOS os itens encontrados (multi-sku) */
   checkoutUrl: string;
   pricedByCep: boolean;
+  /**
+   * A simulação da cesta EXATA rodou e não existe opção de entrega/retirada comum a todos
+   * os itens (cada um chega de um jeito). Não é "sem entrega": é "confira no site".
+   */
+  semOpcaoComum?: boolean;
 }
 
 /** Uma cotação de plataforma pronta pra entrar no pool e virar handoff. */

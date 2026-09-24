@@ -17,8 +17,9 @@ import {
   strengthsCompatible,
   medNameForSearch,
 } from '../packages/integrations/src/pharmacy-platforms/matching.js';
-import { PLATFORM_REGISTRY, activeNetworks, matchPlatformNetworkByName } from '../packages/integrations/src/pharmacy-platforms/registry.js';
+import { PLATFORM_REGISTRY, activeNetworks, matchPlatformNetworkByName, marcaIrmaNaFachada } from '../packages/integrations/src/pharmacy-platforms/registry.js';
 import { affiliateWrap } from '../packages/integrations/src/pharmacy-platforms/index.js';
+import { escolherCandidatosDisponiveis, MAX_CANDIDATOS } from '../packages/integrations/src/pharmacy-platforms/candidatos.js';
 import { parseRDSearch, parseRDPrice } from '../packages/integrations/src/pharmacy-platforms/rd-adapter.js';
 import { parseNisseiResults, parseNisseiPrices, parseNisseiCsrf, humanizeNisseiSlug } from '../packages/integrations/src/pharmacy-platforms/nissei-adapter.js';
 import { parseUltrafarmaProducts, parseBrl } from '../packages/integrations/src/pharmacy-platforms/ultrafarma-adapter.js';
@@ -109,8 +110,9 @@ describe('parseVtexSimulation (preço/estoque/entrega por CEP)', () => {
   it('separa ENTREGA de RETIRADA e escolhe a mais rápida de cada', () => {
     const f = parseVtexSimulation(SIM)!;
     // entrega mais rápida = EXPRESSA (2h) e não NORMAL (1 dia útil)
-    expect(f.delivery).toEqual({ etaText: '2 horas', feeReais: 14.9, etaMinutes: 120 });
-    expect(f.pickup).toEqual({ etaText: '60 min', feeReais: 0, etaMinutes: 60 });
+    expect(f.delivery).toEqual({ etaText: '2 horas', feeReais: 14.9, etaMinutes: 120, slaName: 'EXPRESSA' });
+    // a amostra não traz pickupStoreInfo → loja null (e não inventada)
+    expect(f.pickup).toEqual({ etaText: '60 min', feeReais: 0, etaMinutes: 60, slaName: 'RETIRE NA LOJA (2448)', store: null });
   });
 
   it('sem entrega em domicílio (só retirada) → delivery null', () => {
@@ -206,6 +208,26 @@ describe('matchPlatformNetworkByName — discernimento nome→canal (fundador 16
   it('word-boundary: não casa alias/label dentro de token maior (review Leva 2 #7)', () => {
     expect(matchPlatformNetworkByName('Drogalândia da esquina')).toBeNull(); // não casa "drogal"
     expect(matchPlatformNetworkByName('Farmácia Indianópolis')).toBeNull();  // não casa "indiana"
+  });
+});
+
+describe('marcaIrmaNaFachada — "loja do mesmo grupo" só com prova do registro', () => {
+  const rede = (id: string) => PLATFORM_REGISTRY.find((n) => n.id === id)!;
+
+  it('Extrafarma retirando em loja Pague Menos → Pague Menos (prova ao vivo de 24/09)', () => {
+    expect(marcaIrmaNaFachada('Pague Menos - Av. Goiás, 415 (Loja 304)', rede('extrafarma'))).toBe('Pague Menos');
+  });
+
+  it('Drogaria São Paulo retirando em loja Pacheco → Drogaria Pacheco ("Drogarias" ≈ "Drogaria")', () => {
+    expect(marcaIrmaNaFachada('Drogarias Pacheco - Filial Republica Do Libano 2', rede('drogaria-sao-paulo'))).toBe('Drogaria Pacheco');
+  });
+
+  it('a própria marca, prefixo que não é rede, sem prefixo ou rede de OUTRO grupo → null', () => {
+    expect(marcaIrmaNaFachada('Pague Menos - Av. Goiás, 415', rede('pague-menos'))).toBeNull();
+    expect(marcaIrmaNaFachada('Loja 123 - Centro', rede('pague-menos'))).toBeNull();
+    expect(marcaIrmaNaFachada('Unidade Centro - Av. Goiás', rede('drogaria-sao-paulo'))).toBeNull();
+    expect(marcaIrmaNaFachada('Filial Republica Do Libano 2', rede('drogaria-sao-paulo'))).toBeNull();
+    expect(marcaIrmaNaFachada('Drogarias Pacheco - Filial X', rede('pague-menos'))).toBeNull();
   });
 });
 
@@ -410,9 +432,9 @@ describe('cesta multi-item (auditoria 1º pedido — P2)', () => {
     };
     const r = parseVtexBasketSimulation(sim)!;
     expect(r.total).toBeCloseTo(26.99 + 4.99 * 2, 2); // 36.97
-    expect(r.perSku['52332']).toEqual({ price: 26.99, available: true });
+    expect(r.perSku['52332']).toEqual({ price: 26.99, available: true, temLogistica: true });
     expect(r.allAvailable).toBe(true);
-    expect(r.delivery).toEqual({ etaText: '60 min', feeReais: 7.9, etaMinutes: 60 });
+    expect(r.delivery).toMatchObject({ etaText: '60 min', feeReais: 7.9, etaMinutes: 60 });
   });
 
   it('parseVtexBasketSimulation: item indisponível não entra no total e marca allAvailable=false', () => {
@@ -611,5 +633,163 @@ describe('adaptador Ultrafarma — parsing dos cards SSR', () => {
     expect(parseBrl('R$ 9,73')).toBe(9.73);
     expect(parseBrl('0,00')).toBeNull();
     expect(parseBrl('grátis')).toBeNull();
+  });
+});
+
+describe('entrega na hora — a logística vale pra CESTA INTEIRA (medição real 24/09, Goiânia)', () => {
+  // Pague Menos, CEP 74003-010: dipirona tem Super Expressa (60 min); amoxicilina (antibiótico,
+  // retém receita) só tem Econômica (1 dia útil). As duas têm retirada na loja da Av. Goiás.
+  const lojaAvGoias = {
+    id: 'loja-304', name: 'Retire em Loja (304)', deliveryChannel: 'pickup-in-point', shippingEstimate: '60m', price: 0,
+    pickupDistance: 0.35245220612000006,
+    pickupStoreInfo: { friendlyName: 'Pague Menos - Av. Goiás, 415 (Loja 304). ', address: { street: 'Avenida Goiás', neighborhood: 'Setor Central', city: 'Goiânia', state: 'GO' } },
+  };
+  // Setor Sul é MAIS PERTO que a Av. Goiás de propósito: sem a interseção, ela venceria o
+  // desempate por distância — e a pessoa iria a uma loja que não tem a amoxicilina. (A 1ª
+  // versão deste fixture punha a Av. Goiás mais perto, e o teste passava por acaso.)
+  const lojaSetorSul = {
+    ...lojaAvGoias, id: 'loja-sul', pickupDistance: 0.2,
+    pickupStoreInfo: { friendlyName: 'Pague Menos - Setor Sul', address: { street: 'Rua 10', neighborhood: 'Setor Sul', city: 'Goiânia', state: 'GO' } },
+  };
+  const dipirona = {
+    itemIndex: 0,
+    slas: [
+      { id: 'economica', name: 'Econômica', deliveryChannel: 'delivery', shippingEstimate: '1bd', price: 245 },
+      { id: 'super', name: 'Super Expressa', deliveryChannel: 'delivery', shippingEstimate: '60m', price: 395 },
+      lojaSetorSul, lojaAvGoias,
+    ],
+  };
+  const amoxicilina = {
+    itemIndex: 1,
+    slas: [
+      { id: 'economica', name: 'Econômica', deliveryChannel: 'delivery', shippingEstimate: '1bd', price: 245 },
+      lojaAvGoias,
+    ],
+  };
+  const itens = [
+    { id: 'dip', price: 349, quantity: 1, availability: 'available' },
+    { id: 'amox', price: 2190, quantity: 1, availability: 'available' },
+  ];
+
+  it('cesta com antibiótico NÃO promete a Super Expressa de 60 min do outro item', () => {
+    const r = parseVtexBasketSimulation({ items: itens, logisticsInfo: [dipirona, amoxicilina] })!;
+    // a única entrega comum aos dois é a Econômica — prazo do mais lento, frete somado
+    expect(r.delivery).toMatchObject({ etaText: '1 dia útil', slaName: 'Econômica', feeReais: 4.9 });
+  });
+
+  it('a retirada da cesta é na loja que tem OS DOIS (Av. Goiás), não na do Setor Sul', () => {
+    const r = parseVtexBasketSimulation({ items: itens, logisticsInfo: [dipirona, amoxicilina] })!;
+    expect(r.pickup).toMatchObject({ etaText: '60 min', etaMinutes: 60 });
+    expect(r.pickup!.store).toEqual({ name: 'Pague Menos - Av. Goiás, 415 (Loja 304)', address: 'Avenida Goiás, Setor Central', distanceKm: 0.35 });
+  });
+
+  it('item sozinho: a entrega mais rápida dele vale (dipirona → 60 min)', () => {
+    const r = parseVtexBasketSimulation({ items: [itens[0]], logisticsInfo: [dipirona] })!;
+    expect(r.delivery).toMatchObject({ etaText: '60 min', slaName: 'Super Expressa' });
+  });
+
+  it('empate de prazo na retirada → a loja MAIS PERTO (item sozinho: Setor Sul a 200 m)', () => {
+    const r = parseVtexBasketSimulation({ items: [itens[0]], logisticsInfo: [dipirona] })!;
+    expect(r.pickup!.store!.address).toBe('Rua 10, Setor Sul');
+    expect(r.pickup!.store!.distanceKm).toBe(0.2);
+  });
+
+  it('item SEM opção nenhuma não zera a logística do outro (B2, defesa no parser)', () => {
+    const r = parseVtexBasketSimulation({
+      items: [itens[0], { id: 'ome', price: 1990, quantity: 1, availability: 'cannotBeDelivered' }],
+      logisticsInfo: [dipirona, { itemIndex: 1, slas: [] }],
+    })!;
+    expect(r.delivery).toMatchObject({ etaText: '60 min' });
+    expect(r.perSku['ome']!.temLogistica).toBe(false);
+  });
+
+  it('item sem NENHUMA logística no CEP é marcado — disponível no catálogo não basta', () => {
+    const r = parseVtexBasketSimulation({
+      items: [{ id: 'losartana', price: 1199, quantity: 1, availability: 'available' }],
+      logisticsInfo: [{ itemIndex: 0, slas: [] }],
+    })!;
+    expect(r.perSku['losartana']!.temLogistica).toBe(false);
+    expect(r.delivery).toBeNull();
+    expect(r.pickup).toBeNull();
+  });
+
+  it('"no mesmo dia útil" (0bd) não é "agora" — não pode ganhar de uma entrega real de 60 min', () => {
+    expect(estimateToMinutes('0bd')).toBeGreaterThan(estimateToMinutes('60m'));
+    expect(estimateToMinutes('0bd')).toBeGreaterThan(4 * 60);
+    expect(estimateToMinutes('0bd')).toBeLessThan(estimateToMinutes('1bd'));
+  });
+});
+
+describe('escolherCandidatosDisponiveis — a marca que EXISTE no estoque do CEP (medição 24/09)', () => {
+  // Drogaria São Paulo, Goiânia: a losartana Eurofarma (1ª do ranking) não tinha nenhuma
+  // entrega nem loja pro CEP; a rede saía da cotação tendo outra losartana 50mg na loja.
+  const eurofarma = { sku: 'eurofarma', sellerId: '1' };
+  const ems = { sku: 'ems', sellerId: '1' };
+  const medley = { sku: 'medley', sellerId: '1' };
+
+  it('pula a marca sem estoque/logística no CEP e fica com a próxima do ranking', () => {
+    const r = escolherCandidatosDisponiveis(
+      [{ label: 'Losartana 50mg', candidatos: [eurofarma, ems, medley] }],
+      {
+        eurofarma: { available: true, temLogistica: false },
+        ems: { available: true, temLogistica: true },
+        medley: { available: true, temLogistica: true },
+      },
+    );
+    expect(r.escolhidos).toEqual([{ pedidoIdx: 0, candidato: ems }]); // a 1ª que serve, não a mais barata
+    expect(r.faltando).toEqual([]);
+  });
+
+  it('indisponível (sem estoque) também é pulado', () => {
+    const r = escolherCandidatosDisponiveis(
+      [{ label: 'Losartana 50mg', candidatos: [eurofarma, ems] }],
+      { eurofarma: { available: false }, ems: { available: true } },
+    );
+    expect(r.escolhidos[0]!.candidato).toBe(ems);
+  });
+
+  it('nenhuma marca serve → o remédio vai pra "faltando" (e a rede diz que não tem aqui)', () => {
+    const r = escolherCandidatosDisponiveis(
+      [{ label: 'Amoxicilina 500mg', candidatos: [eurofarma] }],
+      { eurofarma: { available: true, temLogistica: false } },
+    );
+    expect(r.escolhidos).toEqual([]);
+    expect(r.faltando).toEqual(['Amoxicilina 500mg']);
+  });
+
+  it('sem resposta do CEP (simulação falhou) → 1º do ranking, como antes — nunca pior que a versão anterior', () => {
+    const r = escolherCandidatosDisponiveis(
+      [{ label: 'Losartana 50mg', candidatos: [eurofarma, ems] }],
+      null,
+    );
+    expect(r.escolhidos).toEqual([{ pedidoIdx: 0, candidato: eurofarma }]);
+  });
+
+  it('logística DESCONHECIDA (sem entrada no payload) não descarta um item disponível', () => {
+    const r = escolherCandidatosDisponiveis(
+      [{ label: 'Dipirona', candidatos: [eurofarma] }],
+      { eurofarma: { available: true } },
+    );
+    expect(r.escolhidos).toHaveLength(1);
+  });
+
+  it('vários remédios: cada um escolhe o seu, e a ordem dos pedidos é preservada', () => {
+    const r = escolherCandidatosDisponiveis(
+      [
+        { label: 'Losartana', candidatos: [eurofarma, ems] },
+        { label: 'Dipirona', candidatos: [medley] },
+      ],
+      {
+        eurofarma: { available: true, temLogistica: false },
+        ems: { available: true, temLogistica: true },
+        medley: { available: true, temLogistica: true },
+      },
+    );
+    expect(r.escolhidos.map((e) => [e.pedidoIdx, e.candidato.sku])).toEqual([[0, 'ems'], [1, 'medley']]);
+  });
+
+  it('teto de candidatos é pequeno (custo de uma consulta a mais por rede, não uma varredura)', () => {
+    expect(MAX_CANDIDATOS).toBeGreaterThanOrEqual(2);
+    expect(MAX_CANDIDATOS).toBeLessThanOrEqual(5);
   });
 });

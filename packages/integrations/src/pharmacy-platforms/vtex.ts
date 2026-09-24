@@ -8,7 +8,7 @@
  */
 import axios, { type AxiosRequestConfig } from 'axios';
 import type { PlatformNetwork } from './registry.js';
-import type { PlatformProduct, PlatformFulfillment, FulfillmentOption } from './types.js';
+import type { PlatformProduct, PlatformFulfillment, FulfillmentOption, PickupStore } from './types.js';
 
 // User-Agent de navegador: as APIs REST do Grupo A respondem sem isso, mas mandar um UA
 // realista reduz chance de tropeçar em regra de bot leve (e nunca finge ser outra coisa).
@@ -20,15 +20,45 @@ const DEFAULT_TIMEOUT_MS = 8000;
 // frete real de farmácia passa de R$150, nem prazo real de e-commerce passa de ~20 dias.
 const MAX_REALISTIC_FEE_CENTS = 15000;
 const MAX_REALISTIC_ETA_MIN = 20 * 24 * 60;
+/** "No mesmo dia útil", sem hora: tratado como 8h pra ordenar (ver estimateToMinutes). */
+const MESMO_DIA_MIN = 8 * 60;
+
+/**
+ * O cliente HTTP da VTEX — trocável SÓ em teste.
+ *
+ * Com pnpm, o `axios` deste pacote é outro arquivo físico que o da raiz (que nem existe),
+ * então `vi.mock('axios')` num teste não intercepta nada: a primeira versão do teste ponta
+ * a ponta da cotação bateu nas APIs REAIS da Pague Menos. Uma costura explícita é mais
+ * honesta que um mock por caminho de versão (`.pnpm/axios@1.15.1/...`), que quebraria em
+ * silêncio no próximo upgrade.
+ */
+export interface ClienteHttp {
+  get<T = unknown>(url: string, cfg?: AxiosRequestConfig): Promise<{ data: T }>;
+  post<T = unknown>(url: string, body: unknown, cfg?: AxiosRequestConfig): Promise<{ data: T }>;
+}
+let http: ClienteHttp = axios;
+
+/** Só pra teste: troca o cliente HTTP (`null` volta pro axios). */
+export function __definirClienteHttpParaTeste(cliente: ClienteHttp | null): void {
+  http = cliente ?? axios;
+}
 
 function headers() {
   return { 'User-Agent': BROWSER_UA, Accept: 'application/json', 'Accept-Language': 'pt-BR' };
 }
 
-/** Uma tentativa de retry em erro de rede/timeout/5xx — não martela (CLAUDE.md: timeout+retry). */
+/**
+ * Tentativas em erro de rede/timeout/5xx — não martela (CLAUDE.md: timeout+retry).
+ *
+ * ⚠️ `tries` é o TOTAL de tentativas, e nunca menos que 1. A primeira versão da troca de
+ * marca (24/09) passou `retries: 0` querendo dizer "sem nova tentativa" — o laço não
+ * rodava, a função lançava `undefined` sem fazer a chamada, e o `catch` de quem chamou
+ * engolia. A etapa inteira ficou morta sem uma linha de log; a revisão independente pegou.
+ */
 async function withRetry<T>(fn: () => Promise<T>, tries = 2): Promise<T> {
   let lastErr: unknown;
-  for (let i = 0; i < tries; i++) {
+  const total = Math.max(1, Math.floor(tries));
+  for (let i = 0; i < total; i++) {
     try {
       return await fn();
     } catch (err) {
@@ -128,7 +158,7 @@ export async function searchVtexProducts(
     `${net.host}/api/catalog_system/pub/products/search` +
     `?ft=${encodeURIComponent(term)}&_from=0&_to=${limit - 1}&sc=${encodeURIComponent(net.salesChannel)}`;
   const cfg: AxiosRequestConfig = { timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, headers: headers() };
-  const data = await withRetry(async () => (await axios.get<unknown[]>(url, cfg)).data, opts.retries ?? 2);
+  const data = await withRetry(async () => (await http.get<unknown[]>(url, cfg)).data, opts.retries ?? 2);
   if (!Array.isArray(data)) return [];
   const out: PlatformProduct[] = [];
   for (const raw of data) {
@@ -140,20 +170,6 @@ export async function searchVtexProducts(
 
 // ───────────────────────── SIMULAÇÃO POR CEP ─────────────────────────
 
-/** Escolhe a melhor opção de um conjunto de SLAs: menor prazo, desempate por menor frete. */
-function pickBestSla(slas: Record<string, unknown>[]): FulfillmentOption | null {
-  let best: { rankMin: number; fee: number; est: string } | null = null;
-  for (const s of slas) {
-    const est = typeof s['shippingEstimate'] === 'string' ? (s['shippingEstimate'] as string) : '';
-    const fee = centavosToReais(typeof s['price'] === 'number' ? (s['price'] as number) : 0);
-    const rankMin = estimateToMinutes(est);
-    if (!best || rankMin < best.rankMin || (rankMin === best.rankMin && fee < best.fee)) {
-      best = { rankMin, fee, est };
-    }
-  }
-  return best ? { etaText: formatShippingEstimate(best.est), feeReais: best.fee, etaMinutes: best.rankMin } : null;
-}
-
 /** Converte shippingEstimate num nº de minutos comparável (pra achar a opção mais rápida). */
 export function estimateToMinutes(est: string): number {
   const m = /^(\d+)\s*(m|h|d|bd|min)$/i.exec((est ?? '').trim());
@@ -162,24 +178,144 @@ export function estimateToMinutes(est: string): number {
   const u = m[2]!.toLowerCase();
   if (u === 'm' || u === 'min') return n;
   if (u === 'h') return n * 60;
+  // "0bd"/"0d" = "no mesmo dia útil" — NÃO é "agora". Contado como 0 minutos, ele virava
+  // "⚡ chega agora" e ganhava de uma entrega real de 60 min. Oito horas é a leitura honesta
+  // de "ainda hoje, sem hora marcada".
+  if (n === 0) return MESMO_DIA_MIN;
   return n * 24 * 60; // 'd' e 'bd' contam como dias (útil ~ dia pro ranking)
 }
 
+
+/** Uma opção de logística que vale para a CESTA INTEIRA (ver `agregarSlasDaCesta`). */
+interface SlaDaCesta {
+  id: string;
+  name: string;
+  pickup: boolean;
+  /** o prazo do item MAIS LENTO — a cesta só chega quando o último item chega */
+  etaMinutes: number;
+  estimate: string;
+  /** frete da cesta = soma da fração de cada item (o VTEX rateia o frete por item) */
+  feeCents: number;
+  store: PickupStore | null;
+  distanceKm: number | null;
+}
+
+function slaRealista(s: Record<string, unknown>): boolean {
+  const feeCents = typeof s['price'] === 'number' ? (s['price'] as number) : 0;
+  return feeCents <= MAX_REALISTIC_FEE_CENTS && estimateToMinutes(String(s['shippingEstimate'] ?? '')) <= MAX_REALISTIC_ETA_MIN;
+}
+
 /**
- * Melhor entrega e retirada a partir do logisticsInfo, descartando SLA-sentinela (frete
- * gigante + prazo enorme, ex.: São João "30 dias / R$1000" = "não entrego de verdade aqui").
+ * A loja como o CHECKOUT a lista: nome da filial, rua com número, bairro e distância.
+ *
+ * A primeira versão guardava só rua + bairro e trocava o nome pela rua: duas filiais
+ * Pacheco na Av. T-63 (Setor Bueno e Setor Bueno 9) viravam o MESMO texto, e a retirada é
+ * reservada numa loja específica. O nome da filial é o que a pessoa vai escolher no site.
+ */
+function lojaDoSla(s: Record<string, unknown>): PickupStore | null {
+  const info = (s['pickupStoreInfo'] ?? null) as Record<string, unknown> | null;
+  if (!info) return null;
+  const limpar = (v: unknown) =>
+    typeof v === 'string' ? v.replace(/\s+/g, ' ').replace(/[\s.\-–]+$/, '').trim() : '';
+  const name = limpar(info['friendlyName']) || limpar(s['name']);
+  if (!name) return null;
+  const a = (info['address'] ?? null) as Record<string, unknown> | null;
+  const rua = a ? limpar(a['street']) : '';
+  const numeroCru = a ? limpar(a['number']) : '';
+  const numero = numeroCru && !/^s\/?n$/i.test(numeroCru) && numeroCru !== '0' ? numeroCru : '';
+  const bairro = a ? limpar(a['neighborhood']) : '';
+  const partes = [rua && numero ? `${rua}, ${numero}` : rua, bairro].filter(Boolean);
+  // Precisão de 10 m: arredondar pra 0,1 km fazia 352 m virar "400 m" na mensagem.
+  const dist = typeof s['pickupDistance'] === 'number' && Number.isFinite(s['pickupDistance'] as number)
+    ? Math.round((s['pickupDistance'] as number) * 100) / 100
+    : null;
+  return { name, address: partes.length ? partes.join(', ') : null, distanceKm: dist };
+}
+
+/**
+ * As opções de logística que valem para TODOS os itens da cesta.
+ *
+ * ⚠️ A versão anterior lia só `logisticsInfo[0]` — o PRIMEIRO item. Numa receita com
+ * dipirona (entrega em 90 min) e amoxicilina (antibiótico: a rede só entrega em 1 dia útil,
+ * porque o entregador precisa recolher a receita), a Xarlote prometia 90 min para a cesta
+ * inteira. Medido ao vivo em 24/09 na Pague Menos, CEP do Setor Central.
+ *
+ * Uma opção só vale para a cesta se TODO item a oferece (mesmo `id` de SLA); o prazo é o
+ * do item mais lento e o frete é a soma das frações. Loja de retirada idem: se um item não
+ * está naquela loja, a pessoa não retira a cesta ali.
+ */
+export function agregarSlasDaCesta(li: Record<string, unknown>[]): SlaDaCesta[] {
+  // ⚠️ Item sem NENHUMA opção no CEP (indisponível, "cannotBeDelivered") não participa da
+  // interseção: ele sai da cesta de qualquer jeito (vira "não achei aqui"), e contá-lo
+  // zerava a logística dos outros — a Drogaria São Paulo aparecia "sem entrega" com a
+  // losartana saindo em 3h, só porque o omeprazol da mesma receita não tinha estoque
+  // (revisão de 24/09: 3 de 8 receitas reais). Quem chama ainda re-simula a cesta final.
+  const entregaveis = li.filter((e) =>
+    (Array.isArray(e['slas']) ? (e['slas'] as Record<string, unknown>[]) : []).some(slaRealista));
+  if (!entregaveis.length) return [];
+  const porId = new Map<string, SlaDaCesta & { itens: number }>();
+  for (const entrada of entregaveis) {
+    const slas = Array.isArray(entrada['slas']) ? (entrada['slas'] as Record<string, unknown>[]) : [];
+    const vistos = new Set<string>();
+    for (const s of slas) {
+      if (!slaRealista(s)) continue;
+      // O VTEX sempre manda `id`; o nome e a combinação canal+prazo são só rede de
+      // segurança pra payload incompleto — sem eles, a opção sumiria em silêncio.
+      const id = String(s['id'] ?? s['name'] ?? `${String(s['deliveryChannel'] ?? '')}:${String(s['shippingEstimate'] ?? '')}`);
+      if (vistos.has(id)) continue;
+      vistos.add(id);
+      const estimate = String(s['shippingEstimate'] ?? '');
+      const eta = estimateToMinutes(estimate);
+      const fee = typeof s['price'] === 'number' ? (s['price'] as number) : 0;
+      const atual = porId.get(id);
+      if (!atual) {
+        const pickup = s['deliveryChannel'] === 'pickup-in-point';
+        const store = pickup ? lojaDoSla(s) : null;
+        porId.set(id, {
+          id, name: String(s['name'] ?? id), pickup,
+          etaMinutes: eta, estimate, feeCents: fee, store,
+          distanceKm: store?.distanceKm ?? null, itens: 1,
+        });
+      } else {
+        atual.itens += 1;
+        atual.feeCents += fee;
+        if (eta > atual.etaMinutes) { atual.etaMinutes = eta; atual.estimate = estimate; }
+      }
+    }
+  }
+  return [...porId.values()].filter((x) => x.itens === entregaveis.length);
+}
+
+function comoOpcao(x: SlaDaCesta): FulfillmentOption {
+  return {
+    etaText: formatShippingEstimate(x.estimate),
+    feeReais: centavosToReais(x.feeCents),
+    etaMinutes: x.etaMinutes,
+    slaName: x.name,
+    ...(x.pickup ? { store: x.store } : {}),
+  };
+}
+
+/**
+ * Melhor ENTREGA (mais rápida; desempate pelo menor frete) e melhor RETIRADA (mais rápida;
+ * desempate pela loja mais PERTO — frete é zero em todas) entre as opções que valem pra
+ * cesta inteira. Descarta SLA-sentinela (frete gigante + prazo enorme, ex.: São João
+ * "30 dias / R$1000" = "não entrego de verdade aqui").
  */
 function bestSlasFromLogistics(li: Record<string, unknown>[]): { delivery: FulfillmentOption | null; pickup: FulfillmentOption | null } {
-  const slas = li[0] && Array.isArray(li[0]['slas']) ? (li[0]['slas'] as Record<string, unknown>[]) : [];
-  const ok = (s: Record<string, unknown>) => {
-    const feeCents = typeof s['price'] === 'number' ? (s['price'] as number) : 0;
-    return feeCents <= MAX_REALISTIC_FEE_CENTS && estimateToMinutes(String(s['shippingEstimate'] ?? '')) <= MAX_REALISTIC_ETA_MIN;
-  };
-  const deliverySlas = slas.filter((s) => s['deliveryChannel'] !== 'pickup-in-point').filter(ok);
-  const pickupSlas = slas.filter((s) => s['deliveryChannel'] === 'pickup-in-point').filter(ok);
+  const validas = agregarSlasDaCesta(li);
+  const entrega = validas
+    .filter((x) => !x.pickup)
+    .sort((a, b) => a.etaMinutes - b.etaMinutes || a.feeCents - b.feeCents)[0];
+  const retirada = validas
+    .filter((x) => x.pickup)
+    .sort((a, b) =>
+      a.etaMinutes - b.etaMinutes
+      || (a.distanceKm ?? Number.MAX_SAFE_INTEGER) - (b.distanceKm ?? Number.MAX_SAFE_INTEGER)
+      || a.feeCents - b.feeCents)[0];
   return {
-    delivery: deliverySlas.length ? pickBestSla(deliverySlas) : null,
-    pickup: pickupSlas.length ? pickBestSla(pickupSlas) : null,
+    delivery: entrega ? comoOpcao(entrega) : null,
+    pickup: retirada ? comoOpcao(retirada) : null,
   };
 }
 
@@ -222,7 +358,7 @@ export async function simulateVtexByCep(
     timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     headers: { ...headers(), 'Content-Type': 'application/json' },
   };
-  const data = await withRetry(async () => (await axios.post<unknown>(url, body, cfg)).data, opts.retries ?? 2);
+  const data = await withRetry(async () => (await http.post<unknown>(url, body, cfg)).data, opts.retries ?? 2);
   return parseVtexSimulation(data);
 }
 
@@ -250,8 +386,12 @@ export function buildVtexCartLinkMulti(net: PlatformNetwork, items: BasketItem[]
 }
 
 export interface VtexBasketResult {
-  /** preço UNITÁRIO por sku no CEP (reais) */
-  perSku: Record<string, { price: number; available: boolean }>;
+  /**
+   * Por sku: preço UNITÁRIO no CEP (reais), disponibilidade e se existe ALGUMA forma de
+   * receber/retirar aqui. `available` sozinho engana: o item pode constar como disponível
+   * no catálogo e não ter nenhuma entrega nem loja pro CEP.
+   */
+  perSku: Record<string, { price: number; available: boolean; temLogistica?: boolean }>;
   /** total da cesta no CEP (reais) — soma de price×qty dos itens disponíveis */
   total: number;
   /** todos os itens simulados estão disponíveis? */
@@ -266,19 +406,24 @@ export function parseVtexBasketSimulation(raw: unknown): VtexBasketResult | null
   if (!d || typeof d !== 'object') return null;
   const items = Array.isArray(d['items']) ? (d['items'] as Record<string, unknown>[]) : [];
   if (items.length === 0) return null;
-  const perSku: Record<string, { price: number; available: boolean }> = {};
+  const perSku: Record<string, { price: number; available: boolean; temLogistica?: boolean }> = {};
   let total = 0;
   let allAvailable = true;
-  for (const it of items) {
+  const li = Array.isArray(d['logisticsInfo']) ? (d['logisticsInfo'] as Record<string, unknown>[]) : [];
+  items.forEach((it, idx) => {
     const id = String(it['id'] ?? '');
     const price = centavosToReais(typeof it['price'] === 'number' ? (it['price'] as number) : 0);
     const qty = typeof it['quantity'] === 'number' ? (it['quantity'] as number) : 1;
     const available = String(it['availability'] ?? '') === 'available';
-    if (id) perSku[id] = { price, available };
+    // A logística do item vem pelo `itemIndex`; sem ele, pela posição.
+    const entrada = li.find((e) => e['itemIndex'] === idx) ?? li[idx];
+    const temLogistica = entrada
+      ? (Array.isArray(entrada['slas']) ? (entrada['slas'] as Record<string, unknown>[]) : []).some(slaRealista)
+      : undefined;
+    if (id) perSku[id] = { price, available, ...(temLogistica !== undefined ? { temLogistica } : {}) };
     if (available) total += price * qty;
     else allAvailable = false;
-  }
-  const li = Array.isArray(d['logisticsInfo']) ? (d['logisticsInfo'] as Record<string, unknown>[]) : [];
+  });
   const { delivery, pickup } = bestSlasFromLogistics(li);
   return { perSku, total, allAvailable, delivery, pickup };
 }
@@ -302,6 +447,6 @@ export async function simulateVtexBasket(
     timeout: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     headers: { ...headers(), 'Content-Type': 'application/json' },
   };
-  const data = await withRetry(async () => (await axios.post<unknown>(url, body, cfg)).data, opts.retries ?? 2);
+  const data = await withRetry(async () => (await http.post<unknown>(url, body, cfg)).data, opts.retries ?? 2);
   return parseVtexBasketSimulation(data);
 }

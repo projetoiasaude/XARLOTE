@@ -140,3 +140,27 @@ export function activeNetworks(): PlatformNetwork[] {
     (n) => n.enabled && (n.access === 'rest' || n.access === 'custom' || (n.access === 'akamai' && zenrows)),
   );
 }
+
+/** Palavras que toda rede usa — não distinguem uma marca da outra. */
+const GENERICAS_DE_MARCA = new Set(['drogaria', 'drogarias', 'farmacia', 'farmacias', 'de', 'da', 'do', 'das', 'dos']);
+
+function nucleoDaMarca(nome: string): string {
+  return nome.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .split(/[^a-z0-9]+/).filter((p) => p && !GENERICAS_DE_MARCA.has(p)).join(' ');
+}
+
+/**
+ * A loja de retirada tem na fachada a marca de OUTRA rede do MESMO grupo econômico?
+ * "Pague Menos - Av. Goiás, 415" no site da Extrafarma → 'Pague Menos'; "Drogarias Pacheco -
+ * Filial …" no site da Drogaria São Paulo → 'Drogaria Pacheco'. Só afirma o que o registro
+ * prova: sem prefixo de marca ("Filial 12"), prefixo que não é rede conhecida ("Loja 123 -
+ * Centro") ou rede de outro grupo → null. O texto diz "loja do mesmo grupo" só com isso.
+ */
+export function marcaIrmaNaFachada(nomeDaLoja: string, net: Pick<PlatformNetwork, 'id' | 'group'>): string | null {
+  const partes = nomeDaLoja.split(' - ');
+  if (partes.length < 2) return null;
+  const prefixo = nucleoDaMarca(partes[0]!);
+  if (!prefixo) return null;
+  const irma = PLATFORM_REGISTRY.find((n) => n.group === net.group && n.id !== net.id && nucleoDaMarca(n.label) === prefixo);
+  return irma ? irma.label : null;
+}

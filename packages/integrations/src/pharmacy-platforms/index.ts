@@ -9,14 +9,25 @@
  *
  * Ver docs/PHARMACY_PLATFORMS.md.
  */
-import { activeNetworks, type PlatformNetwork } from './registry.js';
+import { activeNetworks, marcaIrmaNaFachada, type PlatformNetwork } from './registry.js';
 import { rankProductMatches, medNameForSearch } from './matching.js';
 import { searchVtexProducts, simulateVtexByCep, buildVtexCartLink, buildVtexCartLinkMulti, simulateVtexBasket, onlyDigits, type BasketItem } from './vtex.js';
-import { ordenarCotacoesDeRede } from '@iasaude/shared';
+import { ordenarCotacoesDeRede, compararCotacoesDeRede } from '@iasaude/shared';
+import { escolherCandidatosDisponiveis, MAX_CANDIDATOS } from './candidatos.js';
 import { quoteRDProduct, zenrowsConfigured } from './rd-adapter.js';
 import { quoteNisseiProduct } from './nissei-adapter.js';
 import { quoteUltrafarmaProduct } from './ultrafarma-adapter.js';
-import type { PlatformQuote, PlatformProduct, PlatformBasketQuote, PlatformBasketLine } from './types.js';
+import type { PlatformQuote, PlatformProduct, PlatformBasketQuote, PlatformBasketLine, FulfillmentOption } from './types.js';
+
+/**
+ * Marca a loja de retirada cuja FACHADA é de uma rede irmã (mesmo grupo no registro): a
+ * Extrafarma de Goiânia retira em lojas Pague Menos. Cópia nova — o objeto em cache fica intacto.
+ */
+function comMarcaDoGrupo(pickup: FulfillmentOption | null, net: PlatformNetwork): FulfillmentOption | null {
+  if (!pickup?.store) return pickup;
+  const marcaDoGrupo = marcaIrmaNaFachada(pickup.store.name, net);
+  return marcaDoGrupo ? { ...pickup, store: { ...pickup.store, marcaDoGrupo } } : pickup;
+}
 
 /**
  * Adaptadores das redes de PLATAFORMA PRÓPRIA (access 'custom' — nem VTEX nem Akamai). Cada uma
@@ -39,6 +50,7 @@ const CUSTOM_ADAPTERS: Record<string, CustomAdapter> = {
 
 export * from './types.js';
 export * from './registry.js';
+export { escolherCandidatosDisponiveis, MAX_CANDIDATOS } from './candidatos.js';
 export { PLATFORM_REGISTRY } from './registry.js';
 export {
   searchVtexProducts,
@@ -149,7 +161,7 @@ async function quoteOneNetwork(
       listPrice = sim.listPrice;
       available = sim.available;
       delivery = sim.delivery;
-      pickup = sim.pickup;
+      pickup = comMarcaDoGrupo(sim.pickup, net);
       pricedByCep = true;
     }
   } catch {
@@ -342,63 +354,153 @@ async function quoteBasketOneNetwork(
   if (net.access === 'akamai') return quoteBasketRD(net, items, opts);
   if (net.access === 'custom') return quoteBasketCustom(net, items, opts);
   if (net.access !== 'rest') return null;
+  // Teto de wall-clock por rede VTEX (as buscas são sequenciais, mais 1–3 simulações): uma
+  // rede lenta ou com 429 não pode segurar a cotação inteira — o turno do paciente tem ~75s.
+  return withDeadline(quoteBasketVtex(net, items, cep8, opts), VTEX_DEADLINE_MS, null);
+}
 
-  // 1) casa cada item na rede; item sem match vai pra `missing`.
-  const found: { req: BasketRequestItem; product: PlatformProduct; score: number }[] = [];
+/** Uma consulta de busca por (rede, termo) vale 30 min — preço de catálogo muda devagar. */
+const BUSCA_CACHE = new Map<string, { at: number; products: PlatformProduct[] }>();
+/** Uma simulação por (rede, CEP, cesta) vale 5 min — estoque e prazo mudam mais rápido. */
+const SIM_CACHE = new Map<string, { at: number; sim: Awaited<ReturnType<typeof simulateVtexBasket>> }>();
+const BUSCA_TTL_MS = 30 * 60_000;
+const SIM_TTL_MS = 5 * 60_000;
+const CACHE_MAX = 2_000;
+const VTEX_DEADLINE_MS = 15_000;
+
+function podarCache<V>(m: Map<string, V>): void {
+  // Map preserva ordem de inserção: o mais antigo sai primeiro. Sem teto, um processo de
+  // meses guardaria toda busca já feita.
+  while (m.size > CACHE_MAX) m.delete(m.keys().next().value as string);
+}
+
+async function buscarComCache(net: PlatformNetwork, termo: string, opts: QuotePlatformsOptions): Promise<PlatformProduct[]> {
+  const k = `${net.id}|${termo}`;
+  const hit = BUSCA_CACHE.get(k);
+  if (hit && Date.now() - hit.at < BUSCA_TTL_MS) return hit.products;
+  let products: PlatformProduct[] = [];
+  try {
+    products = await searchVtexProducts(net, termo, { limit: 16, timeoutMs: opts.timeoutMs, retries: 1 });
+    BUSCA_CACHE.set(k, { at: Date.now(), products });
+    podarCache(BUSCA_CACHE);
+  } catch { products = []; }
+  return products;
+}
+
+async function simularComCache(net: PlatformNetwork, cesta: BasketItem[], cep8: string, opts: QuotePlatformsOptions) {
+  const k = `${net.id}|${cep8}|${cesta.map((c) => `${c.sku}:${c.seller}:${c.qty}`).sort().join(',')}`;
+  const hit = SIM_CACHE.get(k);
+  if (hit && Date.now() - hit.at < SIM_TTL_MS) return hit.sim;
+  let sim: Awaited<ReturnType<typeof simulateVtexBasket>> = null;
+  try { sim = await simulateVtexBasket(net, cesta, cep8, { timeoutMs: opts.timeoutMs, retries: 1 }); } catch { sim = null; }
+  // Falha NÃO entra no cache: um 429 de agora não pode virar "sem logística" por 5 minutos.
+  if (sim) { SIM_CACHE.set(k, { at: Date.now(), sim }); podarCache(SIM_CACHE); }
+  return sim;
+}
+
+type Candidato = { sku: string; sellerId: string; product: PlatformProduct; score: number };
+
+/** Serve neste CEP = disponível E com alguma forma de chegar (entrega ou retirada). */
+function serve(sim: Awaited<ReturnType<typeof simulateVtexBasket>>, sku: string): boolean {
+  const e = sim?.perSku[sku];
+  return !!e && e.available && e.temLogistica !== false;
+}
+
+/**
+ * A cotação de UMA rede VTEX, em três passos — e no caso comum, UMA simulação só.
+ *
+ *  1. Busca e ranqueia cada remédio, guardando até `MAX_CANDIDATOS` marcas aprovadas.
+ *  2. Simula a cesta com a 1ª marca de cada um. Se todas servem no CEP, é essa a resposta.
+ *  3. Só para quem NÃO serviu, pergunta pelas marcas alternativas (ver `candidatos.ts`) e,
+ *     se a cesta final mudou, simula exatamente ela — é essa simulação que dá o prazo e o
+ *     frete que a mensagem promete.
+ *
+ * Por que não perguntar por todas as marcas de uma vez: a revisão de 24/09 tomou 429 do
+ * CloudFront da DSP e da Pague Menos depois de ~40 pedidos em 8 min de um IP só — e em
+ * produção todas as cotações saem do mesmo IP. Chamada extra só quando ela resolve algo.
+ */
+async function quoteBasketVtex(
+  net: PlatformNetwork,
+  items: BasketRequestItem[],
+  cep8: string,
+  opts: QuotePlatformsOptions,
+): Promise<PlatformBasketQuote | null> {
+  // 1) busca + ranking. Busca pelo NOME (medNameForSearch), NÃO pelo `req.query` cru: era o
+  //    bug do Arthur — `ft=Neblock 0.5mg`→0. O ranqueador (req.query completo) reimpõe dose/forma.
+  const pedidos: { req: BasketRequestItem; candidatos: Candidato[] }[] = [];
   const missing: string[] = [];
   for (const req of items) {
-    let products: PlatformProduct[] = [];
-    try {
-      // ESTE é o path VIVO das redes VTEX (10 das 13) — a `presentPlatformQuotes` do fluxo real
-      // passa por aqui. Busca pelo NOME (medNameForSearch), NÃO pelo `req.query` cru: era o bug
-      // do Arthur — `ft=Neblock 0.5mg`→0, `ft=amplictil gotas`→0. O ranqueador (req.query completo)
-      // reimpõe dose/forma. limit 16 (era 12) pra dar folga agora que a busca é mais ampla.
-      products = await searchVtexProducts(net, medNameForSearch(req.query), { limit: 16, timeoutMs: opts.timeoutMs, retries: 1 });
-    } catch { products = []; }
-    const best = rankProductMatches(req.query, products, { minScore: opts.minScore })[0];
-    if (best) found.push({ req, product: best.product, score: best.score });
-    else missing.push(req.label);
+    const products = await buscarComCache(net, medNameForSearch(req.query), opts);
+    const ranked = rankProductMatches(req.query, products, { minScore: opts.minScore }).slice(0, MAX_CANDIDATOS);
+    if (ranked.length) {
+      pedidos.push({ req, candidatos: ranked.map((r) => ({ sku: r.product.sku, sellerId: r.product.sellerId, product: r.product, score: r.score })) });
+    } else {
+      missing.push(req.label);
+    }
   }
-  if (!found.length) return null; // rede não tem NENHUM item → fora do pool
+  if (!pedidos.length) return null; // rede não tem NENHUM item → fora do pool
 
-  // 2) simula a cesta no CEP → preço por sku + total + entrega.
-  const basketItems: BasketItem[] = found.map((f) => ({ sku: f.product.sku, seller: f.product.sellerId, qty: Math.max(1, f.req.qty ?? 1) }));
-  let sim: Awaited<ReturnType<typeof simulateVtexBasket>> = null;
-  try { sim = await simulateVtexBasket(net, basketItems, cep8, { timeoutMs: opts.timeoutMs, retries: 1 }); } catch { sim = null; }
+  const qtyDe = (req: BasketRequestItem) => Math.max(1, req.qty ?? 1);
+  const cestaDe = (esc: { pedidoIdx: number; candidato: Candidato }[]): BasketItem[] =>
+    esc.map((e) => ({ sku: e.candidato.sku, seller: e.candidato.sellerId, qty: qtyDe(pedidos[e.pedidoIdx]!.req) }));
 
-  // item indisponível na simulação sai da cesta (não montar link com item sem estoque) e vira "falta".
-  const kept: typeof found = [];
-  const droppedByStock: string[] = [];
-  for (const f of found) {
-    if (sim && sim.perSku[f.product.sku]?.available === false) droppedByStock.push(f.req.label);
-    else kept.push(f);
+  // 2) a 1ª marca de cada remédio
+  let escolhidos = pedidos.map((p, pedidoIdx) => ({ pedidoIdx, candidato: p.candidatos[0]! }));
+  let sim = await simularComCache(net, cestaDe(escolhidos), cep8, opts);
+
+  if (sim) {
+    // 3) só quem não serviu no CEP vai atrás de alternativa
+    const falharam = escolhidos.filter((e) => !serve(sim, e.candidato.sku));
+    if (falharam.length) {
+      const alternativas: BasketItem[] = [];
+      for (const f of falharam) {
+        for (const c of pedidos[f.pedidoIdx]!.candidatos.slice(1)) {
+          alternativas.push({ sku: c.sku, seller: c.sellerId, qty: qtyDe(pedidos[f.pedidoIdx]!.req) });
+        }
+      }
+      const simAlt = alternativas.length ? await simularComCache(net, alternativas, cep8, opts) : null;
+      const substitutos = escolherCandidatosDisponiveis(
+        falharam.map((f) => ({ label: pedidos[f.pedidoIdx]!.req.label, candidatos: pedidos[f.pedidoIdx]!.candidatos.slice(1) })),
+        simAlt ? simAlt.perSku : {},
+      );
+      const trocaDe = new Map<number, Candidato>();
+      substitutos.escolhidos.forEach((s) => trocaDe.set(falharam[s.pedidoIdx]!.pedidoIdx, s.candidato));
+      missing.push(...substitutos.faltando);
+      const naoServe = new Set(falharam.map((f) => f.pedidoIdx));
+      escolhidos = escolhidos
+        .filter((e) => !naoServe.has(e.pedidoIdx) || trocaDe.has(e.pedidoIdx))
+        .map((e) => (trocaDe.has(e.pedidoIdx) ? { pedidoIdx: e.pedidoIdx, candidato: trocaDe.get(e.pedidoIdx)! } : e));
+      if (!escolhidos.length) return null; // nenhuma marca de nenhum remédio chega neste CEP
+      // A cesta mudou: o prazo e o frete que a mensagem promete têm que vir da cesta REAL.
+      sim = await simularComCache(net, cestaDe(escolhidos), cep8, opts);
+    }
   }
-  // Fallback pro catálogo SÓ quando a simulação NÃO rodou (sim == null). Se a sim rodou e
-  // marcou TODOS os itens indisponíveis no CEP, a rede não serve aqui → fora do pool (não
-  // mostrar rede que dá withoutStock, ex.: Venancio-RJ pra cliente de GO — probe ao vivo 14/07).
-  const usable = kept.length ? kept : (sim ? [] : found);
-  if (!usable.length) return null;
 
-  const lines: PlatformBasketLine[] = usable.map((f) => {
-    const qty = Math.max(1, f.req.qty ?? 1);
-    const simPrice = sim?.perSku[f.product.sku]?.price;
-    const price = simPrice != null && simPrice > 0 ? simPrice : f.product.price;
-    return { requested: f.req.label, productName: f.product.productName, sku: f.product.sku, sellerId: f.product.sellerId, price, qty, matchScore: f.score };
+  // Sem simulação (429/timeout): preço de catálogo, e o prazo fica "confira no site" — nunca
+  // "sem entrega", que seria afirmar sobre o CEP algo que não conseguimos perguntar.
+  const lines: PlatformBasketLine[] = escolhidos.map((e) => {
+    const req = pedidos[e.pedidoIdx]!.req;
+    const simPrice = sim?.perSku[e.candidato.sku]?.price;
+    const price = simPrice != null && simPrice > 0 ? simPrice : e.candidato.product.price;
+    return {
+      requested: req.label, productName: e.candidato.product.productName, sku: e.candidato.sku,
+      sellerId: e.candidato.sellerId, price, qty: qtyDe(req), matchScore: e.candidato.score,
+    };
   });
-  const total = lines.reduce((s, l) => s + l.price * l.qty, 0);
+  const total = lines.reduce((acc, l) => acc + l.price * l.qty, 0);
   const cartItems: BasketItem[] = lines.map((l) => ({ sku: l.sku, seller: l.sellerId, qty: l.qty }));
-
-  // droppedByStock só entra em `missing` quando REALMENTE dropamos (kept não-vazio). No
-  // fallback de catálogo (kept vazio → mostramos os itens mesmo), NÃO reportar os mesmos
-  // itens como "não achei" — seria contradizer a própria cotação (review MEDIUM-2).
-  const finalMissing = kept.length ? [...missing, ...droppedByStock] : missing;
+  const delivery = sim?.delivery ?? null;
+  const pickup = comMarcaDoGrupo(sim?.pickup ?? null, net);
   return {
     network: net.id, networkLabel: net.label, group: net.group,
-    lines, missing: finalMissing,
+    lines, missing,
     total, available: lines.length > 0,
-    delivery: sim?.delivery ?? null, pickup: sim?.pickup ?? null,
+    delivery, pickup,
     checkoutUrl: affiliateWrap(net.id, buildVtexCartLinkMulti(net, cartItems)),
     pricedByCep: !!sim,
+    // Simulou a cesta exata e não há NENHUMA opção comum aos itens — cada um chega de um
+    // jeito. É "confira no site", não "sem entrega pro seu CEP".
+    semOpcaoComum: !!sim && !delivery && !pickup,
   };
 }
 
@@ -432,7 +534,9 @@ export async function quotePlatformBasket(
     const best = new Map<string, PlatformBasketQuote>();
     for (const q of quotes) {
       const cur = best.get(q.group);
-      if (!cur || q.lines.length > cur.lines.length || (q.lines.length === cur.lines.length && q.total < cur.total)) best.set(q.group, q);
+      // O comparador OFICIAL (cobertura → quando chega → quanto custa a opção prometida). Pelo
+      // preço do remédio, a Pacheco lenta podia derrubar a DSP que entrega em 2h (mesmo grupo).
+      if (!cur || compararCotacoesDeRede(q, cur) < 0) best.set(q.group, q);
     }
     quotes = [...best.values()];
   }
@@ -442,4 +546,6 @@ export async function quotePlatformBasket(
 /** Limpa o cache em memória (teste/manutenção). */
 export function _clearPlatformCache(): void {
   CACHE.clear();
+  BUSCA_CACHE.clear();
+  SIM_CACHE.clear();
 }
