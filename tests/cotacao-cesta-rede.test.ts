@@ -9,7 +9,7 @@
  * Aqui o caminho real (`quotePlatformBasket` → busca → simulação → escolha → mensagem) roda
  * de verdade, e as chamadas HTTP são contadas — o custo (e o risco de 429) é contrato.
  */
-import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll, afterEach, vi } from 'vitest';
 import { __definirClienteHttpParaTeste } from '../packages/integrations/src/pharmacy-platforms/vtex.js';
 
 // Estado das respostas falsas da VTEX. SEM rede: a costura `__definirClienteHttpParaTeste`
@@ -216,6 +216,28 @@ describe('a mensagem (montarMensagemDeCotacao) — só promete o que a rede conf
     expect(texto).toContain('escolha *retirar na loja*');
     expect(texto).toContain('leve ela');                                        // a receita
     expect(texto).not.toContain('mesmo grupo');                                 // a loja É da rede
+  });
+
+  describe('à noite (20:41) — a VTEX empurra pra amanhã e o texto diz a HORA', () => {
+    beforeEach(() => { vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-09-24T20:41:00-03:00')); });
+    afterEach(() => { vi.useRealTimers(); });
+
+    it('"retire amanhã a partir das 8h" vira a manchete, sem ⚡ e sem "hoje mesmo"', async () => {
+      catalogar(PM, 'dipirona 1g', produto('dip', 'Dipirona Monoidratada 1g 10 Comprimidos', 6.49));
+      estado.estoque = { dip: { price: 6.49, availability: 'available', slas: [
+        { ...LOJA_304, shippingEstimate: '12h', shippingEstimateDate: '2026-09-25T08:00:00-03:00' },
+        { ...SUPER_60, name: 'EXPRESSA', shippingEstimate: '18h', shippingEstimateDate: '2026-09-25T14:00:00-03:00' },
+      ] } };
+      const [q] = await quotePlatformBasket([{ query: 'dipirona 1g', label: 'Dipirona 1g', qty: 1 }], CEP, { networkIds: ['pague-menos'] });
+      expect(q!.pickup?.etaText).toBe('amanhã a partir das 8h');
+      expect(q!.delivery?.etaText).toBe('amanhã até as 14h');
+      const { texto } = montarMensagemDeCotacao([q!], { soleChannel: true, totalDeItens: 1 });
+      expect(texto).toContain('R$ 6,49 · retire amanhã a partir das 8h');      // retirada na manchete, sem frete
+      expect(texto).toContain('ou entrega amanhã até as 14h (R$ 7,90)');
+      expect(texto).not.toContain('hoje mesmo');
+      expect(texto).not.toContain('⚡');
+      expect(texto).not.toMatch(/em 1[28] horas/);
+    });
   });
 
   it('retirada numa fachada de rede IRMÃ (Extrafarma → Pague Menos) é explicada, não parece erro', async () => {

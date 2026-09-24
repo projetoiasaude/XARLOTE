@@ -90,6 +90,42 @@ export function formatShippingEstimate(est: string): string {
   return n === 0 ? 'hoje' : n === 1 ? '1 dia' : `${n} dias`;
 }
 
+const DIAS_DA_SEMANA = ['no domingo', 'na segunda', 'na terça', 'na quarta', 'na quinta', 'na sexta', 'no sábado'];
+
+/**
+ * O prazo em texto — com a HORA do relógio quando ele passa da meia-noite.
+ *
+ * A VTEX já respeita o horário da loja e do entregador. Medido ao vivo em 24/09 às 20:41:
+ * a loja de Teresina que fecha às 21h passou de "60m" pra "12h" (data: amanhã 08:00), as
+ * lojas de Fortaleza já fechadas deram "11h"/"12h" (a abertura + 1h) e a EXPRESSA da
+ * Drogaria São Paulo virou "18h" (amanhã 14:00). O número está certo, mas à noite ele não
+ * diz nada: "retire em 12 horas" é "amanhã a partir das 8h". Por isso, quando a rede manda
+ * a data e ela cai noutro dia, o texto usa a data.
+ *
+ * Só para prazo em minutos/horas acima de 4h: "2bd" com data 00:01 é dia útil, não hora
+ * marcada; e "60 min" às 23h58 continua "60 min" (é verdade e é o que importa). Data no
+ * passado, malformada ou a mais de 7 dias → o texto de sempre.
+ */
+export function textoDoPrazo(estimate: string, estimateDate: string | null | undefined, retirada: boolean, agora: Date = new Date()): string {
+  const base = formatShippingEstimate(estimate);
+  if (!estimateDate || !/^\d+\s*(m|min|h)$/i.test((estimate ?? '').trim())) return base;
+  if (estimateToMinutes(estimate) <= 240) return base;
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.exec(estimateDate.trim());
+  if (!m) return base;
+  const [, dia, hh, mm, tz] = m as unknown as [string, string, string, string, string];
+  const quando = Date.parse(estimateDate);
+  if (!Number.isFinite(quando) || quando <= agora.getTime() || quando - agora.getTime() > 7 * 24 * 60 * 60 * 1000) return base;
+  // "Hoje" no fuso da PRÓPRIA data (o da loja) — o servidor roda em UTC.
+  const offsetMin = tz === 'Z' ? 0 : (tz.startsWith('-') ? -1 : 1) * (Number(tz.slice(1, 3)) * 60 + Number(tz.slice(4, 6)));
+  const diaLocal = (deslocDias: number) => new Date(agora.getTime() + offsetMin * 60_000 + deslocDias * 86_400_000).toISOString().slice(0, 10);
+  if (dia === diaLocal(0)) return base;
+  const hora = mm === '00' ? `${Number(hh)}h` : `${Number(hh)}h${mm}`;
+  const limite = retirada ? `a partir das ${hora}` : `até as ${hora}`;
+  if (dia === diaLocal(1)) return `amanhã ${limite}`;
+  const semana = DIAS_DA_SEMANA[new Date(`${dia}T12:00:00Z`).getUTCDay()]!;
+  return `${semana} (${dia.slice(8, 10)}/${dia.slice(5, 7)}) ${limite}`;
+}
+
 // ─────────────────────────────── BUSCA ───────────────────────────────
 
 /**
@@ -194,6 +230,8 @@ interface SlaDaCesta {
   /** o prazo do item MAIS LENTO — a cesta só chega quando o último item chega */
   etaMinutes: number;
   estimate: string;
+  /** `shippingEstimateDate` do item mais lento (ISO com fuso da loja) — ver `textoDoPrazo` */
+  estimateDate: string | null;
   /** frete da cesta = soma da fração de cada item (o VTEX rateia o frete por item) */
   feeCents: number;
   store: PickupStore | null;
@@ -216,7 +254,7 @@ function lojaDoSla(s: Record<string, unknown>): PickupStore | null {
   const info = (s['pickupStoreInfo'] ?? null) as Record<string, unknown> | null;
   if (!info) return null;
   const limpar = (v: unknown) =>
-    typeof v === 'string' ? v.replace(/\s+/g, ' ').replace(/[\s.\-–]+$/, '').trim() : '';
+    typeof v === 'string' ? v.replace(/\s+/g, ' ').replace(/\s+,/g, ',').replace(/[\s.\-–]+$/, '').trim() : '';
   const name = limpar(info['friendlyName']) || limpar(s['name']);
   if (!name) return null;
   const a = (info['address'] ?? null) as Record<string, unknown> | null;
@@ -267,19 +305,23 @@ export function agregarSlasDaCesta(li: Record<string, unknown>[]): SlaDaCesta[] 
       const estimate = String(s['shippingEstimate'] ?? '');
       const eta = estimateToMinutes(estimate);
       const fee = typeof s['price'] === 'number' ? (s['price'] as number) : 0;
+      const data = typeof s['shippingEstimateDate'] === 'string' ? (s['shippingEstimateDate'] as string) : null;
       const atual = porId.get(id);
       if (!atual) {
         const pickup = s['deliveryChannel'] === 'pickup-in-point';
         const store = pickup ? lojaDoSla(s) : null;
         porId.set(id, {
           id, name: String(s['name'] ?? id), pickup,
-          etaMinutes: eta, estimate, feeCents: fee, store,
+          etaMinutes: eta, estimate, estimateDate: data, feeCents: fee, store,
           distanceKm: store?.distanceKm ?? null, itens: 1,
         });
       } else {
         atual.itens += 1;
         atual.feeCents += fee;
-        if (eta > atual.etaMinutes) { atual.etaMinutes = eta; atual.estimate = estimate; }
+        if (eta > atual.etaMinutes) { atual.etaMinutes = eta; atual.estimate = estimate; atual.estimateDate = data; }
+        else if (eta === atual.etaMinutes && data && (!atual.estimateDate || Date.parse(data) > Date.parse(atual.estimateDate))) {
+          atual.estimateDate = data;
+        }
       }
     }
   }
@@ -288,7 +330,7 @@ export function agregarSlasDaCesta(li: Record<string, unknown>[]): SlaDaCesta[] 
 
 function comoOpcao(x: SlaDaCesta): FulfillmentOption {
   return {
-    etaText: formatShippingEstimate(x.estimate),
+    etaText: textoDoPrazo(x.estimate, x.estimateDate, x.pickup),
     feeReais: centavosToReais(x.feeCents),
     etaMinutes: x.etaMinutes,
     slaName: x.name,

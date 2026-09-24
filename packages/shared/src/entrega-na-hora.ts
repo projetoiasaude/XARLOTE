@@ -105,9 +105,13 @@ export function ondeRetirar(loja: LojaApresentavel | null | undefined): string {
   return ` na *${loja.name}*${dist ? ` (${dist})` : ''}${grupo}`;
 }
 
-/** "60 min" → "em 60 min"; "no mesmo dia útil" e "hoje" já trazem a preposição. */
+/**
+ * "60 min" → "em 60 min". "no mesmo dia útil", "hoje", "amanhã a partir das 8h" e "na sexta
+ * (26/09) até as 14h" (prazo que vira o dia — ver `textoDoPrazo` na integração) já trazem
+ * a preposição.
+ */
 function quando(etaText: string): string {
-  return /^(no |hoje)/.test(etaText) ? etaText : `em ${etaText}`;
+  return /^(no |na |hoje|amanhã)/.test(etaText) ? etaText : `em ${etaText}`;
 }
 
 /**

@@ -60,8 +60,12 @@ export function faixaDePrazo(q: CotacaoOrdenavel): FaixaDePrazo {
   if (entrega !== undefined && entrega <= MINUTOS_AGORA) return 'agora';
   if (retirada !== undefined && retirada <= MINUTOS_AGORA) return 'retirar-agora';
   if (entrega !== undefined && entrega <= MINUTOS_HOJE) return 'hoje';
-  if (entrega !== undefined) return 'dias';
-  return retirada !== undefined ? 'so-retirada' : 'nenhuma';
+  // Entrega em dias e retirada MAIS CEDO — o caso comum à noite (medido em 24/09, 20:41: a
+  // loja abre amanhã às 8h e a entrega fica pra amanhã 14h ou 2 dias úteis). A manchete é a
+  // retirada. Antes a faixa ficava 'dias', e a rede com as DUAS opções ranqueava PIOR do que
+  // se só tivesse a retirada.
+  if (retirada !== undefined && (entrega === undefined || retirada < entrega)) return 'so-retirada';
+  return entrega !== undefined ? 'dias' : 'nenhuma';
 }
 
 /** Ordem de preferência das faixas (menor = melhor). */
@@ -70,8 +74,8 @@ const PESO_FAIXA: Record<FaixaDePrazo, number> = {
   // Retirar em até 4h vem logo depois da entrega rápida: resolve agora, só exige sair de casa.
   'retirar-agora': 1,
   hoje: 2,
-  // Retirar mais tarde na loja ainda vale mais que esperar dias pela entrega: a pessoa PODE
-  // ter o remédio antes, se quiser.
+  // Retirar mais tarde na loja (sem entrega, ou antes da entrega em dias) ainda vale mais
+  // que esperar dias pela entrega: a pessoa PODE ter o remédio antes, se quiser.
   'so-retirada': 3,
   dias: 4,
   nenhuma: 5,

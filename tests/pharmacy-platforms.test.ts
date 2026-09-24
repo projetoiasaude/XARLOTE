@@ -5,6 +5,7 @@ import {
   parseVtexBasketSimulation,
   formatShippingEstimate,
   estimateToMinutes,
+  textoDoPrazo,
   buildVtexCartLink,
   buildVtexCartLinkMulti,
 } from '../packages/integrations/src/pharmacy-platforms/vtex.js';
@@ -150,6 +151,42 @@ describe('formatShippingEstimate / estimateToMinutes', () => {
   it('ordena prazos por rapidez (min < horas < dias)', () => {
     expect(estimateToMinutes('60m')).toBeLessThan(estimateToMinutes('2h'));
     expect(estimateToMinutes('2h')).toBeLessThan(estimateToMinutes('1bd'));
+  });
+});
+
+describe('textoDoPrazo — à noite o prazo vira a hora do relógio (medição ao vivo 24/09 20:41)', () => {
+  const noite = new Date('2026-09-24T20:41:00-03:00'); // quinta
+
+  it('loja já fechada → "amanhã a partir das 8h" (Fortaleza: "12h", data amanhã 08:00)', () => {
+    expect(textoDoPrazo('12h', '2026-09-25T08:00:00-03:00', true, noite)).toBe('amanhã a partir das 8h');
+  });
+
+  it('minutos quebrados aparecem (loja que abre 6h40 → "7h40")', () => {
+    expect(textoDoPrazo('11h', '2026-09-25T07:40:00-03:00', true, noite)).toBe('amanhã a partir das 7h40');
+  });
+
+  it('entrega que vira o dia → "amanhã até as 14h" (a EXPRESSA da DSP às 20:41 era "18h")', () => {
+    expect(textoDoPrazo('18h', '2026-09-25T14:00:00-03:00', false, noite)).toBe('amanhã até as 14h');
+  });
+
+  it('fim de semana → o dia e a data ("na segunda (28/09) a partir das 8h")', () => {
+    expect(textoDoPrazo('36h', '2026-09-28T08:00:00-03:00', true, new Date('2026-09-26T20:41:00-03:00'))).toBe('na segunda (28/09) a partir das 8h');
+  });
+
+  it('"hoje" é o dia da LOJA, não o do servidor em UTC (22:30 em Goiânia já é dia 25 em UTC)', () => {
+    expect(textoDoPrazo('10h', '2026-09-25T08:00:00-03:00', true, new Date('2026-09-25T01:30:00Z'))).toBe('amanhã a partir das 8h');
+  });
+
+  it('prazo curto não muda: "60 min" às 23h58 segue "60 min"', () => {
+    expect(textoDoPrazo('60m', '2026-09-25T00:58:00-03:00', true, new Date('2026-09-24T23:58:00-03:00'))).toBe('60 min');
+  });
+
+  it('mesmo dia, dia útil, data no passado, malformada ou ausente → o texto de sempre', () => {
+    expect(textoDoPrazo('5h', '2026-09-24T13:00:00-03:00', false, new Date('2026-09-24T08:00:00-03:00'))).toBe('5 horas');
+    expect(textoDoPrazo('2bd', '2026-09-26T00:01:00-03:00', false, noite)).toBe('2 dias úteis');
+    expect(textoDoPrazo('12h', '2026-07-14T08:00:00-03:00', true, noite)).toBe('12 horas');
+    expect(textoDoPrazo('12h', 'amanhã', true, noite)).toBe('12 horas');
+    expect(textoDoPrazo('12h', null, true, noite)).toBe('12 horas');
   });
 });
 
@@ -692,6 +729,17 @@ describe('entrega na hora — a logística vale pra CESTA INTEIRA (medição rea
     const r = parseVtexBasketSimulation({ items: [itens[0]], logisticsInfo: [dipirona] })!;
     expect(r.pickup!.store!.address).toBe('Rua 10, Setor Sul');
     expect(r.pickup!.store!.distanceKm).toBe(0.2);
+  });
+
+  it('nome da loja como a rede manda ("Santos Dumont , 1256 (Loja 67)") sai sem o espaço antes da vírgula', () => {
+    const r = parseVtexBasketSimulation({
+      items: [itens[0]],
+      logisticsInfo: [{ itemIndex: 0, slas: [{
+        id: 'loja-67', name: 'Retire em Loja (67)', deliveryChannel: 'pickup-in-point', shippingEstimate: '60m', price: 0, pickupDistance: 0.59,
+        pickupStoreInfo: { friendlyName: 'Pague Menos - Santos Dumont , 1256 (Loja 67)', address: { street: 'Avenida Santos Dumont', number: '1256', neighborhood: 'Aldeota' } },
+      }] }],
+    })!;
+    expect(r.pickup!.store!.name).toBe('Pague Menos - Santos Dumont, 1256 (Loja 67)');
   });
 
   it('item SEM opção nenhuma não zera a logística do outro (B2, defesa no parser)', () => {

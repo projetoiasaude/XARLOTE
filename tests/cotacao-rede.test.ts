@@ -95,6 +95,23 @@ describe('faixaDePrazo', () => {
   it('entrega rápida continua mandando mesmo com retirada ainda mais rápida (não exige sair de casa)', () => {
     expect(faixaDePrazo(cot(10, { fee: 7.9, min: 90 }, { retirada: { fee: 0, min: 30 } }))).toBe('agora');
   });
+
+  it('à noite: entrega em dias + retirada MAIS CEDO → a manchete é a retirada (medição 24/09 20:41)', () => {
+    // loja abre amanhã 8h ("12h"); entrega EXPRESSA amanhã 14h ("18h") ou NORMAL em 2 dias úteis
+    expect(faixaDePrazo(cot(10, { fee: 7.9, min: 18 * 60 }, { retirada: { fee: 0, min: 12 * 60 } }))).toBe('so-retirada');
+    expect(faixaDePrazo(cot(10, { fee: 6.89, min: 2 * DIA }, { retirada: { fee: 0, min: 12 * 60 } }))).toBe('so-retirada');
+    // retirada mais LENTA que a entrega em dias → a entrega segue na manchete
+    expect(faixaDePrazo(cot(10, { fee: 6.89, min: DIA }, { retirada: { fee: 0, min: 3 * DIA } }))).toBe('dias');
+    // entrega "hoje" (≤12h) não perde a manchete pra retirada um pouco mais cedo
+    expect(faixaDePrazo(cot(10, { fee: 7.9, min: 5 * 60 }, { retirada: { fee: 0, min: 4 * 60 + 30 } }))).toBe('hoje');
+  });
+
+  it('ter as DUAS opções nunca ranqueia pior do que ter só a retirada (a regra antiga invertia)', () => {
+    const soRetirada = cot(10, null, { retirada: { fee: 0, min: 12 * 60 } });
+    const ambas = cot(10, { fee: 6.89, min: 2 * DIA }, { retirada: { fee: 0, min: 12 * 60 } });
+    expect(compararCotacoesDeRede(ambas, soRetirada)).toBeLessThanOrEqual(0);
+    expect(custoDaManchete(ambas)).toBe(10); // a promessa é retirar: o frete da entrega não entra
+  });
 });
 
 describe('regras de desempate', () => {
