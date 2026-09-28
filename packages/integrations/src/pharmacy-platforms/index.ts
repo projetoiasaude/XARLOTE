@@ -17,6 +17,7 @@ import { escolherCandidatosDisponiveis, MAX_CANDIDATOS } from './candidatos.js';
 import { quoteRDProduct, zenrowsConfigured } from './rd-adapter.js';
 import { quoteNisseiProduct } from './nissei-adapter.js';
 import { quoteUltrafarmaProduct } from './ultrafarma-adapter.js';
+import { quoteModeloProduct, simulateModeloBasket, type SimulacaoModelo } from './modelo-adapter.js';
 import type { PlatformQuote, PlatformProduct, PlatformBasketQuote, PlatformBasketLine, FulfillmentOption } from './types.js';
 
 /**
@@ -46,6 +47,23 @@ type CustomAdapter = (
 const CUSTOM_ADAPTERS: Record<string, CustomAdapter> = {
   nissei: quoteNisseiProduct,
   ultrafarma: quoteUltrafarmaProduct,
+  'farmacia-modelo': quoteModeloProduct,
+};
+
+/**
+ * Rede de plataforma própria que SIMULA por CEP (prazo, frete, estoque na região) — aí ela deixa
+ * de ser "confira o prazo no site" e entra na corrida da entrega na hora como as VTEX.
+ * Farmácia Modelo (28/09): entrega em ~1h e retirada em ~1h no Setor Oeste.
+ */
+type CustomSimulator = (
+  net: PlatformNetwork,
+  itens: Array<{ sku: string; qty: number }>,
+  cep8: string,
+  opts: { timeoutMs?: number },
+) => Promise<SimulacaoModelo | null>;
+
+const CUSTOM_SIMULATORS: Record<string, CustomSimulator> = {
+  'farmacia-modelo': simulateModeloBasket,
 };
 
 export * from './types.js';
@@ -73,8 +91,10 @@ export {
   normalize as normalizeMedName,
 } from './matching.js';
 export { apresentacoesDoCatalogo } from './apresentacoes.js';
+export { linkDeBuscaNoIfood } from './ifood-links.js';
 export { quoteRDProduct, zenrowsConfigured, parseRDSearch, parseRDPrice, extractNextData } from './rd-adapter.js';
 export { quoteNisseiProduct, parseNisseiCsrf, parseNisseiResults, parseNisseiPrices, humanizeNisseiSlug } from './nissei-adapter.js';
+export { quoteModeloProduct, simulateModeloBasket, combinarSimulacaoModelo, parseModeloBusca, parseModeloModalidades, prontoNaLoja, horarioDaLoja, prazoEmMinutos, LOJA_MODELO, _clearModeloCache } from './modelo-adapter.js';
 export { quoteUltrafarmaProduct, parseUltrafarmaProducts, parseBrl } from './ultrafarma-adapter.js';
 
 /**
@@ -307,18 +327,20 @@ async function quoteBasketRDInner(
 async function quoteBasketCustom(
   net: PlatformNetwork,
   items: BasketRequestItem[],
+  cep8: string,
   opts: QuotePlatformsOptions,
 ): Promise<PlatformBasketQuote | null> {
   const adapter = CUSTOM_ADAPTERS[net.id];
   if (!adapter) return null;
   // teto de wall-clock: uma rede própria lenta NÃO pode segurar as 10 VTEX rápidas (review H1).
-  return withDeadline(quoteBasketCustomInner(net, items, adapter, opts), CUSTOM_DEADLINE_MS, null);
+  return withDeadline(quoteBasketCustomInner(net, items, adapter, cep8, opts), CUSTOM_DEADLINE_MS, null);
 }
 
 async function quoteBasketCustomInner(
   net: PlatformNetwork,
   items: BasketRequestItem[],
   adapter: CustomAdapter,
+  cep8: string,
   opts: QuotePlatformsOptions,
 ): Promise<PlatformBasketQuote | null> {
   const timeoutMs = Math.min(opts.timeoutMs ?? CUSTOM_REQUEST_TIMEOUT_MS, CUSTOM_REQUEST_TIMEOUT_MS);
@@ -327,8 +349,27 @@ async function quoteBasketCustomInner(
     try { return { req, product: await adapter(net, req.query, { timeoutMs, minScore: opts.minScore }) }; }
     catch { return { req, product: null as PlatformProduct | null }; }
   }));
-  const found = settled.filter((r) => r.product);
+  let found = settled.filter((r) => r.product);
   const missing = settled.filter((r) => !r.product).map((r) => r.req.label);
+  if (!found.length) return null;
+
+  // Prazo, frete e estoque REAIS pro CEP, quando a rede simula (Farmácia Modelo). Item sem estoque
+  // na região sai da cesta ("não achei aqui"); simulação que não responde mantém o handoff.
+  let delivery: PlatformBasketQuote['delivery'] = null;
+  let pickup: PlatformBasketQuote['pickup'] = null;
+  let pricedByCep = false;
+  const simular = CUSTOM_SIMULATORS[net.id];
+  if (simular) {
+    const sim = await simular(net, found.map((f) => ({ sku: f.product!.sku, qty: Math.max(1, f.req.qty ?? 1) })), cep8, { timeoutMs }).catch(() => null);
+    if (sim) {
+      const fora = new Set(sim.indisponiveis);
+      missing.push(...found.filter((f) => fora.has(f.product!.sku)).map((f) => f.req.label));
+      found = found.filter((f) => !fora.has(f.product!.sku));
+      delivery = sim.delivery;
+      pickup = sim.pickup;
+      pricedByCep = true;
+    }
+  }
   if (!found.length) return null;
 
   const lines: PlatformBasketLine[] = found.map((f) => ({
@@ -340,9 +381,11 @@ async function quoteBasketCustomInner(
   return {
     network: net.id, networkLabel: net.label, group: net.group,
     lines, missing, total, available: true,
-    delivery: null, pickup: null, // preço padrão; CEP/entrega confirmados no site (handoff)
+    // Sem simulação: preço padrão, CEP/entrega confirmados no site (handoff).
+    delivery, pickup,
     checkoutUrl: lines[0]!.productUrl!, // fallback (cesta de 1 item); multi-item usa o link por linha
-    pricedByCep: false,
+    pricedByCep,
+    semOpcaoComum: pricedByCep && !delivery && !pickup,
   };
 }
 
@@ -353,7 +396,7 @@ async function quoteBasketOneNetwork(
   opts: QuotePlatformsOptions,
 ): Promise<PlatformBasketQuote | null> {
   if (net.access === 'akamai') return quoteBasketRD(net, items, opts);
-  if (net.access === 'custom') return quoteBasketCustom(net, items, opts);
+  if (net.access === 'custom') return quoteBasketCustom(net, items, cep8, opts);
   if (net.access !== 'rest') return null;
   // Teto de wall-clock por rede VTEX (as buscas são sequenciais, mais 1–3 simulações): uma
   // rede lenta ou com 429 não pode segurar a cotação inteira — o turno do paciente tem ~75s.

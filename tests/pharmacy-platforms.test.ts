@@ -349,11 +349,11 @@ describe('buildVtexCartLink + registry', () => {
     );
   });
 
-  it('activeNetworks SEM ZenRows = 10 VTEX + 2 próprias (Nissei/Ultrafarma) = 12 redes', () => {
+  it('activeNetworks SEM ZenRows = 11 VTEX + 3 próprias (Nissei/Ultrafarma/Modelo) = 14 redes', () => {
     const prev = process.env['ZENROWS_API_KEY'];
     delete process.env['ZENROWS_API_KEY'];
     const act = activeNetworks();
-    expect(act.length).toBe(12);
+    expect(act.length).toBe(14);
     expect(act.every((n) => (n.access === 'rest' || n.access === 'custom') && n.enabled)).toBe(true);
     const ids = act.map((n) => n.id);
     expect(ids).toContain('pague-menos');
@@ -361,6 +361,8 @@ describe('buildVtexCartLink + registry', () => {
     expect(ids).toContain('catarinense');
     expect(ids).toContain('nissei'); // plataforma própria (Django) — ligada 15/07
     expect(ids).toContain('ultrafarma'); // plataforma própria (Angular SSR) — ligada 15/07
+    expect(ids).toContain('alexfarma'); // VTEX de Goiânia — pesquisa de 28/09
+    expect(ids).toContain('farmacia-modelo'); // própria (Vannon), simula por CEP — 28/09
     expect(ids).not.toContain('drogasil'); // RD só com ZenRows
     expect(ids).not.toContain('onofre'); // representada pela Drogasil
     expect(ids).not.toContain('panvel'); // própria, atrás do Azion → registry-ready, desligada
@@ -377,7 +379,7 @@ describe('buildVtexCartLink + registry', () => {
     const ids = activeNetworks().map((n) => n.id);
     expect(ids).not.toContain('drogasil');
     expect(ids).toContain('nissei');
-    expect(ids.length).toBe(12);
+    expect(ids.length).toBe(14);
     if (prev) process.env['ZENROWS_API_KEY'] = prev; else delete process.env['ZENROWS_API_KEY'];
   });
 

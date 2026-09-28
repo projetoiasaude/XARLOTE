@@ -3,10 +3,10 @@ import { extractStructured } from '@iasaude/llm';
 import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem, CareLinkView } from '@iasaude/shared';
-import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, pediuCancelarTudo, ehRruleComListaDeMinutos, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool,
+import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, pediuCancelarTudo, ehRruleComListaDeMinutos, isPharmacyChain, cobertaPeloSite, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool,
   decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, extractDeliverySector, parseEnderecoDigitado, montarEnderecoHumano, nomeJaConfirmadoPeloPaciente, quantidadeFoiMencionada, diagnosticarEnderecoSalvo, respostaDeConfirmacaoDeEndereco, mesmaRuaEComplemento, partesDoSalvo, perguntaDeConfirmacaoDeEndereco, MARCA_CONFIRMACAO_ENDERECO, type EnderecoSalvo, type Lugar, doseFoiDita, separarDoseDoNome, doseAPerguntar, instrucaoDePerguntaDeDose, tokenPrincipal, type PerguntaDeDose, JANELA_PEDIDO_VIVO_MS, pareceProtocoloDeRetirada, RECUSA_DE_PROTOCOLO, interpretarQuando, autorizouBuscaNoPortal, dataDeNascimentoDaFala, quandoPorExtenso, mensagemVouTentarAgora, mensagemVouConferirOSite, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
 import { verificarExistenciaDoRemedio } from './verificar-nome-remedio.js';
-import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, escolherAdapter, type PlaceResult } from '@iasaude/integrations';
+import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, escolherAdapter, linkDeBuscaNoIfood, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 import { sendOutboundToSupplier } from './outbound-agent.js';
 import { markSupplierVerifiedById } from './supplier-directory.js';
@@ -1842,7 +1842,9 @@ async function startPharmacyDiscovery(
     // Gastar um dos 5 slots com ela é tirar o slot de uma farmácia que responderia.
     // EXCEÇÃO: se o usuário pediu a rede PELO NOME, respeitamos — ignorar o pedido dele
     // em silêncio é pior do que uma cotação que não volta.
-    if (!isPref && isPharmacyChain(pharmacy.name)) {
+    // A farmácia LOCAL que a Xarlote já cota pelo site (Farmácia Modelo de Goiânia, 28/09) também
+    // fica pro catálogo: o prazo e o estoque dela já vêm do site, e o número nunca respondia.
+    if (!isPref && (isPharmacyChain(pharmacy.name) || cobertaPeloSite(pharmacy.name, pharmacy.city))) {
       redesPuladas++;
       continue;
     }
@@ -1931,10 +1933,13 @@ async function startPharmacyDiscovery(
       }
     }
     await writeLog('warn', 'order', `Nenhuma farmácia com telefone/WhatsApp encontrada — pedido não pôde ser cotado`, { traceId: ctx.traceId, orderId, semTelefone });
+    const ifood = items.length === 1 ? linkDeBuscaNoIfood(itemDisplayName(items[0]!.name, items[0]!.dosage)) : null;
     await sendOutbound(
       ctx.conversationId,
       ctx.phoneE164,
-      'Achei farmácias aqui na sua região, mas nenhuma com WhatsApp disponível pra eu cotar agora 😕 Assim que eu tiver contatos de farmácias por aqui eu te aviso. Posso te ajudar em outra coisa?',
+      ifood
+        ? `Não consegui cotação aqui na sua região agora 😕 Se quiser resolver já, o iFood mostra as farmácias que entregam no seu endereço: ${ifood}`
+        : 'Achei farmácias aqui na sua região, mas nenhuma com WhatsApp disponível pra eu cotar agora 😕 Assim que eu tiver contatos de farmácias por aqui eu te aviso. Posso te ajudar em outra coisa?',
       ctx.traceId,
     );
     await db.from('orders').update({ status: 'failed' }).eq('id', orderId);
@@ -1986,8 +1991,10 @@ async function startPharmacyDiscovery(
     const nightNote = allClosed
       ? ' Ah, esse horário a maioria já tá fechada — deixei a mensagem lá e assim que abrirem elas costumam responder cedinho, tá?'
       : '';
+    // Sem rede, o bairro é a espera — o iFood é o jeito de resolver JÁ (um remédio só).
+    const ifood = items.length === 1 ? linkDeBuscaNoIfood(itemDisplayName(items[0]!.name, items[0]!.dosage)) : null;
     await sendOutbound(ctx.conversationId, ctx.phoneE164,
-      `Achei ${quoteIds.length} farmácia${plural ? 's' : ''} aqui na sua região e já entrei em contato com ${plural ? 'elas' : 'ela'} ✨ assim que chegarem as respostas eu te aviso na hora.${nightNote}`,
+      `Achei ${quoteIds.length} farmácia${plural ? 's' : ''} aqui na sua região e já entrei em contato com ${plural ? 'elas' : 'ela'} ✨ assim que chegarem as respostas eu te aviso na hora.${nightNote}${ifood ? `\n\nSe preferir resolver já, o iFood mostra as farmácias que entregam no seu endereço agora: ${ifood}` : ''}`,
       ctx.traceId);
   }
 
@@ -2146,9 +2153,11 @@ async function handleExpandPharmacySearch(ctx: ToolContext) {
   }
   const novas = pharmacies.filter((p) => !contacted.has(p.placeId));
   const byDist = (a: (typeof novas)[number], b: (typeof novas)[number]) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999);
+  // Rede grande e farmácia local já cotada pelo site vão pro FIM da fila (só se faltar alguém).
+  const ehRede = (p: (typeof novas)[number]) => isPharmacyChain(p.name) || cobertaPeloSite(p.name, p.city);
   const top = [
-    ...novas.filter((p) => !isPharmacyChain(p.name)).sort(byDist),
-    ...novas.filter((p) => isPharmacyChain(p.name)).sort(byDist),
+    ...novas.filter((p) => !ehRede(p)).sort(byDist),
+    ...novas.filter(ehRede).sort(byDist),
   ].slice(0, 5);
 
   if (top.length === 0) {

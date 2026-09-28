@@ -265,6 +265,18 @@ describe('a mensagem (montarMensagemDeCotacao) — só promete o que a rede conf
     expect(texto.endsWith(bairro)).toBe(true);
   });
 
+  it('o link do iFood vem depois das opções e antes do fecho, como caminho (sem preço nem prazo)', () => {
+    const base = { lines: [{ requested: 'Cefaliv', productName: 'Cefaliv 12 Comprimidos', sku: 's', sellerId: '1', price: 17.69, qty: 1, matchScore: 1 }], missing: [], available: true, checkoutUrl: 'https://x', pricedByCep: true };
+    const pague = { ...base, network: 'pague-menos', networkLabel: 'Pague Menos', group: 'PagueMenos', total: 17.69, delivery: { etaText: '60 min', feeReais: 7.9, etaMinutes: 60, slaName: 'Super Expressa' }, pickup: null };
+    const { texto } = montarMensagemDeCotacao([pague], { soleChannel: false, totalDeItens: 1, outroText: '\n\nFECHO', linkIfood: 'https://www.ifood.com.br/busca?q=cefaliv' });
+    const iIfood = texto.indexOf('📱 Também dá pra pedir pelo iFood');
+    expect(iIfood).toBeGreaterThan(texto.indexOf('Pague Menos'));
+    expect(iIfood).toBeLessThan(texto.indexOf('FECHO'));
+    expect(texto).toContain('https://www.ifood.com.br/busca?q=cefaliv');
+    // sem link, nada de iFood
+    expect(montarMensagemDeCotacao([pague], { soleChannel: false, totalDeItens: 1 }).texto).not.toContain('iFood');
+  });
+
   it('só uma PARTE resolve hoje → não promete a receita toda pra hoje (C3)', () => {
     const rapidaParcial = {
       network: 'pague-menos', networkLabel: 'Pague Menos', group: 'PM', lines: [{ requested: 'A', productName: 'A', sku: 'a', sellerId: '1', price: 10, qty: 1, matchScore: 1 }],

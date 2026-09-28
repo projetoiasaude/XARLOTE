@@ -10,7 +10,7 @@
  */
 import { db, writeLog } from '@iasaude/db';
 import { itemDisplayName, extractCep, faixaDePrazo, temOpcaoImediata, ehNaHora, ordenarCotacoesDeRede, selecionarOpcoesDeRede, seloDePrazo, linhaDeLogistica, instrucaoDoCheckout, podeDizerPertinho, custoDaManchete, type OrderItem } from '@iasaude/shared';
-import { quotePlatformBasket, medNameForSearch, type PlatformBasketQuote, type BasketRequestItem } from '@iasaude/integrations';
+import { quotePlatformBasket, medNameForSearch, linkDeBuscaNoIfood, type PlatformBasketQuote, type BasketRequestItem } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 
 export { extractCep };
@@ -64,7 +64,7 @@ function renderNetworkBlock(idx: number, q: PlatformBasketQuote): string {
  */
 export function montarMensagemDeCotacao(
   quotes: PlatformBasketQuote[],
-  opts: { soleChannel?: boolean; introText?: string; outroText?: string; totalDeItens?: number } = {},
+  opts: { soleChannel?: boolean; introText?: string; outroText?: string; totalDeItens?: number; linkIfood?: string | null } = {},
 ): { texto: string; top: PlatformBasketQuote[]; soNaHora: boolean; descartadas: number } {
   const { soleChannel, introText, outroText } = opts;
   const top = selecionarOpcoesDeRede(ordenarCotacoesDeRede(quotes), MAX_NETWORKS);
@@ -102,7 +102,10 @@ export function montarMensagemDeCotacao(
     ? '\n\nQualquer dúvida na hora de finalizar, é só me chamar 💙'
     : '\n\nEnquanto isso sigo cotando nas farmácias do bairro — se aparecer melhor, te aviso! 😊');
 
-  return { texto: intro + blocks.join('\n\n') + outro, top, soNaHora, descartadas: quotes.length - top.length };
+  // iFood: CAMINHO, não cotação (a API deles é protegida; o app mostra prazo/frete pro endereço da
+  // pessoa — e lá estão Drogasil e Santa Marta, que não temos por aqui). Ver ifood-links.ts.
+  const ifood = opts.linkIfood ? `\n\n📱 Também dá pra pedir pelo iFood, que mostra as farmácias que entregam no seu endereço agora: ${opts.linkIfood}` : '';
+  return { texto: intro + blocks.join('\n\n') + ifood + outro, top, soNaHora, descartadas: quotes.length - top.length };
 }
 
 export interface PresentPlatformQuotesResult {
@@ -165,7 +168,10 @@ export async function presentPlatformQuotes(params: {
     return { networksPresented: 0, itemsCovered: 0 };
   }
 
-  const { texto, top, soNaHora, descartadas } = montarMensagemDeCotacao(quotes, { soleChannel, introText, outroText, totalDeItens: basket.length });
+  // Link de busca do iFood só pra um remédio (a busca deles é por um termo) e fora da cotação por
+  // nome de rede (quem pediu "cota na Drogasil" pediu aquela rede).
+  const linkIfood = basket.length === 1 && !networkIds?.length ? linkDeBuscaNoIfood(basket[0]!.query) : null;
+  const { texto, top, soNaHora, descartadas } = montarMensagemDeCotacao(quotes, { soleChannel, introText, outroText, totalDeItens: basket.length, linkIfood });
   await sendOutbound(conversationId, phoneE164, texto, traceId);
 
   const itemsCovered = new Set(top.flatMap((q) => q.lines.map((l) => l.requested))).size;

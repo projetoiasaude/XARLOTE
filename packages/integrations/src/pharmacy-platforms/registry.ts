@@ -38,6 +38,9 @@ export const PLATFORM_REGISTRY: readonly PlatformNetwork[] = [
   { id: 'drogaria-globo', label: 'Drogaria Globo', host: 'https://www.drogariaglobo.com.br', salesChannel: '1', access: 'rest', group: 'Globo', enabled: true },
   { id: 'catarinense', label: 'Drogaria Catarinense', host: 'https://www.drogariacatarinense.com.br', salesChannel: '1', access: 'rest', group: 'Catarinense', enabled: true },
   { id: 'indiana', label: 'Farmácia Indiana', host: 'https://www.farmaciaindiana.com.br', salesChannel: '1', access: 'rest', group: 'Indiana', enabled: true },
+  // Goiânia (pesquisa de 28/09, CEP 74115-060): Alexfarma é VTEX aberta, 6 lojas em Goiânia/Aparecida,
+  // entrega no Setor Oeste e tem retirada a ~3 km. Canal 1 conferido (é o padrão do site).
+  { id: 'alexfarma', label: 'Alexfarma', host: 'https://www.alexfarma.com.br', salesChannel: '1', access: 'rest', group: 'Alexfarma', enabled: true },
 
   // ── Grupo B: Akamai — via proxy ZenRows (rd-adapter). Drogasil é o REPRESENTANTE do grupo
   // RD (Raia/Onofre têm o mesmo catálogo/preço → ficam off pra não gastar crédito à toa). ──
@@ -63,6 +66,9 @@ export const PLATFORM_REGISTRY: readonly PlatformNetwork[] = [
   // e DESLIGADA — o ZenRows renderiza preço/nome mas o link de produto ainda não sai limpo (ver docs).
   { id: 'nissei', label: 'Farmácias Nissei', host: 'https://www.farmaciasnissei.com.br', salesChannel: '1', access: 'custom', group: 'Nissei', enabled: true },
   { id: 'ultrafarma', label: 'Ultrafarma', host: 'https://www.ultrafarma.com.br', salesChannel: '1', access: 'custom', group: 'Ultrafarma', enabled: true },
+  // Farmácia Modelo (Goiânia, St. Oeste): plataforma própria que SIMULA por CEP — entrega (Goiânia)
+  // R$ 5 e Click & Retire, ambos ~1h no horário da loja. Ver modelo-adapter.ts.
+  { id: 'farmacia-modelo', label: 'Farmácia Modelo', host: 'https://farmaciamodelo.com.br', salesChannel: '1', access: 'custom', group: 'Modelo', enabled: true },
   { id: 'panvel', label: 'Panvel', host: 'https://www.panvel.com', salesChannel: '1', access: 'custom', group: 'Dimed', enabled: false },
 ];
 

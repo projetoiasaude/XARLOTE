@@ -39,6 +39,8 @@ export const PHARMACY_CHAIN_NAMES: readonly string[] = [
   'ultrafarma',
   'panvel',
   'farmais',
+  // regional de Goiânia cotada pelo site (VTEX) desde 28/09 — não gasta lugar no WhatsApp do bairro
+  'alexfarma',
 ];
 
 /** A farmácia é uma rede grande conhecida (por nome)? Match acento-insensível. */
@@ -46,6 +48,24 @@ export function isPharmacyChain(name: string | null | undefined): boolean {
   if (!name) return false;
   const n = fold(name);
   return PHARMACY_CHAIN_NAMES.some((c) => n.includes(c));
+}
+
+/**
+ * Farmácias LOCAIS que a Xarlote já cota pelo SITE (com prazo e estoque pro CEP) — então não
+ * gastam um lugar no WhatsApp do bairro. Por NOME + CIDADE, nunca só por nome: "Farmácia Modelo"
+ * é nome comum de farmácia independente pelo Brasil; só a de Goiânia é a do site (28/09 — o número
+ * dela recebia o nosso template e nunca respondia).
+ */
+const COBERTAS_PELO_SITE: ReadonlyArray<{ nome: string; cidade: string }> = [
+  { nome: 'farmacia modelo', cidade: 'goiania' },
+];
+
+export function cobertaPeloSite(name: string | null | undefined, city: string | null | undefined): boolean {
+  if (!name || !city) return false;
+  const n = fold(name);
+  const c = fold(city);
+  // Cidade EXATA: "Aparecida de Goiânia" é outra cidade, com as suas Farmácias Modelo (revisão de 28/09).
+  return COBERTAS_PELO_SITE.some((x) => n.includes(x.nome) && c.trim() === x.cidade);
 }
 
 // ─── Troca de medicamento (product-switch) ───────────────────────────────────
