@@ -72,6 +72,7 @@ export {
   medNameForSearch,
   normalize as normalizeMedName,
 } from './matching.js';
+export { apresentacoesDoCatalogo } from './apresentacoes.js';
 export { quoteRDProduct, zenrowsConfigured, parseRDSearch, parseRDPrice, extractNextData } from './rd-adapter.js';
 export { quoteNisseiProduct, parseNisseiCsrf, parseNisseiResults, parseNisseiPrices, humanizeNisseiSlug } from './nissei-adapter.js';
 export { quoteUltrafarmaProduct, parseUltrafarmaProducts, parseBrl } from './ultrafarma-adapter.js';

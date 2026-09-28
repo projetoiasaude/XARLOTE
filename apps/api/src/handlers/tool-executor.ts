@@ -4,7 +4,7 @@ import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem, CareLinkView } from '@iasaude/shared';
 import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, pediuCancelarTudo, ehRruleComListaDeMinutos, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool,
-  decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, extractDeliverySector, parseEnderecoDigitado, montarEnderecoHumano, nomeJaConfirmadoPeloPaciente, quantidadeFoiMencionada, JANELA_PEDIDO_VIVO_MS, pareceProtocoloDeRetirada, RECUSA_DE_PROTOCOLO, interpretarQuando, autorizouBuscaNoPortal, dataDeNascimentoDaFala, quandoPorExtenso, mensagemVouTentarAgora, mensagemVouConferirOSite, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
+  decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, extractDeliverySector, parseEnderecoDigitado, montarEnderecoHumano, nomeJaConfirmadoPeloPaciente, quantidadeFoiMencionada, doseFoiDita, separarDoseDoNome, doseAPerguntar, instrucaoDePerguntaDeDose, tokenPrincipal, type PerguntaDeDose, JANELA_PEDIDO_VIVO_MS, pareceProtocoloDeRetirada, RECUSA_DE_PROTOCOLO, interpretarQuando, autorizouBuscaNoPortal, dataDeNascimentoDaFala, quandoPorExtenso, mensagemVouTentarAgora, mensagemVouConferirOSite, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
 import { verificarExistenciaDoRemedio } from './verificar-nome-remedio.js';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, escolherAdapter, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
@@ -1014,7 +1014,31 @@ async function handleStartPharmacyOrder(
   const falas = [...falasDoPaciente, ...falasIn.map((m) => m.transcript)];
   const ultimaFalaDaXarlote = recentes.find((m) => m.direction === 'out')?.content ?? null;
   const falouDeSubstituto = pacienteFalouDeSubstituto(falasDoPaciente);
+  // 💊 O que o prontuário JÁ sabe de dose (remédio em uso, receita lida) — prova tão boa quanto
+  // a fala. Pedido anterior NÃO entra: o "Cefaliv 20mg" inventado em 28/09 está gravado num
+  // pedido e viraria prova da própria invenção.
+  const [{ data: medsConhecidos }, { data: receitasConhecidas }] = await Promise.all([
+    db.from('user_medications').select('medication_name, dosage').eq('user_id', ctx.userId).not('dosage', 'is', null).limit(60),
+    db.from('prescriptions').select('prescription_items(medication_name, dosage)').eq('user_id', ctx.userId).order('created_at', { ascending: false }).limit(10),
+  ]);
+  const dosesDoProntuario = [
+    ...((medsConhecidos ?? []) as Array<{ medication_name: string | null; dosage: string | null }>),
+    ...((receitasConhecidas ?? []) as Array<{ prescription_items: Array<{ medication_name: string | null; dosage: string | null }> | null }>).flatMap((r) => r.prescription_items ?? []),
+  ].map((m) => `${m.medication_name ?? ''} ${m.dosage ?? ''}`.trim());
   args.items = (args.items ?? []).map((i) => {
+    // 💊 DOSE QUE NINGUÉM DISSE NÃO ENTRA (28/09, Cefaliv): o modelo ofereceu "10mg, 20mg e
+    // 40mg" de um remédio que só existe em 1mg + 100mg + 350mg e escolheu "20mg, a mais comum"
+    // sozinho; o ranqueador recusou o Cefaliv real em todas as redes. Dose escrita no nome vem
+    // pro campo de dose antes (senão passaria por fora). Sem prova, a dose cai — e o catálogo
+    // decide mais abaixo se precisa perguntar.
+    const separado = separarDoseDoNome(String(i.name ?? ''));
+    const doseProposta = (i.dosage ?? '').trim() || separado.dose || undefined;
+    const token = tokenPrincipal(separado.nome);
+    const doProntuario = token ? dosesDoProntuario.filter((t) => t.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().includes(token)) : [];
+    const dose = doseProposta && doseFoiDita([...falas, ...doProntuario], doseProposta, separado.nome) ? doseProposta : undefined;
+    if (doseProposta && !dose) {
+      void writeLog('warn', 'order', `start_pharmacy_order: dose "${doseProposta}" de "${separado.nome}" não foi dita pelo paciente nem está no prontuário — removida (o catálogo decide se pergunta)`, { traceId: ctx.traceId });
+    }
     // 📦 QUANTIDADE QUE NINGUÉM DISSE NÃO ENTRA (14/09): "30 cápsulas"/"90 cápsulas" inventados
     // da posologia viraram forma de busca e "(90 cápsulas)" pra farmácia. Sem número dito pelo
     // paciente ou lido da receita, a quantidade cai — 1 caixa é o padrão e a farmácia cota assim.
@@ -1024,7 +1048,8 @@ async function handleStartPharmacyOrder(
     }
     return {
       ...i,
-      name: String(i.name ?? '').trim(),
+      name: separado.nome,
+      dosage: dose,
       quantity: quantidade,
       substitutes_ok: typeof i.substitutes_ok === 'boolean' && falouDeSubstituto ? i.substitutes_ok : null,
       source: (['texto', 'foto', 'audio'] as const).includes((i.source ?? 'texto') as OrigemDoNome) ? (i.source ?? 'texto') : 'texto',
@@ -1093,6 +1118,25 @@ async function handleStartPharmacyOrder(
       await sendCurrentOrderStatus(existingActive.id, ctx.conversationId, ctx.phoneE164, ctx.traceId);
       return;
     }
+  }
+
+  // 💊 SEM DOSE DITA, O CATÁLOGO DECIDE SE PERGUNTA (28/09, Cefaliv). Uma apresentação só →
+  // segue (o ranqueador acha o produto pelo nome); várias → a pergunta cita SÓ as reais. Antes
+  // da localização de propósito: a dose é perguntada junto com o endereço, e a 📍 que chega
+  // depois vale no turno em que for compartilhada.
+  const perguntasDeDose: PerguntaDeDose[] = [];
+  for (const item of args.items) {
+    if (item.dosage) continue;
+    const ver = await verificarExistenciaDoRemedio(item.name, ctx.traceId);
+    const pergunta = doseAPerguntar(item, ver.apresentacoes);
+    if (pergunta) perguntasDeDose.push(pergunta);
+    else if (ver.apresentacoes?.length === 1) {
+      void writeLog('info', 'order', `start_pharmacy_order: "${item.name}" sem dose dita — o catálogo só tem ${ver.apresentacoes[0]}, segue sem perguntar`, { traceId: ctx.traceId });
+    }
+  }
+  if (perguntasDeDose.length) {
+    await writeLog('info', 'order', `start_pharmacy_order: dose não dita e variável — perguntando com as opções do catálogo (${perguntasDeDose.map((p) => `${p.nome}: ${p.opcoes.join(' / ')}`).join('; ')})`, { traceId: ctx.traceId });
+    throw new ToolFailure(`${instrucaoDePerguntaDeDose(perguntasDeDose)} Se ainda falta o endereço/localização, peça junto na mesma frase.`);
   }
 
   let lat: number | null = null;

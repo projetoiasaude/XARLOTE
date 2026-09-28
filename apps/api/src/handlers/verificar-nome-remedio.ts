@@ -15,7 +15,7 @@
  */
 
 import { writeLog } from '@iasaude/db';
-import { PLATFORM_REGISTRY, searchVtexProducts } from '@iasaude/integrations';
+import { PLATFORM_REGISTRY, searchVtexProducts, apresentacoesDoCatalogo } from '@iasaude/integrations';
 import { tokenPrincipal, nomeExisteEm } from '@iasaude/shared';
 import { getRedisClient } from '../queue-config.js';
 
@@ -29,20 +29,31 @@ export interface ExistenciaDoRemedio {
   existe: boolean | null;
   /** Nomes de produtos que provam a existência (pra log/observação), no máximo 3. */
   exemplos: string[];
+  /**
+   * As apresentações REAIS no catálogo ("1mg + 100mg + 350mg"; "25mg", "50mg", "100mg") —
+   * é daqui que sai a pergunta de dose, nunca da memória do modelo (caso Cefaliv, 28/09).
+   * null = não deu pra saber (redes fora do ar).
+   */
+  apresentacoes: string[] | null;
   fonte: 'cache' | 'busca' | 'inconclusivo' | 'sem_token';
 }
 
 export async function verificarExistenciaDoRemedio(nome: string, traceId?: string): Promise<ExistenciaDoRemedio> {
   const token = tokenPrincipal(nome);
-  if (!token) return { token: null, existe: null, exemplos: [], fonte: 'sem_token' };
+  if (!token) return { token: null, existe: null, exemplos: [], apresentacoes: null, fonte: 'sem_token' };
 
-  const chave = `remedio:existe:${token}`;
+  // v2 (28/09): o cache guarda também as apresentações. A chave antiga ('1'/'0') não as tem
+  // e morre sozinha em 30 dias; até lá, uma busca a mais por nome distinto.
+  const chave = `remedio:existe:v2:${token}`;
   try {
     const cached = await getRedisClient().get(chave);
-    if (cached === '1' || cached === '0') {
-      return { token, existe: cached === '1', exemplos: [], fonte: 'cache' };
+    if (cached) {
+      const c = JSON.parse(cached) as { e?: boolean; a?: string[] };
+      if (typeof c.e === 'boolean') {
+        return { token, existe: c.e, exemplos: [], apresentacoes: Array.isArray(c.a) ? c.a : null, fonte: 'cache' };
+      }
     }
-  } catch { /* Redis fora → segue sem cache */ }
+  } catch { /* Redis fora ou valor estranho → segue sem cache */ }
 
   const redes = PLATFORM_REGISTRY.filter((n) => n.access === 'rest' && n.enabled && REDES_DE_REFERENCIA.includes(n.id));
   const resultados = await Promise.all(redes.map(async (net) => {
@@ -56,11 +67,12 @@ export async function verificarExistenciaDoRemedio(nome: string, traceId?: strin
   const respondeu = resultados.filter((r) => r.ok);
   if (!respondeu.length) {
     await writeLog('warn', 'pharmacy', `Verificação de nome INCONCLUSIVA (nenhuma rede respondeu) — seguindo sem verificar "${token}"`, { traceId });
-    return { token, existe: null, exemplos: [], fonte: 'inconclusivo' };
+    return { token, existe: null, exemplos: [], apresentacoes: null, fonte: 'inconclusivo' };
   }
   const nomes = respondeu.flatMap((r) => r.nomes);
   const existe = nomeExisteEm(token, nomes);
   const exemplos = nomes.filter((n) => nomeExisteEm(token, [n])).slice(0, 3);
-  try { await getRedisClient().set(chave, existe ? '1' : '0', 'EX', CACHE_TTL_S); } catch { /* sem cache */ }
-  return { token, existe, exemplos, fonte: 'busca' };
+  const apresentacoes = apresentacoesDoCatalogo(token, nomes);
+  try { await getRedisClient().set(chave, JSON.stringify({ e: existe, a: apresentacoes }), 'EX', CACHE_TTL_S); } catch { /* sem cache */ }
+  return { token, existe, exemplos, apresentacoes, fonte: 'busca' };
 }
