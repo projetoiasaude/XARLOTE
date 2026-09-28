@@ -65,6 +65,12 @@ export interface OrderState {
   supplierAckAfterClose: boolean;
   /** Handoff de plataforma: cotado nas grandes redes (links enviados), sem farmácia de bairro. */
   platformHandoff: boolean;
+  /**
+   * O que a mensagem das GRANDES REDES prometeu (orders.platform_offer) — o paciente já tem o
+   * link. Sem isto o bloco dizia "NÃO fechou — nenhuma opção viável" pro pedido em que o bairro
+   * não respondeu, com o link de 60 min na mão dela (revisão de 28/09).
+   */
+  ofertaDaRede: { rede: string; total: number; prazo: string } | null;
   /** Endereço de entrega do pedido (pra extrair CEP e re-cotar por nome numa grande rede). */
   deliveryAddress: string | null;
   /** Coordenadas de entrega — fallback pra reverse-geocode do CEP quando o endereço não traz. */
@@ -93,7 +99,7 @@ export async function loadLatestOrderState(userId: string): Promise<OrderState |
   const sinceIso = new Date(Date.now() - WINDOW_MS).toISOString();
   const { data: order } = await db
     .from('orders')
-    .select('id, status, items, created_at, selected_quote_id, closed_at, delivery_deadline, close_conditions, summary, delivery_address, delivery_lat, delivery_lng')
+    .select('id, status, items, created_at, selected_quote_id, closed_at, delivery_deadline, close_conditions, summary, delivery_address, delivery_lat, delivery_lng, platform_offer')
     .eq('user_id', userId)
     .in('status', RELEVANT_STATUSES as unknown as string[])
     .gte('created_at', sinceIso)
@@ -174,6 +180,13 @@ export async function loadLatestOrderState(userId: string): Promise<OrderState |
     closeConditions: (order.close_conditions as string | null) ?? null,
     supplierAckAfterClose,
     platformHandoff: typeof order.summary === 'string' && order.summary.startsWith(PLATFORM_HANDOFF_SUMMARY),
+    ofertaDaRede: (() => {
+      const o = (order as { platform_offer?: { melhor?: { rede?: unknown; total?: unknown; prazo?: unknown } } | null }).platform_offer;
+      const m = o?.melhor;
+      return m && typeof m.rede === 'string' && typeof m.total === 'number' && Number.isFinite(m.total) && typeof m.prazo === 'string'
+        ? { rede: m.rede, total: m.total, prazo: m.prazo }
+        : null;
+    })(),
     deliveryAddress: (order.delivery_address as string | null) ?? null,
     deliveryLat: (order.delivery_lat as number | null) ?? null,
     deliveryLng: (order.delivery_lng as number | null) ?? null,
@@ -231,7 +244,10 @@ function orderStatusLabel(state: OrderState): string {
       const cond = state.closeConditions && !state.deliveryDeadline ? `; condição do cliente: "${state.closeConditions}"` : '';
       return `FECHADO com ${chosen?.supplierName ?? 'a farmácia escolhida'}${quando} — ${ack}${prazo}${cond}`;
     }
-    case 'failed': return 'NÃO fechou — nenhuma opção viável ainda';
+    case 'failed':
+      return state.ofertaDaRede
+        ? `o BAIRRO não fechou preço, mas as opções das GRANDES REDES já foram enviadas com link e seguem valendo (melhor: ${state.ofertaDaRede.rede} R$ ${state.ofertaDaRede.total.toFixed(2).replace('.', ',')}, ${state.ofertaDaRede.prazo})`
+        : 'NÃO fechou — nenhuma opção viável ainda';
     default: return state.status;
   }
 }
@@ -261,6 +277,9 @@ export function buildOrderStateBlock(state: OrderState): string {
     `## ESTADO DO PEDIDO (visão completa — todas as farmácias deste pedido)`,
     `Pedido de **${itemNames}** — situação: ${orderStatusLabel(state)}.`,
   ];
+  if (state.ofertaDaRede && !state.selectedQuoteId) {
+    lines.push(`As GRANDES REDES já responderam e os links foram enviados ao paciente (melhor: ${state.ofertaDaRede.rede} R$ ${state.ofertaDaRede.total.toFixed(2).replace('.', ',')}, ${state.ofertaDaRede.prazo}). O bairro é COMPLEMENTO: se nenhuma farmácia daqui responder, a opção da rede segue valendo — NUNCA diga que "nada deu certo" nem que "nenhuma farmácia respondeu" como se ele estivesse sem opção.`);
+  }
 
   if (state.suppliers.length) {
     lines.push('Farmácias contatadas:');

@@ -4,7 +4,7 @@ import { PRESCRIPTION_OCR_PROMPT } from '@iasaude/llm';
 import type { ToolCall } from '@iasaude/llm';
 import type { NormalizedInbound, Message, OrderItem, CareLinkView } from '@iasaude/shared';
 import { resolveReminderFirstRun, proximoDiaDoMes, horaDeIso, isPlaceholderPhone, toE164BR, parseRrule, fimDaRecorrencia, rruleComFim, fimDoDiaLocal, contarOcorrencias, sanitizarCorpoDeLembrete, pediuCancelarTudo, ehRruleComListaDeMinutos, isPharmacyChain, sameMedication, shortSupplierAddress, itemDisplayName, extractAcceptConditions, humanizePaymentLabel, isServiceNumber, normalizeReminderBody, classifyBrPhone, extractWaMeNumber, PLATFORM_HANDOFF_SUMMARY, formatOrderTotal, resolverAlvoDaTool,
-  decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, extractDeliverySector, parseEnderecoDigitado, montarEnderecoHumano, nomeJaConfirmadoPeloPaciente, quantidadeFoiMencionada, doseFoiDita, separarDoseDoNome, doseAPerguntar, instrucaoDePerguntaDeDose, tokenPrincipal, type PerguntaDeDose, JANELA_PEDIDO_VIVO_MS, pareceProtocoloDeRetirada, RECUSA_DE_PROTOCOLO, interpretarQuando, autorizouBuscaNoPortal, dataDeNascimentoDaFala, quandoPorExtenso, mensagemVouTentarAgora, mensagemVouConferirOSite, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
+  decidirVerificacaoDeNome, perguntaDeConfirmacaoDeNome, enderecoFoiMencionado, perguntaJaRespondida, aceitouSubstituto, linhaDoProduto, pacienteFalouDeSubstituto, extractDeliverySector, parseEnderecoDigitado, montarEnderecoHumano, nomeJaConfirmadoPeloPaciente, quantidadeFoiMencionada, diagnosticarEnderecoSalvo, respostaDeConfirmacaoDeEndereco, mesmaRuaEComplemento, partesDoSalvo, perguntaDeConfirmacaoDeEndereco, MARCA_CONFIRMACAO_ENDERECO, type EnderecoSalvo, type Lugar, doseFoiDita, separarDoseDoNome, doseAPerguntar, instrucaoDePerguntaDeDose, tokenPrincipal, type PerguntaDeDose, JANELA_PEDIDO_VIVO_MS, pareceProtocoloDeRetirada, RECUSA_DE_PROTOCOLO, interpretarQuando, autorizouBuscaNoPortal, dataDeNascimentoDaFala, quandoPorExtenso, mensagemVouTentarAgora, mensagemVouConferirOSite, type ProdutoCotado, type OrigemDoNome } from '@iasaude/shared';
 import { verificarExistenciaDoRemedio } from './verificar-nome-remedio.js';
 import { findNearbyPharmacies, geocodeAddress, reverseGeocode, reverseGeocodeNominatim, getPlacePhone, getPlaceContact, fetchWebsiteHtml, matchPlatformNetworkByName, escolherAdapter, type PlaceResult } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
@@ -988,6 +988,93 @@ async function handleSaveAddress(
   }
 }
 
+/**
+ * Arruma o cadastro do rótulo depois de saber qual é o lugar certo: UMA linha fica e as outras do
+ * rótulo somem. Travas (revisão de 28/09):
+ *  • endereço de uma linha só, limpo: NADA é reescrito (só o uso) — re-ler e regravar perdia
+ *    "S/N", "Portão azul", o setor;
+ *  • na fusão, a linha que fica manda: só coluna vazia é preenchida pelas outras;
+ *  • se o update falha, nada é apagado (a fusão — o "201" — não pode se perder);
+ *  • o endereço padrão passa pra linha que fica; pedido antigo é re-apontado (FK de `orders`);
+ *  • tudo filtrado pelo user_id; auditado com os ids removidos.
+ */
+async function consolidarEnderecoSalvo(ctx: ToolContext, rotulo: string, lugar: Lugar, doRotulo: EnderecoSalvo[], coordDoMapa = false): Promise<string | null> {
+  const idsDoRotulo = doRotulo.map((a) => a.id);
+  if (!idsDoRotulo.length) return null;
+  const porUso = [...doRotulo].sort((x, y) => (y.usage_count ?? 0) - (x.usage_count ?? 0));
+  // Lugar escolhido de OUTRO rótulo: fica a linha deste rótulo que é a MESMA rua/quadra/lote
+  // (a que a pergunta comparou), não a mais usada — senão "Av. T-63, 1296" herdava o setor e a
+  // quadra da Rua 14 e virava um endereço que não existe (revisão de 28/09).
+  const irma = doRotulo.find((a) => mesmaRuaEComplemento(partesDoSalvo(a), lugar.partes));
+  const manter = idsDoRotulo.includes(lugar.manter)
+    ? lugar.manter
+    : (lugar.ids.find((id) => idsDoRotulo.includes(id)) ?? irma?.id ?? porUso[0]!.id);
+  const remover = idsDoRotulo.filter((id) => id !== manter);
+  const atual = doRotulo.find((a) => a.id === manter)!;
+  // Fusão de verdade = o lugar veio de mais de uma linha, ou de linha de OUTRO rótulo. Endereço
+  // de uma linha só (o caso comum) não é reescrito.
+  const fundiu = lugar.ids.length > 1 || lugar.manter !== manter;
+  const vazio = (v: unknown) => v === null || v === undefined || v === '';
+  const p = lugar.partes;
+  const preencher: Record<string, unknown> = {};
+  if (fundiu) {
+    const candidatos: Record<string, unknown> = {
+      street: p.street, number: p.number, complement: p.complement, neighborhood: p.neighborhood,
+      city: p.city, state: p.state, cep: p.cep,
+      latitude: lugar.coord?.lat ?? null, longitude: lugar.coord?.lng ?? null,
+    };
+    const atualRec = atual as unknown as Record<string, unknown>;
+    const deOutroRotulo = !lugar.ids.includes(manter);
+    for (const [k, v] of Object.entries(candidatos)) {
+      // Lugar de outro rótulo: a linha vira EXATAMENTE ele — todas as colunas, vazias inclusive
+      // (senão sobrava número/CEP do endereço antigo misturado). Senão, só preenche vazio.
+      if (deOutroRotulo ? (v ?? null) !== (atualRec[k] ?? null) : (!vazio(v) && vazio(atualRec[k]))) preencher[k] = v ?? null;
+    }
+    // "Rua 14, 201, Qd. B8, Lt. 20" gravado inteiro na rua da linha que fica: a rua vira só "Rua 14"
+    // — e só porque número, quadra/lote e setor tirados dela ganham as próprias colunas aqui.
+    if (!('street' in preencher) && p.street && atual.street && atual.street.includes(',') && p.street !== atual.street) {
+      preencher['street'] = p.street;
+      for (const k of ['number', 'complement', 'neighborhood', 'city', 'state', 'cep'] as const) {
+        if (!(k in preencher) && vazio(atualRec[k]) && !vazio(p[k])) preencher[k] = p[k];
+      }
+    }
+  }
+  // Coordenada achada no mapa depois da confirmação: grava, senão a pergunta volta a cada pedido.
+  if (coordDoMapa && lugar.coord && (atual.latitude == null || atual.longitude == null)) {
+    preencher['latitude'] = lugar.coord.lat;
+    preencher['longitude'] = lugar.coord.lng;
+  }
+  const { error: upErr } = await db.from('user_addresses')
+    .update({ ...preencher, usage_count: (atual.usage_count ?? 0) + 1, last_used_at: new Date().toISOString() })
+    .eq('id', manter).eq('user_id', ctx.userId);
+  if (upErr) {
+    await writeLog('warn', 'address', `Consolidação de "${rotulo}" abortada: o update falhou (${upErr.message.slice(0, 120)}) — nada foi removido`, { traceId: ctx.traceId, userAddressId: manter });
+    return manter;
+  }
+  if (remover.length) {
+    const eraPadrao = doRotulo.some((a) => remover.includes(a.id) && a.is_default);
+    await db.from('orders').update({ user_address_id: manter }).in('user_address_id', remover).eq('user_id', ctx.userId);
+    await db.from('consultations').update({ scheduled_address_id: manter }).in('scheduled_address_id', remover);
+    const { error: delErr } = await db.from('user_addresses').delete().in('id', remover).eq('user_id', ctx.userId);
+    if (delErr) {
+      await writeLog('warn', 'address', `Consolidação de "${rotulo}": não consegui remover ${remover.length} linha(s) — ${delErr.message.slice(0, 120)}`, { traceId: ctx.traceId });
+    } else if (eraPadrao && !atual.is_default) {
+      await db.from('user_addresses').update({ is_default: true }).eq('id', manter).eq('user_id', ctx.userId);
+    }
+  }
+  const completou = Object.keys(preencher).length > 0;
+  if (completou || remover.length) {
+    await writeLog('info', 'address', `Endereço "${rotulo}" arrumado: 1 linha fica${completou ? ` (completada: ${Object.keys(preencher).join(', ')})` : ''}, ${remover.length} removida(s)`, { traceId: ctx.traceId, userAddressId: manter });
+    await writeAudit({
+      actorType: 'xarlote', action: 'user.address.consolidate', userId: ctx.userId,
+      targetTable: 'user_addresses', targetId: manter,
+      conversationId: ctx.conversationId, traceId: ctx.traceId,
+      metadata: { label: rotulo, removidas: remover, completada: Object.keys(preencher) },
+    });
+  }
+  return manter;
+}
+
 async function handleStartPharmacyOrder(
   args: { items: OrderItem[]; saved_address_label?: string; location?: { lat?: number; lng?: number; address?: string }; payment_method?: string; preferred_pharmacy_names?: string[] },
   ctx: ToolContext
@@ -1013,6 +1100,18 @@ async function handleStartPharmacyOrder(
   // …e mais o que foi LIDO da foto/áudio (transcript) — vale só pra quantidade (a receita diz "30 comprimidos").
   const falas = [...falasDoPaciente, ...falasIn.map((m) => m.transcript)];
   const ultimaFalaDaXarlote = recentes.find((m) => m.direction === 'out')?.content ?? null;
+  // A pergunta "Só pra confirmar o endereço" mais recente (30 min) — um lembrete ou uma fala do
+  // modelo no meio não pode fazer a Xarlote esquecer que perguntou (revisão de 28/09).
+  const perguntaDeEndereco = (() => {
+    const i = recentes.findIndex((m) => m.direction === 'out' && (m.content ?? '').startsWith(MARCA_CONFIRMACAO_ENDERECO));
+    if (i < 0) return null;
+    // Só vale como resposta se nada foi PERGUNTADO depois (senão "2" pode ser "2 caixas") e se
+    // veio logo em seguida — até duas falas ("peraí" + "é o 1"); revisão de 28/09.
+    const depois = recentes.slice(0, i);
+    const outraPergunta = depois.some((m) => m.direction === 'out' && (m.content ?? '').includes('?'));
+    const falasDepois = depois.filter((m) => m.direction === 'in').length;
+    return !outraPergunta && falasDepois <= 2 ? recentes[i]!.content : null;
+  })();
   const falouDeSubstituto = pacienteFalouDeSubstituto(falasDoPaciente);
   // 💊 O que o prontuário JÁ sabe de dose (remédio em uso, receita lida) — prova tão boa quanto
   // a fala. Pedido anterior NÃO entra: o "Cefaliv 20mg" inventado em 28/09 está gravado num
@@ -1149,56 +1248,93 @@ async function handleStartPharmacyOrder(
   // (LLM costuma reaproveitar coords antigas do histórico — texto fresco é mais confiável;
   //  mas endereço SALVO explicitamente escolhido é a localização exata guardada — reusa direto.)
   if (args.saved_address_label) {
-    const { data: saved } = await db
+    const rotulo = args.saved_address_label.trim();
+    // TODAS as linhas do paciente (não "a primeira do rótulo"): em 28/09 a Ludmila tinha três
+    // "casa" diferentes (Setor Oeste sem número, Setor Oeste com o 201 no campo da rua, Setor
+    // Sul) e o pedido pegou a que o banco devolveu primeiro — acertou por sorte, sem o número.
+    const { data: todosEnderecos } = await db
       .from('user_addresses')
-      .select('id, label, street, number, complement, neighborhood, city, state, cep, latitude, longitude, usage_count')
-      .eq('user_id', ctx.userId)
-      .ilike('label', escapeLike(args.saved_address_label.trim()))
-      .order('is_default', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .select('id, label, street, number, complement, neighborhood, city, state, cep, latitude, longitude, usage_count, is_default, created_at')
+      .eq('user_id', ctx.userId);
+    const todos = (todosEnderecos ?? []) as Array<EnderecoSalvo & { created_at?: string | null }>;
+    const semAcento = (x: string | null | undefined) => (x ?? '').normalize('NFD').replace(/\p{M}/gu, '').trim().toLowerCase();
+    const doRotulo = todos.filter((a) => semAcento(a.label) === semAcento(rotulo));
+    const referencia = doRotulo.find((a) => a.is_default) ?? doRotulo[0];
+    // 🏠 ANOTADO DE MAIS DE UM JEITO? (28/09) Linhas que são o mesmo lugar se fundem sozinhas
+    // (número de uma, CEP e coordenada da outra); lugares DIFERENTES pro mesmo rótulo — ou a mesma
+    // rua/quadra/lote noutro setor — viram pergunta antes de usar, e a resposta arruma o cadastro.
+    const diag = diagnosticarEnderecoSalvo(todos, rotulo, falasDoPaciente);
+    // A resposta à NOSSA pergunta de confirmação deste rótulo já é o consentimento (e só ela).
+    const respondendoConfirmacao = !!perguntaDeEndereco && diag.tipo === 'conflito';
     // 🗣️ CONSENTIMENTO PELA FALA (caso Ludmila): o modelo escolheu "trabalho" sozinho — ela só
     // mandou a foto e "consegue cotar?". Um endereço salvo só entra se o paciente o MENCIONOU
     // (rótulo, "mesmo endereço", a rua) neste turno ou no anterior. Senão, pergunta pra onde vai.
-    if (saved) {
-      // Olha as falas recentes de verdade (não só a atual + 1) e aceita a resposta à NOSSA
-      // proposta: "Confirmo o pedido pro trabalho?" → "Isso" é consentimento (14/09).
-      if (!enderecoFoiMencionado(falasDoPaciente, { label: String(saved.label ?? ''), street: (saved.street as string | null) ?? null }, { propostaDaXarlote: ultimaFalaDaXarlote, respostaAtual: ctx.textoDoPaciente })) {
-        const { data: todos } = await db.from('user_addresses').select('label, street, number, complement, neighborhood, is_default, created_at').eq('user_id', ctx.userId).order('is_default', { ascending: false }).order('created_at', { ascending: false }).limit(8);
-        // Um por rótulo (o default ou o mais novo) — a lista com "trabalho, trabalho, casa, casa" era ilegível.
-        const porRotulo = new Map<string, { label: string; street: string | null; number: string | null; complement: string | null; neighborhood: string | null }>();
-        for (const a of (todos ?? []) as Array<{ label: string; street: string | null; number: string | null; complement: string | null; neighborhood: string | null }>) {
-          const k = String(a.label ?? '').trim().toLowerCase();
-          if (k && !porRotulo.has(k)) porRotulo.set(k, a);
+    // Olha as falas recentes de verdade (não só a atual + 1) e aceita a resposta à NOSSA
+    // proposta: "Confirmo o pedido pro trabalho?" → "Isso" é consentimento (14/09).
+    if (referencia && !respondendoConfirmacao && !enderecoFoiMencionado(falasDoPaciente, { label: String(referencia.label ?? ''), street: referencia.street ?? null }, { propostaDaXarlote: ultimaFalaDaXarlote, respostaAtual: ctx.textoDoPaciente })) {
+      // Um por rótulo (o default ou o mais novo) — a lista com "trabalho, trabalho, casa, casa" era ilegível.
+      const porRotulo = new Map<string, EnderecoSalvo>();
+      const ordenados = [...todos].sort((x, y) => Number(!!y.is_default) - Number(!!x.is_default) || String(y.created_at ?? '').localeCompare(String(x.created_at ?? '')));
+      for (const a of ordenados) {
+        const k = semAcento(a.label);
+        if (k && !porRotulo.has(k) && porRotulo.size < 8) porRotulo.set(k, a);
+      }
+      const lista = [...porRotulo.values()].map((a) => `*${a.label}* (${[[a.street, a.number].filter(Boolean).join(', '), a.complement, a.neighborhood].filter(Boolean).join(', ') || 'endereço salvo'})`).join(', ');
+      await writeLog('warn', 'order', `start_pharmacy_order: endereço salvo "${rotulo}" NÃO foi mencionado pelo paciente — perguntando pra onde vai em vez de assumir`, { traceId: ctx.traceId });
+      await sendOutbound(ctx.conversationId, ctx.phoneE164,
+        `Pra onde eu mando? Tenho aqui ${lista || 'um endereço salvo'} — ou me passa um endereço novo (com o CEP) 💙`, ctx.traceId);
+      if (ctx.observation) ctx.observation.note = 'NENHUM pedido foi criado: o paciente ainda não disse pra qual endereço vai (não assuma um salvo). A pergunta já foi enviada; aguarde a resposta dele.';
+      return;
+    }
+
+    let lugar: Lugar | null = null;
+    if (diag.tipo === 'unico') {
+      lugar = diag.lugar;
+    } else if (diag.tipo === 'conflito') {
+      lugar = respostaDeConfirmacaoDeEndereco(perguntaDeEndereco, ctx.textoDoPaciente, diag);
+      if (!lugar && respondendoConfirmacao && perguntaDeEndereco === ultimaFalaDaXarlote) {
+        // Ele JÁ respondeu à pergunta e não deu pra saber qual é (ex.: "não, mudei"). Perguntar a
+        // mesma coisa de novo seria loop com o paciente (regra 151): o modelo pede o endereço.
+        await writeLog('info', 'order', `start_pharmacy_order: resposta à confirmação do endereço "${rotulo}" não escolheu nenhum — o modelo pede o endereço certo`, { traceId: ctx.traceId });
+        if (ctx.observation) {
+          ctx.observation.note = `NENHUM pedido foi criado: o paciente respondeu à confirmação do endereço "${rotulo}", mas a resposta não escolhe nenhum dos endereços anotados. Pergunte o endereço completo (rua, número, quadra/lote, setor e CEP) ou a 📍 e chame start_pharmacy_order com location.address. Não repita a pergunta de confirmação.`;
         }
-        const lista = [...porRotulo.values()].map((a) => `*${a.label}* (${[[a.street, a.number].filter(Boolean).join(', '), a.complement, a.neighborhood].filter(Boolean).join(', ') || 'endereço salvo'})`).join(', ');
-        await writeLog('warn', 'order', `start_pharmacy_order: endereço salvo "${saved.label}" NÃO foi mencionado pelo paciente — perguntando pra onde vai em vez de assumir`, { traceId: ctx.traceId });
-        await sendOutbound(ctx.conversationId, ctx.phoneE164,
-          `Pra onde eu mando? Tenho aqui ${lista || 'um endereço salvo'} — ou me passa um endereço novo (com o CEP) 💙`, ctx.traceId);
-        if (ctx.observation) ctx.observation.note = 'NENHUM pedido foi criado: o paciente ainda não disse pra qual endereço vai (não assuma um salvo). A pergunta já foi enviada; aguarde a resposta dele.';
+        return;
+      }
+      if (!lugar) {
+        await writeLog('warn', 'order', `start_pharmacy_order: endereço "${rotulo}" ${diag.variantes.length > 1 ? `anotado de ${diag.variantes.length} jeitos` : 'sem coordenada'} — perguntando antes de usar${diag.apontada ? ' (a fala aponta um)' : ''}`, { traceId: ctx.traceId });
+        await sendOutbound(ctx.conversationId, ctx.phoneE164, perguntaDeConfirmacaoDeEndereco(diag), ctx.traceId);
+        if (ctx.observation) {
+          ctx.observation.note = `NENHUM pedido foi criado: o endereço salvo "${rotulo}" precisa ser confirmado e a pergunta JÁ foi enviada ao paciente — aguarde. Quando ele responder, chame start_pharmacy_order de novo com saved_address_label="${rotulo}" (o servidor usa a resposta dele e arruma os endereços). Se ele der um endereço novo, use location.address. NÃO diga que está cotando.`;
+        }
         return;
       }
     }
-    if (saved?.latitude != null && saved?.longitude != null) {
-      lat = saved.latitude as number;
-      lng = saved.longitude as number;
-      userAddressId = saved.id as string;
-      const parts = [
-        [saved.street, saved.number].filter(Boolean).join(', '),
-        saved.complement, saved.neighborhood,
-        [saved.city, saved.state].filter(Boolean).join(' - '),
-        saved.cep,
-      ].filter((p) => p && String(p).trim());
-      deliveryAddress = parts.join(', ') || (saved.label as string);
-      locationSource = `saved_address:${saved.label}`;
-      // Marca uso (pra sugerir default depois e ordenar por frequência). Read-then-write
-      // simples — 1 usuário por vez, sem concorrência real aqui.
-      await db.from('user_addresses')
-        .update({ usage_count: ((saved.usage_count as number | null) ?? 0) + 1, last_used_at: new Date().toISOString() })
-        .eq('id', saved.id);
-      await writeLog('info', 'order', `start_pharmacy_order — usando endereço salvo "${saved.label}"`, {
+
+    let coordDoMapa = false;
+    if (lugar && !lugar.coord) {
+      // O lugar certo pode ser a linha sem coordenada ("201" só existia nela): acha no mapa.
+      const geo = await geocodeAddress(lugar.textoCompleto).catch(() => null);
+      if (geo && geo.confidence === 'precise') { lugar = { ...lugar, coord: { lat: geo.lat, lng: geo.lng } }; coordDoMapa = true; }
+    }
+    if (lugar?.coord) {
+      lat = lugar.coord.lat;
+      lng = lugar.coord.lng;
+      deliveryAddress = lugar.textoCompleto || rotulo;
+      locationSource = `saved_address:${rotulo}`;
+      userAddressId = await consolidarEnderecoSalvo(ctx, rotulo, lugar, doRotulo, coordDoMapa);
+      await writeLog('info', 'order', `start_pharmacy_order — usando endereço salvo "${rotulo}"`, {
         traceId: ctx.traceId, userAddressId, lat, lng,
       });
+    } else if (lugar) {
+      // O lugar foi confirmado, mas o mapa não o acha: pede a 📍 sem desdizer a confirmação.
+      await sendOutbound(ctx.conversationId, ctx.phoneE164,
+        `Não consegui achar esse endereço no mapa 😕 Me manda sua localização 📍 (ou o CEP) que eu sigo daqui 💙`,
+        ctx.traceId);
+      if (ctx.observation) {
+        ctx.observation.note = `NENHUM pedido foi criado: o endereço "${rotulo}" foi confirmado, mas o mapa não o encontrou e a localização já foi pedida. Quando a 📍 ou o CEP chegar, chame start_pharmacy_order SEM saved_address_label (use a localização da mensagem ou location.address com o CEP), senão a mesma pergunta volta.`;
+      }
+      return;
     } else {
       // Label não encontrado / sem coords → pede o endereço (não inventa localização).
       await sendOutbound(ctx.conversationId, ctx.phoneE164,
@@ -1819,12 +1955,24 @@ async function startPharmacyDiscovery(
   //
   // O `await` é deliberado: são ~2s, e a ORDEM das duas mensagens é o produto. As
   // negociações do bairro só saem depois daqui, então o custo é 2s no pior caso.
+  // HONESTIDADE NOTURNA: se a maioria das escolhidas está fechada agora (open_now), avisa que a
+  // resposta vem quando abrirem (senão ele fica esperando resposta de loja fechada, caso Glauber
+  // 22h). Quando a rede JÁ resolveu, a loja fechada deixa de ser má notícia.
+  const openKnown = finalTeam.filter((e) => e.place.isOpen !== undefined);
+  const allClosed = openKnown.length >= 3 && openKnown.every((e) => e.place.isOpen === false);
+  const plural = quoteIds.length > 1;
+  // UMA VOZ SÓ pro bairro (28/09, Ludmila): o fecho da mensagem das redes dizia "sigo cotando nas
+  // farmácias do bairro" e, um segundo depois, outra mensagem dizia "também tô cotando em 4
+  // farmácias do seu bairro". Agora a frase do bairro É o fecho da mensagem das redes.
+  const bairroComRede = `Também pedi orçamento pra ${quoteIds.length} farmácia${plural ? 's' : ''} do seu bairro. Se alguma responder, te passo o valor na hora 😊${allClosed ? ' (a essa hora a maioria já fechou, então devem responder cedinho)' : ''}`;
+
   let redesApresentadas = 0;
   if (userCep) {
     const pres = await presentPlatformQuotes({
       orderId, items, cep: userCep,
       conversationId: ctx.conversationId, phoneE164: ctx.phoneE164, traceId: ctx.traceId,
       soleChannel: false,
+      outroText: `\n\n${bairroComRede}`,
     }).catch(async (err) => {
       await writeLog('warn', 'platform', `Falha apresentando plataformas (primeiro canal): ${String(err).slice(0, 140)}`, { traceId: ctx.traceId, orderId });
       return { networksPresented: 0, itemsCovered: 0 };
@@ -1833,22 +1981,15 @@ async function startPharmacyDiscovery(
   }
 
   // ─── E O BAIRRO COMO COMPLEMENTO ────────────────────────────────────────────
-  // HONESTIDADE NOTURNA: se a maioria das escolhidas está fechada agora (open_now),
-  // avisa que a resposta vem quando abrirem (senão ele fica esperando resposta de loja
-  // fechada, caso Glauber 22h). Quando a rede JÁ resolveu, a loja fechada deixa de ser
-  // má notícia — a pessoa não está mais dependendo dela.
-  const openKnown = finalTeam.filter((e) => e.place.isOpen !== undefined);
-  const allClosed = openKnown.length >= 3 && openKnown.every((e) => e.place.isOpen === false);
-  const nightNote = allClosed
-    ? (redesApresentadas > 0
-        ? ' (esse horário a maioria do bairro já fechou, então elas devem responder cedinho)'
-        : ' Ah, esse horário a maioria já tá fechada — deixei a mensagem lá e assim que abrirem elas costumam responder cedinho, tá?')
-    : '';
-  const plural = quoteIds.length > 1;
-  const textoBairro = redesApresentadas > 0
-    ? `Também tô cotando em ${quoteIds.length} farmácia${plural ? 's' : ''} do seu bairro — se sair mais em conta que isso aí de cima, eu te aviso na hora 😊${nightNote}`
-    : `Achei ${quoteIds.length} farmácia${plural ? 's' : ''} aqui na sua região e já entrei em contato com ${plural ? 'elas' : 'ela'} ✨ assim que chegarem as respostas eu te aviso na hora.${nightNote}`;
-  await sendOutbound(ctx.conversationId, ctx.phoneE164, textoBairro, ctx.traceId);
+  // Sem rede nenhuma, o bairro é a notícia — e ganha a própria mensagem.
+  if (redesApresentadas === 0) {
+    const nightNote = allClosed
+      ? ' Ah, esse horário a maioria já tá fechada — deixei a mensagem lá e assim que abrirem elas costumam responder cedinho, tá?'
+      : '';
+    await sendOutbound(ctx.conversationId, ctx.phoneE164,
+      `Achei ${quoteIds.length} farmácia${plural ? 's' : ''} aqui na sua região e já entrei em contato com ${plural ? 'elas' : 'ela'} ✨ assim que chegarem as respostas eu te aviso na hora.${nightNote}`,
+      ctx.traceId);
+  }
 
   // Setor/bairro real do usuário pra passar pra farmácia (não a cidade da farmácia em si).
   const userNeighborhood =
@@ -1902,7 +2043,7 @@ async function handleGetOrderStatus(ctx: ToolContext) {
   const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const { data: order } = await db
     .from('orders')
-    .select('id, status')
+    .select('id, status, platform_offer')
     .eq('user_id', ctx.userId)
     .in('status', ['quoting', 'quoted', 'confirming', 'handed_off', 'failed'])
     .gte('created_at', sinceIso)
@@ -1923,6 +2064,13 @@ async function handleGetOrderStatus(ctx: ToolContext) {
 
   // Pedido que FALHOU: seja honesta (nunca "confirmado"). O mini-relatório detalhado já
   // saiu na consolidação; aqui ofereço os caminhos de retomada (re-engajar / ampliar).
+  // Falhou só o BAIRRO: as grandes redes já tinham mandado link (platform_offer). "Nenhuma farmácia
+  // deu certo" desmentiria a mensagem das redes — o status detalhado conta as duas partes.
+  if (order.status === 'failed' && (order as { platform_offer?: unknown }).platform_offer) {
+    await sendCurrentOrderStatus(order.id, ctx.conversationId, ctx.phoneE164, ctx.traceId);
+    if (ctx.observation) ctx.observation.note = 'O bairro não fechou preço, mas as opções das GRANDES REDES (com link) já tinham sido enviadas e seguem valendo — o status já foi mandado ao paciente. Não diga que o pedido falhou nem que nenhuma farmácia deu certo.';
+    return;
+  }
   if (order.status === 'failed') {
     await sendOutbound(
       ctx.conversationId,

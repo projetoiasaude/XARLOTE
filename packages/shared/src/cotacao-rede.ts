@@ -132,29 +132,20 @@ export function temOpcaoImediata(quotes: readonly CotacaoOrdenavel[]): boolean {
 }
 
 /**
- * MODO ENTREGA NA HORA: quando existe opção que resolve agora, mostrar SÓ as que resolvem
- * agora — a promessa da Xarlote é "você tem o remédio hoje", e "chega em 4 dias úteis"
- * listado logo abaixo é exatamente o que o fundador pediu pra não aparecer.
+ * ATÉ 3 OPÇÕES DE CARA, a mais rápida primeiro (fundador, 28/09: "o ideal é que ela mandasse
+ * tipo 3 de link já de cara"). Substitui o modo "só as que resolvem na hora", que escondia as
+ * lentas — a Ludmila recebeu UM link. Cada opção diz o próprio prazo, então mostrar a lenta
+ * não promete nada que ela não cumpra.
  *
- * Com UMA exceção, pra nunca esconder a única resposta completa: uma opção lenta que tem
- * MAIS itens da receita do que a melhor opção rápida continua na lista (a pessoa precisa
- * saber que ali tem tudo). Sem nenhuma opção rápida, nada é filtrado — aí a honestidade é
- * mostrar a mais rápida que existe, com o prazo dela.
- *
- * Preserva a ordem de entrada (espera a lista já ordenada por `ordenarCotacoesDeRede`).
+ * A ordem é a do comparador (cobertura → prazo → preço), com UMA garantia: havendo opção que
+ * resolve na hora, ela NUNCA fica de fora. Com três lentas completas e uma rápida parcial, o
+ * corte do top-3 sumia justamente com a rápida (revisão de 24/09) — aqui ela entra no lugar da
+ * última.
  */
-export function selecionarParaEntregaNaHora<T extends CotacaoOrdenavel>(
-  ordenadas: readonly T[],
-): { cotacoes: T[]; soNaHora: boolean } {
-  const rapidas = ordenadas.filter(ehNaHora);
-  if (!rapidas.length) return { cotacoes: [...ordenadas], soNaHora: false };
-  const coberturaRapida = Math.max(...rapidas.map((q) => q.lines.length));
-  // A exceção é UMA: a melhor opção lenta que cobre mais itens. A 1ª versão mantinha TODAS
-  // — com três lentas completas e uma rápida parcial, o corte do top-3 sumia justamente com
-  // a rápida, e o log ainda dizia "só as que resolvem na hora" (revisão de 24/09).
-  const excecao = ordenadas.find((q) => !ehNaHora(q) && q.lines.length > coberturaRapida);
-  return {
-    cotacoes: ordenadas.filter((q) => ehNaHora(q) || q === excecao),
-    soNaHora: !excecao,
-  };
+export function selecionarOpcoesDeRede<T extends CotacaoOrdenavel>(ordenadas: readonly T[], max = 3): T[] {
+  const top = ordenadas.slice(0, max);
+  if (top.some(ehNaHora)) return top;
+  const rapida = ordenadas.find(ehNaHora);
+  if (!rapida || max < 1) return top;
+  return [...top.slice(0, max - 1), rapida];
 }

@@ -1,5 +1,5 @@
 import { db, writeLog } from '@iasaude/db';
-import { sanitizeSupplierNote, noteSignalsConditionalOffer, formatOrderTotal, linhaDoProduto, type ProdutoCotado } from '@iasaude/shared';
+import { sanitizeSupplierNote, noteSignalsConditionalOffer, formatOrderTotal, linhaDoProduto, PLATFORM_HANDOFF_SUMMARY, type ProdutoCotado } from '@iasaude/shared';
 import { sendOutbound } from './outbound.js';
 import { hasPendingClarification } from './clarification.js';
 
@@ -60,8 +60,12 @@ export function scheduleQuoteTimeout(
   // usuário ficava no vácuo achando que a Xarlote esqueceu dele.
   setTimeout(() => {
     void (async () => {
-      const { data: order } = await db.from('orders').select('status').eq('id', orderId).single();
+      const { data: order } = await db.from('orders').select('status, platform_offer').eq('id', orderId).single();
       if (!order || order.status !== 'quoting') return;
+      // As grandes redes JÁ responderam (link na mão): "as farmácias ainda não responderam, te
+      // aviso quando a primeira chegar" diria o contrário da mensagem anterior (Ludmila, 28/09).
+      // Silêncio até o bairro ter o que dizer.
+      if (ofertaDaRede(order)) return;
       const { data: quotes } = await db.from('quotes').select('status').eq('order_id', orderId);
       if ((quotes ?? []).some((q) => q.status === 'quoted')) return;
       await sendOutbound(
@@ -72,6 +76,28 @@ export function scheduleQuoteTimeout(
       );
     })().catch((err) => writeLog('warn', 'order', `progress note failed: ${String(err)}`, { traceId, orderId }));
   }, PROGRESS_NOTE_MS);
+}
+
+/** O que a mensagem das grandes redes prometeu (gravado em `orders.platform_offer`). */
+interface OfertaDaRede {
+  redes: number;
+  melhor: { rede: string; total: number; prazo: string; naHora: boolean };
+}
+
+function ofertaDaRede(order: { platform_offer?: unknown } | null | undefined): OfertaDaRede | null {
+  const o = order?.platform_offer as Partial<OfertaDaRede> | null | undefined;
+  const ok = !!o && typeof o === 'object' && !!o.melhor && typeof o.melhor.rede === 'string'
+    && typeof o.melhor.total === 'number' && Number.isFinite(o.melhor.total) && typeof o.melhor.prazo === 'string';
+  return ok ? (o as OfertaDaRede) : null;
+}
+
+/** "*Pague Menos* R$ 25,59, ⚡ chega em 60 min" — a melhor das redes, pra citar depois. */
+function melhorDaRede(oferta: OfertaDaRede | null): string | null {
+  return oferta ? `*${oferta.melhor.rede}* ${reais(oferta.melhor.total)}, ${oferta.melhor.prazo}` : null;
+}
+
+function reais(n: number): string {
+  return `R$ ${n.toFixed(2).replace('.', ',')}`;
 }
 
 /**
@@ -189,8 +215,27 @@ export async function sendCurrentOrderStatus(
   userPhoneE164: string,
   traceId: string,
 ): Promise<void> {
-  const { data: order } = await db.from('orders').select('status').eq('id', orderId).single();
+  const { data: order } = await db.from('orders').select('status, platform_offer, summary, selected_quote_id').eq('id', orderId).single();
   if (!order) return;
+  const oferta = ofertaDaRede(order);
+  const melhor = melhorDaRede(oferta);
+
+  // HANDOFF DAS REDES não é "confirmado com a farmácia escolhida": a pessoa recebeu os links e
+  // finaliza no site. Só quando ela NÃO fechou com uma farmácia do bairro (selected_quote_id):
+  // aí a entrega é da farmácia, e falar do link das redes podia render compra em dobro.
+  const handoffDeRede = order.status === 'handed_off' && !order.selected_quote_id
+    && (oferta || (typeof order.summary === 'string' && order.summary.startsWith(PLATFORM_HANDOFF_SUMMARY)));
+  if (handoffDeRede) {
+    await sendOutbound(
+      userConversationId,
+      userPhoneE164,
+      `As opções das grandes redes estão na mensagem que te mandei, é só tocar no link e finalizar no site da farmácia 💙${melhor ? ` A melhor: ${melhor}.` : ''}`,
+      traceId,
+      {},
+      { dedup: true, dedupWindowMs: 20_000 },
+    );
+    return;
+  }
 
   if (['quoted', 'confirming', 'handed_off'].includes(order.status)) {
     await sendOutbound(
@@ -223,8 +268,12 @@ export async function sendCurrentOrderStatus(
   let msg: string;
   if (total === 0) {
     msg = 'Ainda estou organizando as farmácias daqui 💙 me dá só mais um instantinho.';
+  } else if (pending > 0 && melhor) {
+    msg = `As grandes redes já responderam: a melhor é ${melhor}, o link tá na mensagem aí em cima 💙 Das farmácias do bairro, ${pending} ainda ${pending > 1 ? 'estão' : 'está'} olhando; se alguma responder, te passo o valor na hora.`;
   } else if (pending > 0) {
     msg = `Ainda nenhuma resposta com preço, mas ${pending} farmácia${pending > 1 ? 's' : ''} ${pending > 1 ? 'estão' : 'está'} olhando ✨ assim que alguma responder eu te aviso na hora.`;
+  } else if (melhor) {
+    msg = `As farmácias do bairro não responderam, mas a opção das grandes redes segue de pé: ${melhor}, pelo link que te mandei 💙`;
   } else {
     msg = 'As farmácias que contatei não conseguiram responder dessa vez 😕 Posso tentar de novo em outra região, se você quiser.';
   }
@@ -452,8 +501,9 @@ export async function consolidateQuotes(
 ): Promise<void> {
   // Guard: only consolidate once per order. Inclui 'failed' (review Cefaliv): um pedido
   // já 'failed' era re-consolidado e re-mandava "não consegui cotação" várias vezes.
-  const { data: order } = await db.from('orders').select('status').eq('id', orderId).single();
+  const { data: order } = await db.from('orders').select('status, platform_offer').eq('id', orderId).single();
   if (!order || ['quoted', 'confirming', 'handed_off', 'cancelled', 'failed'].includes(order.status)) return;
+  const oferta = ofertaDaRede(order);
 
   // Loop agêntico: não fecha as opções enquanto uma farmácia espera um dado do
   // cliente (clarificação). Auto-libera após a janela (hasPendingClarification só
@@ -480,6 +530,29 @@ export async function consolidateQuotes(
     .eq('order_id', orderId);
 
   const successful = (quotes ?? []).filter((q) => q.status === 'quoted') as QuoteRow[];
+
+  if (successful.length === 0 && oferta) {
+    // O bairro não fechou preço, mas a pessoa JÁ TEM a resposta das grandes redes (o link). Um
+    // "não consegui cotação" contradiria a mensagem que ela recebeu — e pode chegar depois de ela
+    // já ter comprado. O status fica 'failed' DE PROPÓSITO: 'handed_off' é pós-venda no roteador
+    // das farmácias e congelava por 72h as respostas atrasadas — deste pedido e de outros
+    // pacientes da mesma farmácia (revisão de 28/09). 'failed' deixa a resposta tardia reviver.
+    const allQuotes = (quotes ?? []) as QuoteRow[];
+    const comNota = allQuotes.some((q) => q.status === 'unavailable' && !!sanitizeSupplierNote(q.notes));
+    if (comNota) {
+      // "não tem, mas tem o similar" / "só amanhã": isso a pessoa precisa saber.
+      const supIds = [...new Set(allQuotes.map((q) => q.supplier_id))];
+      const { data: sups } = await db.from('suppliers').select('id, name').in('id', supIds);
+      const nameOf = new Map<string, string>((sups ?? []).map((sp: SupplierRow) => [sp.id, sp.name]));
+      await sendOutbound(userConversationId, userPhoneE164, buildFailureReport(allQuotes, nameOf, oferta), traceId);
+    }
+    await db.from('orders').update({
+      status: 'failed',
+      cancelled_reason: `bairro sem preço — as grandes redes já tinham sido apresentadas com link (melhor: ${oferta.melhor.rede})`,
+    }).eq('id', orderId);
+    await writeLog('info', 'order', `Bairro sem preço, mas as redes já tinham respondido (${oferta.melhor.rede}) — ${comNota ? 'relato do bairro enviado' : 'sem mensagem'}`, { traceId, orderId, total: allQuotes.length });
+    return;
+  }
 
   if (successful.length === 0) {
     // MINI-RELATÓRIO honesto (incidente São Benedito 07/07): em vez do "não consegui"
@@ -533,7 +606,11 @@ export async function consolidateQuotes(
 
   // Build message
   const NUMBERS = ['1️⃣', '2️⃣', '3️⃣'];
-  const lines: string[] = ['Consegui cotações pra você! 🎉\n'];
+  // Com as redes já apresentadas, o bairro é uma opção A MAIS — a mensagem diz isso e compara
+  // com a melhor da rede ("ela avisava que conseguiu mais e passa o orçamento", fundador 28/09).
+  const lines: string[] = [oferta
+    ? `Chegou orçamento do bairro 👇 (a das grandes redes continua valendo pelo link que te mandei: ${melhorDaRede(oferta)})\n`
+    : 'Consegui cotações pra você! 🎉\n'];
 
   for (let i = 0; i < sorted.length; i++) {
     const q = sorted[i] as QuoteRow;
@@ -565,7 +642,9 @@ export async function consolidateQuotes(
     lines.push(`\n_(${unavailableCount} farmácia${plural ? 's' : ''} ${verb})_`);
   }
 
-  lines.push('\nQual você prefere? Pode me dizer o número ou o nome da farmácia 😊');
+  lines.push(oferta
+    ? '\nSe preferir alguma dessas, me diz o número que eu fecho com a farmácia 😊'
+    : '\nQual você prefere? Pode me dizer o número ou o nome da farmácia 😊');
 
   await sendOutbound(userConversationId, userPhoneE164, lines.join('\n'), traceId);
 
@@ -628,7 +707,7 @@ export async function consolidateQuotes(
  * CONDICIONAL, a Xarlote oferece re-engajar aquela farmácia (via message_supplier) OU
  * ampliar o raio. Tom humano (1-3 frases), sem vazar nota interna (sanitizeSupplierNote).
  */
-function buildFailureReport(quotes: QuoteRow[], nameOf: Map<string, string>): string {
+function buildFailureReport(quotes: QuoteRow[], nameOf: Map<string, string>, oferta: OfertaDaRede | null = null): string {
   const total = quotes.length;
   const responders: { name: string; note: string; conditional: boolean }[] = [];
   let noReturn = 0;
@@ -662,6 +741,13 @@ function buildFailureReport(quotes: QuoteRow[], nameOf: Map<string, string>): st
     offer = 'Quer que eu volte em alguma delas pra tentar acertar, ou prefere que eu procure num raio maior?';
   } else {
     offer = 'Nenhuma fechou dessa vez 😔 Quer que eu procure num raio maior?';
+  }
+  if (oferta) {
+    // Com o link das redes na mão, o relato do bairro é complemento — e a opção da rede segue.
+    const volta = conditionals.length === 1
+      ? ` Se quiser, eu volto na *${(conditionals[0] as { name: string }).name}* pra acertar isso.`
+      : conditionals.length > 1 ? ' Se quiser, eu volto em alguma delas pra acertar.' : '';
+    return `Das farmácias do bairro: ${respStr}.${outras}${volta}\n\nA opção das grandes redes segue valendo pelo link que te mandei: ${melhorDaRede(oferta)} 💙`;
   }
   return `Falei com ${total} farmácia${total > 1 ? 's' : ''} — ${respStr}.${outras}\n\n${offer}`;
 }

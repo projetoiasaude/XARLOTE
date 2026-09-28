@@ -40,6 +40,7 @@ export * from './pos-cotacao.js';
 export * from './endereco-entrega.js';
 export * from './quantidade-pedida.js';
 export * from './dose-pedida.js';
+export * from './enderecos-salvos.js';
 export * from './protocolo-de-retirada.js';
 export * from './busca-agendada.js';
 export * from './documento-de-exame.js';

@@ -18,6 +18,10 @@ export interface LojaApresentavel {
    * Menos; a Drogaria São Paulo, em lojas Pacheco). Vem do REGISTRO das redes, nunca de chute.
    */
   marcaDoGrupo?: string | null;
+  /** Partes do endereço (quando a rede manda separadas): servem pra não repetir o nome. */
+  rua?: string | null;
+  numero?: string | null;
+  bairro?: string | null;
 }
 
 export interface OpcaoApresentavel {
@@ -90,16 +94,30 @@ export function ondeRetirar(loja: LojaApresentavel | null | undefined): string {
   // — mas sem essa frase a pessoa acha que a Xarlote errou a loja (prova ao vivo de 24/09).
   const grupo = loja.marcaDoGrupo ? ' — loja do mesmo grupo' : '';
   const dist = loja.distanceKm !== null ? formatarDistancia(loja.distanceKm) : null;
+  const nome = fold(loja.name);
   const ruaNoNome = loja.address
     ? (() => {
-        const rua = nucleoDaRua(loja.address.split(',')[0] ?? '');
+        const rua = nucleoDaRua(loja.rua ?? loja.address.split(',')[0] ?? '');
         // Rua curta ou só número ("Rua 10", "T-63") casaria por acaso dentro de "Loja 104":
         // aí o endereço sempre vai junto — sobrar informação é melhor que faltar.
         const distintiva = rua.replace(/\s/g, '').length >= 4 && !/^[\d\s]+$/.test(rua);
-        return distintiva && fold(loja.name).includes(rua);
+        return distintiva && nome.includes(rua);
       })()
     : false;
-  if (loja.address && !ruaNoNome) {
+  // O NÚMERO da rua já está no nome da filial ("Pague Menos - Av. BN, 17 (Loja 709)"): o nome
+  // já é o endereço. Repetir saía "— B, 17, Setor Oeste" (a rede grava a rua como "B"), e
+  // parecia texto quebrado (Ludmila, 28/09). Aí só o bairro, se o nome não o traz.
+  // Só número de verdade ("17", "415", "1830-A"): "3" casaria "Loja 3", e "N/A" casaria qualquer nome.
+  const numeroLimpo = (loja.numero ?? '').trim();
+  const numeroNoNome = /^\d{2,}[a-z]?$/i.test(numeroLimpo.replace(/-/g, ''))
+    && new RegExp(`(^|[^0-9])${numeroLimpo.replace(/[^0-9a-z]/gi, '')}([^0-9a-z]|$)`, 'i').test(loja.name);
+  // Rua de 1–2 letras ("B") não diz nada sozinha: conta como sem rua.
+  const ruaInutil = !!loja.rua && fold(loja.rua).replace(/[^a-z0-9]/g, '').length <= 2;
+  if (loja.address && (ruaNoNome || numeroNoNome || ruaInutil)) {
+    const bairro = loja.bairro && !nome.includes(fold(loja.bairro)) ? loja.bairro : null;
+    return ` na *${loja.name}*${bairro ? ` — ${bairro}` : ''}${dist ? ` (${dist})` : ''}${grupo}`;
+  }
+  if (loja.address) {
     return ` na *${loja.name}* — ${loja.address}${dist ? ` (${dist})` : ''}${grupo}`;
   }
   return ` na *${loja.name}*${dist ? ` (${dist})` : ''}${grupo}`;

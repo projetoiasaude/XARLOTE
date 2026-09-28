@@ -76,6 +76,10 @@ export interface PickupStore {
   distanceKm: number | null;
   /** Label da rede IRMÃ (mesmo grupo no registro) cuja marca está na fachada — ver `marcarLojaDoGrupo`. */
   marcaDoGrupo?: string | null;
+  /** As partes do endereço, pra não repetir o que o nome da filial já diz ("Av. BN, 17"). */
+  rua?: string | null;
+  numero?: string | null;
+  bairro?: string | null;
 }
 
 // ─── Cesta (pedido com N medicamentos numa MESMA rede → 1 carrinho) ───────────

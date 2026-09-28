@@ -717,7 +717,7 @@ describe('entrega na hora — a logística vale pra CESTA INTEIRA (medição rea
   it('a retirada da cesta é na loja que tem OS DOIS (Av. Goiás), não na do Setor Sul', () => {
     const r = parseVtexBasketSimulation({ items: itens, logisticsInfo: [dipirona, amoxicilina] })!;
     expect(r.pickup).toMatchObject({ etaText: '60 min', etaMinutes: 60 });
-    expect(r.pickup!.store).toEqual({ name: 'Pague Menos - Av. Goiás, 415 (Loja 304)', address: 'Avenida Goiás, Setor Central', distanceKm: 0.35 });
+    expect(r.pickup!.store).toEqual({ name: 'Pague Menos - Av. Goiás, 415 (Loja 304)', address: 'Avenida Goiás, Setor Central', distanceKm: 0.35, rua: 'Avenida Goiás', numero: null, bairro: 'Setor Central' });
   });
 
   it('item sozinho: a entrega mais rápida dele vale (dipirona → 60 min)', () => {

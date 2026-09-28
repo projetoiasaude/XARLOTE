@@ -254,7 +254,7 @@ function lojaDoSla(s: Record<string, unknown>): PickupStore | null {
   const info = (s['pickupStoreInfo'] ?? null) as Record<string, unknown> | null;
   if (!info) return null;
   const limpar = (v: unknown) =>
-    typeof v === 'string' ? v.replace(/\s+/g, ' ').replace(/\s+,/g, ',').replace(/[\s.\-–]+$/, '').trim() : '';
+    typeof v === 'string' ? v.replace(/\s+/g, ' ').replace(/\s+,/g, ',').replace(/,\s*\(/g, ' (').replace(/[\s.\-–]+$/, '').trim() : '';
   const name = limpar(info['friendlyName']) || limpar(s['name']);
   if (!name) return null;
   const a = (info['address'] ?? null) as Record<string, unknown> | null;
@@ -267,7 +267,7 @@ function lojaDoSla(s: Record<string, unknown>): PickupStore | null {
   const dist = typeof s['pickupDistance'] === 'number' && Number.isFinite(s['pickupDistance'] as number)
     ? Math.round((s['pickupDistance'] as number) * 100) / 100
     : null;
-  return { name, address: partes.length ? partes.join(', ') : null, distanceKm: dist };
+  return { name, address: partes.length ? partes.join(', ') : null, distanceKm: dist, rua: rua || null, numero: numero || null, bairro: bairro || null };
 }
 
 /**

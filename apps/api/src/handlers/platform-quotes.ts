@@ -8,8 +8,8 @@
  * quotes/negociação. Resolve "só tem rede grande perto → nenhuma cotação".
  * Ver docs/PHARMACY_PLATFORMS.md.
  */
-import { writeLog } from '@iasaude/db';
-import { itemDisplayName, extractCep, faixaDePrazo, temOpcaoImediata, ehNaHora, selecionarParaEntregaNaHora, seloDePrazo, linhaDeLogistica, instrucaoDoCheckout, podeDizerPertinho, custoDaManchete, type OrderItem } from '@iasaude/shared';
+import { db, writeLog } from '@iasaude/db';
+import { itemDisplayName, extractCep, faixaDePrazo, temOpcaoImediata, ehNaHora, ordenarCotacoesDeRede, selecionarOpcoesDeRede, seloDePrazo, linhaDeLogistica, instrucaoDoCheckout, podeDizerPertinho, custoDaManchete, type OrderItem } from '@iasaude/shared';
 import { quotePlatformBasket, medNameForSearch, type PlatformBasketQuote, type BasketRequestItem } from '@iasaude/integrations';
 import { sendOutbound } from './outbound.js';
 
@@ -57,18 +57,18 @@ function renderNetworkBlock(idx: number, q: PlatformBasketQuote): string {
  * Monta a mensagem da cotação — PURA (sem envio, sem banco), pra poder ser testada e
  * conferida com dados reais antes de chegar a um paciente.
  *
- * MODO ENTREGA NA HORA: havendo opção que põe o remédio na mão da pessoa em até 4h
- * (entrega OU retirada), só essas aparecem — "chega em 4 dias úteis" logo abaixo era o
- * ruído que fazia a cotação parecer marketplace. A exceção (quem cobre MAIS itens da
- * receita continua) e o porquê estão em `selecionarParaEntregaNaHora`.
+ * ATÉ 3 LINKS DE CARA (fundador, 28/09): a Ludmila recebeu UM link porque o modo "só na hora"
+ * escondia a Catarinense (10 dias úteis) e a Ultrafarma (sem prazo por CEP). A ordem continua
+ * sendo a promessa — a que chega mais rápido vem primeiro, e cada uma diz o PRÓPRIO prazo —,
+ * mas a pessoa vê as opções. Havendo opção na hora, ela nunca fica de fora (`selecionarOpcoesDeRede`).
  */
 export function montarMensagemDeCotacao(
   quotes: PlatformBasketQuote[],
   opts: { soleChannel?: boolean; introText?: string; outroText?: string; totalDeItens?: number } = {},
 ): { texto: string; top: PlatformBasketQuote[]; soNaHora: boolean; descartadas: number } {
   const { soleChannel, introText, outroText } = opts;
-  const { cotacoes: selecionadas, soNaHora } = selecionarParaEntregaNaHora(quotes);
-  const top = selecionadas.slice(0, MAX_NETWORKS);
+  const top = selecionarOpcoesDeRede(ordenarCotacoesDeRede(quotes), MAX_NETWORKS);
+  const soNaHora = top.length > 0 && top.every(ehNaHora);
   const blocks = top.map((q, i) => renderNetworkBlock(i, q));
 
   // Quando existe opção que resolve HOJE, isso é a notícia — e vem antes de qualquer
@@ -92,7 +92,9 @@ export function montarMensagemDeCotacao(
           ? PARTE
           : 'Não achei farmácia de bairro com WhatsApp aqui na sua região agora 😕 mas dá pra pedir nas grandes redes — o prazo de cada uma pro seu CEP tá do lado 👇 é só tocar e finalizar o pagamento no site.\n\n')
     : (receitaTodaHoje
-        ? 'Já tenho uma opção que resolve *hoje* 👇 é só tocar e finalizar o pagamento no site da farmácia.\n\n'
+        ? (top.length > 1
+            ? `Já tenho ${top.length} opções nas grandes redes, e a primeira resolve *hoje* 👇 é só tocar e finalizar o pagamento no site da farmácia.\n\n`
+            : 'Já tenho uma opção que resolve *hoje* 👇 é só tocar e finalizar o pagamento no site da farmácia.\n\n')
         : parteHoje
           ? PARTE
           : 'Também achei nas grandes redes — o prazo de cada uma pro seu CEP tá do lado 👇 é só tocar e finalizar o pagamento no site.\n\n'));
@@ -100,7 +102,7 @@ export function montarMensagemDeCotacao(
     ? '\n\nQualquer dúvida na hora de finalizar, é só me chamar 💙'
     : '\n\nEnquanto isso sigo cotando nas farmácias do bairro — se aparecer melhor, te aviso! 😊');
 
-  return { texto: intro + blocks.join('\n\n') + outro, top, soNaHora, descartadas: quotes.length - selecionadas.length };
+  return { texto: intro + blocks.join('\n\n') + outro, top, soNaHora, descartadas: quotes.length - top.length };
 }
 
 export interface PresentPlatformQuotesResult {
@@ -167,12 +169,22 @@ export async function presentPlatformQuotes(params: {
   await sendOutbound(conversationId, phoneE164, texto, traceId);
 
   const itemsCovered = new Set(top.flatMap((q) => q.lines.map((l) => l.requested))).size;
-  // Três casos, não dois: com rápidas E a exceção de cobertura (uma lenta que tem mais itens),
-  // `soNaHora` é false — e o log dizia "nenhuma resolve na hora" com a rápida na mensagem.
+  // O pedido LEMBRA que as redes já responderam (28/09, Ludmila): sem isso, o aviso de 10 min
+  // ("as farmácias ainda não responderam") e o relatório de 45 min falavam como se ela não
+  // tivesse resposta nenhuma, com o link de 60 min já na mão.
+  const melhor = top[0];
+  if (melhor) {
+    const { error } = await db.from('orders').update({
+      platform_offer: { em: new Date().toISOString(), redes: top.length, melhor: { rede: melhor.networkLabel, total: custoDaManchete(melhor), prazo: seloDePrazo(melhor), naHora: ehNaHora(melhor) } },
+    }).eq('id', orderId);
+    if (error) await writeLog('warn', 'platform', `platform_offer não gravado: ${error.message.slice(0, 120)}`, { traceId, orderId });
+  }
+
+  const rapidas = top.filter(ehNaHora).length;
   const modo = soNaHora
-    ? ` — só as que resolvem na hora (${descartadas} lenta(s) fora)`
-    : temOpcaoImediata(top)
-      ? ` — resolvem na hora + 1 lenta que cobre mais itens (${descartadas} fora)`
+    ? ' — todas resolvem na hora'
+    : rapidas > 0
+      ? ` — ${rapidas} resolve(m) na hora, ${top.length - rapidas} com prazo maior${descartadas ? ` (${descartadas} fora do top ${MAX_NETWORKS})` : ''}`
       : ' — nenhuma resolve na hora';
   await writeLog('info', 'platform', `Cotação de plataformas (cesta): ${top.length} rede(s), ${itemsCovered}/${basket.length} item(ns) coberto(s)${modo}`, {
     traceId, orderId,

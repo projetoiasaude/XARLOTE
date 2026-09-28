@@ -4,7 +4,7 @@ import { isConsentAccepted, buildConsentEvent } from '@iasaude/core';
 import { marcarPedidoDeEsquecimento, consumirPedidoDeEsquecimento } from '../lib/esquecimento-pendente.js';
 import { acompanharEmVoo } from '../lifecycle.js';
 import { LIVE_CONSULTATION_STATUSES } from './entity-resolve.js';
-import { ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, afirmacaoDeProdutoSemProva, ehAncoraDeFechamento, classificarAckDeDose, lembretesQueTocaramJuntos, lembretesEntregues, anunciouRegistroDeDose, falaHonestaDeDose, tokenPrincipal, FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA, JANELA_PEDIDO_VIVO_MS, blocoDeIngestaoParaModelo, categoriaDeEmergenciaNaFala, decidirEsquecimento, confirmouEsquecimento, mensagemDeConfirmacaoDeEsquecimento, type OnboardingTopic } from '@iasaude/shared';
+import { PLATFORM_HANDOFF_SUMMARY, ONBOARDING_CONSENT_MESSAGE, ONBOARDING_CONSENT_REPEAT_MESSAGE, SARA_INSTANCE, QUEUE_NAMES, resolveQuotePick, resolveSpecificPick, isOrderAcceptance, resolveSupplierByHint, itemDisplayName, shouldAskOnboardingQuestions, isAmbiguousNegation, detectConsultationIntent, resolvedElsewhere, recortarLaudo, saudacaoDeConhecimento, OFERTA_RE, consertarConfusiveis, verificarAnuncios, falaHonestaPara, emergenciaSobreQuemCuido, PASSADO_RE, TERCEIRO_RE, selecionarFotosRecentes, FAMILIAS_COM_PROVA_NO_TURNO, semAnuncios, fimDaRecorrencia, afirmacaoDeProdutoSemProva, ehAncoraDeFechamento, classificarAckDeDose, lembretesQueTocaramJuntos, lembretesEntregues, anunciouRegistroDeDose, falaHonestaDeDose, tokenPrincipal, FAMILIAS_DE_PROMESSA_SEM_FERRAMENTA, JANELA_PEDIDO_VIVO_MS, blocoDeIngestaoParaModelo, categoriaDeEmergenciaNaFala, decidirEsquecimento, confirmouEsquecimento, mensagemDeConfirmacaoDeEsquecimento, type OnboardingTopic } from '@iasaude/shared';
 
 /**
  * Teto de idade da APRESENTAÇÃO pro backstop determinístico de fechamento poder agir.
@@ -969,12 +969,16 @@ async function processInboundUserInner(
   // Sem pedido ativo, o estado vazio FALA o que houve com o último (regra 3): senão o modelo
   // lê no histórico "vou pedir o frete pra Coimbra" de 4 dias atrás e segue esperando (14/09).
   const ultimoPedidoEncerrado = activeOrderSummary ? null : await (async () => {
-    const { data: ult } = await db.from('orders').select('items, status, cancelled_reason, created_at, closed_at')
+    const { data: ult } = await db.from('orders').select('items, status, cancelled_reason, created_at, closed_at, summary, platform_offer, selected_quote_id')
       .eq('user_id', user.id).order('created_at', { ascending: false }).limit(1).maybeSingle();
     if (!ult) return null;
     const itens = ((ult.items as Array<{ name?: string }> | null) ?? []).map((i) => i.name).filter(Boolean).join(', ') || 'medicamento';
     const quando = new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit' }).format(new Date(ult.created_at as string));
-    const motivo = ult.status === 'handed_off' ? 'fechado com a farmácia (entrega combinada)'
+    // Handoff das GRANDES REDES não é "fechado com a farmácia": a pessoa recebeu os links e
+    // finaliza no site. Sem esta distinção o modelo contava uma entrega combinada que não houve.
+    const deRede = !ult.selected_quote_id && (!!ult.platform_offer || (typeof ult.summary === 'string' && ult.summary.startsWith(PLATFORM_HANDOFF_SUMMARY)));
+    const motivo = ult.status === 'handed_off' && deRede ? 'opções das grandes redes enviadas com link (a pessoa finaliza no site da farmácia)'
+      : ult.status === 'handed_off' ? 'fechado com a farmácia (entrega combinada)'
       : ult.status === 'delivered' ? 'entregue'
       : (ult.cancelled_reason as string | null) || (ult.status === 'failed' ? 'sem cotação' : String(ult.status));
     return { itens, quando, motivo };

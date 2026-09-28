@@ -46,6 +46,22 @@ describe('ondeRetirar — a loja como o checkout lista (nome da filial + endere�
     expect(a).toBe(' na *Drogarias Pacheco - Filial Setor Bueno* — Avenida T-63, 1830, Setor Bueno (4,8 km)');
   });
 
+  it('o nome da filial já traz o endereço ("Av. BN, 17"): só o bairro vai junto (Ludmila 28/09)', () => {
+    // a rede grava a rua como "B": antes saía "— B, 17, Setor Oeste", com cara de texto quebrado
+    const loja709 = { name: 'Pague Menos - Av. BN, 17 (Loja 709)', address: 'B, 17, Setor Oeste', distanceKm: 0.47, rua: 'B', numero: '17', bairro: 'Setor Oeste' };
+    expect(ondeRetirar(loja709)).toBe(' na *Pague Menos - Av. BN, 17 (Loja 709)* — Setor Oeste (470 m)');
+  });
+
+  it('rua de uma letra sem número no nome também não vai; o bairro sim', () => {
+    expect(ondeRetirar({ name: 'Pague Menos - Loja 709', address: 'B, Setor Oeste', distanceKm: 0.47, rua: 'B', numero: null, bairro: 'Setor Oeste' }))
+      .toBe(' na *Pague Menos - Loja 709* — Setor Oeste (470 m)');
+  });
+
+  it('bairro que o nome já diz não repete', () => {
+    expect(ondeRetirar({ name: 'Drogarias Pacheco - Filial Setor Bueno 9', address: 'Avenida T-63, 1830, Setor Bueno', distanceKm: 4.8, rua: 'Avenida T-63', numero: '1830', bairro: 'Setor Bueno' }))
+      .toBe(' na *Drogarias Pacheco - Filial Setor Bueno 9* — Avenida T-63, 1830, Setor Bueno (4,8 km)');
+  });
+
   it('a marca da FACHADA aparece (a DSP de Goiânia retira em lojas Pacheco)', () => {
     expect(ondeRetirar(lojaPacheco)).toContain('Drogarias Pacheco');
   });

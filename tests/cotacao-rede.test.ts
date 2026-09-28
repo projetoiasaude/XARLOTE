@@ -14,7 +14,7 @@ import {
   faixaDePrazo,
   totalEntregue,
   temOpcaoImediata,
-  selecionarParaEntregaNaHora,
+  selecionarOpcoesDeRede,
   custoDaManchete,
   type CotacaoOrdenavel,
 } from '../packages/shared/src/cotacao-rede.js';
@@ -165,44 +165,43 @@ describe('temOpcaoImediata', () => {
   });
 });
 
-describe('selecionarParaEntregaNaHora — o modo "entrega na hora"', () => {
+describe('selecionarOpcoesDeRede — até 3 links de cara, a mais rápida primeiro (fundador 28/09)', () => {
   const pagueMenos60 = cot(16.99, { fee: 7.9, min: 60 });
   const pacheco90 = cot(21.26, { fee: 7.9, min: 90 });
   const drogal4dias = cot(3.49, { fee: 10.57, min: 4 * DIA });
   const catarinense11dias = cot(5.75, { fee: 30.35, min: 11 * DIA });
 
-  it('havendo quem resolve agora, os lentos saem da lista', () => {
+  it('as lentas COMPLETAM a lista (antes sumiam e a Ludmila recebeu um link só)', () => {
     const ordenadas = ordenarCotacoesDeRede([drogal4dias, pagueMenos60, catarinense11dias, pacheco90]);
-    const r = selecionarParaEntregaNaHora(ordenadas);
-    expect(r.soNaHora).toBe(true);
-    expect(r.cotacoes).toEqual([pagueMenos60, pacheco90]);
+    expect(selecionarOpcoesDeRede(ordenadas)).toEqual([pagueMenos60, pacheco90, drogal4dias]);
   });
 
-  it('retirada rápida conta como "na hora"', () => {
-    const retira = cot(21.9, { fee: 2.45, min: DIA }, { retirada: { fee: 0, min: 60 } });
-    const r = selecionarParaEntregaNaHora(ordenarCotacoesDeRede([drogal4dias, retira]));
-    expect(r.cotacoes).toEqual([retira]);
+  it('uma rápida só + lentas: a rápida primeiro, as outras duas depois', () => {
+    const ordenadas = ordenarCotacoesDeRede([catarinense11dias, drogal4dias, pagueMenos60]);
+    expect(selecionarOpcoesDeRede(ordenadas)).toEqual([pagueMenos60, drogal4dias, catarinense11dias]);
   });
 
-  it('NUNCA esconde a única opção com a receita COMPLETA, mesmo lenta', () => {
-    const completaLenta = cot(40, { fee: 10, min: 4 * DIA }, { itens: 3 });
+  it('a rápida PARCIAL nunca some atrás de três lentas completas (revisão 24/09)', () => {
+    const completa1 = cot(40, { fee: 10, min: 4 * DIA }, { itens: 3 });
+    const completa2 = cot(42, { fee: 10, min: 5 * DIA }, { itens: 3 });
+    const completa3 = cot(45, { fee: 10, min: 6 * DIA }, { itens: 3 });
     const parcialRapida = cot(20, { fee: 7.9, min: 60 }, { itens: 2 });
-    const r = selecionarParaEntregaNaHora(ordenarCotacoesDeRede([parcialRapida, completaLenta]));
-    expect(r.cotacoes).toContain(completaLenta);
-    expect(r.cotacoes).toContain(parcialRapida);
+    const r = selecionarOpcoesDeRede(ordenarCotacoesDeRede([completa1, completa2, completa3, parcialRapida]));
+    expect(r).toHaveLength(3);
+    expect(r).toContain(parcialRapida);
+    expect(r[0]).toBe(completa1);
   });
 
-  it('sem ninguém rápido, nada é filtrado — a honestidade é mostrar o prazo que existe', () => {
-    const ordenadas = ordenarCotacoesDeRede([drogal4dias, catarinense11dias]);
-    const r = selecionarParaEntregaNaHora(ordenadas);
-    expect(r.soNaHora).toBe(false);
-    expect(r.cotacoes).toEqual(ordenadas);
+  it('sem ninguém rápido, as 3 melhores pelo comparador', () => {
+    const lenta3 = cot(9, { fee: 20, min: 7 * DIA });
+    const ordenadas = ordenarCotacoesDeRede([catarinense11dias, drogal4dias, lenta3]);
+    expect(selecionarOpcoesDeRede(ordenadas)).toEqual(ordenadas);
   });
 
-  it('preserva a ordem de entrada e não muta', () => {
+  it('não muta a entrada', () => {
     const ordenadas = ordenarCotacoesDeRede([pacheco90, pagueMenos60]);
     const copia = [...ordenadas];
-    selecionarParaEntregaNaHora(ordenadas);
+    selecionarOpcoesDeRede(ordenadas);
     expect(ordenadas).toEqual(copia);
   });
 });

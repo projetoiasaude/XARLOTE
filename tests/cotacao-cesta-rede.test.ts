@@ -212,7 +212,7 @@ describe('a mensagem (montarMensagemDeCotacao) — só promete o que a rede conf
     const { texto } = montarMensagemDeCotacao([q!], { soleChannel: true, totalDeItens: 1 });
     expect(texto).toContain('hoje mesmo');
     expect(texto).toContain('R$ 10,49 · ⚡ retire em 60 min');                 // preço de RETIRAR, sem o frete
-    expect(texto).toContain('na *Pague Menos - Av. Goiás, 415 (Loja 304)* (350 m)');
+    expect(texto).toContain('na *Pague Menos - Av. Goiás, 415 (Loja 304)* — Setor Central (350 m)');
     expect(texto).toContain('escolha *retirar na loja*');
     expect(texto).toContain('leve ela');                                        // a receita
     expect(texto).not.toContain('mesmo grupo');                                 // a loja É da rede
@@ -246,7 +246,23 @@ describe('a mensagem (montarMensagemDeCotacao) — só promete o que a rede conf
     const [q] = await quotePlatformBasket([{ query: 'losartana 50mg', label: 'Losartana 50mg', qty: 1 }], CEP, { networkIds: ['extrafarma'] });
     expect(q!.pickup?.store?.marcaDoGrupo).toBe('Pague Menos');
     const { texto } = montarMensagemDeCotacao([q!], { soleChannel: true, totalDeItens: 1 });
-    expect(texto).toContain('na *Pague Menos - Av. Goiás, 415 (Loja 304)* (350 m) — loja do mesmo grupo');
+    expect(texto).toContain('na *Pague Menos - Av. Goiás, 415 (Loja 304)* — Setor Central (350 m) — loja do mesmo grupo');
+  });
+
+  it('3 links de cara: a rápida primeiro, as outras com o próprio prazo, e o bairro UMA vez só (Ludmila 28/09)', () => {
+    const base = { lines: [{ requested: 'Cefaliv', productName: 'Cefaliv 1mg + 100mg + 350mg 12 Comprimidos', sku: 's', sellerId: '1', price: 17.69, qty: 1, matchScore: 1 }], missing: [], available: true, checkoutUrl: 'https://x', pricedByCep: true };
+    const pague = { ...base, network: 'pague-menos', networkLabel: 'Pague Menos', group: 'PagueMenos', total: 17.69, delivery: { etaText: '60 min', feeReais: 7.9, etaMinutes: 60, slaName: 'Super Expressa' }, pickup: null };
+    const catarinense = { ...base, network: 'catarinense', networkLabel: 'Drogaria Catarinense', group: 'Catarinense', total: 21.5, delivery: { etaText: '10 dias úteis', feeReais: 15, etaMinutes: 10 * 24 * 60, slaName: 'NORMAL' }, pickup: null };
+    const ultrafarma = { ...base, network: 'ultrafarma', networkLabel: 'Ultrafarma', group: 'Ultrafarma', total: 17.21, delivery: null, pickup: null, pricedByCep: false };
+    const bairro = 'Também pedi orçamento pra 4 farmácias do seu bairro. Se alguma responder, te passo o valor na hora 😊';
+    const { texto, top } = montarMensagemDeCotacao([ultrafarma, catarinense, pague], { soleChannel: false, totalDeItens: 1, outroText: `\n\n${bairro}` });
+    expect(top.map((q) => q.networkLabel)).toEqual(['Pague Menos', 'Drogaria Catarinense', 'Ultrafarma']);
+    expect(texto).toContain('Já tenho 3 opções nas grandes redes, e a primeira resolve *hoje*');
+    expect(texto).toContain('⚡ chega em 60 min');
+    expect(texto).toContain('chega em 10 dias úteis');
+    expect(texto).toContain('confira o prazo no site');
+    expect(texto.match(/bairro/g)).toHaveLength(1);          // o fecho É a frase do bairro
+    expect(texto.endsWith(bairro)).toBe(true);
   });
 
   it('só uma PARTE resolve hoje → não promete a receita toda pra hoje (C3)', () => {
